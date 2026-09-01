@@ -177,6 +177,42 @@ npx evenhub pack app.json dist -o g2-even-reality-hub.ehpk
 
 Submit the `.ehpk` to the Even Hub developer portal, or load via QR for personal use.
 
+## Authentication (Google Sign-In, web control app only)
+
+The web control app (when opened in a normal browser) requires **Google Sign-In**
+and only lets **your whitelisted Google account** in. The glasses drawing is NOT
+gated (the Even App WebView can't do OAuth), so the glasses keep working.
+
+### 1. Create a Google OAuth Client ID
+
+1. Go to https://console.cloud.google.com and create/select a project.
+2. **APIs & Services → OAuth consent screen** → External → fill in the app name and
+   your email. Add your Google account as a **Test user** (or publish the app).
+3. **APIs & Services → Credentials → + Create Credentials → OAuth client ID → Web application**.
+4. **Authorized JavaScript origins** (exact origin, no trailing slash):
+   - `https://g2-even-note-taking-production.up.railway.app`
+   - `http://localhost:5175` (local dev)
+5. Copy the **Client ID** (ends in `.apps.googleusercontent.com`).
+
+### 2. Set the server env vars (Railway dashboard → Variables)
+
+| Variable | Value |
+|---|---|
+| `GOOGLE_CLIENT_ID` | `xxxx.apps.googleusercontent.com` |
+| `ALLOWED_EMAILS` | your email, e.g. `you@gmail.com` (comma-separated for more) |
+
+### 3. Local dev
+
+```bash
+GOOGLE_CLIENT_ID="xxxx.apps.googleusercontent.com" \
+ALLOWED_EMAILS="you@gmail.com" \
+node server/local-sse.mjs
+```
+
+The login screen appears in a browser until a whitelisted account signs in; the
+ID token is verified server-side by the relay (`/api/auth/verify`, RS256 via
+`node:crypto` — no extra dependencies).
+
 ## Copilot Skills
 
 The **everything-evenhub** skill set (13 skills) is installed globally at `~/.copilot/skills/`.

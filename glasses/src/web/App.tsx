@@ -1,5 +1,6 @@
 import { useSyncExternalStore, useState } from 'react';
 import { categorize } from './categorize';
+import { useAuth } from './auth';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
 import type { ConnStatus } from '../store';
 import type { HubState, SectionId, TodoItem } from '../types';
@@ -22,6 +23,7 @@ function useConn(): ConnStatus {
 export default function App() {
   const state = useHubState();
   const conn = useConn();
+  const { authed, email, inEvenApp, signOut } = useAuth();
   const [paste, setPaste] = useState('');
   const [detected, setDetected] = useState<SectionId[]>([]);
   const [newTask, setNewTask] = useState('');
@@ -107,6 +109,13 @@ export default function App() {
           {chip.label}
           {state.updatedAt ? ` · ${new Date(state.updatedAt).toLocaleTimeString()}` : ''}
         </div>
+        {authed && (
+          <div className="sync-chip" title="Signed-in account">
+            <span>👤 {email}</span>
+            <button className="icon-btn" onClick={signOut} aria-label="Sign out">⏻</button>
+          </div>
+        )}
+        {inEvenApp && <div className="sync-chip">Even App mode</div>}
       </header>
 
       <section className="paste-panel card">

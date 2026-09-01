@@ -6,6 +6,9 @@ import type { HubState, StreamFrame } from './types';
 export const STREAM_URL: string =
   (import.meta.env.VITE_HUB_STREAM_URL as string | undefined) ?? '/api/stream?channel=hub';
 
+// Base origin of the relay API (auth / config / stream). Same-origin by default.
+export const API_BASE: string = STREAM_URL.split('/api/')[0];
+
 // POST endpoint for publishing state (same host/path as the SSE stream).
 const STATE_URL = STREAM_URL.split('?')[0];
 
