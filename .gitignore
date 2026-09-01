@@ -14,6 +14,9 @@ dist/
 *.log
 npm-debug.log*
 
+# Relay disk state (created at runtime by web/server/local-sse.mjs)
+.g2-hub-state.json
+
 # Editor / OS
 .vscode/
 .idea/

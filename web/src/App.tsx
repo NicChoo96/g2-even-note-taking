@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { categorize } from './categorize';
-import { publishState } from './stream';
+import { publishState, subscribeState } from './stream';
 import { loadState, saveState } from './store';
 import type { HubState, SectionId, TodoItem } from './types';
 import { uid } from './types';
@@ -21,15 +21,18 @@ export default function App() {
   const [sync, setSync] = useState<SyncState>('idle');
   const [lastSync, setLastSync] = useState<number | null>(null);
   const publishTimer = useRef<number | null>(null);
+  // updatedAt of the last state THIS device published — lets us ignore our own SSE echo.
+  const lastSentAt = useRef<number>(0);
 
   // Mutate state, stamping updatedAt so the glasses can order frames.
   const mutate = useCallback((fn: (s: HubState) => HubState) => {
     setState((prev) => ({ ...fn(prev), updatedAt: Date.now() }));
   }, []);
 
-  // Persist to localStorage + broadcast to the glasses on every change (debounced).
+  // Persist to localStorage + broadcast to ALL devices on every change (debounced).
   useEffect(() => {
     saveState(state);
+    lastSentAt.current = state.updatedAt;
     setSync('pushing');
     if (publishTimer.current) window.clearTimeout(publishTimer.current);
     publishTimer.current = window.setTimeout(() => {
@@ -43,9 +46,38 @@ export default function App() {
     };
   }, [state]);
 
-  // Seed the hub with the stored state on first load (in case the server restarted).
+  // Cross-device sync: on connect the server sends an `init` frame with the
+  // authoritative latest state, then live `state` frames whenever ANY device
+  // edits. Ignore the echo of our own POSTs. If the server has no state at all
+  // (fresh deploy / relay restart), seed it from this device's local copy so
+  // other devices can pick it up.
   useEffect(() => {
-    void publishState(loadState());
+    let gotFrame = false;
+    const seedTimer = window.setTimeout(() => {
+      if (gotFrame) return;
+      const local = loadState();
+      const hasData =
+        local.sections.todo.length > 0 || !!local.sections.docs || !!local.sections.notes;
+      if (hasData) void publishState({ ...local, updatedAt: Date.now() });
+    }, 2000);
+
+    const off = subscribeState((frame) => {
+      gotFrame = true;
+      window.clearTimeout(seedTimer);
+      if (!frame?.state) return;
+      setState((prev) => {
+        const next = frame.state;
+        if (next.updatedAt === lastSentAt.current && prev.updatedAt === next.updatedAt) {
+          return prev; // our own echo — already applied
+        }
+        return { ...next, updatedAt: next.updatedAt ?? Date.now() };
+      });
+    });
+
+    return () => {
+      window.clearTimeout(seedTimer);
+      off();
+    };
   }, []);
 
   const handleCategorize = () => {

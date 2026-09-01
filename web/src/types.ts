@@ -20,6 +20,11 @@ export interface HubState {
   updatedAt: number;
 }
 
+export interface StreamFrame {
+  type: 'init' | 'state';
+  state: HubState;
+}
+
 export function emptyHubState(): HubState {
   return {
     activeSection: 'todo',
