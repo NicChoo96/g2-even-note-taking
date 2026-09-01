@@ -1,10 +1,14 @@
 // Persistent G2 Even Reality Hub relay — ONE always-on process that serves BOTH
-// the built web app (from dist/) and the live SSE/state stream. This is the
-// "live always, all devices at the same time" backend for Railway/Fly/Render.
+// apps and the live SSE/state stream. This is the "live always, all devices at
+// the same time" backend for Railway/Fly/Render.
 //
 //   GET  /api/stream?channel=hub  -> SSE stream (the glasses app connects here)
 //   POST /api/stream              -> publish HubState + broadcast to SSE clients
-//   GET  /                        -> serves the built web app (SPA fallback)
+//   GET  /                        -> serves the G2 GLASSES app (glasses-dist),
+//                                     so the bare main URL loads the app the
+//                                     Even App prototype QR points at.
+//   GET  /app/                    -> serves the web pasteboard UI (dist)
+//   GET  /app.json                -> glasses manifest (Even App recognition)
 //
 // Zero runtime dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
@@ -160,14 +164,14 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // G2 glasses app — served at /glasses/ (the URL the Even App prototype QR loads).
-  if (req.method === 'GET' && (url.pathname === '/glasses' || url.pathname.startsWith('/glasses/'))) {
-    await serveFrom(GLASSES_DIST, '/glasses', req, res);
+  // Web pasteboard app (data-entry UI) — served at /app/.
+  if (req.method === 'GET' && (url.pathname === '/app' || url.pathname.startsWith('/app/'))) {
+    await serveFrom(DIST, '/app', req, res);
     return;
   }
 
-  // The Even App identifies an Even Hub app by its app.json manifest. Serve the
-  // glasses manifest at the origin root too, in case it probes the bare host.
+  // The Even App identifies an Even Hub app by its app.json manifest at the
+  // BARE ORIGIN ROOT — serve the glasses manifest exactly there.
   if (req.method === 'GET' && url.pathname === '/app.json') {
     try {
       const data = await readFile(join(GLASSES_DIST, 'app.json'));
@@ -180,9 +184,11 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Everything else: serve the built web app (SPA fallback to index.html).
+  // Everything else at the origin root = the G2 GLASSES app (SPA fallback).
+  // Scanning the bare main URL loads the glasses app — exactly like the local
+  // dev-server flow that already works on real hardware.
   if (req.method === 'GET') {
-    await serveFrom(DIST, '', req, res);
+    await serveFrom(GLASSES_DIST, '', req, res);
     return;
   }
 
