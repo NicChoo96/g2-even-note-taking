@@ -3,7 +3,6 @@
   "edition": "202601",
   "name": "Reality Hub",
   "version": "0.1.0",
-  "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.14",
   "entrypoint": "index.html",
   "permissions": [
@@ -14,6 +13,7 @@
         "https://g2-even-note-taking-production.up.railway.app",
         "https://g2-even-note-taking.vercel.app",
         "http://192.168.10.109:5175",
+        "http://192.168.10.109:5177",
         "http://localhost:5174",
         "http://localhost:5175",
         "http://localhost:5173"
