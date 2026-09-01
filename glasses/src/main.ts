@@ -17,9 +17,29 @@ const STATE_API = STREAM_URL.replace('/api/stream', '/api/state');
 const LS_KEY = 'hub:state';
 const MAX_UPGRADE_TEXT = 2000;
 
+/** Append a visible line to the WebView status panel (shows on the phone in the Even App browser). */
+function setStatus(line: string): void {
+  const el = document.getElementById('status');
+  if (el) {
+    el.textContent = el.textContent ? `${el.textContent}\n${line}` : line;
+  }
+  console.log('[hub]', line);
+}
+
 async function main(): Promise<void> {
+  setStatus('⌛ waiting for EvenAppBridge…');
   const bridge: EvenAppBridge = await waitForEvenAppBridge();
+  setStatus('✅ EvenAppBridge ready');
   console.log('[hub] bridge ready');
+
+  try {
+    const dev = await bridge.getDeviceInfo();
+    setStatus(
+      `👓 device: ${dev ? `${dev.model} · ${dev.status?.connectType ?? 'unknown'}` : 'none detected'}`,
+    );
+  } catch {
+    setStatus('👓 device info unavailable');
+  }
 
   // ── State ──────────────────────────────────────────────────────────────────
   let state: HubState = emptyHubState();
@@ -77,6 +97,7 @@ async function main(): Promise<void> {
       await doRender(opts);
     } catch (err) {
       console.error('[hub] render error', err);
+      setStatus(`⚠️ render error: ${String(err)}`);
     } finally {
       rendering = false;
       if (pendingRender) {
@@ -118,11 +139,15 @@ async function main(): Promise<void> {
     if (!started) {
       const res = await bridge.createStartUpPageContainer(buildStartupPage(state));
       console.log('[hub] createStartUpPageContainer ->', res);
+      setStatus(
+        `🖼 createStartUpPageContainer -> ${res}${res === StartUpPageCreateResult.success ? '' : ' (REJECTED — nothing will draw on glasses)'}`,
+      );
       started = res === StartUpPageCreateResult.success;
       if (!started) console.log('[hub] WARNING: startup page rejected');
     } else {
       const ok = await bridge.rebuildPageContainer(buildPage(state));
       console.log('[hub] rebuildPageContainer ->', ok);
+      setStatus(`🔁 rebuild -> ${ok}`);
     }
     renderedSection = section;
     renderedText = section === 'docs' ? state.sections.docs : state.sections.notes;
@@ -206,8 +231,8 @@ async function main(): Promise<void> {
       state.updatedAt = next.updatedAt ?? Date.now();
       void render();
     },
-    onStatus: () => {
-      /* status is reflected by the stream reconnecting itself */
+    onStatus: (s) => {
+      setStatus(`📡 SSE ${s}`);
     },
   });
 
