@@ -8,7 +8,8 @@
     "dev:full": "node server/dev.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "start:local": "node server/local-sse.mjs"
+    "start:local": "node server/local-sse.mjs",
+    "start": "node server/local-sse.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

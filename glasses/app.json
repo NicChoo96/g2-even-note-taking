@@ -11,7 +11,7 @@
       "name": "network",
       "desc": "Connect to the G2 Even Reality Hub SSE stream for live data sync",
       "whitelist": [
-        "https://<your-vercel-app>.vercel.app",
+        "https://g2-even-note-taking.vercel.app",
         "http://localhost:5174",
         "http://localhost:5175",
         "http://localhost:5173"

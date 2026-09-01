@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.vercel
+*.log
+.env
+.env.*.local
+Dockerfile
+.dockerignore

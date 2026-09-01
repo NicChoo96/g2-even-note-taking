@@ -123,6 +123,45 @@ npx vercel --prod
 - Optional persistence: Upstash Redis via `REDIS_REST_URL` / `REDIS_REST_TOKEN` (for
   multi-device/collab sync across serverless instances)
 
+## Persistent Relay — true live sync on all devices (recommended)
+
+Vercel serverless is ephemeral, so "live on all devices **at the same time**" is more reliable
+from a **single always-on process** that serves the web UI **and** the SSE stream together.
+
+`web/server/local-sse.mjs` is that process (zero runtime dependencies). It serves:
+- the built web app from `web/dist/` (SPA fallback), and
+- `/api/stream` (GET = SSE, POST = state broadcast) on the same origin.
+
+### Run it locally
+
+```bash
+cd web
+npm run build        # produce dist/
+npm start            # → http://localhost:5174  (web UI + live stream together)
+```
+
+### Deploy it (pick one free host)
+
+| Host | Steps |
+|---|---|
+| **Railway** | New Project → Deploy from GitHub repo → set Root Directory `web` → Railway reads the `Procfile`/`Dockerfile` and starts `node server/local-sse.mjs`. |
+| **Render** | New Web Service → repo → Root Directory `web` → Build `npm run build` → Start `node server/local-sse.mjs`. |
+| **Fly.io** | `cd web && fly launch` (uses the included `Dockerfile`). |
+
+All three give you a stable `https://<your-app>.up.railway.app`-style URL.
+
+### Point the glasses at the relay
+
+```bash
+cd glasses
+# .env.local:
+#   VITE_HUB_STREAM_URL=https://<your-relay-host>/api/stream?channel=hub
+```
+And add the relay domain to the `network` whitelist in `glasses/app.json`.
+
+Now every device — phone browser, desktop, and the glasses (via the Even App WebView) — connects
+to the **same live stream**, so edits appear on all of them simultaneously.
+
 ## Packaging the Glasses App
 
 ```bash
