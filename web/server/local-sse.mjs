@@ -166,6 +166,20 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // The Even App identifies an Even Hub app by its app.json manifest. Serve the
+  // glasses manifest at the origin root too, in case it probes the bare host.
+  if (req.method === 'GET' && url.pathname === '/app.json') {
+    try {
+      const data = await readFile(join(GLASSES_DIST, 'app.json'));
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(data);
+    } catch {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+    return;
+  }
+
   // Everything else: serve the built web app (SPA fallback to index.html).
   if (req.method === 'GET') {
     await serveFrom(DIST, '', req, res);

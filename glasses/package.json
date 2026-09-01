@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "build:deploy": "tsc --noEmit && vite build --base=/glasses/",
+    "build": "tsc --noEmit && vite build && node -e \"fs.copyFileSync('app.json','dist/app.json')\"",
+    "build:deploy": "tsc --noEmit && vite build --base=/glasses/ && node -e \"fs.copyFileSync('app.json','dist/app.json')\"",
     "preview": "vite preview",
     "simulate": "evenhub-simulator http://127.0.0.1:5175"
   },
