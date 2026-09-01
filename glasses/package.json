@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:deploy": "tsc --noEmit && vite build --base=/glasses/",
     "preview": "vite preview",
     "simulate": "evenhub-simulator http://127.0.0.1:5175"
   },

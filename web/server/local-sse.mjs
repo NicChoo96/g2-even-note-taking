@@ -16,6 +16,8 @@ import { fileURLToPath } from 'node:url';
 
 const PORT = Number(process.env.PORT || 5174);
 const DIST = fileURLToPath(new URL('../dist', import.meta.url));
+// Built G2 glasses app — served at /glasses/ (see the root Dockerfile).
+const GLASSES_DIST = fileURLToPath(new URL('../glasses-dist', import.meta.url));
 // Last-known state is mirrored to disk so a Railway/Fly/Render restart does not
 // wipe the data. Override the path with STATE_FILE for a persistent volume.
 const STATE_FILE = process.env.STATE_FILE || join(process.cwd(), '.g2-hub-state.json');
@@ -83,20 +85,24 @@ function send(client, frame) {
   }
 }
 
-/** Serve a file from dist/ with a safe index.html fallback (SPA routing). */
-async function serveStatic(req, res) {
+/**
+ * Serve a static file from `root` with a safe index.html fallback (SPA routing).
+ * `mount` is an optional URL prefix to strip (e.g. '/glasses').
+ */
+async function serveFrom(root, mount, req, res) {
   const pathname = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-  let filePath = join(DIST, normalize(pathname).replace(/^([/\\])+/, ''));
+  const rel = mount && pathname.startsWith(mount) ? pathname.slice(mount.length) : pathname;
+  let filePath = join(root, normalize(rel).replace(/^([/\\])+/, ''));
 
-  // Path-traversal guard: resolved path must stay inside dist/.
-  if (relative(DIST, filePath).startsWith('..')) {
+  // Path-traversal guard: resolved path must stay inside root/.
+  if (relative(root, filePath).startsWith('..')) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
   }
 
   if (!existsSync(filePath) || statSync(filePath).isDirectory()) {
-    filePath = join(DIST, 'index.html');
+    filePath = join(root, 'index.html');
   }
 
   try {
@@ -154,9 +160,15 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // G2 glasses app — served at /glasses/ (the URL the Even App prototype QR loads).
+  if (req.method === 'GET' && (url.pathname === '/glasses' || url.pathname.startsWith('/glasses/'))) {
+    await serveFrom(GLASSES_DIST, '/glasses', req, res);
+    return;
+  }
+
   // Everything else: serve the built web app (SPA fallback to index.html).
   if (req.method === 'GET') {
-    await serveStatic(req, res);
+    await serveFrom(DIST, '', req, res);
     return;
   }
 

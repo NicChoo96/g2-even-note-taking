@@ -17,6 +17,9 @@ npm-debug.log*
 # Relay disk state (created at runtime by web/server/local-sse.mjs)
 .g2-hub-state.json
 
+# Local staging of the built glasses app (Docker builds its own copy)
+glasses-dist/
+
 # Editor / OS
 .vscode/
 .idea/

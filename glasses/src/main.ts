@@ -12,9 +12,12 @@ import { sectionText } from './sections';
 import { emptyHubState, type HubState } from './types';
 
 // ── Configuration ────────────────────────────────────────────────────────────
+// Same-origin by default: when the deployed glasses app is served by the relay
+// (at /glasses/ on the same host), this resolves to the live SSE stream next to
+// it. Local dev overrides via VITE_HUB_STREAM_URL in .env.local.
 const STREAM_URL: string =
   (import.meta.env.VITE_HUB_STREAM_URL as string | undefined) ??
-  'http://localhost:5174/api/stream?channel=hub';
+  '/api/stream?channel=hub';
 const MAX_UPGRADE_TEXT = 2000;
 
 // Single full-canvas text container — the official template pattern.
