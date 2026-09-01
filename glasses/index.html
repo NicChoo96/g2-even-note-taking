@@ -21,7 +21,13 @@
     </style>
   </head>
   <body>
-    <div id="status">booting…</div>
+    <!-- Tiny diagnostic readout (helps debug real-glasses loading) -->
+    <details style="position:fixed;top:6px;right:6px;z-index:99;max-width:340px;background:rgba(4,23,13,.92);border:1px solid #1e4d35;border-radius:8px;padding:6px 10px;font-size:10px;color:#3ddc84;">
+      <summary>glasses status</summary>
+      <pre id="status" style="margin:4px 0 0;white-space:pre-wrap;word-break:break-word;">booting…</pre>
+    </details>
+    <!-- Companion web UI — same URL drives this page AND the glasses -->
+    <div id="root"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

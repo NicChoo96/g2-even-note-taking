@@ -9,22 +9,16 @@ import {
 } from '@evenrealities/even_hub_sdk';
 import { connectStream } from './stream';
 import { sectionText } from './sections';
-import { emptyHubState, type HubState } from './types';
+import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe } from './store';
+import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
-// Same-origin by default: when the deployed glasses app is served by the relay
-// (at /glasses/ on the same host), this resolves to the live SSE stream next to
-// it. Local dev overrides via VITE_HUB_STREAM_URL in .env.local.
-const STREAM_URL: string =
-  (import.meta.env.VITE_HUB_STREAM_URL as string | undefined) ??
-  '/api/stream?channel=hub';
 const MAX_UPGRADE_TEXT = 2000;
-
 // Single full-canvas text container — the official template pattern.
 const CONTAINER_ID = 1;
 const CONTAINER_NAME = 'main';
 
-/** Append a visible line to the WebView status panel (shows on the phone in the Even App browser). */
+/** Append a visible line to the WebView status panel (phone Even App browser). */
 function setStatus(line: string): void {
   const el = document.getElementById('status');
   if (el) {
@@ -34,6 +28,11 @@ function setStatus(line: string): void {
 }
 
 async function main(): Promise<void> {
+  // ONE app, ONE URL: render the companion web UI in any browser (including the
+  // Even App WebView), then draw to the glasses via the SDK when the bridge is
+  // available. The shared store keeps the UI and the glasses in sync.
+  mountUi();
+
   setStatus('⌛ waiting for EvenAppBridge…');
   const bridge: EvenAppBridge = await waitForEvenAppBridge();
   setStatus('✅ EvenAppBridge ready');
@@ -48,49 +47,39 @@ async function main(): Promise<void> {
     setStatus('👓 device info unavailable');
   }
 
-  // ── State ──────────────────────────────────────────────────────────────────
-  let state: HubState = emptyHubState();
   let started = false; // createStartUpPageContainer called exactly once
   let renderedText = '';
 
-  // ── Rendering ──────────────────────────────────────────────────────────────
-  // createStartUpPageContainer is a ONE-SHOT call — a second concurrent call is
-  // rejected by the host (returns 1 = invalid). SSE frames can arrive during
-  // boot, so coalesce + serialize renders to guarantee create runs exactly once.
+  // createStartUpPageContainer is a ONE-SHOT call — coalesce + serialize renders
+  // so create runs exactly once no matter how fast state changes arrive.
   let rendering = false;
-  let pendingRender: { force?: boolean } | null = null;
+  let pendingRender = false;
 
-  async function render(opts: { force?: boolean } = {}): Promise<void> {
+  async function renderGlasses(): Promise<void> {
     if (rendering) {
-      pendingRender = opts;
+      pendingRender = true;
       return;
     }
     rendering = true;
     try {
-      await doRender(opts);
+      await doRender();
     } catch (err) {
       console.error('[hub] render error', err);
       setStatus(`⚠️ render error: ${String(err)}`);
     } finally {
       rendering = false;
       if (pendingRender) {
-        const next = pendingRender;
-        pendingRender = null;
-        await render(next);
+        pendingRender = false;
+        await renderGlasses();
       }
     }
   }
 
-  async function doRender(opts: { force?: boolean } = {}): Promise<void> {
-    const text = sectionText(state);
+  async function doRender(): Promise<void> {
+    const text = sectionText(getState());
     const clipped =
       text.length <= MAX_UPGRADE_TEXT ? text : text.slice(0, MAX_UPGRADE_TEXT - 1) + '…';
-    console.log('[hub] render', {
-      started,
-      section: state.activeSection,
-      force: opts.force,
-      len: clipped.length,
-    });
+    console.log('[hub] render', { started, section: getState().activeSection, len: clipped.length });
 
     if (!started) {
       // ONE full-canvas text container — exactly like the official minimal template.
@@ -120,7 +109,7 @@ async function main(): Promise<void> {
     }
 
     // Already created — update the text in place (flicker-free, like text-heavy).
-    if (clipped !== renderedText || opts.force) {
+    if (clipped !== renderedText) {
       const ok = await bridge.textContainerUpgrade(
         new TextContainerUpgrade({
           containerID: CONTAINER_ID,
@@ -129,16 +118,16 @@ async function main(): Promise<void> {
         }),
       );
       console.log('[hub] textContainerUpgrade ->', ok);
-      if (ok || opts.force) renderedText = clipped;
+      if (ok) renderedText = clipped;
     }
   }
 
-  // ── R1 ring / touchpad input ───────────────────────────────────────────────
-  // Ring swipes and presses produce the SAME SDK events as the temple touchpads
-  // (textEvent scroll, listEvent selection, sysEvent click/double-click), so
-  // hands-free control works with either input. To react differently per device,
-  // check `event.sysEvent?.eventSource === EventSourceType.TOUCH_EVENT_FROM_RING`.
+  // Any state change (UI edit or remote frame) re-renders the glasses.
+  subscribe(() => {
+    void renderGlasses();
+  });
 
+  // R1 ring / touchpad: double-tap exits; foreground re-renders.
   const unsubscribeEvents = bridge.onEvenHubEvent(async (event) => {
     const sysType = event.sysEvent?.eventType;
     console.log('[hub] sys event', sysType);
@@ -147,7 +136,7 @@ async function main(): Promise<void> {
       return;
     }
     if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
-      await render();
+      void renderGlasses();
       return;
     }
     if (sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT || sysType === OsEventTypeList.SYSTEM_EXIT_EVENT) {
@@ -156,20 +145,18 @@ async function main(): Promise<void> {
     }
   });
 
-  // ── Live stream from the web layer ─────────────────────────────────────────
-  const closeStream = connectStream(STREAM_URL, {
-    onState: (next) => {
-      state = next;
-      state.updatedAt = next.updatedAt ?? Date.now();
-      void render();
-    },
+  // Live stream: the source of truth shared by the UI and the glasses.
+  const closeStream = connectStream({
+    onState: (next) => applyRemote(next),
     onStatus: (s) => {
       setStatus(`📡 SSE ${s}`);
+      setConnStatus(s);
     },
   });
 
-  // ── Boot ───────────────────────────────────────────────────────────────────
-  await render();
+  // Boot render + seed the server from local data if it's empty.
+  await renderGlasses();
+  window.setTimeout(() => seedIfEmpty(), 2000);
 }
 
 void main();

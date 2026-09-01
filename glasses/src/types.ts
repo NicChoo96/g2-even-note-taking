@@ -33,3 +33,9 @@ export function emptyHubState(): HubState {
     updatedAt: Date.now(),
   };
 }
+
+export function uid(): string {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}

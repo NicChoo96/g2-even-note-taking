@@ -1,14 +1,13 @@
-// Persistent G2 Even Reality Hub relay — ONE always-on process that serves BOTH
-// apps and the live SSE/state stream. This is the "live always, all devices at
-// the same time" backend for Railway/Fly/Render.
+// Persistent G2 Even Reality Hub relay — ONE always-on process that serves the
+// UNIFIED app and the live SSE/state stream. This is the "live always, all
+// devices at the same time" backend for Railway/Fly/Render.
 //
-//   GET  /api/stream?channel=hub  -> SSE stream (the glasses app connects here)
+//   GET  /api/stream?channel=hub  -> SSE stream (the app + glasses connect here)
 //   POST /api/stream              -> publish HubState + broadcast to SSE clients
-//   GET  /                        -> serves the G2 GLASSES app (glasses-dist),
-//                                     so the bare main URL loads the app the
-//                                     Even App prototype QR points at.
-//   GET  /app/                    -> serves the web pasteboard UI (dist)
-//   GET  /app.json                -> glasses manifest (Even App recognition)
+//   GET  /                        -> serves the unified app (glasses-dist): the
+//                                     companion web UI in any browser, AND the
+//                                     SDK that draws to the G2 in the Even App
+//   GET  /app.json                -> app manifest (Even App recognition)
 //
 // Zero runtime dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
@@ -19,8 +18,7 @@ import { extname, join, normalize, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PORT = Number(process.env.PORT || 5174);
-const DIST = fileURLToPath(new URL('../dist', import.meta.url));
-// Built G2 glasses app — served at /glasses/ (see the root Dockerfile).
+// Built unified app (companion web UI + glasses) — served at the bare root.
 const GLASSES_DIST = fileURLToPath(new URL('../glasses-dist', import.meta.url));
 // Last-known state is mirrored to disk so a Railway/Fly/Render restart does not
 // wipe the data. Override the path with STATE_FILE for a persistent volume.
@@ -161,12 +159,6 @@ const server = createServer(async (req, res) => {
     for (const client of [...channel.clients]) send(client, frame);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, clients: channel.clients.size }));
-    return;
-  }
-
-  // Web pasteboard app (data-entry UI) — served at /app/.
-  if (req.method === 'GET' && (url.pathname === '/app' || url.pathname.startsWith('/app/'))) {
-    await serveFrom(DIST, '/app', req, res);
     return;
   }
 
