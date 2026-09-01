@@ -8,8 +8,8 @@ import {
   type EvenAppBridge,
 } from '@evenrealities/even_hub_sdk';
 import { connectStream } from './stream';
-import { sectionText } from './sections';
-import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe } from './store';
+import { sectionByMenuId, sectionMenu, sectionText } from './sections';
+import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe, update } from './store';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -97,7 +97,13 @@ async function main(): Promise<void> {
         content: clipped,
       });
       const res = await bridge.createStartUpPageContainer(
-        new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [container] }),
+        new CreateStartUpPageContainer({
+          containerTotalNum: 1,
+          textObject: [container],
+          // OS contextual menu (To-Do / Docs / Notes) — lives for the page's
+          // lifetime; selections arrive as menuItemClickEvent.
+          menuObject: sectionMenu(),
+        }),
       );
       console.log('[hub] createStartUpPageContainer ->', res);
       setStatus(
@@ -129,6 +135,16 @@ async function main(): Promise<void> {
 
   // R1 ring / touchpad: double-tap exits; foreground re-renders.
   const unsubscribeEvents = bridge.onEvenHubEvent(async (event) => {
+    // OS contextual menu selection -> switch section (UI + glasses + all devices).
+    if (event.menuItemClickEvent) {
+      const def = sectionByMenuId(event.menuItemClickEvent.itemID ?? 0);
+      if (def) {
+        console.log('[hub] menu ->', def.id);
+        update((s) => ({ ...s, activeSection: def.id }));
+      }
+      return;
+    }
+
     const sysType = event.sysEvent?.eventType;
     console.log('[hub] sys event', sysType);
     if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT) {

@@ -2,21 +2,41 @@
 // "minimal" pattern: ONE full-canvas text container, updated in place with
 // textContainerUpgrade. No list containers, no OS menu, no rebuilds — the
 // smallest surface area possible, so real firmware accepts the page.
+import { MenuContainerProperty, MenuItemProperty } from '@evenrealities/even_hub_sdk';
 import type { HubState, SectionId } from './types';
 
 export interface SectionDef {
   id: SectionId;
   title: string;
+  /** uint32 identifier used by the OS contextual menu (must be > 0, unique). */
+  menuId: number;
 }
 
 export const SECTIONS: SectionDef[] = [
-  { id: 'todo', title: 'To-Do' },
-  { id: 'docs', title: 'Docs' },
-  { id: 'notes', title: 'Notes' },
+  { id: 'todo', title: 'To-Do', menuId: 1 },
+  { id: 'docs', title: 'Docs', menuId: 2 },
+  { id: 'notes', title: 'Notes', menuId: 3 },
 ];
 
 export function sectionTitle(id: SectionId): string {
   return SECTIONS.find((s) => s.id === id)?.title ?? id;
+}
+
+/**
+ * OS contextual menu — your items sit between the system slots (Display off /
+ * Brightness on top, "Close Reality Hub" at the bottom). Declared ONCE on the
+ * startup page so they live for the page's lifetime. Max 10 items.
+ */
+export function sectionMenu(): MenuContainerProperty {
+  return new MenuContainerProperty({
+    menuItems: SECTIONS.map(
+      (s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId }),
+    ),
+  });
+}
+
+export function sectionByMenuId(menuId: number): SectionDef | undefined {
+  return SECTIONS.find((s) => s.menuId === menuId);
 }
 
 // textContainerUpgrade hard cap is 2000 chars — keep well under it.
