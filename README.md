@@ -142,13 +142,18 @@ npm start            # → http://localhost:5174  (web UI + live stream together
 
 ### Deploy it (pick one free host)
 
+> **Deploy the whole repo:** a root-level `Dockerfile` (plus `render.yaml` for Render) is included,
+> so you can point any of these hosts at the repo root — no need to dig into `web/`.
+
 | Host | Steps |
 |---|---|
-| **Railway** | New Project → Deploy from GitHub repo → set Root Directory `web` → Railway reads the `Procfile`/`Dockerfile` and starts `node server/local-sse.mjs`. |
-| **Render** | New Web Service → repo → Root Directory `web` → Build `npm run build` → Start `node server/local-sse.mjs`. |
-| **Fly.io** | `cd web && fly launch` (uses the included `Dockerfile`). |
+| **Railway** | New Project → Deploy from GitHub repo → Railway auto-detects the **root `Dockerfile`** → done. |
+| **Render** | New Blueprint / Web Service → repo → Render reads **`render.yaml`** (runtime: docker) → done. |
+| **Fly.io** | `fly launch` from the repo root (uses the root `Dockerfile`). |
 
-All three give you a stable `https://<your-app>.up.railway.app`-style URL.
+Alternatively, deploy only `web/`: root `web`, build `npm run build`, start `node server/local-sse.mjs`.
+
+All of these give you a stable `https://<your-app>.up.railway.app`-style URL.
 
 ### Point the glasses at the relay
 

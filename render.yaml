@@ -1,0 +1,9 @@
+# Render blueprint — deploy the whole repo as one persistent web service.
+# The root Dockerfile builds web/ and runs the always-on relay.
+services:
+  - type: web
+    name: g2-even-reality-hub
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true

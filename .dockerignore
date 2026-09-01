@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+.vercel
+*.log
+.env
+**/.env
+**/.env.*.local
+qr-prototype.png
+Dockerfile
+.dockerignore
+render.yaml
