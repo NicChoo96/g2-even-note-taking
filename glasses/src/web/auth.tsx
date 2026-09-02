@@ -20,10 +20,10 @@ import {
 } from 'react';
 import { API_BASE } from '../stream';
 import { setStreamToken } from '../auth-token';
+import { clearDeviceSession, loadDeviceSession, saveDeviceSession } from '../durable-docs';
 
 const AUTH_KEY = 'hub:auth'; // owner email (sessionStorage)
 const SESSION_KEY = 'hub:session'; // owner session token (sessionStorage)
-const DEVICE_KEY = 'hub:deviceId'; // per-device credential (localStorage)
 
 export interface PairedDevice {
   deviceId: string;
@@ -128,20 +128,12 @@ async function verify(idToken: string): Promise<{
   }
 }
 
-function getOrCreateDeviceId(): string {
-  try {
-    let id = localStorage.getItem(DEVICE_KEY);
-    if (!id) {
-      id =
-        (typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`) + '';
-      localStorage.setItem(DEVICE_KEY, id);
-    }
-    return id;
-  } catch {
-    return `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  }
+function makeDeviceId(): string {
+  return (
+    (typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`) + ''
+  );
 }
 
 async function pairRequest(deviceId: string): Promise<{
@@ -156,6 +148,16 @@ async function pairRequest(deviceId: string): Promise<{
       body: JSON.stringify({ deviceId }),
     });
     return (await res.json()) as { ok: boolean; status?: string; pairCode?: string };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Read-only approval check — used by the approved-device watchdog. */
+async function checkPairStatus(deviceId: string): Promise<{ ok: boolean; status?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/pair/status?deviceId=${encodeURIComponent(deviceId)}`);
+    return (await res.json()) as { ok: boolean; status?: string };
   } catch {
     return { ok: false };
   }
@@ -214,34 +216,71 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [devices, setDevices] = useState<PairedDevice[] | null>(null);
 
   // Boot: restore an existing credential, or start the device pairing flow.
+  // The device ID lives in the host's reliable storage (bridge.setLocalStorage)
+  // so it survives Even App restarts — no re-pairing every launch.
   useEffect(() => {
     if (inEvenApp) {
-      const deviceId = getOrCreateDeviceId();
       let cancelled = false;
-      let iv = 0;
-      const attempt = async () => {
+      let timer: number | undefined;
+      let approvedOnce = false;
+
+      const tick = async () => {
+        if (cancelled) return;
         try {
+          let deviceId = await loadDeviceSession();
+          if (!deviceId) {
+            deviceId = makeDeviceId();
+            await saveDeviceSession(deviceId);
+          }
+
+          if (approvedOnce) {
+            // Already approved — watchdog for owner-initiated revoke.
+            const r = await checkPairStatus(deviceId);
+            if (cancelled) return;
+            if (r.status === 'approved') {
+              setPairedState(true);
+              setPairStatus('approved');
+              setStreamToken(deviceId);
+            } else {
+              // Revoked / reset — drop the stale credential, go back to pairing.
+              console.log('[auth] device no longer approved — clearing session');
+              await clearDeviceSession();
+              setStreamToken(null);
+              approvedOnce = false;
+              setPairedState(false);
+              setPairStatus('pending');
+              setPairCode(null);
+            }
+            if (!cancelled) timer = window.setTimeout(tick, 15000);
+            return;
+          }
+
+          // Not approved yet — register (creates/refreshes the pair code).
           const r = await pairRequest(deviceId);
           if (cancelled) return;
           if (r.status === 'approved') {
+            approvedOnce = true;
             setPairedState(true);
             setPairStatus('approved');
+            setPairCode(null);
             setStreamToken(deviceId);
-            if (iv) window.clearInterval(iv); // stop polling once approved
-            return;
+          } else {
+            setPairedState(false);
+            setPairStatus('pending');
+            setPairCode(r.pairCode ?? null);
           }
-          setPairCode(r.pairCode ?? null);
-          setPairStatus('pending');
+          if (!cancelled) timer = window.setTimeout(tick, 3000);
         } catch {
-          /* transient — retry on next tick */
+          // Transient — retry.
+          if (!cancelled) timer = window.setTimeout(tick, 3000);
         }
       };
-      void attempt();
+
+      void tick();
       setLoading(false);
-      iv = window.setInterval(attempt, 3000);
       return () => {
         cancelled = true;
-        window.clearInterval(iv);
+        if (timer) window.clearTimeout(timer);
       };
     }
 

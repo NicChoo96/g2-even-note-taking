@@ -49,12 +49,18 @@ async function main(): Promise<void> {
   // 1) The stream is driven by a credential, NOT the SDK bridge: a browser gets
   //    an owner session token after Google Sign-In; the Even App gets an
   //    approved per-device ID. Until one exists the relay refuses connections.
+  //    If the credential changes (device re-paired or revoked), the stream is
+  //    torn down and re-created so a kicked device can't keep streaming.
   mountUi();
-  let streamConnected = false;
+  let closeStream: (() => void) | null = null;
+  let lastStreamToken: string | null = null;
   onStreamToken((token) => {
-    if (streamConnected || !token) return;
-    streamConnected = true;
-    connectStream({
+    if (token === lastStreamToken) return; // idempotent
+    lastStreamToken = token;
+    closeStream?.();
+    closeStream = null;
+    if (!token) return; // kicked / not authenticated — no stream
+    closeStream = connectStream({
       onState: (next) => applyRemote(next),
       onStatus: (s) => {
         setStatus(`📡 SSE ${s}`);
@@ -426,9 +432,10 @@ async function main(): Promise<void> {
     }
   });
 
-  // When pairing completes (credential arrives), drop onboarding and draw live.
-  onStreamToken((token) => {
-    if (!token) return;
+  // When the credential changes (pairing completes OR the device is revoked),
+  // reset navigation and re-render — a kick shows the pairing/onboarding text
+  // again instead of leaving stale content on the glasses.
+  onStreamToken(() => {
     pickerActive = false;
     pickerCursor = 0;
     todoCursor = 0;
