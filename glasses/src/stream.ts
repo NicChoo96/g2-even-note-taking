@@ -1,4 +1,5 @@
 import type { HubState, StreamFrame } from './types';
+import { getStreamToken } from './auth-token';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
 // root, so /api/stream resolves to the live stream next to it. Local dev
@@ -9,8 +10,13 @@ export const STREAM_URL: string =
 // Base origin of the relay API (auth / config / stream). Same-origin by default.
 export const API_BASE: string = STREAM_URL.split('/api/')[0];
 
-// POST endpoint for publishing state (same host/path as the SSE stream).
-const STATE_URL = STREAM_URL.split('?')[0];
+/** The SSE/state URL with the current stream credential appended. */
+export function streamUrl(): string {
+  const token = getStreamToken();
+  if (!token) return STREAM_URL;
+  const sep = STREAM_URL.includes('?') ? '&' : '?';
+  return `${STREAM_URL}${sep}token=${encodeURIComponent(token)}`;
+}
 
 export interface StreamHandlers {
   onState(state: HubState): void;
@@ -19,8 +25,10 @@ export interface StreamHandlers {
 
 /** Publish the full HubState snapshot to the relay (broadcast to all devices). */
 export async function publishState(state: HubState): Promise<boolean> {
+  const token = getStreamToken();
+  if (!token) return false; // not authorized yet — nothing to publish to
   try {
-    const res = await fetch(STATE_URL, {
+    const res = await fetch(streamUrl(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(state),
@@ -44,7 +52,7 @@ export function connectStream(handlers: StreamHandlers): () => void {
   const connect = () => {
     if (closed) return;
     handlers.onStatus?.('connecting');
-    es = new EventSource(STREAM_URL);
+    es = new EventSource(streamUrl());
 
     es.onopen = () => {
       retry = 0;

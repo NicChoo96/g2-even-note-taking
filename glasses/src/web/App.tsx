@@ -1,4 +1,4 @@
-import { useSyncExternalStore, useState } from 'react';
+import { useEffect, useSyncExternalStore, useState } from 'react';
 import { categorize } from './categorize';
 import { useAuth } from './auth';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
@@ -18,6 +18,73 @@ function useHubState(): HubState {
 
 function useConn(): ConnStatus {
   return useSyncExternalStore(subscribeConn, getConnStatus);
+}
+
+/** Owner-only device manager: approve a pairing code + revoke glasses devices. */
+function DevicesPanel() {
+  const { devices, pairDevice, revokeDevice, refreshDevices, pairError } = useAuth();
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<string | null>(null);
+
+  useEffect(() => {
+    void refreshDevices();
+  }, [refreshDevices]);
+
+  const approve = async () => {
+    if (!code.trim()) return;
+    setBusy(true);
+    setDone(null);
+    const r = await pairDevice(code);
+    setBusy(false);
+    if (r.ok) {
+      setDone('Device approved 🎉');
+      setCode('');
+    }
+  };
+
+  return (
+    <section className="card devices-panel">
+      <div className="panel-label">
+        Devices · each glasses device must be approved here before it can see the stream
+      </div>
+      <div className="pair-row">
+        <input
+          value={code}
+          onChange={(e) => setCode(e.target.value.toUpperCase())}
+          onKeyDown={(e) => e.key === 'Enter' && approve()}
+          placeholder="Pairing code (shown on the glasses phone screen)"
+          maxLength={6}
+        />
+        <button className="primary" onClick={approve} disabled={busy || !code.trim()}>
+          {busy ? 'Approving…' : 'Approve'}
+        </button>
+      </div>
+      {pairError && <p style={{ color: 'var(--danger)', fontSize: 12 }}>{pairError}</p>}
+      {done && <p style={{ color: 'var(--good)', fontSize: 12 }}>{done}</p>}
+      {(devices ?? []).length > 0 && (
+        <ul className="device-list">
+          {(devices ?? []).map((d) => (
+            <li key={d.deviceId} className="device-row">
+              <span className="device-name" title={d.deviceId}>
+                🥽 {d.deviceId.slice(0, 8)}…
+              </span>
+              <span className="device-meta">
+                {d.email} · {d.approvedAt ? new Date(d.approvedAt).toLocaleDateString() : ''}
+              </span>
+              <button
+                className="icon-btn danger"
+                onClick={() => void revokeDevice(d.deviceId)}
+                aria-label="Revoke device"
+              >
+                ✕
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
 }
 
 export default function App() {
@@ -231,9 +298,11 @@ export default function App() {
         )}
       </main>
 
+      {authed && !inEvenApp && <DevicesPanel />}
+
       <footer className="app-footer">
         <span>Same URL drives the web UI and the glasses · edits broadcast live</span>
-        <span>Double-tap R1 ring = open system exit · single press = confirm · swipe = scroll</span>
+        <span>R1 ring: swipe = move · single press = toggle · double-press = exit</span>
       </footer>
     </div>
   );

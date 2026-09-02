@@ -9,16 +9,27 @@
 //                                     SDK that draws to the G2 in the Even App
 //   GET  /app.json                -> app manifest (Even App recognition)
 //   GET  /api/config              -> { googleClientId } for the login button
-//   POST /api/auth/verify         -> verify a Google ID token against the
-//                                     ALLOWED_EMAILS whitelist (RS256, node:crypto)
+//   POST /api/auth/verify         -> Google ID token -> owner session token
+//   POST /api/auth/logout         -> revoke an owner session
+//   POST /api/pair/request        -> device self-registers (returns pair code)
+//   GET  /api/pair/status         -> device polls until the owner approves
+//   POST /api/pair/approve        -> owner (session) approves a pair code
+//   GET  /api/devices             -> owner lists approved devices
+//   POST /api/pair/revoke         -> owner revokes a device
 //
-// Env: PORT, STATE_FILE, GOOGLE_CLIENT_ID, ALLOWED_EMAILS (comma-separated).
-// Zero runtime dependencies (node built-ins only). Run:
+// SECURITY: /api/stream (GET + POST) requires a valid owner session token OR an
+// approved per-device ID. Browsers authenticate via Google SSO; each glasses
+// device gets its own unguessable deviceId that the owner approves from a
+// logged-in browser. There is NO anonymous read of the stream and NO shared
+// device login.
+//
+// Env: PORT, STATE_FILE, AUTH_FILE, GOOGLE_CLIENT_ID, ALLOWED_EMAILS
+// (comma-separated). Zero runtime dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, statSync } from 'node:fs';
-import { createPublicKey, createVerify } from 'node:crypto';
+import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { createPublicKey, createVerify, randomBytes } from 'node:crypto';
 import { extname, join, normalize, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -80,6 +91,86 @@ const GLASSES_DIST = fileURLToPath(new URL('../glasses-dist', import.meta.url));
 // Last-known state is mirrored to disk so a Railway/Fly/Render restart does not
 // wipe the data. Override the path with STATE_FILE for a persistent volume.
 const STATE_FILE = process.env.STATE_FILE || join(process.cwd(), '.g2-hub-state.json');
+// Auth store (owner sessions + approved devices) — also persisted to disk.
+const AUTH_FILE = process.env.AUTH_FILE || join(process.cwd(), '.g2-hub-auth.json');
+
+// ── Auth store: owner sessions + approved devices ────────────────────────────
+// sessions: { [token]: { email, createdAt } }
+// devices:  { [deviceId]: { deviceId, status, pairCode, email, createdAt, approvedAt } }
+const SESSION_TTL_MS = 30 * 24 * 3600e3; // 30 days
+const PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
+let authStore = { sessions: {}, devices: {} };
+
+function loadAuthStore() {
+  try {
+    authStore = JSON.parse(readFileSync(AUTH_FILE, 'utf8')) || authStore;
+  } catch {
+    /* fresh start */
+  }
+}
+
+function persistAuthStore() {
+  try {
+    writeFileSync(AUTH_FILE, JSON.stringify(authStore, null, 2));
+  } catch {
+    /* read-only host — in-memory auth still works for this process */
+  }
+}
+
+function randomToken() {
+  return randomBytes(24).toString('hex');
+}
+
+function randomPairCode() {
+  let s = '';
+  for (let i = 0; i < 6; i++) s += PAIR_ALPHABET[Math.floor(Math.random() * PAIR_ALPHABET.length)];
+  return s;
+}
+
+function sessionByToken(token) {
+  const s = authStore.sessions[token];
+  if (!s) return null;
+  if (Date.now() - s.createdAt > SESSION_TTL_MS) {
+    delete authStore.sessions[token];
+    persistAuthStore();
+    return null;
+  }
+  return s;
+}
+
+function deviceById(deviceId) {
+  return authStore.devices[deviceId] || null;
+}
+
+function approvedDeviceByToken(deviceId) {
+  const d = deviceById(deviceId);
+  return d && d.status === 'approved' ? d : null;
+}
+
+/** Map a bearer token (owner session OR approved deviceId) to a principal. */
+function principalFromToken(token) {
+  if (!token) return null;
+  const s = sessionByToken(token);
+  if (s) return { kind: 'owner', email: s.email };
+  const d = approvedDeviceByToken(token);
+  if (d) return { kind: 'device', deviceId: token };
+  return null;
+}
+
+function readToken(req, url) {
+  const q = url.searchParams.get('token');
+  if (q) return q;
+  const h = req.headers.authorization;
+  if (h && h.startsWith('Bearer ')) return h.slice(7).trim();
+  return null;
+}
+
+function requireOwner(req, url) {
+  const p = principalFromToken(readToken(req, url));
+  return p && p.kind === 'owner' ? p : null;
+}
+
+loadAuthStore();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -185,21 +276,15 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const channel = getChannel(url.searchParams.get('channel') || 'hub');
 
-  // SSE stream (glasses app / any device subscriber) — long-lived.
-  if (req.method === 'GET' && url.pathname === '/api/stream') {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-    });
-    channel.clients.add(res);
-    if (channel.lastState) send(res, { type: 'init', state: channel.lastState });
-    req.on('close', () => channel.clients.delete(res));
-    return;
-  }
-
   // Publish a HubState snapshot + broadcast to ALL connected devices.
+  // Authorized only for an owner session or an approved device ID.
   if (req.method === 'POST' && url.pathname === '/api/stream') {
+    const principal = principalFromToken(readToken(req, url));
+    if (!principal) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
     let body = '';
     for await (const chunk of req) body += chunk;
     let state;
@@ -216,6 +301,26 @@ const server = createServer(async (req, res) => {
     for (const client of [...channel.clients]) send(client, frame);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, clients: channel.clients.size }));
+    return;
+  }
+
+  // SSE stream (owner browser + approved glasses devices) — long-lived.
+  // Authorized only for an owner session or an approved device ID.
+  if (req.method === 'GET' && url.pathname === '/api/stream') {
+    const principal = principalFromToken(readToken(req, url));
+    if (!principal) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    });
+    channel.clients.add(res);
+    if (channel.lastState) send(res, { type: 'init', state: channel.lastState });
+    req.on('close', () => channel.clients.delete(res));
     return;
   }
 
@@ -250,8 +355,11 @@ const server = createServer(async (req, res) => {
       const payload = await verifyGoogleIdToken(parsed.idToken, clientId);
       const email = (payload?.email || '').toLowerCase();
       if (payload && email && allowed.includes(email)) {
+        const sessionToken = randomToken();
+        authStore.sessions[sessionToken] = { email: payload.email, createdAt: Date.now() };
+        persistAuthStore();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, email: payload.email }));
+        res.end(JSON.stringify({ ok: true, email: payload.email, sessionToken }));
       } else {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(
@@ -262,6 +370,148 @@ const server = createServer(async (req, res) => {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'invalid token' }));
     }
+    return;
+  }
+
+  // Owner sign-out — revoke the session token.
+  if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+    const token = readToken(req, url);
+    if (token && authStore.sessions[token]) {
+      delete authStore.sessions[token];
+      persistAuthStore();
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+    return;
+  }
+
+  // A glasses device self-registers with its unguessable per-device ID. If it
+  // is already approved it learns so; otherwise it gets the pairing code the
+  // owner must approve from a logged-in browser.
+  if (req.method === 'POST' && url.pathname === '/api/pair/request') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let parsed = {};
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      /* ignore */
+    }
+    const deviceId = String(parsed.deviceId || '').trim();
+    if (!deviceId || deviceId.length > 128) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'invalid deviceId' }));
+      return;
+    }
+    let dev = deviceById(deviceId);
+    if (dev && dev.status === 'approved') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, status: 'approved' }));
+      return;
+    }
+    if (!dev) {
+      dev = {
+        deviceId,
+        status: 'pending',
+        pairCode: randomPairCode(),
+        createdAt: Date.now(),
+      };
+      authStore.devices[deviceId] = dev;
+      persistAuthStore();
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, status: 'pending', pairCode: dev.pairCode }));
+    return;
+  }
+
+  // Device polls until the owner approves its pairing code.
+  if (req.method === 'GET' && url.pathname === '/api/pair/status') {
+    const deviceId = String(url.searchParams.get('deviceId') || '').trim();
+    const dev = deviceId ? deviceById(deviceId) : null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({ ok: true, status: dev && dev.status === 'approved' ? 'approved' : 'pending' }),
+    );
+    return;
+  }
+
+  // Owner (logged-in browser) approves a pending pairing code.
+  if (req.method === 'POST' && url.pathname === '/api/pair/approve') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let parsed = {};
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      /* ignore */
+    }
+    const code = String(parsed.pairCode || '').trim().toUpperCase();
+    const dev = Object.values(authStore.devices).find(
+      (d) => d.status === 'pending' && d.pairCode === code,
+    );
+    if (!dev) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'code not found' }));
+      return;
+    }
+    dev.status = 'approved';
+    dev.email = owner.email;
+    dev.approvedAt = Date.now();
+    persistAuthStore();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, deviceId: dev.deviceId }));
+    return;
+  }
+
+  // Owner lists approved devices (for the web UI's device manager).
+  if (req.method === 'GET' && url.pathname === '/api/devices') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    const devices = Object.values(authStore.devices)
+      .filter((d) => d.status === 'approved')
+      .map((d) => ({
+        deviceId: d.deviceId,
+        email: d.email,
+        approvedAt: d.approvedAt ?? null,
+      }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, devices }));
+    return;
+  }
+
+  // Owner revokes an approved device.
+  if (req.method === 'POST' && url.pathname === '/api/pair/revoke') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let parsed = {};
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      /* ignore */
+    }
+    const deviceId = String(parsed.deviceId || '');
+    if (deviceId && authStore.devices[deviceId]) {
+      delete authStore.devices[deviceId];
+      persistAuthStore();
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
     return;
   }
 

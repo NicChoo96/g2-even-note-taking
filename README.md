@@ -177,11 +177,21 @@ npx evenhub pack app.json dist -o g2-even-reality-hub.ehpk
 
 Submit the `.ehpk` to the Even Hub developer portal, or load via QR for personal use.
 
-## Authentication (Google Sign-In, web control app only)
+## Authentication (Google Sign-In + per-device pairing)
 
-The web control app (when opened in a normal browser) requires **Google Sign-In**
-and only lets **your whitelisted Google account** in. The glasses drawing is NOT
-gated (the Even App WebView can't do OAuth), so the glasses keep working.
+There is **no anonymous access to the stream**. Both ends must be authorized:
+
+- **Web control app (normal browser)** — requires **Google Sign-In**, and only
+  your **whitelisted Google account** gets in. The relay issues a per-session
+  token the browser sends with every stream request.
+- **Glasses device (Even App WebView)** — the device generates its own
+  unguessable per-device ID, shows a short **pairing code** on its screen, and
+  the owner approves it from a logged-in browser. Each glasses device is
+  individually approved — there is **no shared device login**, and an unpaired
+  (or revoked) device gets `401` and can't read or write the stream.
+
+Once a browser is signed in, use the **Devices** panel on the web app to approve
+pairing codes and revoke devices.
 
 ### 1. Create a Google OAuth Client ID
 
@@ -200,6 +210,7 @@ gated (the Even App WebView can't do OAuth), so the glasses keep working.
 |---|---|
 | `GOOGLE_CLIENT_ID` | `xxxx.apps.googleusercontent.com` |
 | `ALLOWED_EMAILS` | your email, e.g. `you@gmail.com` (comma-separated for more) |
+| `AUTH_FILE` (optional) | path to a persistent volume for sessions/devices, e.g. `/data/.g2-hub-auth.json`. Without it, sessions + approved devices reset on redeploy and you re-pair. |
 
 ### 3. Local dev
 
@@ -211,7 +222,18 @@ node server/local-sse.mjs
 
 The login screen appears in a browser until a whitelisted account signs in; the
 ID token is verified server-side by the relay (`/api/auth/verify`, RS256 via
-`node:crypto` — no extra dependencies).
+`node:crypto` — no extra dependencies). Owner sessions and approved devices are
+stored in `.g2-hub-auth.json` (git-ignored).
+
+### 4. Pairing flow
+
+1. Open the hub URL in the **Even App** on your phone → the device shows a
+   6-character code (e.g. `Z4E88D`) on the phone screen.
+2. Open the same URL in a **browser**, sign in with your Google account.
+3. In the **Devices** panel, enter the code and press **Approve**.
+4. The device connects automatically and starts drawing to the glasses.
+
+Both the browser and the paired glasses now see the same live stream.
 
 ## Copilot Skills
 

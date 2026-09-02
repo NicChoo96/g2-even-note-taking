@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "^0.0.14",
+    "@evenrealities/pretext": "^0.1.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
