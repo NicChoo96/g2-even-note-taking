@@ -18,12 +18,8 @@ const MAX_UPGRADE_TEXT = 2000;
 const CONTAINER_ID = 1;
 const CONTAINER_NAME = 'main';
 
-/** Append a visible line to the WebView status panel (phone Even App browser). */
+/** Diagnostic logging only — the phone screen stays clean (just the web UI). */
 function setStatus(line: string): void {
-  const el = document.getElementById('status');
-  if (el) {
-    el.textContent = el.textContent ? `${el.textContent}\n${line}` : line;
-  }
   console.log('[hub]', line);
 }
 

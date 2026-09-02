@@ -7,27 +7,12 @@
     <!-- Google Sign-In (Google Identity Services) for the web control app -->
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
-      /* Diagnostic status panel — visible in the Even App WebView (phone browser).
-         The glasses UI itself is drawn by the SDK, this is just a debug readout. */
-      body {
-        margin: 0;
-        background: #04170d;
-        color: #3ddc84;
-        font: 12px/1.55 ui-monospace, Consolas, monospace;
-        padding: 12px;
-      }
-      #status {
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
+      /* WebView hygiene — matches the official evenhub-templates. */
+      html, body { margin: 0; height: 100%; }
+      body { touch-action: manipulation; -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
     </style>
   </head>
   <body>
-    <!-- Tiny diagnostic readout (helps debug real-glasses loading) -->
-    <details style="position:fixed;top:6px;right:6px;z-index:99;max-width:340px;background:rgba(4,23,13,.92);border:1px solid #1e4d35;border-radius:8px;padding:6px 10px;font-size:10px;color:#3ddc84;">
-      <summary>glasses status</summary>
-      <pre id="status" style="margin:4px 0 0;white-space:pre-wrap;word-break:break-word;">booting…</pre>
-    </details>
     <!-- Companion web UI — same URL drives this page AND the glasses -->
     <div id="root"></div>
     <script type="module" src="/src/main.ts"></script>
