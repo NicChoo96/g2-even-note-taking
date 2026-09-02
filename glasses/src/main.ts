@@ -10,7 +10,9 @@ import {
 import { connectStream } from './stream';
 import {
   clipBytes,
+  docPickerView,
   MAX_CONTENT_BYTES,
+  MENU,
   sectionByMenuId,
   sectionMenu,
   sectionView,
@@ -18,6 +20,8 @@ import {
 } from './sections';
 import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe, update } from './store';
 import { getStreamToken, onStreamToken } from './auth-token';
+import { loadDocsDurable, saveDocsDurable, setDurableBridge } from './durable-docs';
+import { emptyDoc, upsertDoc, type DocEntry } from './types';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -87,11 +91,39 @@ async function main(): Promise<void> {
     setStatus('👓 device info unavailable');
   }
 
+  // Mirror the docs library to the host's reliable storage (Even App WebView
+  // browser-localStorage does not survive restarts — see device-features skill).
+  setDurableBridge(b);
+  void (async () => {
+    try {
+      const saved = await loadDocsDurable();
+      if (saved && saved.length && getState().sections.docs.length === 0) {
+        update((s) => ({
+          ...s,
+          sections: { ...s.sections, docs: saved },
+          activeDocId: saved[0].id,
+        }));
+      }
+    } catch {
+      /* ignore */
+    }
+  })();
+
   let started = false; // createStartUpPageContainer called exactly once
   let renderedText = '';
   let todoCursor = 0; // selected todo row
   let docPage = 0; // current docs/notes page
   let lastView: SectionView | null = null;
+  let lastActiveDocId: string | null = null; // reset pagination when doc changes
+
+  // In-app doc picker (long-press → Select/Delete Doc). While active the ring
+  // moves over the doc list and a tap opens/deletes the highlighted doc.
+  let pickerActive = false;
+  let pickerIntent: 'open' | 'delete' = 'open';
+  let pickerCursor = 0;
+
+  // Durable docs writes are debounced (bridge.setLocalStorage shares the BLE hop).
+  let saveDocsTimer: number | null = null;
 
   // createStartUpPageContainer is a ONE-SHOT call — coalesce + serialize renders
   // so create runs exactly once no matter how fast state changes arrive.
@@ -167,15 +199,30 @@ async function main(): Promise<void> {
       return;
     }
 
-    const view = sectionView(getState(), todoCursor, docPage);
+    // Switching to a different doc (web UI or the glasses picker) restarts its
+    // pagination at page 1.
+    if (!pickerActive) {
+      const curDocId = getState().activeSection === 'docs' ? getState().activeDocId : null;
+      if (curDocId !== lastActiveDocId) {
+        lastActiveDocId = curDocId;
+        docPage = 0;
+      }
+    }
+
+    // In-app doc picker (open/delete) OR the normal section renderer.
+    const view = pickerActive
+      ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
+      : sectionView(getState(), todoCursor, docPage);
     lastView = view;
-    todoCursor = view.todoCursor;
+    if (pickerActive) pickerCursor = view.todoCursor;
+    else todoCursor = view.todoCursor;
     const text = view.text;
     console.log('[hub] render', {
       started,
       section: getState().activeSection,
       len: text.length,
-      cursor: todoCursor,
+      picker: pickerActive ? pickerIntent : false,
+      cursor: pickerActive ? pickerCursor : todoCursor,
     });
 
     if (!started) {
@@ -207,7 +254,65 @@ async function main(): Promise<void> {
     }
   }
 
+  function enterPicker(intent: 'open' | 'delete'): void {
+    if (getState().sections.docs.length === 0) return;
+    pickerIntent = intent;
+    pickerCursor = 0;
+    pickerActive = true;
+    void renderGlasses();
+  }
+
+  function newDoc(): void {
+    const doc = emptyDoc('Untitled');
+    update((s) => {
+      const { docs, activeDocId } = upsertDoc(s, doc);
+      return { ...s, activeSection: 'docs', activeDocId, sections: { ...s.sections, docs } };
+    });
+  }
+
+  function onPickerSwipe(dir: -1 | 1): void {
+    const ds = getState().sections.docs;
+    if (!ds.length) return;
+    const next = Math.min(ds.length - 1, Math.max(0, pickerCursor + dir));
+    if (next !== pickerCursor) {
+      pickerCursor = next;
+      void renderGlasses();
+    }
+  }
+
+  function onPickerTap(): void {
+    const ds = getState().sections.docs;
+    if (!ds.length) return;
+    const target: DocEntry = ds[Math.min(ds.length - 1, Math.max(0, pickerCursor))];
+    if (pickerIntent === 'delete') {
+      update((s) => {
+        const remaining = s.sections.docs.filter((d) => d.id !== target.id);
+        return {
+          ...s,
+          sections: { ...s.sections, docs: remaining },
+          activeDocId:
+            remaining.length > 0
+              ? s.activeDocId === target.id
+                ? remaining[0].id
+                : s.activeDocId
+              : null,
+        };
+      });
+      // Stay in the picker so more docs can be removed; cursor clamps on render.
+      pickerCursor = Math.min(pickerCursor, Math.max(0, ds.length - 2));
+      return;
+    }
+    // Open the highlighted doc.
+    pickerActive = false;
+    pickerCursor = 0;
+    update((s) => ({ ...s, activeSection: 'docs', activeDocId: target.id }));
+  }
+
   function onSwipe(dir: -1 | 1): void {
+    if (pickerActive) {
+      onPickerSwipe(dir);
+      return;
+    }
     if (getState().activeSection === 'todo') {
       const items = getState().sections.todo;
       if (!items.length) return;
@@ -230,6 +335,10 @@ async function main(): Promise<void> {
   }
 
   function onTap(): void {
+    if (pickerActive) {
+      onPickerTap();
+      return;
+    }
     if (getState().activeSection !== 'todo') return;
     const items = getState().sections.todo;
     if (!items.length || todoCursor >= items.length) return;
@@ -243,20 +352,43 @@ async function main(): Promise<void> {
     }));
   }
 
-  // Any state change (UI edit, remote frame, or a ring tap) re-renders.
+  // Any state change (UI edit, remote frame, or a ring tap) re-renders and
+  // mirrors the docs library into durable storage (debounced).
   subscribe(() => {
     void renderGlasses();
+    if (saveDocsTimer !== null) window.clearTimeout(saveDocsTimer);
+    saveDocsTimer = window.setTimeout(() => {
+      saveDocsTimer = null;
+      void saveDocsDurable(getState().sections.docs);
+    }, 400);
   });
 
   // R1 ring / G2 touchpad: swipe up/down moves the todo cursor (or flips a
-  // docs/notes page), single tap toggles the selected todo item, double-tap
-  // exits.
+  // docs/notes page, or moves the doc picker), single tap toggles/opens, and
+  // double-tap exits.
   const unsubscribeEvents = b.onEvenHubEvent(async (event) => {
-    // OS contextual menu selection -> switch section (UI + glasses + all devices).
+    // OS contextual menu selections arrive even while a picker is showing.
     if (event.menuItemClickEvent) {
-      const def = sectionByMenuId(event.menuItemClickEvent.itemID ?? 0);
+      const itemID = event.menuItemClickEvent.itemID ?? 0;
+      console.log('[hub] menu item', itemID);
+      if (itemID === MENU.DOC_NEW) {
+        pickerActive = false;
+        newDoc();
+        return;
+      }
+      if (itemID === MENU.DOC_SELECT) {
+        enterPicker('open');
+        return;
+      }
+      if (itemID === MENU.DOC_DELETE) {
+        enterPicker('delete');
+        return;
+      }
+      // Section switchers (To-Do / Docs / Notes) also cancel any picker.
+      const def = sectionByMenuId(itemID);
       if (def) {
-        console.log('[hub] menu ->', def.id);
+        pickerActive = false;
+        pickerCursor = 0;
         todoCursor = 0;
         docPage = 0;
         lastView = null;
@@ -284,6 +416,8 @@ async function main(): Promise<void> {
       return;
     }
     if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
+      pickerActive = false;
+      pickerCursor = 0;
       void renderGlasses();
       return;
     }
@@ -295,6 +429,8 @@ async function main(): Promise<void> {
   // When pairing completes (credential arrives), drop onboarding and draw live.
   onStreamToken((token) => {
     if (!token) return;
+    pickerActive = false;
+    pickerCursor = 0;
     todoCursor = 0;
     docPage = 0;
     lastView = null;

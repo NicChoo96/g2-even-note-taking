@@ -10,7 +10,13 @@
 // the simulator; oversized content makes the whole page get REJECTED).
 import { MenuContainerProperty, MenuItemProperty, utf8ByteLength } from '@evenrealities/even_hub_sdk';
 import { measureTextWrap } from '@evenrealities/pretext';
-import type { HubState, SectionId, TodoItem } from './types';
+import {
+  activeDoc,
+  type DocEntry,
+  type HubState,
+  type SectionId,
+  type TodoItem,
+} from './types';
 
 export interface SectionDef {
   id: SectionId;
@@ -29,6 +35,16 @@ export function sectionTitle(id: SectionId): string {
   return SECTIONS.find((s) => s.id === id)?.title ?? id;
 }
 
+/** OS contextual-menu item IDs (section switchers + Docs actions). */
+export const MENU = {
+  TODO: 1,
+  DOCS: 2,
+  NOTES: 3,
+  DOC_NEW: 4,
+  DOC_SELECT: 5,
+  DOC_DELETE: 6,
+} as const;
+
 /**
  * OS contextual menu — your items sit between the system slots (Display off /
  * Brightness on top, "Close Reality Hub" at the bottom). Declared ONCE on the
@@ -36,9 +52,13 @@ export function sectionTitle(id: SectionId): string {
  */
 export function sectionMenu(): MenuContainerProperty {
   return new MenuContainerProperty({
-    menuItems: SECTIONS.map(
-      (s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId }),
-    ),
+    menuItems: [
+      ...SECTIONS.map((s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId })),
+      // Docs actions: long-press anywhere to open the menu, then act on docs.
+      new MenuItemProperty({ itemName: 'New Doc', itemID: MENU.DOC_NEW }),
+      new MenuItemProperty({ itemName: 'Select Doc', itemID: MENU.DOC_SELECT }),
+      new MenuItemProperty({ itemName: 'Delete Doc', itemID: MENU.DOC_DELETE }),
+    ],
   });
 }
 
@@ -201,14 +221,13 @@ function todoView(items: TodoItem[], cursor: number): SectionView {
   };
 }
 
-function docView(state: HubState, section: SectionId, page: number): SectionView {
-  const raw = section === 'docs' ? state.sections.docs : state.sections.notes;
-  const body = raw.trim() || '(empty)';
+function bodyView(title: string, raw: string, page: number): SectionView {
+  const body = (raw || '').trim() || '(empty)';
   const pages = pageText(body);
   const idx = Math.min(pages.length - 1, Math.max(0, page));
-  const title = sectionTitle(section);
+  const head = truncate(title, 24);
   // Compact 1-line header (no divider/footer) so the measured body page fits.
-  const header = pages.length > 1 ? `${title} ${idx + 1}/${pages.length}` : title;
+  const header = pages.length > 1 ? `${head} ${idx + 1}/${pages.length}` : head;
   return {
     text: clipBytes(`${header}\n${pages[idx]}`, MAX_CONTENT_BYTES),
     todoCursor: 0,
@@ -217,9 +236,64 @@ function docView(state: HubState, section: SectionId, page: number): SectionView
   };
 }
 
-/** Render the active section (todo cursor window or docs/notes page). */
+function docView(state: HubState, page: number): SectionView {
+  const doc = activeDoc(state);
+  if (!doc) {
+    return {
+      text: clipBytes(
+        'Docs\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)',
+        MAX_CONTENT_BYTES,
+      ),
+      todoCursor: 0,
+      canPrev: false,
+      canNext: false,
+    };
+  }
+  return bodyView(doc.title, doc.content, page);
+}
+
+/** Render the active section (todo cursor window, active-doc page, or notes). */
 export function sectionView(state: HubState, todoCursor: number, docPage: number): SectionView {
   const section = state.activeSection;
   if (section === 'todo') return todoView(state.sections.todo, todoCursor);
-  return docView(state, section, docPage);
+  if (section === 'docs') return docView(state, docPage);
+  return bodyView(sectionTitle('notes'), state.sections.notes, docPage);
+}
+
+/** In-app doc picker list (long-press → Select/Delete Doc). Ring navigates. */
+export function docPickerView(
+  docs: DocEntry[],
+  cursor: number,
+  intent: 'open' | 'delete',
+): SectionView {
+  const label = intent === 'delete' ? 'Delete doc' : 'Open doc';
+  if (docs.length === 0) {
+    return {
+      text: clipBytes(
+        `${label}\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)`,
+        MAX_CONTENT_BYTES,
+      ),
+      todoCursor: 0,
+      canPrev: false,
+      canNext: false,
+    };
+  }
+  const clamped = Math.min(docs.length - 1, Math.max(0, cursor));
+  const half = Math.floor(VISIBLE_ITEMS / 2);
+  let start = Math.max(0, clamped - half);
+  let end = Math.min(docs.length, start + VISIBLE_ITEMS);
+  start = Math.max(0, end - VISIBLE_ITEMS);
+
+  const lines: string[] = [`${label} ${clamped + 1}/${docs.length}`];
+  for (let i = start; i < end; i++) {
+    const sel = i === clamped ? '▶' : ' ';
+    lines.push(`${sel} ${i + 1}. ${truncate(docs[i].title || '(untitled)', TODO_ITEM_TEXT)}`);
+  }
+  lines.push(intent === 'delete' ? '▲▼ move · tap delete' : '▲▼ move · tap open');
+  return {
+    text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
+    todoCursor: clamped,
+    canPrev: clamped > 0,
+    canNext: clamped < docs.length - 1,
+  };
 }

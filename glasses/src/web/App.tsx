@@ -4,7 +4,7 @@ import { useAuth } from './auth';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
 import type { ConnStatus } from '../store';
 import type { HubState, SectionId, TodoItem } from '../types';
-import { uid } from '../types';
+import { activeDoc, emptyDoc, uid, upsertDoc } from '../types';
 
 const SECTION_LABELS: Record<SectionId, string> = {
   todo: 'To-Do',
@@ -99,14 +99,45 @@ export default function App() {
     if (!paste.trim()) return;
     const result = categorize(paste, state.sections.todo);
     setDetected(result.detected);
-    update((s) => ({
-      ...s,
-      sections: {
-        todo: result.todo,
-        docs: result.docs || s.sections.docs,
-        notes: result.notes || s.sections.notes,
-      },
-    }));
+    update((s) => {
+      const docText = result.docs;
+      let docs = s.sections.docs;
+      let activeDocId = s.activeDocId;
+      let activeSection = s.activeSection;
+      if (docText) {
+        const cur = activeDoc(s);
+        if (cur) {
+          // Append the pasted text to the currently-open doc.
+          docs = docs.map((d) =>
+            d.id === cur.id
+              ? {
+                  ...d,
+                  content: d.content ? `${d.content}\n${docText}` : docText,
+                  updatedAt: Date.now(),
+                }
+              : d,
+          );
+        } else {
+          // No doc yet — start one from the paste.
+          const firstLine = docText.split('\n')[0].trim().slice(0, 40) || 'Untitled';
+          const doc = emptyDoc(firstLine);
+          docs = [...docs, { ...doc, content: docText }];
+          activeDocId = doc.id;
+          activeSection = 'docs';
+        }
+      }
+      const notes = result.notes
+        ? s.sections.notes
+          ? `${s.sections.notes}\n${result.notes}`
+          : result.notes
+        : s.sections.notes;
+      return {
+        ...s,
+        activeSection,
+        activeDocId,
+        sections: { todo: result.todo, docs, notes },
+      };
+    });
     setPaste('');
   };
 
@@ -145,8 +176,65 @@ export default function App() {
     }));
   };
 
-  const setTextSection = (section: 'docs' | 'notes', text: string) => {
-    update((s) => ({ ...s, sections: { ...s.sections, [section]: text } }));
+  // ── Docs library (multiple named docs, auto-saved + synced across devices) ─
+  const docs = state.sections.docs;
+  const active = activeDoc(state);
+
+  const selectDoc = (id: string) => {
+    update((s) => ({ ...s, activeDocId: id }));
+  };
+
+  const createDoc = () => {
+    const doc = emptyDoc('Untitled');
+    update((s) => {
+      const { docs: ds, activeDocId } = upsertDoc(s, doc);
+      return { ...s, activeSection: 'docs', activeDocId, sections: { ...s.sections, docs: ds } };
+    });
+  };
+
+  const renameActiveDoc = (title: string) => {
+    const id = active?.id;
+    if (!id) return;
+    update((s) => ({
+      ...s,
+      sections: {
+        ...s.sections,
+        docs: s.sections.docs.map((d) =>
+          d.id === id ? { ...d, title, updatedAt: Date.now() } : d,
+        ),
+      },
+    }));
+  };
+
+  const setActiveDocContent = (content: string) => {
+    const id = active?.id;
+    if (!id) return;
+    update((s) => ({
+      ...s,
+      sections: {
+        ...s.sections,
+        docs: s.sections.docs.map((d) =>
+          d.id === id ? { ...d, content, updatedAt: Date.now() } : d,
+        ),
+      },
+    }));
+  };
+
+  const deleteDoc = (id: string) => {
+    if (!window.confirm('Delete this doc? This syncs to all your devices.')) return;
+    update((s) => {
+      const remaining = s.sections.docs.filter((d) => d.id !== id);
+      return {
+        ...s,
+        sections: { ...s.sections, docs: remaining },
+        activeDocId:
+          remaining.length > 0 ? (s.activeDocId === id ? remaining[0].id : s.activeDocId) : null,
+      };
+    });
+  };
+
+  const setNotes = (text: string) => {
+    update((s) => ({ ...s, sections: { ...s.sections, notes: text } }));
   };
 
   const switchSection = (section: SectionId) => {
@@ -274,14 +362,63 @@ export default function App() {
         )}
 
         {state.activeSection === 'docs' && (
-          <div className="text-panel">
-            <div className="panel-label">Live Docs Stream · double-sync with glasses</div>
-            <textarea
-              className="doc-textarea"
-              value={state.sections.docs}
-              onChange={(e) => setTextSection('docs', e.target.value)}
-              placeholder="Pasted docs / long-form text appear here. Edits stream live to the glasses."
-            />
+          <div className="docs-manager">
+            <div className="panel-label">
+              Docs library · auto-saved to storage & synced to all your devices
+            </div>
+
+            {docs.length === 0 ? (
+              <div className="empty">No docs yet — create one to start writing.</div>
+            ) : (
+              <>
+                <div className="doc-tabs" role="tablist" aria-label="Documents">
+                  {docs.map((d) => (
+                    <button
+                      key={d.id}
+                      role="tab"
+                      aria-selected={active?.id === d.id}
+                      className={active?.id === d.id ? 'doc-chip active' : 'doc-chip'}
+                      onClick={() => selectDoc(d.id)}
+                      title={d.title || '(untitled)'}
+                    >
+                      {d.title || '(untitled)'}
+                    </button>
+                  ))}
+                </div>
+
+                {active && (
+                  <div className="doc-title-row">
+                    <input
+                      className="doc-title-input"
+                      value={active.title}
+                      onChange={(e) => renameActiveDoc(e.target.value)}
+                      placeholder="Doc title…"
+                    />
+                    <button
+                      className="icon-btn danger"
+                      onClick={() => deleteDoc(active.id)}
+                      aria-label="Delete doc"
+                      title="Delete doc"
+                    >
+                      🗑
+                    </button>
+                  </div>
+                )}
+
+                <textarea
+                  className="doc-textarea"
+                  value={active?.content ?? ''}
+                  onChange={(e) => setActiveDocContent(e.target.value)}
+                  placeholder="Start writing… saved automatically and streamed live to your glasses."
+                />
+              </>
+            )}
+
+            <div className="docs-actions">
+              <button className="primary" onClick={createDoc}>
+                + New doc
+              </button>
+            </div>
           </div>
         )}
 
@@ -291,7 +428,7 @@ export default function App() {
             <textarea
               className="doc-textarea"
               value={state.sections.notes}
-              onChange={(e) => setTextSection('notes', e.target.value)}
+              onChange={(e) => setNotes(e.target.value)}
               placeholder="Quick notes / memos. Edits stream live to the glasses."
             />
           </div>

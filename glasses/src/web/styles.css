@@ -392,3 +392,58 @@ li.empty {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* Docs library (multi-doc manager) */
+.docs-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.doc-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.doc-chip {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-chip.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.doc-title-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.doc-title-input {
+  flex: 1;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 9px 12px;
+  font: inherit;
+  font-weight: 600;
+}
+
+.docs-actions {
+  display: flex;
+  justify-content: flex-end;
+}

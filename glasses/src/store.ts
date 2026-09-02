@@ -4,7 +4,7 @@
 // echoes). This is what makes ONE app at ONE URL drive the web UI AND the
 // glasses at the same time.
 import { publishState } from './stream';
-import { emptyHubState, type HubState } from './types';
+import { emptyHubState, type DocEntry, type HubState } from './types';
 
 const LS_KEY = 'hub:state';
 
@@ -18,12 +18,53 @@ let pubTimer: number | null = null;
 let conn: ConnStatus = 'idle';
 const connListeners = new Set<(s: ConnStatus) => void>();
 
+interface RawSections {
+  todo?: unknown;
+  docs?: unknown;
+  notes?: unknown;
+}
+type RawState = Partial<HubState> & { sections?: RawSections };
+
 function loadLocal(): HubState {
   try {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return emptyHubState();
-    const parsed = JSON.parse(raw) as Partial<HubState>;
-    if (parsed?.sections) return { ...emptyHubState(), ...parsed };
+    const parsed = JSON.parse(raw) as RawState;
+    if (!parsed?.sections) return emptyHubState();
+    const base = { ...emptyHubState(), ...(parsed as Partial<HubState>) };
+    // Migration: legacy builds stored Docs as a single string.
+    let docs: DocEntry[];
+    if (typeof parsed.sections.docs === 'string') {
+      const legacy = parsed.sections.docs as string;
+      docs = legacy
+        ? [
+            {
+              id: legacy.length ? `doc-${Date.now()}` : '',
+              title: 'Untitled',
+              content: legacy,
+              updatedAt: Date.now(),
+            },
+          ]
+        : [];
+      if (docs[0] && !docs[0].id) docs = [];
+    } else if (Array.isArray(parsed.sections.docs)) {
+      docs = (parsed.sections.docs as DocEntry[]).filter((d) => d && d.id && typeof d.content === 'string');
+    } else {
+      docs = [];
+    }
+    const state: HubState = {
+      ...base,
+      sections: {
+        todo: Array.isArray(parsed.sections.todo) ? (parsed.sections.todo as HubState['sections']['todo']) : [],
+        docs,
+        notes: typeof parsed.sections.notes === 'string' ? parsed.sections.notes : '',
+      },
+      activeDocId:
+        typeof parsed.activeDocId === 'string' && docs.some((d) => d.id === parsed.activeDocId)
+          ? parsed.activeDocId
+          : docs[0]?.id ?? null,
+    };
+    return state;
   } catch {
     /* ignore */
   }
@@ -84,7 +125,9 @@ export function applyRemote(next: HubState): void {
 export function seedIfEmpty(): void {
   const local = getState();
   const hasData =
-    local.sections.todo.length > 0 || !!local.sections.docs || !!local.sections.notes;
+    local.sections.todo.length > 0 ||
+    local.sections.docs.length > 0 ||
+    (local.sections.notes ?? '').trim().length > 0;
   if (hasData) {
     lastPublishedAt = Date.now();
     void publishState({ ...local, updatedAt: lastPublishedAt });
