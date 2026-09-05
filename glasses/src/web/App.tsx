@@ -1,6 +1,7 @@
 import { useEffect, useSyncExternalStore, useState } from 'react';
 import { categorize } from './categorize';
 import { useAuth } from './auth';
+import { MicButton } from './Dictate';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
 import type { ConnStatus } from '../store';
 import type { HubState, SectionId, TodoItem } from '../types';
@@ -237,6 +238,40 @@ export default function App() {
     update((s) => ({ ...s, sections: { ...s.sections, notes: text } }));
   };
 
+  const appendPaste = (text: string) => {
+    setPaste((p) => (p.trim() ? `${p.replace(/\s+$/, '')}\n${text}` : text));
+  };
+
+  const appendTask = (text: string) => {
+    setNewTask((t) => (t.trim() ? `${t.replace(/\s+$/, ' ')}${text}` : text));
+  };
+
+  const appendToActiveDoc = (text: string) => {
+    const id = active?.id;
+    if (!id) return;
+    update((s) => ({
+      ...s,
+      sections: {
+        ...s.sections,
+        docs: s.sections.docs.map((d) =>
+          d.id === id
+            ? { ...d, content: d.content ? `${d.content.replace(/\s+$/, '')}\n${text}` : text, updatedAt: Date.now() }
+            : d,
+        ),
+      },
+    }));
+  };
+
+  const appendToNotes = (text: string) => {
+    update((s) => ({
+      ...s,
+      sections: {
+        ...s.sections,
+        notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
+      },
+    }));
+  };
+
   const switchSection = (section: SectionId) => {
     update((s) => ({ ...s, activeSection: section }));
   };
@@ -274,6 +309,9 @@ export default function App() {
       </header>
 
       <section className="paste-panel card">
+        <div className="field-toolbar">
+          <MicButton onText={appendPaste} hint="Speak → text lands in the box below" />
+        </div>
         <textarea
           value={paste}
           onChange={(e) => setPaste(e.target.value)}
@@ -348,6 +386,7 @@ export default function App() {
               ))}
             </ul>
             <div className="todo-add">
+              <MicButton compact onText={appendTask} title="Dictate a task" />
               <input
                 value={newTask}
                 onChange={(e) => setNewTask(e.target.value)}
@@ -405,6 +444,9 @@ export default function App() {
                   </div>
                 )}
 
+                <div className="field-toolbar">
+                  <MicButton onText={appendToActiveDoc} hint="Speak → appends to this doc" />
+                </div>
                 <textarea
                   className="doc-textarea"
                   value={active?.content ?? ''}
@@ -425,6 +467,9 @@ export default function App() {
         {state.activeSection === 'notes' && (
           <div className="text-panel">
             <div className="panel-label">Notes · double-sync with glasses</div>
+            <div className="field-toolbar">
+              <MicButton onText={appendToNotes} hint="Speak → appends to notes" />
+            </div>
             <textarea
               className="doc-textarea"
               value={state.sections.notes}

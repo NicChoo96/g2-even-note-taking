@@ -16,15 +16,20 @@
 //   POST /api/pair/approve        -> owner (session) approves a pair code
 //   GET  /api/devices             -> owner lists approved devices
 //   POST /api/pair/revoke         -> owner revokes a device
+//   GET  /api/stt/status          -> is a speech provider configured?
+//   POST /api/stt                 -> raw audio bytes -> transcribed text
+//                                     (auth required; key stays server-side)
 //
 // SECURITY: /api/stream (GET + POST) requires a valid owner session token OR an
 // approved per-device ID. Browsers authenticate via Google SSO; each glasses
 // device gets its own unguessable deviceId that the owner approves from a
 // logged-in browser. There is NO anonymous read of the stream and NO shared
-// device login.
+// device login. /api/stt is protected the same way so randos can't spend your
+// speech-provider key.
 //
 // Env: PORT, STATE_FILE, AUTH_FILE, GOOGLE_CLIENT_ID, ALLOWED_EMAILS
-// (comma-separated). Zero runtime dependencies (node built-ins only). Run:
+// (comma-separated), OPENAI_API_KEY (Whisper) or DEEPGRAM_API_KEY (Nova-2) for
+// voice dictation. Zero runtime dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -168,6 +173,41 @@ function readToken(req, url) {
 function requireOwner(req, url) {
   const p = principalFromToken(readToken(req, url));
   return p && p.kind === 'owner' ? p : null;
+}
+
+// ── Speech-to-text proxy ─────────────────────────────────────────────────────
+// The glasses/browser mic audio is POSTed here as raw bytes; this process holds
+// the provider API key (never shipped in the client bundle) and returns the
+// transcript. OpenAI Whisper (default) or Deepgram Nova-2.
+const STT_MAX_BYTES = 25 * 1024 * 1024;
+
+function sttProvider() {
+  if (process.env.OPENAI_API_KEY) return 'openai';
+  if (process.env.DEEPGRAM_API_KEY) return 'deepgram';
+  return null;
+}
+
+/** Re-wrap raw audio bytes as a multipart body for OpenAI Whisper. */
+function openaiMultipart(audio, contentType) {
+  const boundary = '----g2hub' + randomBytes(16).toString('hex');
+  const ext = contentType.includes('webm')
+    ? 'webm'
+    : contentType.includes('mp4')
+      ? 'mp4'
+      : contentType.includes('mpeg') || contentType.includes('mp3')
+        ? 'mp3'
+        : 'wav';
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="audio.${ext}"\r\n` +
+      `Content-Type: ${contentType}\r\n\r\n`,
+  );
+  const tail = Buffer.from(
+    `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n` +
+      `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n` +
+      `--${boundary}--\r\n`,
+  );
+  return { body: Buffer.concat([head, audio, tail]), boundary };
 }
 
 loadAuthStore();
@@ -512,6 +552,99 @@ const server = createServer(async (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');
+    return;
+  }
+
+  // Voice-dictation capability probe (the app hides/short-circuits the mic UI
+  // when no provider is configured).
+  if (req.method === 'GET' && url.pathname === '/api/stt/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, supported: sttProvider() !== null }));
+    return;
+  }
+
+  // Raw audio bytes → transcribed text. Auth is required (owner session OR an
+  // approved device) so nobody can burn your provider quota anonymously.
+  if (req.method === 'POST' && url.pathname === '/api/stt') {
+    const principal = principalFromToken(readToken(req, url));
+    if (!principal) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    const provider = sttProvider();
+    if (!provider) {
+      res.writeHead(501, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: 'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY',
+        }),
+      );
+      return;
+    }
+    const contentType = String(req.headers['content-type'] || 'audio/wav')
+      .split(';')[0]
+      .trim();
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > STT_MAX_BYTES) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'audio too large' }));
+        return;
+      }
+      chunks.push(chunk);
+    }
+    const audio = Buffer.concat(chunks);
+    if (!audio.length) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'empty audio' }));
+      return;
+    }
+    try {
+      let text = '';
+      if (provider === 'openai') {
+        const mp = openaiMultipart(audio, contentType);
+        const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': `multipart/form-data; boundary=${mp.boundary}`,
+          },
+          body: mp.body,
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j?.error?.message || `Whisper ${r.status}`);
+        text = String(j.text || '').trim();
+      } else if (provider === 'deepgram') {
+        const r = await fetch(
+          'https://api.deepgram.com/v1/listen?model=nova-2&language=en&punctuate=true&smart_format=true',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+              'Content-Type': contentType,
+            },
+            body: audio,
+          },
+        );
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j?.err?.message || `Deepgram ${r.status}`);
+        text = String(j?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '').trim();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, text }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
     return;
   }
 

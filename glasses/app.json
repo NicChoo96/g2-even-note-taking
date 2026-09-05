@@ -18,6 +18,14 @@
         "http://localhost:5175",
         "http://localhost:5173"
       ]
+    },
+    {
+      "name": "g2-microphone",
+      "desc": "Voice dictation via the glasses four-mic array"
+    },
+    {
+      "name": "phone-microphone",
+      "desc": "Voice dictation via the phone mic (fallback)"
     }
   ],
   "supported_languages": ["en"]

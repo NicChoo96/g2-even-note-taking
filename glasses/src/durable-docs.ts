@@ -17,6 +17,11 @@ export function setDurableBridge(b: EvenAppBridge | null): void {
   bridge = b;
 }
 
+/** The live SDK bridge once it is available (null in a plain browser). */
+export function getDurableBridge(): EvenAppBridge | null {
+  return bridge;
+}
+
 // Dual-write strategy. On the real Even App the host's setLocalStorage is the
 // ONLY layer that survives app restarts (browser localStorage is wiped). In the
 // simulator the reverse is true — the SDK bridge store is per-process but
