@@ -34,7 +34,7 @@
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
-import { createPublicKey, createVerify, randomBytes } from 'node:crypto';
+import { createPublicKey, createVerify, randomBytes, createHash } from 'node:crypto';
 import { extname, join, normalize, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -305,6 +305,118 @@ async function serveFrom(root, mount, req, res) {
   }
 }
 
+// ── Live streaming speech-to-text (WebSocket relay to Deepgram) ─────────────
+// The glasses/browser opens a WebSocket to /api/stt/ws and streams raw 16 kHz
+// s16le mono PCM; this process relays it to Deepgram's live endpoint (nova-3)
+// and streams Results (interim + final) back. The API key stays server-side —
+// the client only ever talks to this relay. Uses Node's global WebSocket client
+// (Node ≥ 22), so the Docker image must NOT be older than node:22.
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+function wsAcceptKey(key) {
+  return createHash('sha1').update(String(key) + WS_GUID).digest('base64');
+}
+
+/** Build a server→client WebSocket frame (never masked). */
+function wsFrame(opcode, payload) {
+  const data = Buffer.isBuffer(payload)
+    ? payload
+    : Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload), 'utf8');
+  const len = data.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, data]);
+}
+
+/**
+ * Incremental client-frame parser. Calls cb(opcode, payload, fin) for every
+ * complete frame received on the socket. Handles ping/pong/close internally.
+ */
+function wsPipe(socket, cb) {
+  let buf = Buffer.alloc(0);
+  socket.on('data', (d) => {
+    buf = buf.length === 0 ? d : Buffer.concat([buf, d]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const b0 = buf[0];
+      const opcode = b0 & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) return;
+        const big = buf.readBigUInt64BE(2);
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) return socket.destroy();
+        len = Number(big);
+        off = 10;
+      }
+      const maskLen = masked ? 4 : 0;
+      if (buf.length < off + maskLen + len) return;
+      let payload = buf.subarray(off + maskLen, off + maskLen + len);
+      if (masked) {
+        const mask = buf.subarray(off, off + 4);
+        const out = Buffer.allocUnsafe(payload.length);
+        for (let i = 0; i < payload.length; i++) out[i] = payload[i] ^ mask[i & 3];
+        payload = out;
+      }
+      buf = buf.subarray(off + maskLen + len);
+      if (opcode === 0x8) {
+        // close
+        try {
+          socket.write(wsFrame(0x8, payload.subarray(0, 2)));
+        } catch {
+          /* socket gone */
+        }
+        socket.end();
+        cb(0x8, payload, true);
+        return;
+      }
+      if (opcode === 0x9) {
+        // ping → pong
+        try {
+          socket.write(wsFrame(0xa, payload));
+        } catch {
+          /* socket gone */
+        }
+        continue;
+      }
+      if (opcode === 0x1 || opcode === 0x2) cb(opcode, payload, (b0 & 0x80) !== 0);
+      // 0x0 continuation + 0xa pong: ignore
+    }
+  });
+}
+
+/** Deepgram live URL (auth token in the query — Node's WebSocket has no headers). */
+function deepgramWsUrl() {
+  const p = new URLSearchParams({
+    model: process.env.DEEPGRAM_MODEL || 'nova-3',
+    language: process.env.DEEPGRAM_LANG || 'en',
+    interim_results: 'true',
+    punctuate: 'true',
+    smart_format: 'true',
+    encoding: 'linear16',
+    sample_rate: '16000',
+    channels: '1',
+  });
+  return `wss://api.deepgram.com/v1/listen?${p.toString()}&token=${process.env.DEEPGRAM_API_KEY}`;
+}
+
 const server = createServer(async (req, res) => {
   setCors(res);
   if (req.method === 'OPTIONS') {
@@ -558,8 +670,9 @@ const server = createServer(async (req, res) => {
   // Voice-dictation capability probe (the app hides/short-circuits the mic UI
   // when no provider is configured).
   if (req.method === 'GET' && url.pathname === '/api/stt/status') {
+    const provider = sttProvider();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, supported: sttProvider() !== null }));
+    res.end(JSON.stringify({ ok: true, supported: provider !== null, provider }));
     return;
   }
 
@@ -619,8 +732,10 @@ const server = createServer(async (req, res) => {
         if (!r.ok) throw new Error(j?.error?.message || `Whisper ${r.status}`);
         text = String(j.text || '').trim();
       } else if (provider === 'deepgram') {
+        const dgModel = process.env.DEEPGRAM_MODEL || 'nova-3';
+        const dgLang = process.env.DEEPGRAM_LANG || 'en';
         const r = await fetch(
-          'https://api.deepgram.com/v1/listen?model=nova-2&language=en&punctuate=true&smart_format=true',
+          `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(dgModel)}&language=${encodeURIComponent(dgLang)}&punctuate=true&smart_format=true`,
           {
             method: 'POST',
             headers: {
@@ -631,7 +746,7 @@ const server = createServer(async (req, res) => {
           },
         );
         const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j?.err?.message || `Deepgram ${r.status}`);
+        if (!r.ok) throw new Error(j?.err?.message || j?.message || `Deepgram ${r.status}`);
         text = String(j?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '').trim();
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -672,6 +787,135 @@ const server = createServer(async (req, res) => {
 
   res.writeHead(405);
   res.end();
+});
+
+// ── Live STT WebSocket: /api/stt/ws?token=… ─────────────────────────────────
+// Streams raw 16 kHz s16le mono PCM from an authorized client to Deepgram and
+// relays Results (interim + final) back as text frames.
+server.on('upgrade', (req, socket) => {
+  // Never crash the relay on a dead client socket — swallow socket errors.
+  socket.on('error', () => {
+    /* client went away */
+  });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname !== '/api/stt/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  const principal = principalFromToken(url.searchParams.get('token'));
+  if (!principal) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  if (!process.env.DEEPGRAM_API_KEY || typeof WebSocket !== 'function') {
+    socket.write('HTTP/1.1 501 Not Implemented\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${wsAcceptKey(req.headers['sec-websocket-key'])}\r\n\r\n`,
+  );
+
+  let dg = null;
+  let clientEnded = false;
+  let dgOpened = false;
+  const pending = []; // client frames that arrived before Deepgram finished connecting
+
+  const flushPending = () => {
+    while (pending.length) {
+      const p = pending.shift();
+      try {
+        dg.send(p.kind === 'text' ? p.data.toString('utf8') : p.data);
+      } catch {
+        /* noop */
+      }
+    }
+  };
+
+  const closeAll = () => {
+    try {
+      dg?.close();
+    } catch {
+      /* noop */
+    }
+    try {
+      socket.end();
+    } catch {
+      /* noop */
+    }
+  };
+
+  try {
+    dg = new WebSocket(deepgramWsUrl());
+  } catch (err) {
+    console.error('[g2-hub] deepgram ws error:', err);
+    closeAll();
+    return;
+  }
+
+  // If Deepgram never opens (network/plan issue), don't hang the client — the
+  // app falls back to the batch path when the socket closes without results.
+  const openTimer = setTimeout(() => {
+    if (!dgOpened) {
+      console.error('[g2-hub] deepgram live: open timeout');
+      clientEnded = true;
+      closeAll();
+    }
+  }, 8000);
+
+  dg.onopen = () => {
+    dgOpened = true;
+    clearTimeout(openTimer);
+    console.log('[g2-hub] deepgram live: open');
+    flushPending();
+  };
+  dg.onmessage = (ev) => {
+    if (clientEnded) return;
+    try {
+      socket.write(wsFrame(0x1, String(ev.data)));
+    } catch {
+      /* socket gone */
+    }
+  };
+  dg.onerror = () => {
+    if (!clientEnded) console.error('[g2-hub] deepgram live: stream error');
+    closeAll();
+  };
+  dg.onclose = (ev) => {
+    clearTimeout(openTimer);
+    console.log(`[g2-hub] deepgram live: closed (code=${ev?.code ?? '?'})`);
+    closeAll();
+  };
+
+  wsPipe(socket, (opcode, payload) => {
+    if (clientEnded) return;
+    if (opcode === 0x8) {
+      clientEnded = true;
+      // Tell Deepgram to flush its final transcript, then shut down.
+      try {
+        dg?.send(JSON.stringify({ type: 'CloseStream' }));
+      } catch {
+        /* noop */
+      }
+      setTimeout(closeAll, 1500);
+      return;
+    }
+    const kind = opcode === 0x1 ? 'text' : 'binary';
+    if (!dg || dg.readyState !== WebSocket.OPEN) {
+      pending.push({ kind, data: payload });
+      return;
+    }
+    try {
+      dg.send(kind === 'text' ? payload.toString('utf8') : payload);
+    } catch {
+      /* noop */
+    }
+  });
 });
 
 await loadPersistedState();

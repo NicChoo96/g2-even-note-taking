@@ -78,16 +78,42 @@ async function waitForBridge(ms: number): Promise<EvenAppBridge | null> {
   return getDurableBridge();
 }
 
-/** Is the relay configured with a speech provider (for bridge/media engines)? */
-async function serverSttSupported(): Promise<boolean> {
+export interface SttStatus {
+  supported: boolean;
+  provider: 'openai' | 'deepgram' | null;
+}
+
+/** What speech backend is the relay configured with (if any)? */
+async function serverSttStatus(): Promise<SttStatus> {
   try {
     const res = await fetch(`${API_BASE}/api/stt/status`);
-    if (!res.ok) return false;
-    const j = (await res.json()) as { supported?: boolean };
-    return !!j.supported;
+    if (!res.ok) return { supported: false, provider: null };
+    const j = (await res.json()) as { supported?: boolean; provider?: string };
+    return {
+      supported: !!j.supported,
+      provider: j.provider === 'openai' || j.provider === 'deepgram' ? j.provider : null,
+    };
   } catch {
-    return false;
+    return { supported: false, provider: null };
   }
+}
+
+function hasWebSocket(): boolean {
+  return typeof WebSocket !== 'undefined';
+}
+
+/** WebSocket URL for live streaming STT (this relay → Deepgram). */
+function sttWsUrl(): string {
+  const token = getStreamToken();
+  let base = API_BASE.trim();
+  if (!base || base.startsWith('/')) {
+    const proto =
+      typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss:' : 'ws:';
+    base = `${proto}//${location.host}`;
+  } else {
+    base = base.replace(/^http/i, 'ws');
+  }
+  return `${base}/api/stt/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`;
 }
 
 /** POST raw audio bytes to the relay; returns the transcript text. */
@@ -118,15 +144,24 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
   }
 
   // Inside the Even App → G2/phone mic through the SDK bridge, transcribed by
-  // the relay (server-side key, so none ships in this bundle).
+  // the relay (server-side key, so none ships in this bundle). Deepgram gets
+  // live streaming; otherwise fall back to the record-then-upload batch path.
   if (isEvenApp() || getDurableBridge()) {
     const bridge = getDurableBridge() || (await waitForBridge(2500));
     if (bridge) {
-      if (!(await serverSttSupported())) {
-        hooks.onState?.('error', 'Voice server not configured — set OPENAI_API_KEY on the server.');
+      const status = await serverSttStatus();
+      if (!status.supported) {
+        hooks.onState?.(
+          'error',
+          'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.',
+        );
         return false;
       }
-      void startBridge(bridge, hooks);
+      if (status.provider === 'deepgram' && hasWebSocket()) {
+        void startBridgeStream(bridge, hooks);
+      } else {
+        void startBridge(bridge, hooks); // OpenAI batch (or Deepgram batch fallback)
+      }
       return true;
     }
   }
@@ -137,8 +172,11 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
       ? (navigator as { mediaDevices?: MediaDevices }).mediaDevices
       : undefined) || null;
   if (mediaDevices && typeof mediaDevices.getUserMedia === 'function') {
-    if (!(await serverSttSupported())) {
-      hooks.onState?.('error', 'Voice server not configured — set OPENAI_API_KEY on the server.');
+    if (!(await serverSttStatus()).supported) {
+      hooks.onState?.(
+        'error',
+        'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.',
+      );
       return false;
     }
     void startMedia(hooks);
@@ -342,6 +380,201 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     'listening',
     source === AudioInputSource.Glasses ? 'Glasses mic' : 'Phone mic',
   );
+}
+
+// ── Engine 2b: LIVE streaming (glasses/phone mic → relay WS → Deepgram) ──────
+// Like the official @deepgram/sdk live sample, but the Deepgram leg runs on the
+// relay so the API key never leaves the server. The glasses PCM is streamed in
+// real time and Results (interim + final) come back as you speak.
+async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promise<void> {
+  let ws: WebSocket | null = null;
+  let unsub: (() => void) | null = null;
+  let watchdog = 0;
+  let source: AudioInputSource = AudioInputSource.Glasses;
+  let closed = false;
+  let spoken = false;
+  let lastActivity = Date.now();
+  let utteranceEnded = false;
+  const startedAt = Date.now();
+  let finalText = '';
+  let interimText = '';
+
+  const emitLive = () => {
+    const live = `${finalText}${interimText ? ` ${interimText}` : ''}`.trim();
+    if (live) hooks.onPartial?.(live);
+  };
+
+  let ctl: DictController = { stop: () => undefined, abort: () => undefined };
+
+  const finalize = () => {
+    if (session !== ctl) return;
+    session = null;
+    hooks.onPartial?.('');
+    const t = finalText.trim();
+    if (t) hooks.onFinal?.(t);
+    hooks.onState?.('idle');
+  };
+
+  const shutdown = (commit: boolean) => {
+    if (closed) return;
+    closed = true;
+    window.clearInterval(watchdog);
+    unsub?.();
+    void bridge.audioControl(false).catch(() => undefined);
+    if (commit && spoken && ws && ws.readyState === WebSocket.OPEN) {
+      // Tell Deepgram to flush its final transcript, then let it close us.
+      try {
+        ws.send(JSON.stringify({ type: 'CloseStream' }));
+      } catch {
+        /* noop */
+      }
+      window.setTimeout(() => {
+        try {
+          ws?.close();
+        } catch {
+          /* noop */
+        }
+      }, 2500);
+      window.setTimeout(() => {
+        if (session === ctl) finalize();
+      }, 4500);
+      return;
+    }
+    try {
+      ws?.close();
+    } catch {
+      /* noop */
+    }
+    if (session === ctl) finalize();
+  };
+
+  const onAudio = (ev: EvenHubEvent) => {
+    const pcm = toBytes(ev?.audioEvent?.audioPcm);
+    if (!pcm || pcm.length === 0) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength) as ArrayBuffer);
+    }
+  };
+
+  // Open the live relay → Deepgram socket first (5s cap), then start the mic.
+  try {
+    ws = await openSttSocket(5000);
+  } catch {
+    // Deepgram live unreachable here — fall back to the verified batch path so
+    // dictation still works (relay → Deepgram REST, no live interim).
+    hooks.onState?.('idle');
+    void startBridge(bridge, hooks);
+    return;
+  }
+
+  ws.onmessage = (ev) => {
+    lastActivity = Date.now();
+    let msg: { type?: string; is_final?: boolean; speech_final?: boolean; channel?: { alternatives?: Array<{ transcript?: string }> } };
+    try {
+      msg = JSON.parse(String(ev.data));
+    } catch {
+      return;
+    }
+    if (msg.type !== 'Results' || !msg.channel?.alternatives?.[0]) return;
+    const transcript = (msg.channel.alternatives[0].transcript || '').trim();
+    if (!transcript) return;
+    spoken = true;
+    if (msg.is_final) {
+      finalText = `${finalText} ${transcript}`.trim();
+      interimText = '';
+      utteranceEnded = !!msg.speech_final;
+    } else {
+      interimText = transcript;
+      utteranceEnded = false;
+    }
+    emitLive();
+  };
+  ws.onerror = () => {
+    if (!closed) hooks.onState?.('error', 'Live voice stream error.');
+    if (session === ctl) session = null;
+    closed = true;
+    window.clearInterval(watchdog);
+    unsub?.();
+    void bridge.audioControl(false).catch(() => undefined);
+  };
+  ws.onclose = () => {
+    if (session === ctl) finalize();
+  };
+
+  unsub = bridge.onEvenHubEvent(onAudio);
+
+  // Prefer the glasses four-mic array; fall back to the phone mic.
+  try {
+    const ok = await bridge.audioControl(true, AudioInputSource.Glasses);
+    if (!ok) throw new Error('glasses mic rejected');
+  } catch {
+    try {
+      const ok = await bridge.audioControl(true, AudioInputSource.Phone);
+      source = AudioInputSource.Phone;
+      if (!ok) throw new Error('phone mic rejected');
+    } catch {
+      unsub();
+      closed = true;
+      try {
+        ws.close();
+      } catch {
+        /* noop */
+      }
+      hooks.onState?.('error', 'No microphone available on this device.');
+      return;
+    }
+  }
+
+  ctl = {
+    stop: () => shutdown(true),
+    abort: () => shutdown(false),
+  };
+  session = ctl;
+
+  watchdog = window.setInterval(() => {
+    if (closed) return;
+    const age = Date.now() - startedAt;
+    const idle = Date.now() - lastActivity;
+    if (utteranceEnded && idle > 900) shutdown(true); // Deepgram said end-of-speech → flush
+    else if (spoken && idle > 6000) shutdown(true); // long quiet after speech → flush
+    else if (!spoken && age > 15000) shutdown(false); // never heard anything
+    else if (age > 120000) shutdown(true); // hard cap
+  }, 300);
+
+  hooks.onState?.(
+    'listening',
+    source === AudioInputSource.Glasses ? 'Glasses mic · live' : 'Phone mic · live',
+  );
+}
+
+/** Open the relay WebSocket with a connect timeout. */
+function openSttSocket(timeoutMs: number): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(sttWsUrl());
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      try {
+        ws.close();
+      } catch {
+        /* noop */
+      }
+      reject(new Error('voice socket timeout'));
+    }, timeoutMs);
+    ws.onopen = () => {
+      window.clearTimeout(timer);
+      ws.onerror = null;
+      resolve(ws);
+    };
+    ws.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error('voice socket error'));
+    };
+  });
 }
 
 // ── Engine 3: browser getUserMedia → MediaRecorder → relay ───────────────────

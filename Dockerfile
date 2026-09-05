@@ -5,7 +5,7 @@
 # plus the live SSE/state stream.
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-FROM node:20-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 
 COPY glasses/package.json glasses/package-lock.json ./glasses/
@@ -15,7 +15,9 @@ RUN cd glasses && npm run build:deploy
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 # The relay has ZERO runtime dependencies — only needs the built dist + server.
-FROM node:20-alpine
+# node:22+ is required: the live STT relay uses Node's global WebSocket client
+# to talk to Deepgram.
+FROM node:22-alpine
 WORKDIR /app
 ENV PORT=8080
 EXPOSE 8080
