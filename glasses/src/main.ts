@@ -157,6 +157,9 @@ async function main(): Promise<void> {
   let dictationStartedAt = 0;
   let dictationGotFinal = false;
   let dictationTapStop = false;
+  // Accumulates per-phrase commits during a session; committed as ONE block at
+  // the end so todo stays a single task and notes/docs read as flowing text.
+  let dictationDraft = '';
   // Sticky diagnostics shown when a dictation session stops ITSELF (no tap).
   let dictationDiagText = '';
   // Ignore taps until this time. The single-press that CONFIRMS the 'Dictate'
@@ -270,18 +273,6 @@ async function main(): Promise<void> {
     void renderGlasses();
   }
 
-  /** True when a no-tap end is unexpected and worth showing diagnostics for. */
-  function shouldShowDictationDiag(): boolean {
-    if (dictationTapStop) return false; // user tapped stop — normal
-    if (dictationGotFinal) {
-      const r = lastDictationReason();
-      // A full silence auto-commit ('quiet') or the hard cap is a normal end.
-      if (r.includes('quiet') || r.includes('cap')) return false;
-    }
-    // Otherwise it ended by itself before/without a clean commit — show why.
-    return true;
-  }
-
   /** Contextual menu → Dictate: turn on the glasses/phone mic and show live text. */
   function startGlassesDictation(): void {
     if (isDictating()) return; // already capturing
@@ -293,6 +284,7 @@ async function main(): Promise<void> {
     dictationStartedAt = Date.now();
     dictationGotFinal = false;
     dictationTapStop = false;
+    dictationDraft = '';
     dictationDiagText = '';
     // Grace from the very start: the press that confirmed the menu item can be
     // re-delivered as a CLICK before the engine even reports 'listening'.
@@ -310,15 +302,26 @@ async function main(): Promise<void> {
           dictationStatus = 'Transcribing…';
           dictationStopAfter = Date.now() + 60000; // don't stop mid-transcribe
         } else if (s === 'error' || s === 'unsupported') {
+          // Commit whatever phrases were already heard, then show the reason.
+          const had = dictationDraft.trim();
+          dictationDraft = '';
+          if (had) commitSpeechToSection(had);
           dictationStatus = detail || 'Voice unavailable';
           dictationStopAfter = 0;
           // Persist the reason + session log on the glasses until the user taps.
           showDictationDiag(detail);
         } else if (s === 'idle') {
+          // Continuous streaming ended: explicit tap, ~5s of real silence, or a
+          // cap. Commit the whole draft once as a single block, then leave.
+          const draft = dictationDraft.trim();
+          dictationDraft = '';
           dictationInterim = '';
-          if (shouldShowDictationDiag()) showDictationDiag();
-          else {
-            dictationActive = false;
+          dictationActive = false;
+          if (draft) commitSpeechToSection(draft);
+          if (!draft && !dictationTapStop) {
+            // Stopped by itself without hearing anything — surface why.
+            showDictationDiag();
+          } else {
             void renderGlasses();
           }
         } else {
@@ -333,15 +336,12 @@ async function main(): Promise<void> {
         }
       },
       onFinal: (t) => {
-        dictationGotFinal = true;
+        // Per-phrase commit (continuous streaming) — keep the session listening.
         const text = (t || '').trim();
-        if (text) commitSpeechToSection(text);
-        if (shouldShowDictationDiag()) showDictationDiag();
-        else {
-          dictationActive = false;
-          dictationInterim = '';
-          void renderGlasses();
-        }
+        if (!text) return;
+        dictationGotFinal = true;
+        dictationDraft = dictationDraft ? `${dictationDraft} ${text}` : text;
+        void renderGlasses();
       },
     });
   }

@@ -255,24 +255,6 @@ async function serverSttStatus(): Promise<SttStatus> {
   }
 }
 
-function hasWebSocket(): boolean {
-  return typeof WebSocket !== 'undefined';
-}
-
-/** WebSocket URL for live streaming STT (this relay → Deepgram). */
-function sttWsUrl(): string {
-  const token = getStreamToken();
-  let base = API_BASE.trim();
-  if (!base || base.startsWith('/')) {
-    const proto =
-      typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss:' : 'ws:';
-    base = `${proto}//${location.host}`;
-  } else {
-    base = base.replace(/^http/i, 'ws');
-  }
-  return `${base}/api/stt/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`;
-}
-
 /** POST raw audio bytes to the relay; returns the transcript text. */
 async function sendToStt(audio: Uint8Array, contentType: string): Promise<string> {
   const token = getStreamToken();
@@ -339,13 +321,13 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
         );
         return false;
       }
-      if (status.provider === 'deepgram' && hasWebSocket()) {
-        dlog('engine: live bridge stream (relay->deepgram)');
-        void startBridgeStream(bridge, hooks);
-      } else {
-        dlog('engine: batch bridge (provider=', status.provider ?? 'none', ')');
-        void startBridge(bridge, hooks); // OpenAI batch (or Deepgram batch fallback)
-      }
+      // Continuous streaming session: ONE clean mic open, per-phrase REST
+      // commits so text appears live and the session stays open until tap or
+      // ~5s of silence. (The Deepgram-LIVE ws leg is unreliable from Railway —
+      // it closes ~0.7s in, code 1006 — and attempting it first forced a second
+      // mic re-open that stalled after the first word, so we stream via REST.)
+      dlog('engine: continuous streaming (single mic, per-phrase REST)');
+      void startBridge(bridge, hooks);
       return true;
     }
     // Bridge not ready yet → fall through to a browser-style capture if the
@@ -528,63 +510,129 @@ function startWebSpeech(hooks: DictHooks): boolean {
   }
 }
 
-// ── Engine 2: Even App SDK mic (glasses, falling back to phone) → relay ─────
+// ── Engine 2: Even App SDK mic (glasses/phone) → continuous streaming ───────
+// Mirrors Even Realities' own low-latency pipeline as closely as our infra
+// allows: the mic is opened ONCE and left open, speech is cut into phrases on
+// short pauses, and each finished phrase is transcribed over the relay's REST
+// ASR as you keep talking. Text grows live (onPartial = running transcript,
+// onFinal = committed phrase) so it appears on the glasses/note in near-real
+// time. The session stays open until an explicit tap, ~5s of real silence, or
+// the time cap — it never ends just because you paused mid-note.
 async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<void> {
-  dlog('engine batch');
-  const chunks: Uint8Array[] = [];
-  let frames = 0;
-  let closed = false;
-  let spoken = false;
-  let lastSpeech = Date.now();
-  const startedAt = Date.now();
-  let watchdog = 0;
+  dlog('engine: streaming (single mic, per-phrase REST)');
   let unsub: (() => void) | null = null;
+  let watchdog = 0;
   let source: AudioInputSource = AudioInputSource.Glasses;
+  let closed = false;
+  let anySpeech = false;
+  let lastVoicedAt = Date.now(); // any voiced frame → resets the 5s auto-stop
+  let lastFrameAt = Date.now(); // any frame (even silence) → mic liveness
+  let micReopened = false;
+  const startedAt = Date.now();
+  let phraseChunks: Uint8Array[] = []; // current (unfinished) phrase PCM
+  let phraseVoicedMs = 0; // voiced audio inside the current phrase
+  let phraseQuietMs = 0; // trailing quiet since the phrase's last voiced frame
+  let queue: Uint8Array[] = []; // finished phrases awaiting transcription
+  let busy = false;
+  let wantEnd = false;
+  let endWhy = 'quiet';
+  let consecErr = 0;
+  let transcript = '';
 
-  const finish = async (commit: boolean) => {
+  const PHRASE_END_MS = 900; // trailing quiet that cuts a phrase
+  const MIN_VOICED_MS = 250; // ignore blips shorter than this (noise/click)
+  const VAD_RMS = 700;
+  const STOP_QUIET_MS = 5000; // real silence → auto-stop (flush then idle)
+  const NEVER_MS = 20000; // never heard anything → idle
+  const CAP_MS = 300000; // hard cap
+
+  const finalize = (why: string) => {
     if (closed) return;
     closed = true;
+    diagReason = `auto-stop (${why})`;
     window.clearInterval(watchdog);
     unsub?.();
-    diagReason = commit ? 'batch-commit' : 'batch-abort';
-    try {
-      await bridge.audioControl(false);
-    } catch {
-      /* noop */
-    }
-    const pcm = concatBytes(chunks);
-    if (!commit || pcm.length < 1600) {
-      dlog(`batch end: too-little-audio pcm=${pcm.length}B`);
-      // Too little audio to transcribe.
-      hooks.onState?.('idle');
-      if (session === ctl) session = null;
+    void bridge.audioControl(false).catch(() => undefined);
+    hooks.onPartial?.('');
+    if (session === ctl) session = null;
+    hooks.onState?.('idle');
+    dlog(`finalize why=${why} text=${transcript.length}ch`);
+  };
+
+  // Transcribe finished phrases one at a time. Never blocks capture — new audio
+  // keeps streaming into phraseChunks / queue while a phrase is in flight.
+  const pump = async () => {
+    if (busy || closed) return;
+    if (queue.length === 0) {
+      if (wantEnd) finalize(endWhy);
       return;
     }
-    dlog(`batch transcribing pcm=${pcm.length}B`);
-    hooks.onState?.('transcribing');
+    busy = true;
+    const pcm = queue.shift() as Uint8Array;
     try {
-      const text = await sendToStt(wavFromPcm(pcm), 'audio/wav');
-      dlog(`batch text=${(text || '').length}ch`);
-      if (text) hooks.onFinal?.(text);
-      hooks.onState?.('idle');
+      const text = ((await sendToStt(wavFromPcm(pcm), 'audio/wav')) || '').trim();
+      consecErr = 0;
+      if (text) {
+        transcript = transcript ? `${transcript} ${text}` : text;
+        hooks.onPartial?.(transcript);
+        hooks.onFinal?.(text); // commit this phrase to the target live
+        dlog(`phrase ok ch=${text.length}`);
+      } else {
+        dlog('phrase empty (no speech detected server-side)');
+      }
     } catch (err) {
-      dlog('batch error', errMsg(err));
-      hooks.onState?.('error', errMsg(err));
+      consecErr++;
+      dlog('phrase error', errMsg(err));
+      if (consecErr >= 3) {
+        endWhy = 'stt-failing';
+        wantEnd = true;
+        finalize('stt-failing');
+        return;
+      }
     } finally {
-      if (session === ctl) session = null;
+      busy = false;
+      void pump();
     }
+  };
+
+  const enqueuePhrase = () => {
+    const pcm = concatBytes(phraseChunks);
+    phraseChunks = [];
+    phraseVoicedMs = 0;
+    phraseQuietMs = 0;
+    if (pcm.length < 1600) return; // micro-blip — ignore
+    queue.push(pcm);
+    dlog(`phrase queued pcm=${pcm.length}B queue=${queue.length} busy=${busy}`);
+    void pump();
   };
 
   const onAudio = (ev: EvenHubEvent) => {
     const pcm = toBytes(ev?.audioEvent?.audioPcm);
-    if (!pcm || pcm.length === 0) return;
-    frames++;
-    if (frames === 1) dlog('batch mic audio frames flowing');
-    chunks.push(pcm);
-    if (rms(pcm) > 700) {
-      spoken = true;
-      lastSpeech = Date.now();
+    if (!pcm || pcm.length === 0 || closed) return;
+    const now = Date.now();
+    const dt = Math.min(1000, Math.max(10, now - lastFrameAt)); // cadence-proof
+    lastFrameAt = now;
+    const voiced = rms(pcm) > VAD_RMS;
+    if (voiced) {
+      anySpeech = true;
+      lastVoicedAt = now;
+      phraseQuietMs = 0;
+      phraseVoicedMs += dt;
+      phraseChunks.push(pcm);
+      if (wantEnd) wantEnd = false; // still talking — don't end yet
+    } else if (phraseChunks.length > 0) {
+      phraseQuietMs += dt;
+      phraseChunks.push(pcm); // keep a natural trailing-silence tail
+      if (phraseQuietMs >= PHRASE_END_MS) {
+        if (phraseVoicedMs >= MIN_VOICED_MS) enqueuePhrase();
+        else {
+          phraseChunks = [];
+          phraseVoicedMs = 0;
+          phraseQuietMs = 0;
+        }
+      }
     }
+    // silence with no phrase in progress → nothing to do (idle is the watchdog's job)
   };
 
   unsub = bridge.onEvenHubEvent(onAudio);
@@ -592,34 +640,66 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   // G2 glasses mic (needs the startup page) → phone mic → WebView mic.
   const opened = await openEvenMic(bridge);
   if (!opened) {
-    dlog('batch mic open FAILED -> webview fallback');
+    dlog('streaming mic open FAILED -> webview fallback');
     unsub();
     if (await tryWebviewMic(hooks)) return;
     hooks.onState?.('error', EVEN_MIC_COPY);
     return;
   }
   source = opened.source;
-  dlog('batch mic open source=', source === AudioInputSource.Glasses ? 'glasses' : 'phone');
+  dlog('streaming mic open source=', source === AudioInputSource.Glasses ? 'glasses' : 'phone');
 
   const ctl: DictController = {
-    stop: () => void finish(true),
-    abort: () => void finish(false),
+    stop: () => {
+      wantEnd = true;
+      endWhy = 'tap';
+      if (phraseChunks.length) enqueuePhrase(); // flush the trailing phrase
+      if (!busy && queue.length === 0) finalize('tap');
+      else if (!busy) void pump();
+    },
+    abort: () => {
+      wantEnd = true;
+      endWhy = 'abort';
+      phraseChunks = [];
+      queue = [];
+      finalize('abort');
+    },
   };
   session = ctl;
 
   watchdog = window.setInterval(() => {
     if (closed) return;
+    if (wantEnd) {
+      if (!busy && queue.length === 0) finalize(endWhy);
+      return;
+    }
     const age = Date.now() - startedAt;
-    // Wait ~5s of quiet so natural pauses mid-note don't end dictation.
-    if (spoken && Date.now() - lastSpeech > 5000) {
-      dlog(`batch watchdog: quiet ${Math.round(Date.now() - lastSpeech)}ms`);
-      void finish(true);
-    } else if (!spoken && age > 20000) {
-      dlog(`batch watchdog: never-heard ${Math.round(age)}ms`);
-      void finish(false);
-    } else if (age > 300000) {
-      dlog(`batch watchdog: hard-cap ${Math.round(age)}ms`);
-      void finish(true);
+    const idle = Date.now() - lastVoicedAt;
+    // If the glasses mic stops delivering frames entirely (OS hiccup), reopen
+    // it once so dictation doesn't die after the first captured word.
+    if (anySpeech && !micReopened && Date.now() - lastFrameAt > 2000) {
+      micReopened = true;
+      dlog('mic frames stalled -> reopening mic once');
+      void bridge.audioControl(false).catch(() => undefined);
+      void openEvenMic(bridge).then((o) => dlog(o ? 'mic reopened' : 'mic reopen failed'));
+    }
+    if (anySpeech && idle > STOP_QUIET_MS) {
+      dlog(`watchdog: quiet ${Math.round(idle)}ms`);
+      wantEnd = true;
+      endWhy = 'quiet';
+      if (phraseChunks.length) enqueuePhrase();
+      if (!busy && queue.length === 0) finalize('quiet');
+    } else if (!anySpeech && age > NEVER_MS) {
+      dlog(`watchdog: never-heard ${Math.round(age)}ms`);
+      wantEnd = true;
+      endWhy = 'never-heard';
+      finalize('never-heard');
+    } else if (age > CAP_MS) {
+      dlog(`watchdog: hard-cap ${Math.round(age)}ms`);
+      wantEnd = true;
+      endWhy = 'cap';
+      if (phraseChunks.length) enqueuePhrase();
+      if (!busy && queue.length === 0) finalize('cap');
     }
   }, 250);
 
@@ -627,240 +707,6 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     'listening',
     source === AudioInputSource.Glasses ? 'Glasses mic' : 'Phone mic',
   );
-}
-
-// ── Engine 2b: LIVE streaming (glasses/phone mic → relay WS → Deepgram) ──────
-// Like the official @deepgram/sdk live sample, but the Deepgram leg runs on the
-// relay so the API key never leaves the server. The glasses PCM is streamed in
-// real time and Results (interim + final) come back as you speak.
-async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promise<void> {
-  let ws: WebSocket | null = null;
-  let unsub: (() => void) | null = null;
-  let watchdog = 0;
-  let source: AudioInputSource = AudioInputSource.Glasses;
-  let closed = false;
-  let spoken = false;
-  let lastActivity = Date.now();
-  const startedAt = Date.now();
-  let finalText = '';
-  let interimText = '';
-  let audioFrames = 0;
-  let msgs = 0;
-  let shutdownWhy = '';
-
-  const emitLive = () => {
-    const live = `${finalText}${interimText ? ` ${interimText}` : ''}`.trim();
-    if (live) hooks.onPartial?.(live);
-  };
-
-  let ctl: DictController = { stop: () => undefined, abort: () => undefined };
-
-  const finalize = (why: string) => {
-    if (session !== ctl) return;
-    diagReason = `auto-stop (${why})`;
-    session = null;
-    hooks.onPartial?.('');
-    const t = finalText.trim();
-    dlog(`finalize why=${why} text=${t.length}ch spoken=${spoken} audioFrames=${audioFrames} msgs=${msgs}`);
-    if (t) hooks.onFinal?.(t);
-    hooks.onState?.('idle');
-  };
-
-  const shutdown = (commit: boolean, why: string) => {
-    if (closed) return;
-    closed = true;
-    shutdownWhy = why;
-    window.clearInterval(watchdog);
-    unsub?.();
-    void bridge.audioControl(false).catch(() => undefined);
-    dlog(`shutdown commit=${commit} why=${why}`);
-    if (commit && spoken && ws && ws.readyState === WebSocket.OPEN) {
-      // Tell Deepgram to flush its final transcript, then let it close us.
-      try {
-        ws.send(JSON.stringify({ type: 'CloseStream' }));
-      } catch {
-        /* noop */
-      }
-      window.setTimeout(() => {
-        try {
-          ws?.close();
-        } catch {
-          /* noop */
-        }
-      }, 2500);
-      window.setTimeout(() => {
-        if (session === ctl) finalize(shutdownWhy);
-      }, 4500);
-      return;
-    }
-    try {
-      ws?.close();
-    } catch {
-      /* noop */
-    }
-    if (session === ctl) finalize(shutdownWhy);
-  };
-
-  const onAudio = (ev: EvenHubEvent) => {
-    const pcm = toBytes(ev?.audioEvent?.audioPcm);
-    if (!pcm || pcm.length === 0) return;
-    audioFrames++;
-    if (audioFrames === 1) dlog('mic audio frames flowing');
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength) as ArrayBuffer);
-    }
-  };
-
-  // Open the live relay → Deepgram socket first (5s cap), then start the mic.
-  try {
-    ws = await openSttSocket(5000);
-    dlog('ws open ok');
-  } catch (err) {
-    // Deepgram live unreachable here — fall back to the verified batch path so
-    // dictation still works (relay → Deepgram REST, no live interim).
-    dlog('ws open FAILED -> batch fallback:', errMsg(err));
-    // NO onState('idle') here — that would close the glasses overlay while the
-    // fallback engine is still starting the mic. Let the fallback own the state.
-    void startBridge(bridge, hooks);
-    return;
-  }
-
-  ws.onmessage = (ev) => {
-    lastActivity = Date.now();
-    msgs++;
-    let msg: { type?: string; is_final?: boolean; speech_final?: boolean; channel?: { alternatives?: Array<{ transcript?: string }> } };
-    try {
-      msg = JSON.parse(String(ev.data));
-    } catch {
-      return;
-    }
-    if (msg.type !== 'Results' || !msg.channel?.alternatives?.[0]) return;
-    const transcript = (msg.channel.alternatives[0].transcript || '').trim();
-    if (!transcript) return;
-    spoken = true;
-    if (msgs === 1) dlog('first server result');
-    if (msg.is_final) {
-      finalText = `${finalText} ${transcript}`.trim();
-      interimText = '';
-      dlog(`is_final ch=${transcript.length}${msg.speech_final ? ' speech_final' : ''} total=${finalText.length}`);
-    } else {
-      interimText = transcript;
-    }
-    emitLive();
-  };
-  ws.onerror = () => {
-    dlog('ws ERROR');
-    diagReason = 'auto-stop (ws-error)';
-    if (!closed) hooks.onState?.('error', 'Live voice stream error.');
-    if (session === ctl) session = null;
-    closed = true;
-    window.clearInterval(watchdog);
-    unsub?.();
-    void bridge.audioControl(false).catch(() => undefined);
-  };
-  ws.onclose = (ev) => {
-    const wasClosed = closed; // false = the relay/Deepgram dropped us (the auto-exit bug)
-    dlog(`ws CLOSE code=${ev.code} reason="${ev.reason}" clean=${ev.wasClean} wasClosed=${wasClosed}`);
-    if (!wasClosed) {
-      // The relay/Deepgram closed the socket on us. Stop the mic; if we never
-      // got a single FINAL yet, fall back to the batch path (relay -> Deepgram
-      // REST) so dictation keeps working even when the live leg is down.
-      closed = true;
-      window.clearInterval(watchdog);
-      unsub?.();
-      void bridge.audioControl(false).catch(() => undefined);
-      if (session === ctl) session = null;
-      if (finalText.length === 0) {
-        dlog('live socket died before any final -> batch fallback');
-        void startBridge(bridge, hooks);
-        return;
-      }
-    }
-    if (session === ctl) finalize(wasClosed ? shutdownWhy : `ws-close-${ev.code}`);
-  };
-
-  unsub = bridge.onEvenHubEvent(onAudio);
-
-  // G2 glasses mic (needs the startup page) → phone mic → WebView mic.
-  const opened = await openEvenMic(bridge);
-  if (!opened) {
-    dlog('mic open FAILED -> webview fallback');
-    unsub();
-    closed = true;
-    shutdownWhy = 'mic-unavailable';
-    try {
-      ws.close();
-    } catch {
-      /* noop */
-    }
-    if (await tryWebviewMic(hooks)) return;
-    hooks.onState?.('error', EVEN_MIC_COPY);
-    return;
-  }
-  source = opened.source;
-  dlog('mic open source=', source === AudioInputSource.Glasses ? 'glasses' : 'phone');
-
-  ctl = {
-    stop: () => shutdown(true, 'tap'),
-    abort: () => shutdown(false, 'abort'),
-  };
-  session = ctl;
-
-  watchdog = window.setInterval(() => {
-    if (closed) return;
-    const age = Date.now() - startedAt;
-    const idle = Date.now() - lastActivity;
-    // NOTE: Deepgram fires is_final + speech_final at the end of EVERY phrase
-    // (endpointing). Treating that as "done" (as a ~900ms auto-commit did) made
-    // dictation stop itself right after the first phrase/pause. Instead we keep
-    // listening across phrases and only end after a REAL silence (~5s with no
-    // new speech), an explicit tap (stop), or the caps below.
-    if (spoken && idle > 5000) {
-      dlog(`watchdog: quiet idle=${Math.round(idle)}ms`);
-      shutdown(true, 'quiet');
-    } else if (!spoken && age > 20000) {
-      dlog(`watchdog: never-heard age=${Math.round(age)}ms`);
-      shutdown(false, 'never-heard');
-    } else if (age > 300000) {
-      dlog(`watchdog: hard-cap age=${Math.round(age)}ms`);
-      shutdown(true, 'cap');
-    }
-  }, 300);
-
-  hooks.onState?.(
-    'listening',
-    source === AudioInputSource.Glasses ? 'Glasses mic · live' : 'Phone mic · live',
-  );
-}
-
-/** Open the relay WebSocket with a connect timeout. */
-function openSttSocket(timeoutMs: number): Promise<WebSocket> {
-  return new Promise((resolve, reject) => {
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(sttWsUrl());
-    } catch (err) {
-      reject(err);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      try {
-        ws.close();
-      } catch {
-        /* noop */
-      }
-      reject(new Error('voice socket timeout'));
-    }, timeoutMs);
-    ws.onopen = () => {
-      window.clearTimeout(timer);
-      ws.onerror = null;
-      resolve(ws);
-    };
-    ws.onerror = () => {
-      window.clearTimeout(timer);
-      reject(new Error('voice socket error'));
-    };
-  });
 }
 
 // ── Engine 3: browser getUserMedia → MediaRecorder → relay ───────────────────
