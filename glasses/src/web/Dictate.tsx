@@ -73,7 +73,7 @@ export function MicButton({ onText, hint, title, compact = false }: MicButtonPro
           {bad
             ? detail || 'Voice unavailable'
             : interim ||
-              (listening ? 'Listening… tap the mic to stop' : hint || 'Voice input')}
+              (listening ? 'Listening… tap the mic to stop' : hint || 'Tap to dictate (mic permission will be requested)')}
         </span>
       )}
     </span>

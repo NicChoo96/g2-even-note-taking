@@ -1,17 +1,20 @@
 // Speech-to-text module for the G2 Even Reality Hub.
 //
 // One engine-agnostic API for "talk → text" that can be attached to ANY text
-// input in the app. The engine is auto-selected at runtime:
+// input in the app. The engine is auto-selected at runtime and microphone
+// permission is requested explicitly:
 //
-//   1. bridge    — inside the Even App: captures the G2 four-mic array (falls
-//                  back to the phone mic) via even_hub_sdk audioControl, then
-//                  batches the 16 kHz PCM and transcribes it server-side
-//                  (the relay proxies to a speech API with a server-side key).
-//                  This is the "g2 even skill" path — the mic is on the glasses.
-//   2. webspeech — a plain browser that supports the Web Speech API
-//                  (Chrome/Edge/Safari): free, no key, no audio upload.
-//   3. media     — a browser without Web Speech (e.g. Firefox): getUserMedia →
-//                  MediaRecorder → same server-side transcription.
+//   1. browser    — getUserMedia permission is requested FIRST, inside the tap
+//                   gesture (iOS Safari rejects mic access after an await), so
+//                   dictation works on mobile and desktop web. Then:
+//   2. webspeech  — the free browser Web Speech API when available; if its
+//                   service is unavailable it falls back to engine 4.
+//   3. bridge     — inside the Even App: the G2 four-mic array (falls back to
+//                   the phone mic) via even_hub_sdk audioControl, which
+//                   surfaces the host/OS microphone permission dialog, then
+//                   transcribes server-side (relay → Deepgram/Whisper).
+//   4. media      — a browser without Web Speech (e.g. Firefox/iOS): the same
+//                   granted getUserMedia stream → MediaRecorder → relay.
 //
 // Transcribed text arrives through the onFinal hook. The React wrapper in
 // web/Dictate.tsx turns this into a reusable <MicButton> that drops the text
@@ -66,6 +69,78 @@ export function isEvenApp(): boolean {
 function hasWebSpeech(): boolean {
   const w = window as unknown as Record<string, unknown>;
   return Boolean(w.SpeechRecognition || w.webkitSpeechRecognition);
+}
+
+// ── Microphone permission ────────────────────────────────────────────────────
+// getUserMedia is the universal browser mic gate: granting it covers BOTH the
+// MediaRecorder engine AND the Web Speech API (same "microphone" permission in
+// Chrome). iOS Safari only honours getUserMedia when it's called inside the
+// user's tap gesture — before any await — so we probe permission FIRST in
+// startDictation, then pick an engine. The Even App/glasses path requests the
+// host permission through audioControl when an engine opens the mic.
+function browserMedia(): MediaDevices | null {
+  if (typeof navigator === 'undefined') return null;
+  const nd = navigator as { mediaDevices?: MediaDevices };
+  return nd.mediaDevices && typeof nd.mediaDevices.getUserMedia === 'function'
+    ? nd.mediaDevices
+    : null;
+}
+
+let lastMicProbeError: unknown = null;
+
+/** Best-effort read of the site's mic permission state. */
+export async function getMicPermission(): Promise<
+  'granted' | 'denied' | 'prompt' | 'unsupported'
+> {
+  if (isEvenApp() || getDurableBridge()) return 'prompt'; // host decides via audioControl
+  if (!browserMedia()) return 'unsupported';
+  try {
+    const perms = navigator.permissions;
+    if (perms && typeof perms.query === 'function') {
+      const st = await perms.query({ name: 'microphone' as PermissionName });
+      return st.state as 'granted' | 'denied' | 'prompt';
+    }
+  } catch {
+    /* permission API unavailable — assume prompt */
+  }
+  return 'prompt';
+}
+
+/**
+ * Explicitly ask for browser microphone access (shows the browser prompt).
+ * MUST be invoked inside the user's click gesture and before any other await
+ * (iOS Safari rejects getUserMedia otherwise). On success the tracks are
+ * released immediately — the browser remembers the grant.
+ */
+export async function requestBrowserMicPermission(): Promise<boolean> {
+  const media = browserMedia();
+  if (!media) return false;
+  try {
+    const stream = await media.getUserMedia({ audio: true });
+    stream.getTracks().forEach((t) => t.stop());
+    return true;
+  } catch (err) {
+    lastMicProbeError = err;
+    return false;
+  }
+}
+
+/** Human-readable reason for a failed getUserMedia call. */
+function micDeniedMsg(err: unknown): string {
+  const name =
+    (err && typeof err === 'object' && 'name' in err
+      ? String((err as { name?: string }).name)
+      : '') || '';
+  if (name === 'NotAllowedError' || name === 'SecurityError' || name === 'PermissionDeniedError') {
+    return 'Microphone is blocked. Tap the 🔒 in the address bar → Site settings → allow Microphone, then tap the mic again.';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return 'No microphone was found on this device.';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'The microphone is in use by another app.';
+  }
+  return 'Microphone access failed — allow the mic for this site and try again.';
 }
 
 async function waitForBridge(ms: number): Promise<EvenAppBridge | null> {
@@ -133,20 +208,38 @@ async function sendToStt(audio: Uint8Array, contentType: string): Promise<string
 /**
  * Start a dictation session. Returns false if one is already active or no
  * engine is available (the reason is delivered via hooks.onState).
+ *
+ * Permission flow:
+ *  - Web/mobile browser: getUserMedia is requested FIRST, synchronously inside
+ *    the tap gesture (required by iOS Safari). Once granted, both the Web
+ *    Speech API and the MediaRecorder engine can start without re-prompting.
+ *  - Even App: the SDK engine opens the mic via audioControl, which surfaces
+ *    the host/OS permission dialog.
  */
 export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
   if (session) return false; // already dictating — call stopDictation() first
 
-  // Plain browser with the Web Speech API → start synchronously so the mic
-  // permission prompt stays inside the user's click gesture.
-  if (!isEvenApp() && !getDurableBridge() && hasWebSpeech()) {
+  const inApp = isEvenApp() || !!getDurableBridge();
+  const media = browserMedia();
+
+  // Web/mobile browser → ask for the mic now, inside the user gesture.
+  // (Skipped in the Even App: getUserMedia may not exist there and the host
+  // permission is requested by the SDK bridge instead.)
+  let mediaGranted = !inApp && media ? await requestBrowserMicPermission() : false;
+  if (!inApp && media && !mediaGranted) {
+    hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+    return false;
+  }
+
+  // Plain browser with the Web Speech API → free, keyless, no audio upload.
+  if (!inApp && !getDurableBridge() && hasWebSpeech()) {
     return startWebSpeech(hooks);
   }
 
   // Inside the Even App → G2/phone mic through the SDK bridge, transcribed by
   // the relay (server-side key, so none ships in this bundle). Deepgram gets
   // live streaming; otherwise fall back to the record-then-upload batch path.
-  if (isEvenApp() || getDurableBridge()) {
+  if (inApp) {
     const bridge = getDurableBridge() || (await waitForBridge(2500));
     if (bridge) {
       const status = await serverSttStatus();
@@ -164,14 +257,19 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
       }
       return true;
     }
+    // Bridge not ready yet → fall through to a browser-style capture if the
+    // WebView exposes getUserMedia (e.g. the Even App WebView).
   }
 
-  // Any other browser without Web Speech → record the mic + transcribe server-side.
-  const mediaDevices =
-    (typeof navigator !== 'undefined'
-      ? (navigator as { mediaDevices?: MediaDevices }).mediaDevices
-      : undefined) || null;
-  if (mediaDevices && typeof mediaDevices.getUserMedia === 'function') {
+  // Browser without Web Speech (or WebView without a ready bridge) → record the
+  // mic with getUserMedia + MediaRecorder, transcribe server-side.
+  if (media) {
+    // Request permission here too if we haven't yet (only possible on the
+    // Even-app-without-bridge path above).
+    if (!mediaGranted && !(await requestBrowserMicPermission())) {
+      hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+      return false;
+    }
     if (!(await serverSttStatus()).supported) {
       hooks.onState?.(
         'error',
@@ -209,6 +307,7 @@ function startWebSpeech(hooks: DictHooks): boolean {
   let lastResult = Date.now();
   let spoken = false;
   let done = false;
+  let fallbackTried = false;
   const startedAt = Date.now();
   let watchdog = 0;
 
@@ -262,16 +361,49 @@ function startWebSpeech(hooks: DictHooks): boolean {
       hooks.onPartial?.(live);
     }
   };
+  // Some browsers expose SpeechRecognition but its service is unavailable
+  // (e.g. no engine, enterprise policy, language pack). In that case fall back
+  // to the mic → server engine so dictation still works.
+  const tryFallback = () => {
+    if (fallbackTried || done) return;
+    fallbackTried = true;
+    done = true;
+    window.clearInterval(watchdog);
+    try {
+      rec.abort();
+    } catch {
+      /* noop */
+    }
+    if (session === ctl) session = null;
+    void (async () => {
+      const media = browserMedia();
+      if (!media) {
+        hooks.onState?.('error', 'Browser speech service is unavailable on this device.');
+        return;
+      }
+      if (!(await requestBrowserMicPermission())) {
+        hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+        return;
+      }
+      if (!(await serverSttStatus()).supported) {
+        hooks.onState?.('error', 'Browser speech is unavailable here and no server voice engine is configured.');
+        return;
+      }
+      void startMedia(hooks);
+    })();
+  };
+
   rec.onerror = (ev: { error?: string }) => {
     const code = String(ev?.error || '');
-    if (code === 'not-allowed' || code === 'service-not-allowed') {
-      fail('Microphone access blocked — allow the mic for this site.');
-    } else if (code === 'no-speech' || code === 'audio-capture') {
+    if (code === 'no-speech' || code === 'audio-capture') {
       settle(false);
-    } else if (code === 'network') {
-      fail('Speech recognition network error.');
+    } else if (code === 'aborted') {
+      // handled by onend
+    } else {
+      // 'not-allowed', 'service-not-allowed', 'network', 'language-not-supported',
+      // 'bad-grammar', or anything unknown → speech service failed, try the mic.
+      tryFallback();
     }
-    // 'aborted' → onend settles.
   };
   rec.onend = () => settle(true);
 
@@ -357,7 +489,10 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
       if (!ok) throw new Error('phone mic rejected');
     } catch {
       unsub();
-      hooks.onState?.('error', 'No microphone available on this device.');
+      hooks.onState?.(
+        'error',
+        'No microphone available — allow mic access when the phone asks, then tap the mic again.',
+      );
       return;
     }
   }
@@ -520,7 +655,10 @@ async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promi
       } catch {
         /* noop */
       }
-      hooks.onState?.('error', 'No microphone available on this device.');
+      hooks.onState?.(
+        'error',
+        'No microphone available — allow mic access when the phone asks, then tap the mic again.',
+      );
       return;
     }
   }
@@ -579,8 +717,13 @@ function openSttSocket(timeoutMs: number): Promise<WebSocket> {
 
 // ── Engine 3: browser getUserMedia → MediaRecorder → relay ───────────────────
 async function startMedia(hooks: DictHooks): Promise<void> {
+  const media = browserMedia();
   const w = window as unknown as { webkitAudioContext?: typeof AudioContext };
   const Ctx = window.AudioContext || w.webkitAudioContext;
+  if (!media) {
+    hooks.onState?.('unsupported', 'Recording is not supported in this browser.');
+    return;
+  }
   if (!Ctx) {
     hooks.onState?.('error', 'Audio is not supported here.');
     return;
@@ -588,9 +731,9 @@ async function startMedia(hooks: DictHooks): Promise<void> {
 
   let stream: MediaStream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    hooks.onState?.('error', 'Microphone access blocked — allow the mic for this site.');
+    stream = await media.getUserMedia({ audio: true });
+  } catch (err) {
+    hooks.onState?.('error', micDeniedMsg(err));
     return;
   }
 
