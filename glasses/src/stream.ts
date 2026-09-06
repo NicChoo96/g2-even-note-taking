@@ -1,5 +1,5 @@
 import type { HubState, StreamFrame } from './types';
-import { getStreamToken } from './auth-token';
+import { getStreamToken, notifyAuthRejected } from './auth-token';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
 // root, so /api/stream resolves to the live stream next to it. Local dev
@@ -33,10 +33,39 @@ export async function publishState(state: HubState): Promise<boolean> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(state),
     });
+    if (res.status === 401) notifyAuthRejected(); // credential no longer valid
     return res.ok;
   } catch {
     return false;
   }
+}
+
+/**
+ * Is the current credential still accepted by the relay? Owner sessions are
+ * checked against /api/auth/me; Even App device IDs against /api/pair/status.
+ * On a network error we optimistically return true (don't sign out on a blip).
+ */
+async function credentialStillValid(): Promise<boolean> {
+  const token = getStreamToken();
+  if (!token) return false;
+  try {
+    const me = await fetch(`${API_BASE}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (me.ok) return true;
+  } catch {
+    return true; // network issue — can't tell, keep trying
+  }
+  try {
+    const st = await fetch(`${API_BASE}/api/pair/status?deviceId=${encodeURIComponent(token)}`);
+    if (st.ok) {
+      const j = (await st.json()) as { status?: string };
+      return j.status === 'approved';
+    }
+  } catch {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -65,6 +94,13 @@ export function connectStream(handlers: StreamHandlers): () => void {
       if (!closed) {
         const delay = Math.min(1000 * 2 ** retry, 15000);
         retry += 1;
+        // After a few failed reconnects, confirm the credential is still valid;
+        // a 401 (reset auth store) otherwise shows as a misleading "Offline".
+        if (retry === 3) {
+          void credentialStillValid().then((ok) => {
+            if (!ok) notifyAuthRejected();
+          });
+        }
         setTimeout(connect, delay);
       }
     };

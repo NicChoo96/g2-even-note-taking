@@ -19,7 +19,7 @@ import {
   useState,
 } from 'react';
 import { API_BASE } from '../stream';
-import { setStreamToken } from '../auth-token';
+import { onAuthRejected, setStreamToken } from '../auth-token';
 import { clearDeviceSession, loadDeviceSession, saveDeviceSession } from '../durable-docs';
 
 const AUTH_KEY = 'hub:auth'; // owner email (sessionStorage)
@@ -125,6 +125,21 @@ async function verify(idToken: string): Promise<{
     };
   } catch {
     return { ok: false, error: 'network error' };
+  }
+}
+
+/** Is this stored owner session token still accepted by the relay? */
+async function me(sessionToken: string): Promise<{ ok: boolean; email?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    if (!res.ok) return { ok: false };
+    const j = (await res.json()) as { ok?: boolean; email?: string };
+    return { ok: !!j.ok, email: j.email };
+  } catch {
+    // Network issue — keep the session rather than logging the user out.
+    return { ok: true };
   }
 }
 
@@ -284,11 +299,53 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
-    // Browser: restore the owner session if one exists.
+    // Browser: restore the owner session — but ASK THE RELAY whether the stored
+    // token is still valid first. If the auth store was reset (e.g. a Railway
+    // redeploy without a persistent volume) the old token 401s everywhere and
+    // we'd otherwise sit "signed in" showing a misleading Offline state.
+    let cancelled = false;
     const tok = sessionStorage.getItem(SESSION_KEY);
-    if (tok) setStreamToken(tok);
-    setLoading(false);
-    return;
+    const em = sessionStorage.getItem(AUTH_KEY);
+    (async () => {
+      if (!tok) {
+        if (!cancelled) setLoading(false);
+        return;
+      }
+      const m = await me(tok);
+      if (cancelled) return;
+      if (m.ok) {
+        setAuthedState(true);
+        setEmail(em || m.email || null);
+        setStreamToken(tok);
+      } else {
+        sessionStorage.removeItem(AUTH_KEY);
+        sessionStorage.removeItem(SESSION_KEY);
+        setStreamToken(null);
+        setAuthedState(false);
+        setEmail(null);
+      }
+      setLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [inEvenApp]);
+
+  // Any owner call (stream publish, dictation, SSE reconnect) that comes back
+  // 401 means this session died server-side → drop it and show the login screen.
+  // The Even App device path is excluded: it self-heals via the pairing watchdog.
+  useEffect(() => {
+    if (inEvenApp) return;
+    return onAuthRejected(() => {
+      const tok = sessionStorage.getItem(SESSION_KEY);
+      if (tok) void logout(tok);
+      sessionStorage.removeItem(AUTH_KEY);
+      sessionStorage.removeItem(SESSION_KEY);
+      setAuthedState(false);
+      setEmail(null);
+      setStreamToken(null);
+      window.google?.accounts?.id?.disableAutoSelect?.();
+    });
   }, [inEvenApp]);
 
   const setAuthed = useCallback((em: string, sessionToken: string) => {

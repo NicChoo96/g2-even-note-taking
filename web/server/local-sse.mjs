@@ -11,6 +11,7 @@
 //   GET  /api/config              -> { googleClientId } for the login button
 //   POST /api/auth/verify         -> Google ID token -> owner session token
 //   POST /api/auth/logout         -> revoke an owner session
+//   GET  /api/auth/me             -> is this owner session still valid?
 //   POST /api/pair/request        -> device self-registers (returns pair code)
 //   GET  /api/pair/status         -> device polls until the owner approves
 //   POST /api/pair/approve        -> owner (session) approves a pair code
@@ -534,6 +535,21 @@ const server = createServer(async (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');
+    return;
+  }
+
+  // Owner session check — the web UI validates its stored token at boot so a
+  // stale token (e.g. the auth store was reset by a redeploy) lands on the
+  // login screen instead of a misleading "Offline" state.
+  if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, email: owner.email }));
     return;
   }
 

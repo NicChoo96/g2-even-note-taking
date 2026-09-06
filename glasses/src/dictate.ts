@@ -25,7 +25,7 @@ import {
   type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk';
 import { getDurableBridge, isStartupReady } from './durable-docs';
-import { getStreamToken } from './auth-token';
+import { getStreamToken, notifyAuthRejected } from './auth-token';
 import { API_BASE } from './stream';
 
 export type DictState = 'idle' | 'listening' | 'transcribing' | 'error' | 'unsupported';
@@ -254,6 +254,7 @@ async function sendToStt(audio: Uint8Array, contentType: string): Promise<string
     body: audio as unknown as BodyInit,
   });
   const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
+  if (res.status === 401) notifyAuthRejected(); // session no longer valid
   if (!res.ok) throw new Error(j.error || `Speech server error (${res.status})`);
   return (j.text || '').trim();
 }

@@ -23,3 +23,19 @@ export function onStreamToken(fn: (t: string | null) => void): () => void {
     listeners.delete(fn);
   };
 }
+
+// A credential was REJECTED by the relay (401) — e.g. an owner session token
+// that no longer exists after the auth store was reset. The auth UI subscribes
+// to this to drop the stale session and show the login/pairing screen again.
+const rejected = new Set<() => void>();
+
+export function onAuthRejected(fn: () => void): () => void {
+  rejected.add(fn);
+  return () => {
+    rejected.delete(fn);
+  };
+}
+
+export function notifyAuthRejected(): void {
+  for (const fn of [...rejected]) fn();
+}
