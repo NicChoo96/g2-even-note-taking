@@ -45,21 +45,37 @@ export const MENU = {
   DOC_DELETE: 6,
 } as const;
 
+/** Which section menu to build — drives the dynamic contextual menu. */
+export interface MenuState {
+  /** The active section (docs actions only show while the Docs tab is active). */
+  section: SectionId;
+  /** Whether the docs library has any docs (Select/Delete need at least one). */
+  hasDocs: boolean;
+}
+
 /**
- * OS contextual menu — your items sit between the system slots (Display off /
- * Brightness on top, "Close Reality Hub" at the bottom). Declared ONCE on the
- * startup page so they live for the page's lifetime. Max 10 items.
+ * Build the OS contextual menu for the current state. The section switchers
+ * (To-Do / Docs / Notes) are always present; the **Docs actions** (New Doc /
+ * Select Doc / Delete Doc) only appear while the Docs tab is active — Select
+ * and Delete additionally need at least one doc. The menu is applied on the
+ * startup page and REPLACED wholesale on every `rebuildPageContainer`, so call
+ * this with the current state whenever the active section changes.
+ *
+ * Your items sit between the system slots (Display off / Brightness on top,
+ * "Close Reality Hub" at the bottom). Max 10 items.
  */
-export function sectionMenu(): MenuContainerProperty {
-  return new MenuContainerProperty({
-    menuItems: [
-      ...SECTIONS.map((s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId })),
-      // Docs actions: long-press anywhere to open the menu, then act on docs.
-      new MenuItemProperty({ itemName: 'New Doc', itemID: MENU.DOC_NEW }),
-      new MenuItemProperty({ itemName: 'Select Doc', itemID: MENU.DOC_SELECT }),
-      new MenuItemProperty({ itemName: 'Delete Doc', itemID: MENU.DOC_DELETE }),
-    ],
-  });
+export function sectionMenu(state: MenuState): MenuContainerProperty {
+  const items: MenuItemProperty[] = SECTIONS.map(
+    (s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId }),
+  );
+  if (state.section === 'docs') {
+    items.push(new MenuItemProperty({ itemName: 'New Doc', itemID: MENU.DOC_NEW }));
+    if (state.hasDocs) {
+      items.push(new MenuItemProperty({ itemName: 'Select Doc', itemID: MENU.DOC_SELECT }));
+      items.push(new MenuItemProperty({ itemName: 'Delete Doc', itemID: MENU.DOC_DELETE }));
+    }
+  }
+  return new MenuContainerProperty({ menuItems: items });
 }
 
 export function sectionByMenuId(menuId: number): SectionDef | undefined {

@@ -1,11 +1,13 @@
 import {
   CreateStartUpPageContainer,
   OsEventTypeList,
+  RebuildPageContainer,
   StartUpPageCreateResult,
   TextContainerProperty,
   TextContainerUpgrade,
   waitForEvenAppBridge,
   type EvenAppBridge,
+  type MenuContainerProperty,
 } from '@evenrealities/even_hub_sdk';
 import { connectStream } from './stream';
 import {
@@ -117,6 +119,11 @@ async function main(): Promise<void> {
 
   let started = false; // createStartUpPageContainer called exactly once
   let renderedText = '';
+  // Signature of the contextual menu currently installed on the page. The OS
+  // menu is swapped wholesale via rebuildPageContainer, so we rebuild ONLY when
+  // this changes (entering/leaving Docs, or docs count crossing 0) — ordinary
+  // content updates still use flicker-free textContainerUpgrade.
+  let appliedMenuSig = '';
   let todoCursor = 0; // selected todo row
   let docPage = 0; // current docs/notes page
   let lastView: SectionView | null = null;
@@ -156,8 +163,9 @@ async function main(): Promise<void> {
     }
   }
 
-  async function createPage(content: string): Promise<StartUpPageCreateResult> {
-    const container = new TextContainerProperty({
+  /** The G2 page text container — exactly one, event-capturing, byte-clipped. */
+  function textContainer(content: string): TextContainerProperty {
+    return new TextContainerProperty({
       xPosition: 0,
       yPosition: 0,
       width: 576,
@@ -170,15 +178,36 @@ async function main(): Promise<void> {
       isEventCapture: 1,
       content: clipBytes(content, MAX_CONTENT_BYTES),
     });
-    return b.createStartUpPageContainer(
+  }
+
+  /** Contextual menu for the current state (docs actions only in the Docs tab). */
+  function currentSectionMenu(): MenuContainerProperty {
+    const st = getState();
+    return sectionMenu({
+      section: st.activeSection,
+      hasDocs: st.sections.docs.length > 0,
+    });
+  }
+
+  /** Cheap identity of the installed menu, so we only rebuild when it changes. */
+  function menuSignature(menu: MenuContainerProperty): string {
+    return (menu.menuItems ?? [])
+      .map((i) => `${i.itemID ?? 0}:${i.itemName ?? ''}`)
+      .join('|');
+  }
+
+  async function createPage(content: string): Promise<StartUpPageCreateResult> {
+    const menu = currentSectionMenu();
+    const res = await b.createStartUpPageContainer(
       new CreateStartUpPageContainer({
         containerTotalNum: 1,
-        textObject: [container],
-        // OS contextual menu (To-Do / Docs / Notes) — lives for the page's
-        // lifetime; selections arrive as menuItemClickEvent.
-        menuObject: sectionMenu(),
+        textObject: [textContainer(content)],
+        // OS contextual menu — state-aware: docs actions only in the Docs tab.
+        menuObject: menu,
       }),
     );
+    if (res === StartUpPageCreateResult.success) appliedMenuSig = menuSignature(menu);
+    return res;
   }
 
   async function doRender(): Promise<void> {
@@ -248,7 +277,31 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Already created — update in place (flicker-free).
+    // Already created — if the contextual menu needs to change (entered/left
+    // the Docs tab, or the docs count crossed zero), REBUILD the page with the
+    // new menuObject. menuObject is replaced wholesale on rebuild (never merged),
+    // so we always pass the fresh menu for the current section.
+    const menu = currentSectionMenu();
+    const sig = menuSignature(menu);
+    if (sig !== appliedMenuSig) {
+      const ok = await b.rebuildPageContainer(
+        new RebuildPageContainer({
+          containerTotalNum: 1,
+          textObject: [textContainer(text)],
+          menuObject: menu,
+        }),
+      );
+      console.log('[hub] rebuildPageContainer (menu) ->', ok);
+      if (ok) {
+        appliedMenuSig = sig;
+        renderedText = text;
+        return;
+      }
+      // Rebuild failed (e.g. simulator has no page rebuild) — keep the old menu
+      // but still refresh the content below so the screen isn't stuck.
+    }
+
+    // Menu unchanged (or rebuild failed) — update in place (flicker-free).
     if (text !== renderedText) {
       const ok = await b.textContainerUpgrade(
         new TextContainerUpgrade({
