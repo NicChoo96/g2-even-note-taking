@@ -1,12 +1,17 @@
 # 🥽 G2 Even Reality Hub
 
 A personal live-sync viewport for **Even Realities G2 smart glasses**.
-Paste text/docs once on the web → it gets categorized into sections → streams **live into
-your glasses** via SSE → you control everything hands-free with the **R1 ring**.
+Paste/docs/voice text once on the web → it is categorized into sections → streams
+**live into your glasses** via SSE → you control everything hands-free with the
+**R1 ring** (and can dictate with your voice).
 
 ```
-Paste on web  →  categorize (To-Do / Docs / Notes)  →  SSE stream  →  glasses  →  R1 ring control
+Web/voice  →  categorize (To-Do / Docs / Notes)  →  SSE stream  →  glasses  →  R1 ring control
 ```
+
+> **ONE unified app.** The same codebase and the same URL serve BOTH the companion
+> web UI (any browser) **and** the G2 glasses renderer (when opened inside the
+> Even App). One persistent Node relay hosts everything — no serverless split.
 
 ## Repository Layout
 
@@ -16,227 +21,208 @@ g2-even-reality-hub/
 ├── README.md
 ├── docs/
 │   └── architecture.md    # Architecture + data-flow diagram
-├── glasses/               # G2 glasses app (Even Hub WebView) — Vite + TS + SDK
-└── web/                   # Vercel web layer — React + Vite + SSE
+├── glasses/               # THE app — Vite + TS + @evenrealities/even_hub_sdk
+│   │                       #   → web UI lives in glasses/src/web/ (App.tsx)
+│   │                       #   → glasses renderer in glasses/src/main.ts
+│   └── dist/              # built output (web UI + glasses, app.json copied in)
+├── web/
+│   ├── server/local-sse.mjs   # the relay — zero-dependency Node server
+│   └── glasses-dist/          # staging of glasses/dist served by the relay
+├── Dockerfile             # root deploy target → Railway / Render / Fly.io
+└── render.yaml            # Render blueprint (same Dockerfile)
 ```
 
-## Quick Start
-
-### 1. Web layer (Vercel)
-
-```bash
-cd web
-npm install
-
-# Local full-stack dev (SSE server + Vite frontend, no Vercel needed)
-npm run dev:full          # -> http://localhost:5173
-
-# Or use Vercel CLI
-npx vercel dev
-```
-
-### 2. Glasses app
-
-```bash
-cd glasses
-npm install
-npm run simulate          # desktop Even Hub simulator
-npm run dev               # Vite dev server (for real glasses via QR)
-npx @evenrealities/evenhub-cli qr --url http://<your-ip>:5173
-```
-
-Set the SSE endpoint in `glasses/.env.local`:
-
-```env
-VITE_HUB_STREAM_URL=https://<your-vercel-app>.vercel.app/api/stream?channel=hub
-```
-
-For local testing point it at your local SSE server (see `web/server/local-sse.mjs`).
+The deployable artifact is the **glasses build**. `web/` only provides the relay
+server that serves it plus the SSE/state/auth/STT APIs. (Older `web/`-only Vercel
+files — `web/api`, `web/src`, `vercel.json` — still exist in the tree but are
+**not used anymore**.)
 
 ## Features
 
 | # | Feature | Where |
 |---|---|---|
-| 1 | To-Do list (add / edit / remove / toggle) | `web/`, `glasses/` |
-| 2 | Live Docs stream (paste → scrollable text) | `web/`, `glasses/` |
-| 3 | Contextual menu (switch sections) | `glasses/` |
-| 4 | Double-sync text box (bi-directional web ↔ glasses) | `web/`, `glasses/` |
-| 5 | R1 ring: scroll, switch sections, confirm | `glasses/` |
-| 6 | Auto-categorization tags (To-Do / Docs / Notes) | `web/` |
-| 7 | localStorage persistence | `web/` |
+| 1 | To-Do list (add / edit / remove / toggle) | web + glasses |
+| 2 | **Multi-doc library** (named docs, auto-saved, pickable on glasses) | web + glasses |
+| 3 | Notes double-sync box (bi-directional web ↔ glasses) | web + glasses |
+| 4 | Live SSE stream (docs/notes stream into the glasses) | web + glasses |
+| 5 | **Voice dictation** on any text box (browser speech + glasses/phone mic) | web + glasses |
+| 6 | Contextual menu + in-app picker (switch / new / select / delete doc) | glasses |
+| 7 | R1 ring: scroll, cursor nav, toggle, confirm | glasses |
+| 8 | Auto-categorization tags (To-Do / Docs / Notes) | web |
+| 9 | Full-screen paging on the glasses (LVGL-accurate pagination) | glasses |
+| 10 | Per-device pairing + owner Google Sign-In (no anonymous access) | web + glasses |
 
-## Deploying to Vercel (git-based)
+## Quick Start (local full-stack dev)
 
-The **web layer** (`web/`) is what deploys to Vercel. The `glasses/` app is a separate Even Hub
-package (`.ehpk`) and is **not** deployed to Vercel — but it connects to your deployed
-`/api/stream` endpoint for live sync.
-
-### 1. Push this repo to GitHub
+The whole app is built from `glasses/` and served by the relay in `web/`.
 
 ```bash
-# create an empty repo on github.com first (e.g. "g2-even-reality-hub"), then:
-git remote add origin https://github.com/<you>/g2-even-reality-hub.git
-git push -u origin master
+# 1) Install + build the app (builds dist/ and copies app.json into it)
+cd glasses
+npm install
+npm run build:deploy
+
+# 2) Stage the build where the relay serves it
+cd ../web
+rm -rf glasses-dist && cp -r ../glasses/dist ./glasses-dist
+
+# 3) Run the relay (serves the UI + /api/stream + auth + STT on one origin)
+PORT=5198 node server/local-sse.mjs
+#    → open http://127.0.0.1:5198/ in a browser (owner dashboard)
 ```
 
-### 2. Import into Vercel
+Optionally point the build at a specific stream origin with `glasses/.env.local`:
 
-1. Open https://vercel.com/new and **Import** the GitHub repo.
-2. In **Root Directory**, select **`web`** — this is the deployable app
-   (the `glasses/`, `docs/`, `AGENTS.md` etc. stay in the repo but aren't deployed).
-3. Vercel auto-detects **Vite** → framework preset. Build command stays `npm run build`
-   (runs `tsc --noEmit && vite build`), output dir `dist`.
-4. **Deploy.** The serverless function `web/api/stream.mjs` is picked up automatically.
+```env
+# Local relay / simulator:
+VITE_HUB_STREAM_URL=http://127.0.0.1:5198/api/stream?channel=hub
+# Production (your Railway app):
+# VITE_HUB_STREAM_URL=https://<your-app>.up.railway.app/api/stream?channel=hub
+```
 
-After deploy you get `https://<your-app>.vercel.app`.
+If `VITE_HUB_STREAM_URL` is unset, the app defaults to the **same-origin**
+`/api/stream?channel=hub`, which is correct when the relay serves the app — so
+production builds need no `.env.local` at all.
 
-### 3. Point the glasses app at it
+### Even Hub simulator (no glasses needed)
 
 ```bash
 cd glasses
-cp .env.example .env.local   # then set:
-#   VITE_HUB_STREAM_URL=https://<your-app>.vercel.app/api/stream?channel=hub
+npx evenhub-simulator --automation-port 9898 http://127.0.0.1:5198/
 ```
 
-Also add your deployed URL to the `network` permission `whitelist` in `glasses/app.json`
-so the packaged app is allowed to reach it.
+The simulator loads the same URL as the phone's Even App. Authorize a "device"
+from the web dashboard's **Devices** panel (paste the pairing code shown on the
+simulator), then the glasses viewport and the R1-ring inputs work against the
+local relay.
 
-> ⚠️ **SSE on serverless:** Vercel serverless functions have a max duration (10s on Hobby,
-> 60s on Pro). Long-lived SSE connections get cut off periodically, but the glasses app's
-> `EventSource` auto-reconnects and re-receives the latest state — so it degrades to
-> ~near-polling rather than breaking. For always-on streaming, host `web/server/local-sse.mjs`
-> on a persistent runtime, or add Upstash Redis (`REDIS_REST_URL` + `REDIS_REST_TOKEN`) and
-> extend the function duration.
+## Deploying to Railway (recommended)
 
-### Alternative: Vercel CLI (no GitHub needed)
+Railway auto-detects the **root `Dockerfile`** (builds `glasses/`, serves it with
+`web/server/local-sse.mjs`). No serverless, no Vercel.
 
-```bash
-cd web
-npx vercel --prod
-```
+1. Push this repo to GitHub.
+2. On Railway: **New Project → Deploy from GitHub repo** → select the repo → done
+   (it reads the root `Dockerfile`; no root-directory override needed).
+3. Set the variables below.
+4. Deploy → you get `https://<your-app>.up.railway.app` — the web dashboard **and**
+   the glasses stream live on that one origin.
 
-### What the web layer deploys
+> Node 22+ is required (the relay's live-STT path uses Node's global WebSocket
+> client). The Dockerfile already uses `node:22-alpine`.
 
-- `api/stream.mjs` — single serverless function: `GET` = SSE stream (glasses app subscribes),
-  `POST` = publish `HubState` + broadcast to connected clients (CORS enabled)
-- React + Vite frontend (pasteboard UI, localStorage source of truth)
-- Optional persistence: Upstash Redis via `REDIS_REST_URL` / `REDIS_REST_TOKEN` (for
-  multi-device/collab sync across serverless instances)
+### Environment variables (Railway → Variables)
 
-## Persistent Relay — true live sync on all devices (recommended)
+| Variable | Required | Value |
+|---|---|---|
+| `GOOGLE_CLIENT_ID` | ✅ | `xxxx.apps.googleusercontent.com` (see Auth section) |
+| `ALLOWED_EMAILS` | ✅ | your Google email(s), comma-separated |
+| `AUTH_FILE` | ⚠️ recommended | **path on a persistent volume**, e.g. `/data/.g2-hub-auth.json` |
+| `STATE_FILE` | ⚠️ recommended | **path on a persistent volume**, e.g. `/data/.g2-hub-state.json` |
+| `DEEPGRAM_API_KEY` | for glasses voice | live + batch STT (Nova-3) |
+| `OPENAI_API_KEY` | alternative for voice | Whisper batch STT if no Deepgram |
+| `DEEPGRAM_MODEL` | no | default `nova-3` |
+| `DEEPGRAM_LANG` | no | default `en` |
 
-Vercel serverless is ephemeral, so "live on all devices **at the same time**" is more reliable
-from a **single always-on process** that serves the web UI **and** the SSE stream together.
+> **Important:** mount a **Railway Volume** and set `AUTH_FILE` (+ `STATE_FILE`) to a
+> path on it. Without that, owner sessions and approved devices live on the
+> container's ephemeral disk and **reset on every redeploy** (you would have to sign
+> in and re-approve glasses each time). The web UI now detects a stale session and
+> sends you back to the login screen instead of a misleading "Offline" state.
 
-`web/server/local-sse.mjs` is that process (zero runtime dependencies). It serves:
-- the built web app from `web/dist/` (SPA fallback), and
-- `/api/stream` (GET = SSE, POST = state broadcast) on the same origin.
+### Other hosts
 
-### Run it locally
+The root `Dockerfile` + `render.yaml` also work on **Render** (New Blueprint) and
+**Fly.io** (`fly launch`). Everything below assumes a Railway-style `https://<app>`
+origin.
 
-```bash
-cd web
-npm run build        # produce dist/
-npm start            # → http://localhost:5174  (web UI + live stream together)
-```
+## Pointing the glasses (Even App) at your deployment
 
-### Deploy it (pick one free host)
+The glasses app is a normal Even Hub web app: open your deployed URL inside the
+**Even App**, or sideload the packaged `.ehpk` (below). The `network` permission
+`whitelist` in `glasses/app.json` already includes the Railway domain, a Vercel
+domain, and local hosts — add your own domain if you deploy elsewhere.
 
-> **Deploy the whole repo:** a root-level `Dockerfile` (plus `render.yaml` for Render) is included,
-> so you can point any of these hosts at the repo root — no need to dig into `web/`.
+## Packaging the Glasses App (.ehpk)
 
-| Host | Steps |
-|---|---|
-| **Railway** | New Project → Deploy from GitHub repo → Railway auto-detects the **root `Dockerfile`** → done. |
-| **Render** | New Blueprint / Web Service → repo → Render reads **`render.yaml`** (runtime: docker) → done. |
-| **Fly.io** | `fly launch` from the repo root (uses the root `Dockerfile`). |
-
-Alternatively, deploy only `web/`: root `web`, build `npm run build`, start `node server/local-sse.mjs`.
-
-All of these give you a stable `https://<your-app>.up.railway.app`-style URL.
-
-### Point the glasses at the relay
+The build already drops `app.json` into `dist/`, so packaging is:
 
 ```bash
 cd glasses
-# .env.local:
-#   VITE_HUB_STREAM_URL=https://<your-relay-host>/api/stream?channel=hub
-```
-And add the relay domain to the `network` whitelist in `glasses/app.json`.
-
-Now every device — phone browser, desktop, and the glasses (via the Even App WebView) — connects
-to the **same live stream**, so edits appear on all of them simultaneously.
-
-## Packaging the Glasses App
-
-```bash
-cd glasses
-npm run build
-npx evenhub pack app.json dist -o g2-even-reality-hub.ehpk
+npm run build:deploy                       # tsc + vite build (bakes app.json)
+npx evenhub pack app.json dist -o reality-hub.ehpk --sdk-ver 0.0.14
 ```
 
-Submit the `.ehpk` to the Even Hub developer portal, or load via QR for personal use.
+- The pack step stamps the app version/SDK (`min_app_version 2.2.9` for SDK
+  0.0.14) and validates `app.json`.
+- Keep `glasses/app.json` `version` in sync (currently `0.1.2`).
+- For personal use, load via QR / the Even Hub portal; submit the `.ehpk` to the
+  Even Hub developer portal for wider distribution.
+
+## Voice Dictation (speech-to-text)
+
+A reusable `<MicButton>` sits next to every text box (paste box, todo adder, doc
+editor, notes). It picks the right mic and engine automatically:
+
+- **Browser (PC or phone web)** — requests the browser mic (`getUserMedia`) and
+  prefers the free built-in **Web Speech API**; if the browser speech service is
+  unavailable it falls back to server transcription. Mobile (iOS) is handled by
+  requesting permission inside the tap gesture.
+- **G2 glasses (Even App)** — uses the **glasses mic** via the SDK bridge
+  (`audioControl`, needs the startup page created), falling back to the **phone
+  mic**, then the WebView mic. Deepgram gets **live streaming** (interim words as
+  you speak); otherwise a record-then-upload batch path is used.
+- **Keys stay server-side** (`DEEPGRAM_API_KEY` / `OPENAI_API_KEY`) — nothing is
+  shipped in the client bundle. Mic permissions are declared in `glasses/app.json`
+  (`g2-microphone`, `phone-microphone`).
 
 ## Authentication (Google Sign-In + per-device pairing)
 
-There is **no anonymous access to the stream**. Both ends must be authorized:
+There is **no anonymous access**. Both ends must be authorized:
 
-- **Web control app (normal browser)** — requires **Google Sign-In**, and only
-  your **whitelisted Google account** gets in. The relay issues a per-session
-  token the browser sends with every stream request.
-- **Glasses device (Even App WebView)** — the device generates its own
-  unguessable per-device ID, shows a short **pairing code** on its screen, and
-  the owner approves it from a logged-in browser. Each glasses device is
-  individually approved — there is **no shared device login**, and an unpaired
-  (or revoked) device gets `401` and can't read or write the stream.
-
-Once a browser is signed in, use the **Devices** panel on the web app to approve
-pairing codes and revoke devices.
+- **Web control app (browser)** — Google Sign-In restricted to your whitelisted
+  email. The relay issues a per-session token the browser sends with every request.
+  `GET /api/auth/me` lets the app validate a stored session at boot.
+- **Glasses device (Even App WebView)** — generates its own per-device ID, shows a
+  6-char **pairing code**, and the owner approves it from the logged-in web app.
+  Each device is individually approved — no shared device login; unpaired or
+  revoked devices get `401`.
 
 ### 1. Create a Google OAuth Client ID
 
-1. Go to https://console.cloud.google.com and create/select a project.
-2. **APIs & Services → OAuth consent screen** → External → fill in the app name and
-   your email. Add your Google account as a **Test user** (or publish the app).
-3. **APIs & Services → Credentials → + Create Credentials → OAuth client ID → Web application**.
+1. https://console.cloud.google.com → create/select a project.
+2. **APIs & Services → OAuth consent screen** → External → app name + your email.
+   Add your Google account as a **Test user** (or publish).
+3. **Credentials → + Create Credentials → OAuth client ID → Web application**.
 4. **Authorized JavaScript origins** (exact origin, no trailing slash):
-   - `https://g2-even-note-taking-production.up.railway.app`
-   - `http://localhost:5175` (local dev)
+   - `https://<your-app>.up.railway.app`
+   - `http://127.0.0.1:5198` and `http://localhost:5175` (local dev)
 5. Copy the **Client ID** (ends in `.apps.googleusercontent.com`).
 
-### 2. Set the server env vars (Railway dashboard → Variables)
-
-| Variable | Value |
-|---|---|
-| `GOOGLE_CLIENT_ID` | `xxxx.apps.googleusercontent.com` |
-| `ALLOWED_EMAILS` | your email, e.g. `you@gmail.com` (comma-separated for more) |
-| `AUTH_FILE` (optional) | path to a persistent volume for sessions/devices, e.g. `/data/.g2-hub-auth.json`. Without it, sessions + approved devices reset on redeploy and you re-pair. |
-
-### 3. Local dev
+### 2. Local dev env
 
 ```bash
 GOOGLE_CLIENT_ID="xxxx.apps.googleusercontent.com" \
 ALLOWED_EMAILS="you@gmail.com" \
-node server/local-sse.mjs
+node web/server/local-sse.mjs
 ```
 
-The login screen appears in a browser until a whitelisted account signs in; the
-ID token is verified server-side by the relay (`/api/auth/verify`, RS256 via
-`node:crypto` — no extra dependencies). Owner sessions and approved devices are
-stored in `.g2-hub-auth.json` (git-ignored).
+Owner sessions and approved devices are stored in `.g2-hub-auth.json`
+(git-ignored) unless `AUTH_FILE` points elsewhere.
 
-### 4. Pairing flow
+### 3. Pairing flow
 
 1. Open the hub URL in the **Even App** on your phone → the device shows a
-   6-character code (e.g. `Z4E88D`) on the phone screen.
+   6-character code on the phone screen.
 2. Open the same URL in a **browser**, sign in with your Google account.
 3. In the **Devices** panel, enter the code and press **Approve**.
-4. The device connects automatically and starts drawing to the glasses.
+4. The device connects and starts drawing to the glasses.
 
-Both the browser and the paired glasses now see the same live stream.
+Both the browser and every approved glasses device see the same live stream.
 
 ## Copilot Skills
 
-The **everything-evenhub** skill set (13 skills) is installed globally at `~/.copilot/skills/`.
-Use `/glasses-ui`, `/handle-input`, `/sdk-reference`, `/test-with-simulator`, `/build-and-deploy`,
-etc. while working on `glasses/`. See `AGENTS.md`.
+The **everything-evenhub** skill set (13 skills) is installed globally at
+`~/.copilot/skills/`. Use `/glasses-ui`, `/handle-input`, `/sdk-reference`,
+`/test-with-simulator`, `/build-and-deploy`, `/device-features`, etc. while
+working on `glasses/`. See `AGENTS.md`.
