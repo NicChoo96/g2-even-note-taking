@@ -505,14 +505,14 @@ function startWebSpeech(hooks: DictHooks): boolean {
     if (done) return;
     const idle = Date.now() - lastResult;
     const age = Date.now() - startedAt;
-    // End only after a REAL pause (~3.5s of no speech), an explicit stop, or caps.
-    if (spoken && idle > 3500) {
+    // End only after a REAL pause (~5s of no speech), an explicit tap/stop, or caps.
+    if (spoken && idle > 5000) {
       dlog(`webspeech watchdog: quiet idle=${Math.round(idle)}ms`);
       settle(true);
     } else if (!spoken && age > 20000) {
       dlog(`webspeech watchdog: never-heard age=${Math.round(age)}ms`);
       settle(false);
-    } else if (age > 180000) {
+    } else if (age > 300000) {
       dlog(`webspeech watchdog: hard-cap age=${Math.round(age)}ms`);
       settle(true);
     }
@@ -610,14 +610,14 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   watchdog = window.setInterval(() => {
     if (closed) return;
     const age = Date.now() - startedAt;
-    // Wait ~3.5s of quiet so natural pauses mid-note don't end dictation.
-    if (spoken && Date.now() - lastSpeech > 3500) {
+    // Wait ~5s of quiet so natural pauses mid-note don't end dictation.
+    if (spoken && Date.now() - lastSpeech > 5000) {
       dlog(`batch watchdog: quiet ${Math.round(Date.now() - lastSpeech)}ms`);
       void finish(true);
     } else if (!spoken && age > 20000) {
       dlog(`batch watchdog: never-heard ${Math.round(age)}ms`);
       void finish(false);
-    } else if (age > 120000) {
+    } else if (age > 300000) {
       dlog(`batch watchdog: hard-cap ${Math.round(age)}ms`);
       void finish(true);
     }
@@ -813,15 +813,15 @@ async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promi
     // NOTE: Deepgram fires is_final + speech_final at the end of EVERY phrase
     // (endpointing). Treating that as "done" (as a ~900ms auto-commit did) made
     // dictation stop itself right after the first phrase/pause. Instead we keep
-    // listening across phrases and only end after a REAL silence (~3.5s with no
+    // listening across phrases and only end after a REAL silence (~5s with no
     // new speech), an explicit tap (stop), or the caps below.
-    if (spoken && idle > 3500) {
+    if (spoken && idle > 5000) {
       dlog(`watchdog: quiet idle=${Math.round(idle)}ms`);
       shutdown(true, 'quiet');
     } else if (!spoken && age > 20000) {
       dlog(`watchdog: never-heard age=${Math.round(age)}ms`);
       shutdown(false, 'never-heard');
-    } else if (age > 180000) {
+    } else if (age > 300000) {
       dlog(`watchdog: hard-cap age=${Math.round(age)}ms`);
       shutdown(true, 'cap');
     }
@@ -980,14 +980,14 @@ async function startMedia(hooks: DictHooks): Promise<void> {
       }
     }
     const age = Date.now() - startedAt;
-    // Wait ~3.5s of quiet so natural pauses mid-note don't end dictation.
-    if (spoken && Date.now() - lastSpeech > 3500) {
+    // Wait ~5s of quiet so natural pauses mid-note don't end dictation.
+    if (spoken && Date.now() - lastSpeech > 5000) {
       dlog(`media watchdog: quiet ${Math.round(Date.now() - lastSpeech)}ms`);
       stopRec(true);
     } else if (!spoken && age > 20000) {
       dlog(`media watchdog: never-heard ${Math.round(age)}ms`);
       stopRec(false);
-    } else if (age > 120000) {
+    } else if (age > 300000) {
       dlog(`media watchdog: hard-cap ${Math.round(age)}ms`);
       stopRec(true);
     }

@@ -39,10 +39,10 @@ const MEDIA_RMS = Math.floor(0.02 * 32768); // 655
 const LIVE_SPEECH_RMS = 300; // Deepgram "has speech" floor (emits results)
 
 // Auto-stop quiet thresholds (dictate.ts):
-//   live stream (startBridgeStream) + webspeech (startWebSpeech): 3.5 s
-//   batch (startBridge) + media (startMedia):                      3.5 s  (all unified)
-const LIVE_QUIET_MS = 3500;
-const BATCH_QUIET_MS = 3500;
+//   live stream (startBridgeStream) + webspeech (startWebSpeech): 5 s
+//   batch (startBridge) + media (startMedia):                      5 s  (all unified)
+const LIVE_QUIET_MS = 5000;
+const BATCH_QUIET_MS = 5000;
 
 // ── Tiny WAV parser (16-bit PCM; resample handled outside) ────────────────
 function parseWav(buf) {
