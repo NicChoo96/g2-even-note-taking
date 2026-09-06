@@ -693,7 +693,9 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
       phraseQuietMs = 0;
       phraseVoicedMs += dt;
       phraseChunks.push(pcm);
-      if (wantEnd) wantEnd = false; // still talking — don't end yet
+      // NOTE: once an end has been requested (tap / ~5s quiet / cap) we do NOT
+      // cancel it here — a stray voiced frame during the flush window must not
+      // keep the session alive forever.
       // Bound phrase size so text streams out in ~2-3s chunks, not one giant
       // clip after a long run-on pause.
       if (phraseVoicedMs >= MAX_PHRASE_MS) {
