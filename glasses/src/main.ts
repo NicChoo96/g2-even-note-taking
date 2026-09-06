@@ -32,9 +32,11 @@ import {
   type TodoItem,
 } from './types';
 import {
+  dictationSnapshot,
   isDictating,
   lastDictationLog,
   lastDictationReason,
+  onDictationSnapshot,
   startDictation,
   stopDictation,
 } from './dictate';
@@ -256,6 +258,17 @@ async function main(): Promise<void> {
     };
   }
 
+  /** Mirror a dictation started elsewhere (web/phone MicButton) on the glasses
+   *  so the user sees live text + the R1 stop hint even when not started from
+   *  the contextual menu. */
+  function dictationForeignView(): SectionView {
+    const s = dictationSnapshot();
+    const status = s.detail ? `${s.detail} · tap R1 to stop` : 'Listening… tap R1 to stop';
+    const interim = (s.interim || '').trim();
+    const body = interim ? `${status}\n\n${clipBytes(interim, 380)}` : status;
+    return { text: `>> Dictate\n${body}`, todoCursor: 0, canPrev: false, canNext: false };
+  }
+
   /** R1-ring dictation diagnostics screen (sticky — tap to dismiss). */
   function dictationDiagView(): SectionView {
     return { text: dictationDiagText, todoCursor: 0, canPrev: false, canNext: false };
@@ -433,18 +446,22 @@ async function main(): Promise<void> {
       }
     }
 
-    // In-app doc picker (open/delete), the R1-ring dictation overlay, a sticky
-    // diagnostics screen after a dictation auto-exit, or the normal renderer.
+    // In-app doc picker, the R1-ring dictation overlay, a sticky diagnostics
+    // screen, a mirror of a dictation started elsewhere (web/phone MicButton),
+    // or the normal renderer.
+    const foreignActive = !dictationActive && !dictationDiagText && dictationSnapshot().active;
     const view = pickerActive
       ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
       : dictationActive
         ? dictationView()
         : dictationDiagText
           ? dictationDiagView()
-          : sectionView(getState(), todoCursor, docPage);
+          : foreignActive
+            ? dictationForeignView()
+            : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
-    else if (!dictationActive && !dictationDiagText) todoCursor = view.todoCursor;
+    else if (!dictationActive && !dictationDiagText && !foreignActive) todoCursor = view.todoCursor;
     const text = view.text;
     console.log('[hub] render', {
       started,
@@ -563,7 +580,7 @@ async function main(): Promise<void> {
   }
 
   function onSwipe(dir: -1 | 1): void {
-    if (dictationActive || dictationDiagText) return; // ignore swipes while dictating / diag
+    if (dictationActive || dictationDiagText || dictationSnapshot().active) return; // ignore swipes while dictating / diag
     if (pickerActive) {
       onPickerSwipe(dir);
       return;
@@ -603,6 +620,12 @@ async function main(): Promise<void> {
       // otherwise stop the mic the instant it started.
       if (Date.now() < dictationStopAfter) return;
       dictationTapStop = true;
+      void stopDictation();
+      return;
+    }
+    // A dictation started elsewhere (web/phone MicButton) is active — the R1
+    // ring tap stops it.
+    if (!dictationActive && !dictationDiagText && dictationSnapshot().active) {
       void stopDictation();
       return;
     }
@@ -711,6 +734,13 @@ async function main(): Promise<void> {
     docPage = 0;
     lastView = null;
     void renderGlasses();
+  });
+
+  // When a dictation session starts from the web/phone UI, mirror it live on
+  // the glasses (status + running text + R1 stop hint) until it ends.
+  onDictationSnapshot(() => {
+    const s = dictationSnapshot();
+    if (s.active && !dictationActive && !dictationDiagText) void renderGlasses();
   });
 
   // Boot render (pairing screen or live state).

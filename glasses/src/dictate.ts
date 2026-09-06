@@ -77,6 +77,50 @@ export function lastDictationLog(): string[] {
   return [...diagLines];
 }
 
+// ── Live session snapshot (shared with ANY surface) ─────────────────────────
+// Lets other UI (e.g. the glasses, when dictation is started from the web/phone
+// MicButton) mirror the active session and refresh live via onDictationSnapshot.
+export interface DictationSnapshot {
+  active: boolean;
+  state: DictState;
+  detail: string;
+  interim: string;
+}
+const snap: DictationSnapshot = { active: false, state: 'idle', detail: '', interim: '' };
+let snapCb: (() => void) | null = null;
+
+export function dictationSnapshot(): DictationSnapshot {
+  return { ...snap };
+}
+
+/** Register a callback fired whenever the live snapshot changes. Returns unsub. */
+export function onDictationSnapshot(cb: () => void): () => void {
+  snapCb = cb;
+  return () => {
+    if (snapCb === cb) snapCb = null;
+  };
+}
+
+/** Wrap a caller's hooks so state/interim also update the shared snapshot. */
+function mirrorHooks(hooks: DictHooks): DictHooks {
+  return {
+    onState: (s, d) => {
+      snap.state = s;
+      snap.detail = d || '';
+      snap.interim = s === 'idle' || s === 'error' || s === 'unsupported' ? '' : snap.interim;
+      snap.active = s === 'listening' || s === 'transcribing';
+      snapCb?.();
+      hooks.onState?.(s, d);
+    },
+    onPartial: (t) => {
+      snap.interim = t;
+      snapCb?.();
+      hooks.onPartial?.(t);
+    },
+    onFinal: (t) => hooks.onFinal?.(t),
+  };
+}
+
 export function isDictating(): boolean {
   return session !== null;
 }
@@ -267,18 +311,29 @@ async function serverSttStatus(): Promise<SttStatus> {
 }
 
 /** POST raw audio bytes to the relay; returns the transcript text. */
-async function sendToStt(audio: Uint8Array, contentType: string): Promise<string> {
+async function sendToStt(
+  audio: Uint8Array,
+  contentType: string,
+  timeoutMs = 15000,
+): Promise<string> {
   const token = getStreamToken();
   const q = token ? `?token=${encodeURIComponent(token)}` : '';
-  const res = await fetch(`${API_BASE}/api/stt${q}`, {
-    method: 'POST',
-    headers: { 'Content-Type': contentType },
-    body: audio as unknown as BodyInit,
-  });
-  const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
-  if (res.status === 401) notifyAuthRejected(); // session no longer valid
-  if (!res.ok) throw new Error(j.error || `Speech server error (${res.status})`);
-  return (j.text || '').trim();
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? window.setTimeout(() => ctrl?.abort(), timeoutMs) : 0;
+  try {
+    const res = await fetch(`${API_BASE}/api/stt${q}`, {
+      method: 'POST',
+      headers: { 'Content-Type': contentType },
+      body: audio as unknown as BodyInit,
+      signal: ctrl ? (ctrl.signal as AbortSignal) : undefined,
+    });
+    const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
+    if (res.status === 401) notifyAuthRejected(); // session no longer valid
+    if (!res.ok) throw new Error(j.error || `Speech server error (${res.status})`);
+    return (j.text || '').trim();
+  } finally {
+    if (timer) window.clearTimeout(timer);
+  }
 }
 
 /**
@@ -301,6 +356,10 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
   diagReason = 'running';
   dlog('start: inApp=', micTarget() === 'glasses', 'bridge=', !!getDurableBridge(), 'webspeech=', hasWebSpeech());
 
+  // Mirror state/interim into the shared snapshot (drives any glasses indicator
+  // even when this session was started from the web/phone MicButton).
+  const w = mirrorHooks(hooks);
+
   const inApp = micTarget() === 'glasses';
   const media = browserMedia();
 
@@ -309,24 +368,23 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
   // permission is requested by the SDK bridge instead.)
   let mediaGranted = !inApp && media ? await requestBrowserMicPermission() : false;
   if (!inApp && media && !mediaGranted) {
-    hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+    w.onState?.('error', micDeniedMsg(lastMicProbeError));
     return false;
   }
 
   // Plain browser with the Web Speech API → free, keyless, no audio upload.
   if (!inApp && !getDurableBridge() && hasWebSpeech()) {
-    return startWebSpeech(hooks);
+    return startWebSpeech(w);
   }
 
   // Inside the Even App → G2/phone mic through the SDK bridge, transcribed by
-  // the relay (server-side key, so none ships in this bundle). Deepgram gets
-  // live streaming; otherwise fall back to the record-then-upload batch path.
+  // the relay (server-side key, so none ships in this bundle).
   if (inApp) {
     const bridge = getDurableBridge() || (await waitForBridge(2500));
     if (bridge) {
       const status = await serverSttStatus();
       if (!status.supported) {
-        hooks.onState?.(
+        w.onState?.(
           'error',
           'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.',
         );
@@ -335,10 +393,9 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
       // Continuous streaming session: ONE clean mic open, per-phrase REST
       // commits so text appears live and the session stays open until tap or
       // ~5s of silence. (The Deepgram-LIVE ws leg is unreliable from Railway —
-      // it closes ~0.7s in, code 1006 — and attempting it first forced a second
-      // mic re-open that stalled after the first word, so we stream via REST.)
+      // it closes ~0.7s in, code 1006 — so we stream via REST.)
       dlog('engine: continuous streaming (single mic, per-phrase REST)');
-      void startBridge(bridge, hooks);
+      void startBridge(bridge, w);
       return true;
     }
     // Bridge not ready yet → fall through to a browser-style capture if the
@@ -351,21 +408,21 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
     // Request permission here too if we haven't yet (only possible on the
     // Even-app-without-bridge path above).
     if (!mediaGranted && !(await requestBrowserMicPermission())) {
-      hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+      w.onState?.('error', micDeniedMsg(lastMicProbeError));
       return false;
     }
     if (!(await serverSttStatus()).supported) {
-      hooks.onState?.(
+      w.onState?.(
         'error',
         'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.',
       );
       return false;
     }
-    void startMedia(hooks);
+    void startMedia(w);
     return true;
   }
 
-  hooks.onState?.('unsupported', 'Speech-to-text is not available in this browser/app.');
+  w.onState?.('unsupported', 'Speech-to-text is not available in this browser/app.');
   return false;
 }
 
@@ -547,15 +604,19 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   let busy = false;
   let wantEnd = false;
   let endWhy = 'quiet';
+  let stopDeadline = 0; // when the user tapped, cap how long we flush
   let consecErr = 0;
   let transcript = '';
 
-  const PHRASE_END_MS = 900; // trailing quiet that cuts a phrase
+  const PHRASE_END_MS = 700; // trailing quiet that cuts a phrase
+  const MAX_PHRASE_MS = 2800; // force-split a phrase this long (bounds latency)
   const MIN_VOICED_MS = 250; // ignore blips shorter than this (noise/click)
   const VAD_RMS = 700;
   const STOP_QUIET_MS = 5000; // real silence → auto-stop (flush then idle)
   const NEVER_MS = 20000; // never heard anything → idle
   const CAP_MS = 300000; // hard cap
+  const STT_TIMEOUT_MS = 8000; // a hung server call must never wedge the session
+  const STOP_FLUSH_MS = 5000; // worst-case time to finish after a tap
 
   const finalize = (why: string) => {
     if (closed) return;
@@ -570,8 +631,8 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     dlog(`finalize why=${why} text=${transcript.length}ch`);
   };
 
-  // Transcribe finished phrases one at a time. Never blocks capture — new audio
-  // keeps streaming into phraseChunks / queue while a phrase is in flight.
+  // Transcribe finished phrases one at a time. Every call has a timeout, so a
+  // slow/hung server response can never block the rest of the session or a stop.
   const pump = async () => {
     if (busy || closed) return;
     if (queue.length === 0) {
@@ -581,7 +642,8 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     busy = true;
     const pcm = queue.shift() as Uint8Array;
     try {
-      const text = ((await sendToStt(wavFromPcm(pcm), 'audio/wav')) || '').trim();
+      const text = ((await sendToStt(wavFromPcm(pcm), 'audio/wav', STT_TIMEOUT_MS)) || '').trim();
+      if (closed) return;
       consecErr = 0;
       if (text) {
         transcript = transcript ? `${transcript} ${text}` : text;
@@ -592,6 +654,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
         dlog('phrase empty (no speech detected server-side)');
       }
     } catch (err) {
+      if (closed) return;
       consecErr++;
       dlog('phrase error', errMsg(err));
       if (consecErr >= 3) {
@@ -631,6 +694,13 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
       phraseVoicedMs += dt;
       phraseChunks.push(pcm);
       if (wantEnd) wantEnd = false; // still talking — don't end yet
+      // Bound phrase size so text streams out in ~2-3s chunks, not one giant
+      // clip after a long run-on pause.
+      if (phraseVoicedMs >= MAX_PHRASE_MS) {
+        phraseVoicedMs = 0;
+        phraseQuietMs = 0;
+        enqueuePhrase();
+      }
     } else if (phraseChunks.length > 0) {
       phraseQuietMs += dt;
       phraseChunks.push(pcm); // keep a natural trailing-silence tail
@@ -662,8 +732,15 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
 
   const ctl: DictController = {
     stop: () => {
+      if (closed) return;
       wantEnd = true;
       endWhy = 'tap';
+      stopDeadline = Date.now() + STOP_FLUSH_MS;
+      // Stop capturing NOW so the user immediately gets feedback; we still
+      // transcribe whatever phrase is in flight / was just spoken.
+      hooks.onPartial?.(transcript);
+      hooks.onState?.('transcribing');
+      void bridge.audioControl(false).catch(() => undefined);
       if (phraseChunks.length) enqueuePhrase(); // flush the trailing phrase
       if (!busy && queue.length === 0) finalize('tap');
       else if (!busy) void pump();
@@ -682,6 +759,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     if (closed) return;
     if (wantEnd) {
       if (!busy && queue.length === 0) finalize(endWhy);
+      else if (stopDeadline && Date.now() > stopDeadline) finalize(endWhy); // never hang a tap
       return;
     }
     const age = Date.now() - startedAt;
@@ -698,6 +776,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
       dlog(`watchdog: quiet ${Math.round(idle)}ms`);
       wantEnd = true;
       endWhy = 'quiet';
+      stopDeadline = Date.now() + STOP_FLUSH_MS;
       if (phraseChunks.length) enqueuePhrase();
       if (!busy && queue.length === 0) finalize('quiet');
     } else if (!anySpeech && age > NEVER_MS) {
@@ -709,6 +788,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
       dlog(`watchdog: hard-cap ${Math.round(age)}ms`);
       wantEnd = true;
       endWhy = 'cap';
+      stopDeadline = Date.now() + STOP_FLUSH_MS;
       if (phraseChunks.length) enqueuePhrase();
       if (!busy && queue.length === 0) finalize('cap');
     }
