@@ -465,9 +465,10 @@ function startWebSpeech(hooks: DictHooks): boolean {
     if (done) return;
     const idle = Date.now() - lastResult;
     const age = Date.now() - startedAt;
-    if (spoken && idle > 1800) settle(true); // pause after speech → commit
-    else if (!spoken && age > 15000) settle(false); // never heard anything
-    else if (age > 60000) settle(true); // hard cap
+    // End only after a REAL pause (~3.5s of no speech), an explicit stop, or caps.
+    if (spoken && idle > 3500) settle(true); // genuinely stopped talking
+    else if (!spoken && age > 20000) settle(false); // never heard anything
+    else if (age > 180000) settle(true); // hard cap (3 min)
   }, 250);
 
   hooks.onState?.('listening');
@@ -551,9 +552,10 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   watchdog = window.setInterval(() => {
     if (closed) return;
     const age = Date.now() - startedAt;
-    if (spoken && Date.now() - lastSpeech > 1500) void finish(true); // pause → transcribe
-    else if (!spoken && age > 15000) void finish(false);
-    else if (age > 60000) void finish(true);
+    // Wait ~2.5s of quiet so natural pauses mid-note don't end dictation.
+    if (spoken && Date.now() - lastSpeech > 2500) void finish(true); // pause → transcribe
+    else if (!spoken && age > 20000) void finish(false);
+    else if (age > 120000) void finish(true);
   }, 250);
 
   hooks.onState?.(
@@ -574,7 +576,6 @@ async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promi
   let closed = false;
   let spoken = false;
   let lastActivity = Date.now();
-  let utteranceEnded = false;
   const startedAt = Date.now();
   let finalText = '';
   let interimText = '';
@@ -662,10 +663,8 @@ async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promi
     if (msg.is_final) {
       finalText = `${finalText} ${transcript}`.trim();
       interimText = '';
-      utteranceEnded = !!msg.speech_final;
     } else {
       interimText = transcript;
-      utteranceEnded = false;
     }
     emitLive();
   };
@@ -709,10 +708,14 @@ async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promi
     if (closed) return;
     const age = Date.now() - startedAt;
     const idle = Date.now() - lastActivity;
-    if (utteranceEnded && idle > 900) shutdown(true); // Deepgram said end-of-speech → flush
-    else if (spoken && idle > 6000) shutdown(true); // long quiet after speech → flush
-    else if (!spoken && age > 15000) shutdown(false); // never heard anything
-    else if (age > 120000) shutdown(true); // hard cap
+    // NOTE: Deepgram fires is_final + speech_final at the end of EVERY phrase
+    // (endpointing). Treating that as "done" (as a ~900ms auto-commit did) made
+    // dictation stop itself right after the first phrase/pause. Instead we keep
+    // listening across phrases and only end after a REAL silence (~3.5s with no
+    // new speech), an explicit tap (stop), or the caps below.
+    if (spoken && idle > 3500) shutdown(true); // genuinely stopped talking
+    else if (!spoken && age > 20000) shutdown(false); // never heard anything
+    else if (age > 180000) shutdown(true); // hard cap (3 min)
   }, 300);
 
   hooks.onState?.(
@@ -867,9 +870,10 @@ async function startMedia(hooks: DictHooks): Promise<void> {
       }
     }
     const age = Date.now() - startedAt;
-    if (spoken && Date.now() - lastSpeech > 1500) stopRec(true);
-    else if (!spoken && age > 15000) stopRec(false);
-    else if (age > 60000) stopRec(true);
+    // Wait ~2.5s of quiet so natural pauses mid-note don't end dictation.
+    if (spoken && Date.now() - lastSpeech > 2500) stopRec(true);
+    else if (!spoken && age > 20000) stopRec(false);
+    else if (age > 120000) stopRec(true);
   }, 250);
 
   recorder.start(250);
