@@ -31,7 +31,13 @@ import {
   type DocEntry,
   type TodoItem,
 } from './types';
-import { isDictating, startDictation, stopDictation } from './dictate';
+import {
+  isDictating,
+  lastDictationLog,
+  lastDictationReason,
+  startDictation,
+  stopDictation,
+} from './dictate';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -148,7 +154,11 @@ async function main(): Promise<void> {
   let dictationActive = false;
   let dictationStatus = '';
   let dictationInterim = '';
-  let dictationClearTimer: number | null = null;
+  let dictationStartedAt = 0;
+  let dictationGotFinal = false;
+  let dictationTapStop = false;
+  // Sticky diagnostics shown when a dictation session stops ITSELF (no tap).
+  let dictationDiagText = '';
   // Ignore taps until this time. The single-press that CONFIRMS the 'Dictate'
   // menu item is often re-delivered to the page as a normal CLICK once the OS
   // menu closes — without a grace period that press instantly stops the mic.
@@ -237,17 +247,39 @@ async function main(): Promise<void> {
     return { text: `>> Dictate\n\n${body}`, todoCursor: 0, canPrev: false, canNext: false };
   }
 
-  /** Auto-leave the overlay after an error (no final transcript coming). */
-  function scheduleDictationEnd(ms: number): void {
-    if (dictationClearTimer !== null) window.clearTimeout(dictationClearTimer);
-    dictationClearTimer = window.setTimeout(() => {
-      dictationClearTimer = null;
-      if (dictationActive) {
-        dictationActive = false;
-        dictationInterim = '';
-        void renderGlasses();
-      }
-    }, ms);
+  /** R1-ring dictation diagnostics screen (sticky — tap to dismiss). */
+  function dictationDiagView(): SectionView {
+    return { text: dictationDiagText, todoCursor: 0, canPrev: false, canNext: false };
+  }
+
+  /** Sticky diagnostics screen shown after a dictation session stops ITSELF. */
+  function showDictationDiag(detail?: string): void {
+    dictationActive = false;
+    dictationInterim = '';
+    const why = lastDictationReason();
+    const age = dictationStartedAt ? `${((Date.now() - dictationStartedAt) / 1000).toFixed(1)}s` : '?';
+    const lines: string[] = [
+      detail ? `>> Dictate — ${detail.slice(0, 44)}` : '>> Dictate — stopped itself',
+      `why: ${why} · age ${age} · text ${dictationGotFinal ? 'yes' : 'no'}`, // 'text no' means it ended before committing anything
+      '',
+      ...lastDictationLog().slice(-6),
+      '',
+      'tap to dismiss',
+    ];
+    dictationDiagText = clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
+    void renderGlasses();
+  }
+
+  /** True when a no-tap end is unexpected and worth showing diagnostics for. */
+  function shouldShowDictationDiag(): boolean {
+    if (dictationTapStop) return false; // user tapped stop — normal
+    if (dictationGotFinal) {
+      const r = lastDictationReason();
+      // A full silence auto-commit ('quiet') or the hard cap is a normal end.
+      if (r.includes('quiet') || r.includes('cap')) return false;
+    }
+    // Otherwise it ended by itself before/without a clean commit — show why.
+    return true;
   }
 
   /** Contextual menu → Dictate: turn on the glasses/phone mic and show live text. */
@@ -258,13 +290,13 @@ async function main(): Promise<void> {
     dictationActive = true;
     dictationStatus = 'Starting mic…';
     dictationInterim = '';
+    dictationStartedAt = Date.now();
+    dictationGotFinal = false;
+    dictationTapStop = false;
+    dictationDiagText = '';
     // Grace from the very start: the press that confirmed the menu item can be
     // re-delivered as a CLICK before the engine even reports 'listening'.
     dictationStopAfter = Date.now() + 1200;
-    if (dictationClearTimer !== null) {
-      window.clearTimeout(dictationClearTimer);
-      dictationClearTimer = null;
-    }
     void renderGlasses();
     void startDictation({
       onState: (s, detail) => {
@@ -280,12 +312,18 @@ async function main(): Promise<void> {
         } else if (s === 'error' || s === 'unsupported') {
           dictationStatus = detail || 'Voice unavailable';
           dictationStopAfter = 0;
-          scheduleDictationEnd(3500);
+          // Persist the reason + session log on the glasses until the user taps.
+          showDictationDiag(detail);
         } else if (s === 'idle') {
-          dictationActive = false;
           dictationInterim = '';
+          if (shouldShowDictationDiag()) showDictationDiag();
+          else {
+            dictationActive = false;
+            void renderGlasses();
+          }
+        } else {
+          void renderGlasses();
         }
-        void renderGlasses();
       },
       onPartial: (t) => {
         if (dictationActive) {
@@ -295,15 +333,15 @@ async function main(): Promise<void> {
         }
       },
       onFinal: (t) => {
+        dictationGotFinal = true;
         const text = (t || '').trim();
-        dictationActive = false;
-        dictationInterim = '';
-        if (dictationClearTimer !== null) {
-          window.clearTimeout(dictationClearTimer);
-          dictationClearTimer = null;
-        }
         if (text) commitSpeechToSection(text);
-        void renderGlasses();
+        if (shouldShowDictationDiag()) showDictationDiag();
+        else {
+          dictationActive = false;
+          dictationInterim = '';
+          void renderGlasses();
+        }
       },
     });
   }
@@ -389,16 +427,18 @@ async function main(): Promise<void> {
       }
     }
 
-    // In-app doc picker (open/delete), the R1-ring dictation overlay, or the
-    // normal section renderer.
+    // In-app doc picker (open/delete), the R1-ring dictation overlay, a sticky
+    // diagnostics screen after a dictation auto-exit, or the normal renderer.
     const view = pickerActive
       ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
       : dictationActive
         ? dictationView()
-        : sectionView(getState(), todoCursor, docPage);
+        : dictationDiagText
+          ? dictationDiagView()
+          : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
-    else if (!dictationActive) todoCursor = view.todoCursor;
+    else if (!dictationActive && !dictationDiagText) todoCursor = view.todoCursor;
     const text = view.text;
     console.log('[hub] render', {
       started,
@@ -517,7 +557,7 @@ async function main(): Promise<void> {
   }
 
   function onSwipe(dir: -1 | 1): void {
-    if (dictationActive) return; // ignore swipes while dictating
+    if (dictationActive || dictationDiagText) return; // ignore swipes while dictating / diag
     if (pickerActive) {
       onPickerSwipe(dir);
       return;
@@ -544,12 +584,19 @@ async function main(): Promise<void> {
   }
 
   function onTap(): void {
+    // A tap dismisses the sticky dictation diagnostics screen.
+    if (dictationDiagText) {
+      dictationDiagText = '';
+      void renderGlasses();
+      return;
+    }
     if (dictationActive) {
       // A tap while dictating = stop + commit what was heard. But ignore taps
       // inside the grace window — the press that confirmed the 'Dictate' menu
       // item can arrive as a CLICK right after the menu closes, which would
       // otherwise stop the mic the instant it started.
       if (Date.now() < dictationStopAfter) return;
+      dictationTapStop = true;
       void stopDictation();
       return;
     }

@@ -903,8 +903,18 @@ server.on('upgrade', (req, socket) => {
     if (!clientEnded) console.error('[g2-hub] deepgram live: stream error');
     closeAll();
   };
-  dg.onclose = () => {
+  dg.onclose = (ev) => {
     clearTimeout(openTimer);
+    // Log WHY the Deepgram leg closed — code/reason are safe, never the URL.
+    // 1006 = Deepgram dropped the TCP connection (network/firewall); 4xxx +
+    // reason = Deepgram rejected the request (auth/plan/params).
+    if (!clientEnded) {
+      const e = ev && typeof ev === 'object' ? (ev || {}) : {};
+      const code = 'code' in e ? e.code : '?';
+      const reason = 'reason' in e ? String(e.reason || '') : '';
+      const clean = 'wasClean' in e ? e.wasClean : '?';
+      console.error(`[g2-hub] deepgram live: closed code=${code} reason="${reason}" clean=${clean}`);
+    }
     closeAll();
   };
 
