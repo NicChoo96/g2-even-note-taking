@@ -23,7 +23,15 @@ import {
 import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe, update } from './store';
 import { getStreamToken, onStreamToken } from './auth-token';
 import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
-import { emptyDoc, upsertDoc, type DocEntry } from './types';
+import {
+  activeDoc,
+  emptyDoc,
+  uid,
+  upsertDoc,
+  type DocEntry,
+  type TodoItem,
+} from './types';
+import { isDictating, startDictation, stopDictation } from './dictate';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -135,6 +143,13 @@ async function main(): Promise<void> {
   let pickerIntent: 'open' | 'delete' = 'open';
   let pickerCursor = 0;
 
+  // R1-ring dictation overlay (contextual menu → Dictate). While active the
+  // glasses show a live status/interim view and a tap stops + commits.
+  let dictationActive = false;
+  let dictationStatus = '';
+  let dictationInterim = '';
+  let dictationClearTimer: number | null = null;
+
   // Durable docs writes are debounced (bridge.setLocalStorage shares the BLE hop).
   let saveDocsTimer: number | null = null;
 
@@ -210,6 +225,124 @@ async function main(): Promise<void> {
     return res;
   }
 
+  // R1-ring dictation: a compact full-screen overlay (status + live interim).
+  function dictationView(): SectionView {
+    const status = dictationStatus || 'Starting mic…';
+    const interim = dictationInterim.trim();
+    const body = interim ? `${status}\n\n${clipBytes(interim, 460)}` : status;
+    return { text: `>> Dictate\n\n${body}`, todoCursor: 0, canPrev: false, canNext: false };
+  }
+
+  /** Auto-leave the overlay after an error (no final transcript coming). */
+  function scheduleDictationEnd(ms: number): void {
+    if (dictationClearTimer !== null) window.clearTimeout(dictationClearTimer);
+    dictationClearTimer = window.setTimeout(() => {
+      dictationClearTimer = null;
+      if (dictationActive) {
+        dictationActive = false;
+        dictationInterim = '';
+        void renderGlasses();
+      }
+    }, ms);
+  }
+
+  /** Contextual menu → Dictate: turn on the glasses/phone mic and show live text. */
+  function startGlassesDictation(): void {
+    if (isDictating()) return; // already capturing
+    pickerActive = false;
+    pickerCursor = 0;
+    dictationActive = true;
+    dictationStatus = 'Starting mic…';
+    dictationInterim = '';
+    if (dictationClearTimer !== null) {
+      window.clearTimeout(dictationClearTimer);
+      dictationClearTimer = null;
+    }
+    void renderGlasses();
+    void startDictation({
+      onState: (s, detail) => {
+        if (!dictationActive) return;
+        if (s === 'listening') {
+          dictationStatus = detail || 'Listening… tap to stop';
+          dictationInterim = '';
+        } else if (s === 'transcribing') {
+          dictationStatus = 'Transcribing…';
+        } else if (s === 'error' || s === 'unsupported') {
+          dictationStatus = detail || 'Voice unavailable';
+          scheduleDictationEnd(3500);
+        } else if (s === 'idle') {
+          dictationActive = false;
+          dictationInterim = '';
+        }
+        void renderGlasses();
+      },
+      onPartial: (t) => {
+        if (dictationActive) {
+          dictationStatus = 'Listening… tap to stop';
+          dictationInterim = t;
+          void renderGlasses();
+        }
+      },
+      onFinal: (t) => {
+        const text = (t || '').trim();
+        dictationActive = false;
+        dictationInterim = '';
+        if (dictationClearTimer !== null) {
+          window.clearTimeout(dictationClearTimer);
+          dictationClearTimer = null;
+        }
+        if (text) commitSpeechToSection(text);
+        void renderGlasses();
+      },
+    });
+  }
+
+  /** Drop a transcript into whatever section is active (To-Do → new task, etc.). */
+  function commitSpeechToSection(text: string): void {
+    const st = getState();
+    if (st.activeSection === 'todo') {
+      const item: TodoItem = { id: uid(), text, done: false };
+      update((s) => ({ ...s, sections: { ...s.sections, todo: [...s.sections.todo, item] } }));
+      return;
+    }
+    if (st.activeSection === 'notes') {
+      update((s) => ({
+        ...s,
+        sections: {
+          ...s.sections,
+          notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
+        },
+      }));
+      return;
+    }
+    // Docs — append to the open doc, or create one titled from the first line.
+    const cur = activeDoc(st);
+    if (cur) {
+      update((s) => ({
+        ...s,
+        sections: {
+          ...s.sections,
+          docs: s.sections.docs.map((d) =>
+            d.id === cur.id
+              ? {
+                  ...d,
+                  content: d.content ? `${d.content.replace(/\s+$/, '')}\n${text}` : text,
+                  updatedAt: Date.now(),
+                }
+              : d,
+          ),
+        },
+      }));
+      return;
+    }
+    const firstLine = text.split('\n')[0].trim().slice(0, 28) || 'Voice note';
+    const doc = emptyDoc(firstLine);
+    update((s) => {
+      const { docs, activeDocId } = upsertDoc(s, { ...doc, content: text });
+      return { ...s, activeSection: 'docs', activeDocId, sections: { ...s.sections, docs } };
+    });
+  }
+
   async function doRender(): Promise<void> {
     // Before the device is paired (no credential), the glasses show onboarding.
     if (!getStreamToken()) {
@@ -245,13 +378,16 @@ async function main(): Promise<void> {
       }
     }
 
-    // In-app doc picker (open/delete) OR the normal section renderer.
+    // In-app doc picker (open/delete), the R1-ring dictation overlay, or the
+    // normal section renderer.
     const view = pickerActive
       ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
-      : sectionView(getState(), todoCursor, docPage);
+      : dictationActive
+        ? dictationView()
+        : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
-    else todoCursor = view.todoCursor;
+    else if (!dictationActive) todoCursor = view.todoCursor;
     const text = view.text;
     console.log('[hub] render', {
       started,
@@ -370,6 +506,7 @@ async function main(): Promise<void> {
   }
 
   function onSwipe(dir: -1 | 1): void {
+    if (dictationActive) return; // ignore swipes while dictating
     if (pickerActive) {
       onPickerSwipe(dir);
       return;
@@ -396,6 +533,11 @@ async function main(): Promise<void> {
   }
 
   function onTap(): void {
+    if (dictationActive) {
+      // Tap while dictating = stop + commit what was heard.
+      void stopDictation();
+      return;
+    }
     if (pickerActive) {
       onPickerTap();
       return;
@@ -432,6 +574,10 @@ async function main(): Promise<void> {
     if (event.menuItemClickEvent) {
       const itemID = event.menuItemClickEvent.itemID ?? 0;
       console.log('[hub] menu item', itemID);
+      if (itemID === MENU.DICTATE) {
+        startGlassesDictation();
+        return;
+      }
       if (itemID === MENU.DOC_NEW) {
         pickerActive = false;
         newDoc();

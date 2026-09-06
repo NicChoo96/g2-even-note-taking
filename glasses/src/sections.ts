@@ -35,7 +35,7 @@ export function sectionTitle(id: SectionId): string {
   return SECTIONS.find((s) => s.id === id)?.title ?? id;
 }
 
-/** OS contextual-menu item IDs (section switchers + Docs actions). */
+/** OS contextual-menu item IDs (section switchers + Docs actions + Dictate). */
 export const MENU = {
   TODO: 1,
   DOCS: 2,
@@ -43,6 +43,8 @@ export const MENU = {
   DOC_NEW: 4,
   DOC_SELECT: 5,
   DOC_DELETE: 6,
+  /** R1 → long-press menu → Dictate: start glasses-mic speech-to-text. */
+  DICTATE: 7,
 } as const;
 
 /** Which section menu to build — drives the dynamic contextual menu. */
@@ -68,6 +70,9 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
   const items: MenuItemProperty[] = SECTIONS.map(
     (s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId }),
   );
+  // Global action: R1 ring dictation (works in any section; text lands in the
+  // active section — todo task / notes / open doc).
+  items.push(new MenuItemProperty({ itemName: 'Dictate', itemID: MENU.DICTATE }));
   if (state.section === 'docs') {
     items.push(new MenuItemProperty({ itemName: 'New Doc', itemID: MENU.DOC_NEW }));
     if (state.hasDocs) {
