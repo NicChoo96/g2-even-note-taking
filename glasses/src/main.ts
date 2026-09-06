@@ -149,6 +149,10 @@ async function main(): Promise<void> {
   let dictationStatus = '';
   let dictationInterim = '';
   let dictationClearTimer: number | null = null;
+  // Ignore taps until this time. The single-press that CONFIRMS the 'Dictate'
+  // menu item is often re-delivered to the page as a normal CLICK once the OS
+  // menu closes — without a grace period that press instantly stops the mic.
+  let dictationStopAfter = 0;
 
   // Durable docs writes are debounced (bridge.setLocalStorage shares the BLE hop).
   let saveDocsTimer: number | null = null;
@@ -254,6 +258,9 @@ async function main(): Promise<void> {
     dictationActive = true;
     dictationStatus = 'Starting mic…';
     dictationInterim = '';
+    // Grace from the very start: the press that confirmed the menu item can be
+    // re-delivered as a CLICK before the engine even reports 'listening'.
+    dictationStopAfter = Date.now() + 1200;
     if (dictationClearTimer !== null) {
       window.clearTimeout(dictationClearTimer);
       dictationClearTimer = null;
@@ -265,10 +272,14 @@ async function main(): Promise<void> {
         if (s === 'listening') {
           dictationStatus = detail || 'Listening… tap to stop';
           dictationInterim = '';
+          // Extend the grace window to swallow the menu-confirm CLICK.
+          dictationStopAfter = Date.now() + 1200;
         } else if (s === 'transcribing') {
           dictationStatus = 'Transcribing…';
+          dictationStopAfter = Date.now() + 60000; // don't stop mid-transcribe
         } else if (s === 'error' || s === 'unsupported') {
           dictationStatus = detail || 'Voice unavailable';
+          dictationStopAfter = 0;
           scheduleDictationEnd(3500);
         } else if (s === 'idle') {
           dictationActive = false;
@@ -534,7 +545,11 @@ async function main(): Promise<void> {
 
   function onTap(): void {
     if (dictationActive) {
-      // Tap while dictating = stop + commit what was heard.
+      // A tap while dictating = stop + commit what was heard. But ignore taps
+      // inside the grace window — the press that confirmed the 'Dictate' menu
+      // item can arrive as a CLICK right after the menu closes, which would
+      // otherwise stop the mic the instant it started.
+      if (Date.now() < dictationStopAfter) return;
       void stopDictation();
       return;
     }
