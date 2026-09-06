@@ -246,8 +246,14 @@ async function main(): Promise<void> {
   function dictationView(): SectionView {
     const status = dictationStatus || 'Starting mic…';
     const interim = dictationInterim.trim();
-    const body = interim ? `${status}\n\n${clipBytes(interim, 460)}` : status;
-    return { text: `>> Dictate\n\n${body}`, todoCursor: 0, canPrev: false, canNext: false };
+    const body = interim ? `${status}\n\n${clipBytes(interim, 380)}` : status;
+    // Footer hint is always present so the stop gesture stays visible.
+    return {
+      text: `>> Dictate\n${body}\n\n● Tap R1 = stop · pause ~5s = auto-stop`,
+      todoCursor: 0,
+      canPrev: false,
+      canNext: false,
+    };
   }
 
   /** R1-ring dictation diagnostics screen (sticky — tap to dismiss). */
@@ -294,7 +300,7 @@ async function main(): Promise<void> {
       onState: (s, detail) => {
         if (!dictationActive) return;
         if (s === 'listening') {
-          dictationStatus = detail || 'Listening… tap to stop';
+          dictationStatus = detail ? `${detail} · tap R1 to stop` : 'Listening… tap R1 to stop';
           dictationInterim = '';
           // Extend the grace window to swallow the menu-confirm CLICK.
           dictationStopAfter = Date.now() + 1200;
@@ -330,7 +336,7 @@ async function main(): Promise<void> {
       },
       onPartial: (t) => {
         if (dictationActive) {
-          dictationStatus = 'Listening… tap to stop';
+          dictationStatus = 'Listening… tap R1 to stop';
           dictationInterim = t;
           void renderGlasses();
         }

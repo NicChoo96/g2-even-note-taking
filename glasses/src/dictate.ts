@@ -187,26 +187,37 @@ function micDeniedMsg(err: unknown): string {
 // page container exists; the phone mic does not need it. Both are requested via
 // the SDK bridge (audioControl) which surfaces the host/OS permission dialog.
 const EVEN_MIC_COPY =
-  'The Even App could not open a mic. Grant Even Hub microphone access (phone Settings → Even Hub → Microphone → Allow), make sure this app build declares g2-microphone / phone-microphone, then restart the Even app and try again.';
+  'Mic blocked — grant Even Hub microphone (phone Settings → Even Hub → Microphone → Allow), then try Dictate again.';
 
 async function openEvenMic(bridge: EvenAppBridge): Promise<{ source: AudioInputSource } | null> {
-  if (isStartupReady()) {
-    // Glasses mic first — but only once the startup page has been created.
+  // Glasses mic first — but only once the startup page has been created.
+  const tryOnce = async (): Promise<{ source: AudioInputSource } | null> => {
+    if (isStartupReady()) {
+      try {
+        if (await bridge.audioControl(true, AudioInputSource.Glasses)) {
+          return { source: AudioInputSource.Glasses };
+        }
+      } catch {
+        /* glasses mic unavailable */
+      }
+    }
+    // Phone mic fallback (no startup-page requirement).
     try {
-      if (await bridge.audioControl(true, AudioInputSource.Glasses)) {
-        return { source: AudioInputSource.Glasses };
+      if (await bridge.audioControl(true, AudioInputSource.Phone)) {
+        return { source: AudioInputSource.Phone };
       }
     } catch {
-      /* glasses mic unavailable */
+      /* phone mic unavailable */
     }
-  }
-  // Phone mic fallback (no startup-page requirement).
-  try {
-    if (await bridge.audioControl(true, AudioInputSource.Phone)) {
-      return { source: AudioInputSource.Phone };
-    }
-  } catch {
-    /* phone mic unavailable */
+    return null;
+  };
+  // Try twice: the host surfaces its mic-permission dialog on the first open,
+  // which can race the very first call right after startup. Retrying ~1s later
+  // reliably brings up the prompt so the user can grant access.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ok = await tryOnce();
+    if (ok) return ok;
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 900));
   }
   return null;
 }
