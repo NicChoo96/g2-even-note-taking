@@ -274,13 +274,6 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
 
   const inApp = micTarget() === 'glasses';
   const media = browserMedia();
-  console.log('[dictate] mic', micTarget(), {
-    evenApp: isEvenApp(),
-    bridge: !!getDurableBridge(),
-    startupReady: isStartupReady(),
-    webSpeech: hasWebSpeech(),
-    getUserMedia: !!media,
-  });
 
   // Web/mobile browser → ask for the mic now, inside the user gesture.
   // (Skipped in the Even App: getUserMedia may not exist there and the host

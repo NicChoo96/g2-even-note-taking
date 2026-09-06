@@ -852,8 +852,10 @@ server.on('upgrade', (req, socket) => {
 
   try {
     dg = new WebSocket(deepgramWsUrl());
-  } catch (err) {
-    console.error('[g2-hub] deepgram ws error:', err);
+  } catch {
+    // Log a fixed string only — never the error, which could echo the URL (and
+    // its Deepgram token) if the constructor rejects it.
+    console.error('[g2-hub] deepgram live: failed to create socket');
     closeAll();
     return;
   }
@@ -871,7 +873,6 @@ server.on('upgrade', (req, socket) => {
   dg.onopen = () => {
     dgOpened = true;
     clearTimeout(openTimer);
-    console.log('[g2-hub] deepgram live: open');
     flushPending();
   };
   dg.onmessage = (ev) => {
@@ -886,9 +887,8 @@ server.on('upgrade', (req, socket) => {
     if (!clientEnded) console.error('[g2-hub] deepgram live: stream error');
     closeAll();
   };
-  dg.onclose = (ev) => {
+  dg.onclose = () => {
     clearTimeout(openTimer);
-    console.log(`[g2-hub] deepgram live: closed (code=${ev?.code ?? '?'})`);
     closeAll();
   };
 
