@@ -34,3 +34,6 @@ qr-prototype.png
 
 # Relay auth store (session tokens + approved devices) — NEVER commit
 .g2-hub-auth.json
+
+# Watchdog-sim test artifacts (generated/downloaded wav)
+glasses/tools/*.wav

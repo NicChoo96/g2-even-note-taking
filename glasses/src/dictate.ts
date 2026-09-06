@@ -552,8 +552,8 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   watchdog = window.setInterval(() => {
     if (closed) return;
     const age = Date.now() - startedAt;
-    // Wait ~2.5s of quiet so natural pauses mid-note don't end dictation.
-    if (spoken && Date.now() - lastSpeech > 2500) void finish(true); // pause → transcribe
+    // Wait ~3.5s of quiet so natural pauses mid-note don't end dictation.
+    if (spoken && Date.now() - lastSpeech > 3500) void finish(true); // pause → transcribe
     else if (!spoken && age > 20000) void finish(false);
     else if (age > 120000) void finish(true);
   }, 250);
@@ -870,8 +870,8 @@ async function startMedia(hooks: DictHooks): Promise<void> {
       }
     }
     const age = Date.now() - startedAt;
-    // Wait ~2.5s of quiet so natural pauses mid-note don't end dictation.
-    if (spoken && Date.now() - lastSpeech > 2500) stopRec(true);
+    // Wait ~3.5s of quiet so natural pauses mid-note don't end dictation.
+    if (spoken && Date.now() - lastSpeech > 3500) stopRec(true);
     else if (!spoken && age > 20000) stopRec(false);
     else if (age > 120000) stopRec(true);
   }, 250);
