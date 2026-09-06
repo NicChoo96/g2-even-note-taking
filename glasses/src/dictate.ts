@@ -22,7 +22,6 @@
 import {
   AudioInputSource,
   type EvenAppBridge,
-  type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk';
 import { getDurableBridge, isStartupReady } from './durable-docs';
 import { getStreamToken, notifyAuthRejected } from './auth-token';
@@ -276,7 +275,7 @@ async function tryWebviewMic(hooks: DictHooks): Promise<boolean> {
     return true; // handled with a denial message
   }
   if (!(await serverSttStatus()).supported) return false;
-  void startMedia(hooks);
+  void startBrowserStream(hooks);
   return true;
 }
 
@@ -372,11 +371,6 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
     return false;
   }
 
-  // Plain browser with the Web Speech API → free, keyless, no audio upload.
-  if (!inApp && !getDurableBridge() && hasWebSpeech()) {
-    return startWebSpeech(w);
-  }
-
   // Inside the Even App → G2/phone mic through the SDK bridge, transcribed by
   // the relay (server-side key, so none ships in this bundle).
   if (inApp) {
@@ -390,11 +384,7 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
         );
         return false;
       }
-      // Continuous streaming session: ONE clean mic open, per-phrase REST
-      // commits so text appears live and the session stays open until tap or
-      // ~5s of silence. (The Deepgram-LIVE ws leg is unreliable from Railway —
-      // it closes ~0.7s in, code 1006 — so we stream via REST.)
-      dlog('engine: continuous streaming (single mic, per-phrase REST)');
+      dlog('engine: continuous streaming (Even mic, per-phrase REST)');
       void startBridge(bridge, w);
       return true;
     }
@@ -402,23 +392,10 @@ export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
     // WebView exposes getUserMedia (e.g. the Even App WebView).
   }
 
-  // Browser without Web Speech (or WebView without a ready bridge) → record the
-  // mic with getUserMedia + MediaRecorder, transcribe server-side.
+  // Browser (or Even App WebView without a ready bridge) → the SAME streaming
+  // engine, fed by a getUserMedia mic downsampled to 16k.
   if (media) {
-    // Request permission here too if we haven't yet (only possible on the
-    // Even-app-without-bridge path above).
-    if (!mediaGranted && !(await requestBrowserMicPermission())) {
-      w.onState?.('error', micDeniedMsg(lastMicProbeError));
-      return false;
-    }
-    if (!(await serverSttStatus()).supported) {
-      w.onState?.(
-        'error',
-        'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.',
-      );
-      return false;
-    }
-    void startMedia(w);
+    void startBrowserStream(w);
     return true;
   }
 
@@ -578,19 +555,32 @@ function startWebSpeech(hooks: DictHooks): boolean {
   }
 }
 
-// ── Engine 2: Even App SDK mic (glasses/phone) → continuous streaming ───────
-// Mirrors Even Realities' own low-latency pipeline as closely as our infra
-// allows: the mic is opened ONCE and left open, speech is cut into phrases on
-// short pauses, and each finished phrase is transcribed over the relay's REST
-// ASR as you keep talking. Text grows live (onPartial = running transcript,
-// onFinal = committed phrase) so it appears on the glasses/note in near-real
-// time. The session stays open until an explicit tap, ~5s of real silence, or
-// the time cap — it never ends just because you paused mid-note.
-async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<void> {
-  dlog('engine: streaming (single mic, per-phrase REST)');
+// ── Engine 2: continuous per-phrase streaming — ONE engine for every source ─
+// Even-Realities-style pipeline: a single source of 16k s16le mono frames (Even
+// App glasses/phone mic, or a browser mic downsampled via Web Audio) is
+// VAD-segmented into phrases on short pauses; each finished phrase is
+// transcribed over the relay REST ASR while the user keeps talking. Text grows
+// live (onPartial = running transcript, onFinal = committed phrase) and the
+// session stays open until an explicit stop, ~5s of real silence, or the cap.
+// EVERY entry point (glasses contextual menu, web/phone MicButton, browser)
+// funnels into this one engine so behaviour — live text, tap-to-stop, auto-stop
+// — is identical everywhere.
+
+/** A live source of 16 kHz s16le mono PCM frames. */
+interface DictStream {
+  label: string;
+  /** Start delivering frames (call cb per frame); returns an unsubscribe. */
+  subscribe(cb: (pcm: Uint8Array) => void): () => void;
+  /** Stop the mic/source. */
+  close(): void;
+  /** Optional: try to recover the source if its frames stall. */
+  reopen?(): void;
+}
+
+async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<void> {
+  dlog(`engine: streaming (${src.label}, per-phrase REST)`);
   let unsub: (() => void) | null = null;
   let watchdog = 0;
-  let source: AudioInputSource = AudioInputSource.Glasses;
   let closed = false;
   let anySpeech = false;
   let lastVoicedAt = Date.now(); // any voiced frame → resets the 5s auto-stop
@@ -604,7 +594,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   let busy = false;
   let wantEnd = false;
   let endWhy = 'quiet';
-  let stopDeadline = 0; // when the user tapped, cap how long we flush
+  let stopDeadline = 0; // when the user stopped, cap how long we flush
   let consecErr = 0;
   let transcript = '';
 
@@ -616,7 +606,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
   const NEVER_MS = 20000; // never heard anything → idle
   const CAP_MS = 300000; // hard cap
   const STT_TIMEOUT_MS = 8000; // a hung server call must never wedge the session
-  const STOP_FLUSH_MS = 5000; // worst-case time to finish after a tap
+  const STOP_FLUSH_MS = 5000; // worst-case time to finish after a stop
 
   const finalize = (why: string) => {
     if (closed) return;
@@ -624,7 +614,11 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     diagReason = `auto-stop (${why})`;
     window.clearInterval(watchdog);
     unsub?.();
-    void bridge.audioControl(false).catch(() => undefined);
+    try {
+      src.close();
+    } catch {
+      /* noop */
+    }
     hooks.onPartial?.('');
     if (session === ctl) session = null;
     hooks.onState?.('idle');
@@ -680,9 +674,8 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     void pump();
   };
 
-  const onAudio = (ev: EvenHubEvent) => {
-    const pcm = toBytes(ev?.audioEvent?.audioPcm);
-    if (!pcm || pcm.length === 0 || closed) return;
+  const onFrame = (pcm: Uint8Array) => {
+    if (pcm.length === 0 || closed) return;
     const now = Date.now();
     const dt = Math.min(1000, Math.max(10, now - lastFrameAt)); // cadence-proof
     lastFrameAt = now;
@@ -718,19 +711,7 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     // silence with no phrase in progress → nothing to do (idle is the watchdog's job)
   };
 
-  unsub = bridge.onEvenHubEvent(onAudio);
-
-  // G2 glasses mic (needs the startup page) → phone mic → WebView mic.
-  const opened = await openEvenMic(bridge);
-  if (!opened) {
-    dlog('streaming mic open FAILED -> webview fallback');
-    unsub();
-    if (await tryWebviewMic(hooks)) return;
-    hooks.onState?.('error', EVEN_MIC_COPY);
-    return;
-  }
-  source = opened.source;
-  dlog('streaming mic open source=', source === AudioInputSource.Glasses ? 'glasses' : 'phone');
+  unsub = src.subscribe(onFrame);
 
   const ctl: DictController = {
     stop: () => {
@@ -742,7 +723,11 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
       // transcribe whatever phrase is in flight / was just spoken.
       hooks.onPartial?.(transcript);
       hooks.onState?.('transcribing');
-      void bridge.audioControl(false).catch(() => undefined);
+      try {
+        src.close();
+      } catch {
+        /* noop */
+      }
       if (phraseChunks.length) enqueuePhrase(); // flush the trailing phrase
       if (!busy && queue.length === 0) finalize('tap');
       else if (!busy) void pump();
@@ -761,18 +746,22 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     if (closed) return;
     if (wantEnd) {
       if (!busy && queue.length === 0) finalize(endWhy);
-      else if (stopDeadline && Date.now() > stopDeadline) finalize(endWhy); // never hang a tap
+      else if (stopDeadline && Date.now() > stopDeadline) finalize(endWhy); // never hang a stop
       return;
     }
     const age = Date.now() - startedAt;
     const idle = Date.now() - lastVoicedAt;
-    // If the glasses mic stops delivering frames entirely (OS hiccup), reopen
+    // If the source stops delivering frames entirely (OS hiccup), try to reopen
     // it once so dictation doesn't die after the first captured word.
     if (anySpeech && !micReopened && Date.now() - lastFrameAt > 2000) {
       micReopened = true;
-      dlog('mic frames stalled -> reopening mic once');
-      void bridge.audioControl(false).catch(() => undefined);
-      void openEvenMic(bridge).then((o) => dlog(o ? 'mic reopened' : 'mic reopen failed'));
+      dlog('mic frames stalled -> reopening source once');
+      try {
+        src.close();
+      } catch {
+        /* noop */
+      }
+      src.reopen?.();
     }
     if (anySpeech && idle > STOP_QUIET_MS) {
       dlog(`watchdog: quiet ${Math.round(idle)}ms`);
@@ -796,10 +785,138 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
     }
   }, 250);
 
-  hooks.onState?.(
-    'listening',
-    source === AudioInputSource.Glasses ? 'Glasses mic' : 'Phone mic',
-  );
+  hooks.onState?.('listening', src.label);
+}
+
+// ── Even App entry: glasses/phone SDK mic → the shared streaming engine ─────
+async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<void> {
+  // G2 glasses mic (needs the startup page) → phone mic → WebView/browser mic.
+  const opened = await openEvenMic(bridge);
+  if (!opened) {
+    dlog('streaming mic open FAILED -> browser/webview fallback');
+    if (await tryWebviewMic(hooks)) return;
+    hooks.onState?.('error', EVEN_MIC_COPY);
+    return;
+  }
+  const label = opened.source === AudioInputSource.Glasses ? 'Glasses mic' : 'Phone mic';
+  dlog('streaming mic open source=', label);
+  const src: DictStream = {
+    label,
+    subscribe: (cb) => {
+      const u = bridge.onEvenHubEvent((ev) => {
+        const pcm = toBytes(ev?.audioEvent?.audioPcm);
+        if (pcm && pcm.length) cb(pcm);
+      });
+      return () => u();
+    },
+    close: () => void bridge.audioControl(false).catch(() => undefined),
+    reopen: () => {
+      void bridge.audioControl(false).catch(() => undefined);
+      void openEvenMic(bridge).then((o) => dlog(o ? 'mic reopened' : 'mic reopen failed'));
+    },
+  };
+  await runStreamingStream(src, hooks);
+}
+
+// ── Browser entry: getUserMedia mic → 16k s16le frames → shared engine ──────
+// Downmix + resample the browser mic to 16 kHz mono and feed 100ms frames into
+// the SAME streaming engine the Even App uses — so the web/phone MicButton and
+// the glasses behave identically (live text, tap-to-stop, 5s auto-stop).
+async function startBrowserStream(hooks: DictHooks): Promise<void> {
+  const media = browserMedia();
+  const w = window as unknown as { webkitAudioContext?: typeof AudioContext };
+  const Ctx = window.AudioContext || w.webkitAudioContext;
+  if (!media || !Ctx) {
+    // No raw-PCM capture path — fall back to Web Speech (desktop) or one-shot.
+    if (hasWebSpeech()) {
+      dlog('engine: no audio pipeline -> webspeech fallback');
+      startWebSpeech(hooks);
+    } else {
+      void startMedia(hooks);
+    }
+    return;
+  }
+  if (!(await requestBrowserMicPermission())) {
+    hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+    return;
+  }
+  if (!(await serverSttStatus()).supported) {
+    hooks.onState?.(
+      'error',
+      'Voice server not configured — set OPENAI_API_KEY or DEEPGRAM_API_KEY on the server.',
+    );
+    return;
+  }
+  dlog('engine: browser streaming (getUserMedia -> 16k -> server)');
+  let stream: MediaStream;
+  try {
+    stream = await media.getUserMedia({ audio: true });
+  } catch (err) {
+    hooks.onState?.('error', micDeniedMsg(err));
+    return;
+  }
+  const ctx = new Ctx();
+  const srcNode = ctx.createMediaStreamSource(stream);
+  const sp = ctx.createScriptProcessor(4096, 1, 1) as ScriptProcessorNode;
+  // A silent sink keeps the ScriptProcessor node processing without feedback.
+  const sink = ctx.createMediaStreamDestination();
+  srcNode.connect(sp);
+  sp.connect(sink);
+
+  const TARGET = 16000;
+  const FRAME_N = 1600; // 100ms
+  const ratio = TARGET / ctx.sampleRate;
+  let sBuf: number[] = [];
+  let sPos = 0;
+  let fBuf: number[] = [];
+
+  const src: DictStream = {
+    label: 'Browser mic',
+    subscribe: (cb) => {
+      sp.onaudioprocess = (e) => {
+        const ch = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < ch.length; i++) sBuf.push(ch[i]);
+        while (sPos + ratio < sBuf.length) {
+          const i0 = Math.floor(sPos);
+          const i1 = Math.min(i0 + 1, sBuf.length - 1);
+          const frac = sPos - i0;
+          fBuf.push(sBuf[i0] * (1 - frac) + sBuf[i1] * frac);
+          sPos += ratio;
+        }
+        const consumed = Math.floor(sPos);
+        if (consumed > 0) {
+          sBuf = sBuf.slice(consumed);
+          sPos -= consumed;
+        }
+        while (fBuf.length >= FRAME_N) {
+          const i16 = new Int16Array(FRAME_N);
+          for (let k = 0; k < FRAME_N; k++)
+            i16[k] = Math.max(-32768, Math.min(32767, Math.round(fBuf[k] * 32767)));
+          fBuf = fBuf.slice(FRAME_N);
+          cb(new Uint8Array(i16.buffer));
+        }
+      };
+      return () => {
+        sp.onaudioprocess = null;
+      };
+    },
+    close: () => {
+      try {
+        sp.onaudioprocess = null;
+        sp.disconnect();
+      } catch {
+        /* noop */
+      }
+      try {
+        srcNode.disconnect();
+      } catch {
+        /* noop */
+      }
+      void ctx.close();
+      stream.getTracks().forEach((t) => t.stop());
+    },
+  };
+  await runStreamingStream(src, hooks);
 }
 
 // ── Engine 3: browser getUserMedia → MediaRecorder → relay ───────────────────
