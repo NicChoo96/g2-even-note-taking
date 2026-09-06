@@ -24,7 +24,7 @@ import {
   type EvenAppBridge,
   type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk';
-import { getDurableBridge } from './durable-docs';
+import { getDurableBridge, isStartupReady } from './durable-docs';
 import { getStreamToken } from './auth-token';
 import { API_BASE } from './stream';
 
@@ -64,6 +64,17 @@ export function isEvenApp(): boolean {
       w.evenapp ||
       /EvenApp|Even Hub|Flutter/i.test(navigator.userAgent),
   );
+}
+
+/**
+ * Which microphone the app should use:
+ *   'glasses' → G2 (Even App): the SDK bridge captures the glasses four-mic
+ *               array (or the phone mic) — the "g2 glass skill" path.
+ *   'browser' → any web browser (PC or phone): getUserMedia / Web Speech API.
+ */
+export type MicTarget = 'glasses' | 'browser';
+export function micTarget(): MicTarget {
+  return isEvenApp() || !!getDurableBridge() ? 'glasses' : 'browser';
 }
 
 function hasWebSpeech(): boolean {
@@ -143,6 +154,48 @@ function micDeniedMsg(err: unknown): string {
   return 'Microphone access failed — allow the mic for this site and try again.';
 }
 
+// ── Even App (G2 glasses) mic opening ────────────────────────────────────────
+// Glasses-mic capture (AudioInputSource.Glasses) only works AFTER the startup
+// page container exists; the phone mic does not need it. Both are requested via
+// the SDK bridge (audioControl) which surfaces the host/OS permission dialog.
+const EVEN_MIC_COPY =
+  'The Even App could not open a mic. Grant Even Hub microphone access (phone Settings → Even Hub → Microphone → Allow), make sure this app build declares g2-microphone / phone-microphone, then restart the Even app and try again.';
+
+async function openEvenMic(bridge: EvenAppBridge): Promise<{ source: AudioInputSource } | null> {
+  if (isStartupReady()) {
+    // Glasses mic first — but only once the startup page has been created.
+    try {
+      if (await bridge.audioControl(true, AudioInputSource.Glasses)) {
+        return { source: AudioInputSource.Glasses };
+      }
+    } catch {
+      /* glasses mic unavailable */
+    }
+  }
+  // Phone mic fallback (no startup-page requirement).
+  try {
+    if (await bridge.audioControl(true, AudioInputSource.Phone)) {
+      return { source: AudioInputSource.Phone };
+    }
+  } catch {
+    /* phone mic unavailable */
+  }
+  return null;
+}
+
+/** Last resort inside the Even App: some WebViews expose a browser mic. */
+async function tryWebviewMic(hooks: DictHooks): Promise<boolean> {
+  const media = browserMedia();
+  if (!media) return false;
+  if (!(await requestBrowserMicPermission())) {
+    hooks.onState?.('error', micDeniedMsg(lastMicProbeError));
+    return true; // handled with a denial message
+  }
+  if (!(await serverSttStatus()).supported) return false;
+  void startMedia(hooks);
+  return true;
+}
+
 async function waitForBridge(ms: number): Promise<EvenAppBridge | null> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
@@ -219,8 +272,15 @@ async function sendToStt(audio: Uint8Array, contentType: string): Promise<string
 export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
   if (session) return false; // already dictating — call stopDictation() first
 
-  const inApp = isEvenApp() || !!getDurableBridge();
+  const inApp = micTarget() === 'glasses';
   const media = browserMedia();
+  console.log('[dictate] mic', micTarget(), {
+    evenApp: isEvenApp(),
+    bridge: !!getDurableBridge(),
+    startupReady: isStartupReady(),
+    webSpeech: hasWebSpeech(),
+    getUserMedia: !!media,
+  });
 
   // Web/mobile browser → ask for the mic now, inside the user gesture.
   // (Skipped in the Even App: getUserMedia may not exist there and the host
@@ -478,24 +538,15 @@ async function startBridge(bridge: EvenAppBridge, hooks: DictHooks): Promise<voi
 
   unsub = bridge.onEvenHubEvent(onAudio);
 
-  // Prefer the glasses four-mic array; fall back to the phone mic.
-  try {
-    const ok = await bridge.audioControl(true, AudioInputSource.Glasses);
-    if (!ok) throw new Error('glasses mic rejected');
-  } catch {
-    try {
-      const ok = await bridge.audioControl(true, AudioInputSource.Phone);
-      source = AudioInputSource.Phone;
-      if (!ok) throw new Error('phone mic rejected');
-    } catch {
-      unsub();
-      hooks.onState?.(
-        'error',
-        'No microphone available — allow mic access when the phone asks, then tap the mic again.',
-      );
-      return;
-    }
+  // G2 glasses mic (needs the startup page) → phone mic → WebView mic.
+  const opened = await openEvenMic(bridge);
+  if (!opened) {
+    unsub();
+    if (await tryWebviewMic(hooks)) return;
+    hooks.onState?.('error', EVEN_MIC_COPY);
+    return;
   }
+  source = opened.source;
 
   const ctl: DictController = {
     stop: () => void finish(true),
@@ -638,30 +689,21 @@ async function startBridgeStream(bridge: EvenAppBridge, hooks: DictHooks): Promi
 
   unsub = bridge.onEvenHubEvent(onAudio);
 
-  // Prefer the glasses four-mic array; fall back to the phone mic.
-  try {
-    const ok = await bridge.audioControl(true, AudioInputSource.Glasses);
-    if (!ok) throw new Error('glasses mic rejected');
-  } catch {
+  // G2 glasses mic (needs the startup page) → phone mic → WebView mic.
+  const opened = await openEvenMic(bridge);
+  if (!opened) {
+    unsub();
+    closed = true;
     try {
-      const ok = await bridge.audioControl(true, AudioInputSource.Phone);
-      source = AudioInputSource.Phone;
-      if (!ok) throw new Error('phone mic rejected');
+      ws.close();
     } catch {
-      unsub();
-      closed = true;
-      try {
-        ws.close();
-      } catch {
-        /* noop */
-      }
-      hooks.onState?.(
-        'error',
-        'No microphone available — allow mic access when the phone asks, then tap the mic again.',
-      );
-      return;
+      /* noop */
     }
+    if (await tryWebviewMic(hooks)) return;
+    hooks.onState?.('error', EVEN_MIC_COPY);
+    return;
   }
+  source = opened.source;
 
   ctl = {
     stop: () => shutdown(true),

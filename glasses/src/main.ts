@@ -20,7 +20,7 @@ import {
 } from './sections';
 import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe, update } from './store';
 import { getStreamToken, onStreamToken } from './auth-token';
-import { loadDocsDurable, saveDocsDurable, setDurableBridge } from './durable-docs';
+import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
 import { emptyDoc, upsertDoc, type DocEntry } from './types';
 import { mountUi } from './web/ui';
 
@@ -188,6 +188,7 @@ async function main(): Promise<void> {
       if (!started) {
         const res = await createPage(text);
         started = res === StartUpPageCreateResult.success;
+        if (started) setStartupReady();
         renderedText = text;
         if (!started) console.log('[hub] WARNING: startup page rejected (pairing)');
         return;
@@ -238,6 +239,7 @@ async function main(): Promise<void> {
         `🖼 createStartUpPageContainer -> ${res}${res === StartUpPageCreateResult.success ? '' : ' (REJECTED — nothing will draw on glasses)'}`,
       );
       started = res === StartUpPageCreateResult.success;
+      if (started) setStartupReady();
       if (!started) {
         console.log('[hub] WARNING: startup page rejected');
         return;

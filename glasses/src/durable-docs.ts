@@ -22,6 +22,18 @@ export function getDurableBridge(): EvenAppBridge | null {
   return bridge;
 }
 
+// The Even App glasses MIC (AudioInputSource.Glasses) only works AFTER the
+// startup page container has been created (createStartUpPageContainer success —
+// see the device-features G2 skill). main.ts flips this once it has drawn. The
+// phone mic and browser getUserMedia do NOT need it.
+let startupReady = false;
+export function setStartupReady(ready = true): void {
+  startupReady = ready;
+}
+export function isStartupReady(): boolean {
+  return startupReady;
+}
+
 // Dual-write strategy. On the real Even App the host's setLocalStorage is the
 // ONLY layer that survives app restarts (browser localStorage is wiped). In the
 // simulator the reverse is true — the SDK bridge store is per-process but
