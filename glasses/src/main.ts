@@ -162,10 +162,9 @@ async function main(): Promise<void> {
   // Accumulates per-phrase commits during a session; committed as ONE block at
   // the end so todo stays a single task and notes/docs read as flowing text.
   let dictationDraft = '';
-  // Main-side watchdog: guarantees the session ends (tap / auto-stop) even if
-  // the engine's own quiet timer is disturbed.
+  // Main-side watchdog: guarantees a requested stop (R1 tap) is delivered even
+  // if the engine is busy; dictation itself is tap-to-stop (no auto-stop).
   let dictationTimer: number | null = null;
-  let dictationLastActivity = 0;
   let dictationStopAt = 0;
   // Sticky diagnostics shown when a dictation session stops ITSELF (no tap).
   let dictationDiagText = '';
@@ -256,7 +255,7 @@ async function main(): Promise<void> {
     const body = interim ? `${status}\n\n${clipBytes(interim, 380)}` : status;
     // Footer hint is always present so the stop gesture stays visible.
     return {
-      text: `>> Dictate\n${body}\n\n● Tap R1 = stop · pause ~5s = auto-stop`,
+      text: `>> Dictate\n${body}\n\n● Tap R1 = stop`,
       todoCursor: 0,
       canPrev: false,
       canNext: false,
@@ -294,8 +293,9 @@ async function main(): Promise<void> {
     void renderGlasses();
   }
 
-  /** Backstop watchdog: auto-stop after silence, and force-end if a requested
-   *  stop isn't delivered by the engine within a couple of seconds. */
+  /** Backstop watchdog: if a stop (R1 tap / Stop button) was requested but the
+   *  engine hasn't finished within a couple of seconds, force-end so the user
+   *  is never stuck. Dictation is tap-to-stop — no silence auto-stop. */
   function startDictationGuard(): void {
     if (dictationTimer !== null) return;
     dictationTimer = window.setInterval(() => {
@@ -307,15 +307,8 @@ async function main(): Promise<void> {
         return;
       }
       const now = Date.now();
-      // Auto-stop backstop: no new transcript activity for 6.5s (the engine's
-      // own quiet stop is ~5s; this covers any case where it gets disturbed).
-      if (!dictationStopAt && now - dictationLastActivity > 6500) {
-        dictationStopAt = now;
-        void stopDictation(); // engine commits + emits idle
-        return;
-      }
-      // Force-end if a stop (tap or auto) was requested but the engine hasn't
-      // finished within 2.5s — the user must never be stuck in dictation.
+      // Force-end if a stop was requested but the engine hasn't delivered idle
+      // within 2.5s — the user must never be stuck in dictation.
       if (dictationStopAt && now - dictationStopAt > 2500) {
         endDictationForced();
       }
@@ -353,7 +346,6 @@ async function main(): Promise<void> {
     dictationTapStop = false;
     dictationDraft = '';
     dictationDiagText = '';
-    dictationLastActivity = Date.now();
     dictationStopAt = 0;
     // Grace from the very start: the press that confirmed the menu item can be
     // re-delivered as a CLICK before the engine even reports 'listening'.
@@ -366,12 +358,10 @@ async function main(): Promise<void> {
         if (s === 'listening') {
           dictationStatus = detail ? `${detail} · tap R1 to stop` : 'Listening… tap R1 to stop';
           dictationInterim = '';
-          dictationLastActivity = Date.now();
           // Extend the grace window to swallow the menu-confirm CLICK.
           dictationStopAfter = Date.now() + 1200;
         } else if (s === 'transcribing') {
           dictationStatus = 'Transcribing…';
-          dictationLastActivity = Date.now();
           dictationStopAfter = Date.now() + 60000; // don't stop mid-transcribe
         } else if (s === 'error' || s === 'unsupported') {
           // Commit whatever phrases were already heard, then show the reason.
@@ -383,8 +373,8 @@ async function main(): Promise<void> {
           // Persist the reason + session log on the glasses until the user taps.
           showDictationDiag(detail);
         } else if (s === 'idle') {
-          // Continuous streaming ended: explicit tap, ~5s of real silence, or a
-          // cap. Commit the whole draft once as a single block, then leave.
+          // Continuous streaming ended: explicit tap or a cap. Commit the whole
+          // draft once as a single block, then leave.
           const draft = dictationDraft.trim();
           dictationDraft = '';
           dictationInterim = '';
@@ -395,7 +385,7 @@ async function main(): Promise<void> {
           }
           if (draft) commitSpeechToSection(draft);
           if (!draft && !dictationTapStop) {
-            // Stopped by itself without hearing anything — surface why.
+            // Ended without hearing anything — surface why.
             showDictationDiag();
           } else {
             void renderGlasses();
@@ -406,7 +396,6 @@ async function main(): Promise<void> {
       },
       onPartial: (t) => {
         if (dictationActive) {
-          dictationLastActivity = Date.now();
           dictationStatus = 'Listening… tap R1 to stop';
           dictationInterim = t;
           void renderGlasses();
@@ -416,7 +405,6 @@ async function main(): Promise<void> {
         // Per-phrase commit (continuous streaming) — keep the session listening.
         const text = (t || '').trim();
         if (!text) return;
-        dictationLastActivity = Date.now();
         dictationGotFinal = true;
         dictationDraft = dictationDraft ? `${dictationDraft} ${text}` : text;
         void renderGlasses();

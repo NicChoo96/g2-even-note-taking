@@ -560,10 +560,11 @@ function startWebSpeech(hooks: DictHooks): boolean {
 // App glasses/phone mic, or a browser mic downsampled via Web Audio) is
 // VAD-segmented into phrases on short pauses; each finished phrase is
 // transcribed over the relay REST ASR while the user keeps talking. Text grows
-// live (onPartial = running transcript, onFinal = committed phrase) and the
-// session stays open until an explicit stop, ~5s of real silence, or the cap.
-// EVERY entry point (glasses contextual menu, web/phone MicButton, browser)
-// funnels into this one engine so behaviour — live text, tap-to-stop, auto-stop
+// live (onPartial = running transcript, onFinal = committed phrase). The session
+// is TAP-TO-STOP: it ends only on an explicit stop, or the safety caps (never
+// heard anything / 10 min) — never on silence, so pausing to think/read does
+// not end it. EVERY entry point (glasses contextual menu, web/phone MicButton,
+// browser) funnels into this one engine so behaviour — live text, tap-to-stop
 // — is identical everywhere.
 
 /** A live source of 16 kHz s16le mono PCM frames. */
@@ -583,7 +584,6 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
   let watchdog = 0;
   let closed = false;
   let anySpeech = false;
-  let lastVoicedAt = Date.now(); // any voiced frame → resets the 5s auto-stop
   let lastFrameAt = Date.now(); // any frame (even silence) → mic liveness
   let micReopened = false;
   const startedAt = Date.now();
@@ -602,9 +602,10 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
   const MAX_PHRASE_MS = 2800; // force-split a phrase this long (bounds latency)
   const MIN_VOICED_MS = 250; // ignore blips shorter than this (noise/click)
   const VAD_RMS = 700;
-  const STOP_QUIET_MS = 5000; // real silence → auto-stop (flush then idle)
-  const NEVER_MS = 20000; // never heard anything → idle
-  const CAP_MS = 300000; // hard cap
+  // NO silence auto-stop: dictation keeps listening until an explicit tap/Stop,
+  // so pausing to think/read never ends it. Only safety nets remain below.
+  const NEVER_MS = 90000; // opened but never heard anything → idle (90s)
+  const CAP_MS = 600000; // hard cap (10 min)
   const STT_TIMEOUT_MS = 8000; // a hung server call must never wedge the session
   const STOP_FLUSH_MS = 5000; // worst-case time to finish after a stop
 
@@ -682,13 +683,12 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
     const voiced = rms(pcm) > VAD_RMS;
     if (voiced) {
       anySpeech = true;
-      lastVoicedAt = now;
       phraseQuietMs = 0;
       phraseVoicedMs += dt;
       phraseChunks.push(pcm);
-      // NOTE: once an end has been requested (tap / ~5s quiet / cap) we do NOT
-      // cancel it here — a stray voiced frame during the flush window must not
-      // keep the session alive forever.
+      // NOTE: once an end has been requested (tap / cap) we do NOT cancel it
+      // here — a stray voiced frame during the flush window must not keep the
+      // session alive forever.
       // Bound phrase size so text streams out in ~2-3s chunks, not one giant
       // clip after a long run-on pause.
       if (phraseVoicedMs >= MAX_PHRASE_MS) {
@@ -750,7 +750,6 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
       return;
     }
     const age = Date.now() - startedAt;
-    const idle = Date.now() - lastVoicedAt;
     // If the source stops delivering frames entirely (OS hiccup), try to reopen
     // it once so dictation doesn't die after the first captured word.
     if (anySpeech && !micReopened && Date.now() - lastFrameAt > 2000) {
@@ -763,14 +762,9 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
       }
       src.reopen?.();
     }
-    if (anySpeech && idle > STOP_QUIET_MS) {
-      dlog(`watchdog: quiet ${Math.round(idle)}ms`);
-      wantEnd = true;
-      endWhy = 'quiet';
-      stopDeadline = Date.now() + STOP_FLUSH_MS;
-      if (phraseChunks.length) enqueuePhrase();
-      if (!busy && queue.length === 0) finalize('quiet');
-    } else if (!anySpeech && age > NEVER_MS) {
+    // Tap-to-stop only — we do NOT auto-stop on silence. Safety nets only:
+    // opened but never heard anything, or the hard cap.
+    if (!anySpeech && age > NEVER_MS) {
       dlog(`watchdog: never-heard ${Math.round(age)}ms`);
       wantEnd = true;
       endWhy = 'never-heard';
