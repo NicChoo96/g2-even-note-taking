@@ -29,6 +29,7 @@ import {
   uid,
   upsertDoc,
   type DocEntry,
+  type SectionId,
   type TodoItem,
 } from './types';
 import {
@@ -144,6 +145,9 @@ async function main(): Promise<void> {
   let docPage = 0; // current docs/notes page
   let lastView: SectionView | null = null;
   let lastActiveDocId: string | null = null; // reset pagination when doc changes
+  // Last non-Docs tab, so the Docs tab's "Back" menu item can return there
+  // (the Docs menu hides the To-Do/Notes switchers to stay short).
+  let lastNonDocsSection: SectionId = 'todo';
 
   // In-app doc picker (long-press → Select/Delete Doc). While active the ring
   // moves over the doc list and a tap opens/deletes the highlighted doc.
@@ -493,6 +497,10 @@ async function main(): Promise<void> {
       }
     }
 
+    // Remember the last non-Docs tab we actually showed, whichever path put us
+    // here (menu switcher, web UI tab, new doc, picker) — "Back" restores it.
+    if (getState().activeSection !== 'docs') lastNonDocsSection = getState().activeSection;
+
     // In-app doc picker, the R1-ring dictation overlay, a sticky diagnostics
     // screen, a mirror of a dictation started elsewhere (web/phone MicButton),
     // or the normal renderer.
@@ -548,7 +556,7 @@ async function main(): Promise<void> {
           menuObject: menu,
         }),
       );
-      console.log('[hub] rebuildPageContainer (menu) ->', ok);
+      console.log('[hub] rebuildPageContainer (menu) ->', ok, sig);
       if (ok) {
         appliedMenuSig = sig;
         renderedText = text;
@@ -578,6 +586,27 @@ async function main(): Promise<void> {
     pickerCursor = 0;
     pickerActive = true;
     void renderGlasses();
+  }
+
+  /**
+   * Reusable tab switch: resets navigation state so the new section starts at
+   * its first item/page, and remembers the last non-Docs tab so the Docs
+   * menu's "Back" item can restore it.
+   */
+  function switchSection(next: SectionId): void {
+    if (getState().activeSection === next) return;
+    if (next === 'docs') lastNonDocsSection = getState().activeSection;
+    pickerActive = false;
+    pickerCursor = 0;
+    todoCursor = 0;
+    docPage = 0;
+    lastView = null;
+    update((s) => ({ ...s, activeSection: next }));
+  }
+
+  /** Docs tab → "Back": return to the last non-Docs tab. */
+  function goBack(): void {
+    switchSection(lastNonDocsSection);
   }
 
   function newDoc(): void {
@@ -730,16 +759,13 @@ async function main(): Promise<void> {
         enterPicker('delete');
         return;
       }
+      if (itemID === MENU.BACK) {
+        goBack();
+        return;
+      }
       // Section switchers (To-Do / Docs / Notes) also cancel any picker.
       const def = sectionByMenuId(itemID);
-      if (def) {
-        pickerActive = false;
-        pickerCursor = 0;
-        todoCursor = 0;
-        docPage = 0;
-        lastView = null;
-        update((s) => ({ ...s, activeSection: def.id }));
-      }
+      if (def) switchSection(def.id);
       return;
     }
 

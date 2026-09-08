@@ -45,6 +45,8 @@ export const MENU = {
   DOC_DELETE: 6,
   /** R1 → long-press menu → Dictate: start glasses-mic speech-to-text. */
   DICTATE: 7,
+  /** Docs tab → return to the last non-Docs tab (switchers are hidden there). */
+  BACK: 8,
 } as const;
 
 /** Which section menu to build — drives the dynamic contextual menu. */
@@ -56,28 +58,38 @@ export interface MenuState {
 }
 
 /**
- * Build the OS contextual menu for the current state. The section switchers
- * (To-Do / Docs / Notes) are always present; the **Docs actions** (New Doc /
- * Select Doc / Delete Doc) only appear while the Docs tab is active — Select
- * and Delete additionally need at least one doc. The menu is applied on the
- * startup page and REPLACED wholesale on every `rebuildPageContainer`, so call
- * this with the current state whenever the active section changes.
+ * Build the OS contextual menu for the current state — reusable and
+ * state-aware:
  *
- * Your items sit between the system slots (Display off / Brightness on top,
- * "Close Reality Hub" at the bottom). Max 10 items.
+ *   • **Dictate is always the FIRST item** so a long-press reaches it instantly.
+ *   • **Docs tab** → Dictate · Back · New Docs · Select Docs · Delete Docs.
+ *     The section switchers are hidden here to keep the menu short; use Back to
+ *     return to the last non-Docs tab. Select/Delete need at least one doc.
+ *   • **Any other tab** → Dictate · To-Do · Docs · Notes.
+ *
+ * The menu is applied on the startup page and REPLACED wholesale on every
+ * `rebuildPageContainer`, so call this with the current state whenever the
+ * active section (or docs count) changes. Items sit between the system slots
+ * (Display off / Brightness on top, "Close Reality Hub" at the bottom).
+ * Max 10 items.
  */
 export function sectionMenu(state: MenuState): MenuContainerProperty {
-  const items: MenuItemProperty[] = SECTIONS.map(
-    (s) => new MenuItemProperty({ itemName: s.title, itemID: s.menuId }),
-  );
-  // Global action: R1 ring dictation (works in any section; text lands in the
-  // active section — todo task / notes / open doc).
-  items.push(new MenuItemProperty({ itemName: 'Dictate', itemID: MENU.DICTATE }));
+  const items: MenuItemProperty[] = [
+    // Global action, always first so a long-press reaches it immediately.
+    new MenuItemProperty({ itemName: 'Dictate', itemID: MENU.DICTATE }),
+  ];
   if (state.section === 'docs') {
-    items.push(new MenuItemProperty({ itemName: 'New Doc', itemID: MENU.DOC_NEW }));
+    // Docs-scoped actions only — Back returns to the last non-Docs tab.
+    items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
+    items.push(new MenuItemProperty({ itemName: 'New Docs', itemID: MENU.DOC_NEW }));
     if (state.hasDocs) {
-      items.push(new MenuItemProperty({ itemName: 'Select Doc', itemID: MENU.DOC_SELECT }));
-      items.push(new MenuItemProperty({ itemName: 'Delete Doc', itemID: MENU.DOC_DELETE }));
+      items.push(new MenuItemProperty({ itemName: 'Select Docs', itemID: MENU.DOC_SELECT }));
+      items.push(new MenuItemProperty({ itemName: 'Delete Docs', itemID: MENU.DOC_DELETE }));
+    }
+  } else {
+    // Section switchers (Dictate is already first, so it is not repeated).
+    for (const s of SECTIONS) {
+      items.push(new MenuItemProperty({ itemName: s.title, itemID: s.menuId }));
     }
   }
   return new MenuContainerProperty({ menuItems: items });
