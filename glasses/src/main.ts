@@ -25,11 +25,20 @@ import {
   type AgentFocus,
   type SectionView,
 } from './sections';
-import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe, update } from './store';
+import {
+  applyRemote,
+  getState,
+  noteServerHandshake,
+  seedIfEmpty,
+  setConnStatus,
+  subscribe,
+  update,
+} from './store';
 import {
   applyRemoteAgents,
   getAgents,
   hydrateAgentsDurable,
+  noteAgentsHandshake,
   recordSession,
   seedAgentsIfEmpty,
   setAgentsConn,
@@ -105,12 +114,16 @@ async function main(): Promise<void> {
         setStatus(`📡 SSE ${s}`);
         setConnStatus(s);
       },
+      // A handshake with `state: null` means the relay is empty — only then may
+      // this client seed it from its local copy.
+      onHandshake: (hasSnapshot) => noteServerHandshake(hasSnapshot),
     });
     // Agents ride a SEPARATE channel so agent/session payloads never bloat the
     // HubState frame (and API keys never ride either).
     closeAgentsStream = connectAgentsStream({
       onState: (next) => applyRemoteAgents(next),
       onStatus: (s) => setAgentsConn(s),
+      onHandshake: (hasSnapshot) => noteAgentsHandshake(hasSnapshot),
     });
     // Live agent runs are TRANSIENT frames on the same channel: a run executes
     // in the relay, so the detail pane streams even if this page was
@@ -832,7 +845,7 @@ async function main(): Promise<void> {
     agentFocus = 'detail';
     agentSessionCursor = 0;
     void renderGlasses();
-    const runId = await startRun({
+    const started = await startRun({
       agent: {
         id: agent.id,
         name: agent.name,
@@ -843,14 +856,14 @@ async function main(): Promise<void> {
       prompt: agent.prompt.trim(),
       model: agent.model || st.llm.model,
     });
-    if (!runId) {
+    if (!started.runId) {
       agentRunning = false;
       agentStatus = '';
-      agentError = 'relay refused the run';
+      agentError = started.error || 'relay refused the run';
       void renderGlasses();
       return;
     }
-    agentRunId = runId;
+    agentRunId = started.runId;
   }
 
   /** Contextual menu → "Stop": cancel the in-flight run. */

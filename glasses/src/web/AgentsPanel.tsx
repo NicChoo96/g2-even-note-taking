@@ -334,7 +334,7 @@ export function AgentsPanel() {
     if (!agent || !body || running) return;
     const tools = state.tools.filter((t) => agent.toolIds.includes(t.id));
     setError('');
-    const runId = await startRun({
+    const started = await startRun({
       agent: {
         id: agent.id,
         name: agent.name,
@@ -345,11 +345,11 @@ export function AgentsPanel() {
       prompt: body,
       model: agent.model || state.llm.model,
     });
-    if (!runId) {
-      setError('relay refused the run — is it running and are you signed in?');
+    if (!started.runId) {
+      setError(`relay refused the run — ${started.error}`);
       return;
     }
-    setMyRunId(runId);
+    setMyRunId(started.runId);
     if (!text) setPrompt('');
   };
 

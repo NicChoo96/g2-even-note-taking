@@ -604,13 +604,21 @@ async function executeRun(run) {
         push({ role: 'tool', content: clipText(result, 600), tool: name, at: Date.now() });
       }
     }
+    // The model kept calling tools instead of answering. Rather than failing the
+    // run, ask once more with NO tools available so it is forced to summarise
+    // what it already gathered. (Small free models loop on tool calls; erroring
+    // out here looked to the user like "the relay refused the run".)
+    run.statusText = 'Summarising…';
+    broadcastRun(run);
+    const { content } = await llmOnce(run.model, wire, [], ac.signal);
     run.messages.push({
       role: 'assistant',
-      content: 'Stopped after too many tool calls. Try a simpler prompt.',
+      content:
+        content.trim() ||
+        'I gathered results but could not finish the summary. Try a simpler prompt.',
       at: Date.now(),
     });
-    run.status = 'error';
-    run.error = 'max steps';
+    run.status = 'done';
     run.statusText = '';
     broadcastRun(run);
   } catch (err) {
@@ -704,7 +712,15 @@ async function persistState(name, lastState) {
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // `Authorization` MUST be listed: a browser (or a WebView on a different
+  // origin than the relay) sends the session/device token as a Bearer header,
+  // which makes the request non-simple and triggers a preflight. Omitting it
+  // here made the browser block the call with
+  //   "Request header field authorization is not allowed by
+  //    Access-Control-Allow-Headers in preflight response."
+  // — which surfaced in the UI as "relay refused the run".
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '600');
 }
 
 function send(client, frame) {
@@ -911,7 +927,11 @@ const server = createServer(async (req, res) => {
       Connection: 'keep-alive',
     });
     channel.clients.add(res);
-    if (channel.lastState) send(res, { type: 'init', state: channel.lastState });
+    // ALWAYS send an init frame — `state: null` means "the server has nothing
+    // yet, seed me". Without this a client cannot tell an empty relay from an
+    // unreachable one, and its fallback seeding would overwrite a newer snapshot
+    // that another device already published.
+    send(res, { type: 'init', state: channel.lastState ?? null });
     // Agents channel also replays in-flight/recent runs so a client that just
     // came back from the background can rebuild the live transcript.
     if (channel.name === 'agents') {

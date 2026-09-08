@@ -14,6 +14,14 @@ let state: HubState = loadLocal();
 const listeners = new Set<() => void>();
 let lastPublishedAt = 0;
 let pubTimer: number | null = null;
+// Set once the relay has answered the SSE handshake (or accepted a publish).
+// Seeding before this point is how a stale browser copy used to overwrite a
+// newer relay snapshot on a cold start — and how a client that could not reach
+// the relay at all would clobber it the moment connectivity came back.
+let sawServerState = false;
+let serverReportedEmpty = false;
+let seedArmed = false;
+let seeded = false;
 
 let conn: ConnStatus = 'idle';
 const connListeners = new Set<(s: ConnStatus) => void>();
@@ -88,7 +96,9 @@ function schedulePublish(): void {
   pubTimer = window.setTimeout(() => {
     pubTimer = null;
     lastPublishedAt = state.updatedAt;
-    void publishState(state);
+    void publishState(state).then((ok) => {
+      if (ok) sawServerState = true;
+    });
   }, 250);
 }
 
@@ -115,23 +125,51 @@ export function update(fn: (s: HubState) => HubState): void {
 /** Apply a state frame received from the relay (another device or our echo). */
 export function applyRemote(next: HubState): void {
   if (!next?.sections) return;
+  sawServerState = true;
   if (next.updatedAt === lastPublishedAt) return; // our own echo — already applied
   state = { ...next, updatedAt: next.updatedAt ?? Date.now() };
   persist(state);
   emit();
 }
 
-/** Seed the relay from local storage if the server has no state yet. */
+/**
+ * Arm a one-shot seed of the relay from local storage. The seed only actually
+ * runs once the relay reports an EMPTY snapshot (`state: null`), so a client
+ * that cannot reach the relay — or one that arrives after another device
+ * already published — can never clobber newer server data.
+ */
 export function seedIfEmpty(): void {
+  seedArmed = true;
+  maybeSeed();
+}
+
+function maybeSeed(): void {
+  if (!seedArmed || seeded || sawServerState || !serverReportedEmpty) return;
   const local = getState();
   const hasData =
     local.sections.todo.length > 0 ||
     local.sections.docs.length > 0 ||
     (local.sections.notes ?? '').trim().length > 0;
-  if (hasData) {
-    lastPublishedAt = Date.now();
-    void publishState({ ...local, updatedAt: lastPublishedAt });
+  if (!hasData) return;
+  seeded = true;
+  lastPublishedAt = Date.now();
+  void publishState({ ...local, updatedAt: lastPublishedAt }).then((ok) => {
+    if (ok) sawServerState = true;
+  });
+}
+
+/**
+ * Called when the relay's SSE handshake arrives. A snapshot means "don't seed";
+ * a null snapshot means "server is empty", which is the only condition under
+ * which a client may push its local copy.
+ */
+export function noteServerHandshake(hasSnapshot: boolean): void {
+  if (hasSnapshot) {
+    sawServerState = true;
+    return;
   }
+  serverReportedEmpty = true;
+  maybeSeed();
 }
 
 export function getConnStatus(): ConnStatus {

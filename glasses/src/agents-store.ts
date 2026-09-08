@@ -31,6 +31,14 @@ let state: AgentsState = loadLocal();
 const listeners = new Set<() => void>();
 let lastPublishedAt = 0;
 let pubTimer: number | null = null;
+// Set once the relay has answered the SSE handshake (or accepted a publish).
+// Until then the local copy is the only source; afterwards pushing it back would
+// clobber a newer server snapshot (the reason a saved agent vanished from the
+// glasses, and the reason agents reappeared after a delete).
+let sawServerState = false;
+let serverReportedEmpty = false;
+let seedArmed = false;
+let seeded = false;
 
 let conn: ConnStatus = 'idle';
 const connListeners = new Set<(s: ConnStatus) => void>();
@@ -88,7 +96,9 @@ function schedulePublish(): void {
   pubTimer = window.setTimeout(() => {
     pubTimer = null;
     lastPublishedAt = state.updatedAt;
-    void publishAgents(state);
+    void publishAgents(state).then((ok) => {
+      if (ok) sawServerState = true;
+    });
   }, 250);
 }
 
@@ -116,6 +126,7 @@ export function updateAgents(fn: (s: AgentsState) => AgentsState): void {
 /** Apply an agents frame received from the relay (another device or our echo). */
 export function applyRemoteAgents(next: AgentsState): void {
   if (!next || !Array.isArray(next.agents)) return;
+  sawServerState = true;
   if (next.updatedAt === lastPublishedAt) return; // our own echo — already applied
   const base = emptyAgentsState();
   state = {
@@ -129,15 +140,42 @@ export function applyRemoteAgents(next: AgentsState): void {
   emit();
 }
 
-/** Seed the relay from local storage if the server has no agents state yet. */
+/**
+ * Arm a one-shot seed of the agents channel. The seed only runs once the relay
+ * reports an EMPTY snapshot — the agents list is shared by every paired device,
+ * so pushing a stale browser copy after the relay snapshot arrived would delete
+ * agents another device just created (the reason a saved agent never showed up
+ * on the glasses).
+ */
 export function seedAgentsIfEmpty(): void {
+  seedArmed = true;
+  maybeSeedAgents();
+}
+
+function maybeSeedAgents(): void {
+  if (!seedArmed || seeded || sawServerState || !serverReportedEmpty) return;
   const local = getAgents();
   const hasData =
     local.agents.length > 0 || local.sessions.length > 0 || local.tools.length > 1;
-  if (hasData) {
-    lastPublishedAt = Date.now();
-    void publishAgents({ ...local, updatedAt: lastPublishedAt });
+  if (!hasData) return;
+  seeded = true;
+  lastPublishedAt = Date.now();
+  void publishAgents({ ...local, updatedAt: lastPublishedAt }).then((ok) => {
+    if (ok) sawServerState = true;
+  });
+}
+
+/**
+ * Called when the relay's agents handshake arrives. A snapshot means "don't
+ * seed"; a null snapshot means "server is empty".
+ */
+export function noteAgentsHandshake(hasSnapshot: boolean): void {
+  if (hasSnapshot) {
+    sawServerState = true;
+    return;
   }
+  serverReportedEmpty = true;
+  maybeSeedAgents();
 }
 
 /**
@@ -148,6 +186,10 @@ export function seedAgentsIfEmpty(): void {
 export async function hydrateAgentsDurable(): Promise<void> {
   const [saved, sessions] = await Promise.all([loadAgentsDurable(), loadSessionsDurable()]);
   if (!saved && !sessions) return;
+  // The relay snapshot is authoritative once it has arrived. The bridge copy is
+  // written by THIS device only, so applying it afterwards would silently revert
+  // agents another device added — the same clobber, just via a different path.
+  if (sawServerState) return;
   state = {
     // Normalize: a durable snapshot written before 0.3.5 has no `prompt`, and
     // the glasses menu calls `.trim()` on it.
