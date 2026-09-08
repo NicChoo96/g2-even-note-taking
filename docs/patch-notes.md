@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.8
+
+v0.3.8 - Full transcripts on the glasses
+
+- The agent detail pane now pages through the whole transcript instead of cutting it off, so the glasses show what the web app shows.
+- Swipe up/down to page; running past either end moves to the older or newer session.
+- Tool calls are labelled clearly and long URLs no longer overflow the screen.
+- Removed characters the glasses font cannot draw.
+
 ## 0.3.7
 
 v0.3.7 - Sync & run fixes

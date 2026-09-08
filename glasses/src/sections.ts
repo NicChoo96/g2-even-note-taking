@@ -178,17 +178,69 @@ export function clipBytes(s: string, n: number): string {
   return s.slice(0, cutAtBytes(s, n));
 }
 
-/** Rendered line count of the given page text (LVGL-accurate via pretext). */
-function pageLineCount(lines: string[]): number {
+/** True when `s` renders on a single line at the given pixel width. */
+function lineFits(s: string, width: number): boolean {
   try {
-    return measureTextWrap(lines.join('\n'), INNER_W).lineCount;
+    return measureTextWrap(s, width).lineCount <= 1;
   } catch {
-    return lines.length;
+    return utf8ByteLength(s) <= 40;
   }
 }
 
-/** Split long text into pages that each fit the screen (line- and byte-aware). */
-function pageText(text: string): string[] {
+/**
+ * Split one logical line into pieces that EACH render on exactly one line at
+ * `width`. Word wrap cannot break a long unbroken token (a URL, a long CJK
+ * run), which would otherwise overflow the pane and blow the byte budget — so
+ * hard-split those on the pixel boundary.
+ */
+function splitAtWidth(s: string, width: number): string[] {
+  if (!s) return [''];
+  if (lineFits(s, width)) return [s];
+  const out: string[] = [];
+  let rest = s;
+  while (rest) {
+    let lo = 1;
+    let hi = rest.length;
+    let best = 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (lineFits(rest.slice(0, mid), width)) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    // Never split a surrogate pair (an emoji would render as a broken box).
+    while (best < rest.length) {
+      const c = rest.charCodeAt(best);
+      if (c >= 0xdc00 && c <= 0xdfff) best++;
+      else break;
+    }
+    out.push(rest.slice(0, best));
+    rest = rest.slice(best);
+  }
+  return out;
+}
+
+/** Line + byte budget for one screen of text. */
+interface PageBudget {
+  /** Pixel width the text is laid out in. */
+  width: number;
+  /** Rendered lines that fit. */
+  lines: number;
+  /** UTF-8 byte cap for the page (stays under the 999-byte OS limit). */
+  bytes: number;
+}
+
+/**
+ * Pack logical lines into screen-sized pages. Each logical line is first split
+ * so that every entry occupies exactly ONE rendered line, which reduces packing
+ * to a count + byte-budget loop (no per-candidate re-measurement).
+ */
+function paginateLines(rawLines: readonly string[], budget: PageBudget): string[] {
+  const lines: string[] = [];
+  for (const l of rawLines) lines.push(...splitAtWidth(l, budget.width));
   const pages: string[] = [];
   let page: string[] = [];
   let bytes = 0;
@@ -199,57 +251,36 @@ function pageText(text: string): string[] {
       bytes = 0;
     }
   };
-  for (const line of text.split('\n')) {
+  for (const line of lines) {
     const bl = utf8ByteLength(line);
-    const fits = bl <= PAGE_BYTES && pageLineCount([line]) <= PAGE_BODY_LINES;
-    if (fits) {
-      const candidate = [...page, line];
-      const nb = bytes + bl + (page.length ? 1 : 0);
-      if (page.length && (pageLineCount(candidate) > PAGE_BODY_LINES || nb > PAGE_BYTES)) {
-        // Page full — start a new page with just this line (bytes must reset to
-        // THIS line's size, not the stale pre-flush total, or every later line
-        // trips the byte budget and pages degenerate to one line each).
-        flush();
-        page.push(line);
-        bytes = bl;
-        continue;
-      }
-      page.push(line);
-      bytes = nb;
-      continue;
-    }
-    // Oversized single line — split it into pieces that each fit the screen.
-    flush();
-    let rest = line;
-    while (rest) {
-      let lo = 1;
-      let hi = rest.length;
-      let best = 1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        const piece = rest.slice(0, mid);
-        if (
-          utf8ByteLength(piece) <= PAGE_BYTES &&
-          pageLineCount([piece]) <= PAGE_BODY_LINES
-        ) {
-          best = mid;
-          lo = mid + 1;
-        } else {
-          hi = mid - 1;
-        }
-      }
-      // Avoid splitting a surrogate pair.
-      while (best < rest.length) {
-        const c = rest.charCodeAt(best);
-        if (c >= 0xdc00 && c <= 0xdfff) best++;
-        else break;
-      }
-      pages.push(rest.slice(0, best));
-      rest = rest.slice(best);
-    }
+    // Page full — the byte budget must reset to THIS line's size, not the stale
+    // pre-flush total, or every later line trips it and pages degenerate.
+    if (page.length && (page.length >= budget.lines || bytes + 1 + bl > budget.bytes)) flush();
+    page.push(line);
+    bytes += (page.length > 1 ? 1 : 0) + bl;
   }
   flush();
-  return pages.length ? pages : ['(empty)'];
+  return pages.length ? pages : [''];
+}
+
+/** Split long text into pages that each fit the screen (line- and byte-aware). */
+function pageText(text: string): string[] {
+  return paginateLines(text.split('\n'), {
+    width: INNER_W,
+    lines: PAGE_BODY_LINES,
+    bytes: PAGE_BYTES,
+  });
+}
+
+/** Join parts with " · " while the result stays within `max` characters. */
+function joinFit(parts: readonly string[], max: number): string {
+  let out = '';
+  for (const p of parts) {
+    const next = out ? `${out} · ${p}` : p;
+    if (next.length > max) break;
+    out = next;
+  }
+  return out;
 }
 
 /** Result of rendering the active section for the single glasses container. */
@@ -296,7 +327,9 @@ function todoView(items: TodoItem[], cursor: number): SectionView {
 }
 
 function bodyView(title: string, raw: string, page: number): SectionView {
-  const body = (raw || '').trim() || '(empty)';
+  // `stripUnsupported` drops emoji the firmware font cannot draw; they would
+  // otherwise show as tofu boxes and still consume the byte budget.
+  const body = stripUnsupported(raw || '').trim() || '(empty)';
   const pages = pageText(body);
   const idx = Math.min(pages.length - 1, Math.max(0, page));
   const head = truncate(title, 24);
@@ -400,6 +433,10 @@ export interface AgentsView {
   cursor: number;
   /** Clamped index into the selected agent's sessions (0 = newest). */
   sessionCursor: number;
+  /** Clamped page of the detail pane's transcript (0 = newest). */
+  detailPage: number;
+  /** Total pages available in the detail pane (>= 1). */
+  detailPages: number;
   canPrev: boolean;
   canNext: boolean;
 }
@@ -420,6 +457,8 @@ export interface AgentsViewInput {
   focus: AgentFocus;
   /** Index of the session shown in the detail pane (0 = newest). */
   sessionCursor?: number;
+  /** Page of that session's transcript (0 = newest). */
+  detailPage?: number;
   /** Transient status line while a run is in flight ("Thinking…"). */
   status?: string;
   /** The relay-owned live run for the selected agent, if any. */
@@ -428,7 +467,8 @@ export interface AgentsViewInput {
 
 /** Inner width of the 368px detail panel (paddingLength 4 each side). */
 const DETAIL_W = 360;
-const DETAIL_LINES = 8; // body lines that fit under the 3-line header
+/** Body lines a live (streaming) run shows under the 3-line header. */
+const DETAIL_LINES = 7;
 
 /** Greedy word-wrap to a pixel width, LVGL-accurate via pretext. */
 function wrapToWidth(s: string, width: number): string[] {
@@ -456,18 +496,47 @@ function wrapToWidth(s: string, width: number): string[] {
 }
 
 /**
- * Flatten a run into wrapped lines and keep only the TAIL, so the newest turn
- * is always on screen as the run streams (the user asked for per-turn output).
+ * Characters the firmware font is known to draw. Anything outside this set
+ * (emoji, most pictographs) renders as an empty tofu box AND still costs its
+ * UTF-8 bytes against the 999-byte container cap, so strip it from text that
+ * arrives from the network (tool results, model output) before paginating.
  */
-function liveRunLines(run: LiveRun): string[] {
+const SAFE_NON_ASCII = new Set([
+  ...'─━│┌┐└┘├┤┬┴┼╭╮╯╰═║▲△▶▷▼▽◀◁●○■□▪▫★☆·•‣–—―…′″→←↑↓↔≤≥≠±×÷−°§¶†‡',
+  ...'ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýÿŒœß',
+  ...'ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω',
+  ...'“”‘’«»„',
+]);
+
+function stripUnsupported(s: string): string {
+  let out = '';
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp < 0x7f || SAFE_NON_ASCII.has(ch)) out += ch;
+  }
+  return out;
+}
+
+/**
+ * Flatten a transcript into wrapped lines, NEWEST turn first. Each entry is
+ * prefixed with a label so the glasses and the browser read alike (`You:` /
+ * `[tool]`). Reversing here (rather than slicing the tail) is what makes the
+ * pane paginatable: page 0 is always the newest turn, and older turns are one
+ * swipe further back.
+ *
+ * Labels stay ASCII on purpose, and `stripUnsupported` removes any emoji the
+ * model or a search result embedded: the firmware font has no glyph for them,
+ * so they would draw as tofu boxes and waste the byte budget.
+ */
+function transcriptLines(messages: readonly { role: string; content: string; tool?: string }[]) {
   const out: string[] = [];
-  for (const m of run.messages) {
-    const label = m.role === 'user' ? 'You: ' : m.role === 'tool' ? `🔧 ${m.tool ?? 'tool'}: ` : '';
-    const text = `${label}${m.content}`.replace(/\s+/g, ' ').trim();
+  for (const m of [...messages].reverse()) {
+    const label = m.role === 'user' ? 'You: ' : m.role === 'tool' ? `[${m.tool ?? 'tool'}] ` : '';
+    const text = stripUnsupported(`${label}${m.content}`).replace(/\s+/g, ' ').trim();
     if (!text) continue;
     out.push(...wrapToWidth(text, DETAIL_W));
   }
-  return out.slice(-DETAIL_LINES);
+  return out;
 }
 
 /** Left panel: numbered agent list with a ▶ cursor on the highlighted agent. */
@@ -494,57 +563,120 @@ function agentListView(agents: AgentDef[], cursor: number, focus: AgentFocus): s
   return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
 }
 
+/** Detail pane: body text plus the pagination state it produced. */
+interface DetailRender {
+  text: string;
+  page: number;
+  pages: number;
+}
+
+/** Rendered lines the 288px canvas holds at the fixed 27px line height. */
+const DETAIL_MAX_LINES = 10;
+/** Header (name / tools / divider) above the body on a single-page view. */
+const DETAIL_HEAD_LINES = 3;
+/** Body lines under that header, reserving one line for the footer. */
+const DETAIL_BODY_LINES = DETAIL_MAX_LINES - DETAIL_HEAD_LINES - 1;
+/** Body lines when the header collapses to one line (multi-page transcripts). */
+const DETAIL_COMPACT_BODY_LINES = DETAIL_MAX_LINES - 2;
+/** Body byte budget per page (999 OS cap − header, name and tools line). */
+const DETAIL_PAGE_BYTES = 820;
+
 /** Right panel: the selected agent's setup + live run output or chosen session. */
 function agentDetailView(
   agent: AgentDef | null,
   sessions: AgentSession[],
   toolNames: string[],
   sessionCursor: number,
+  detailPage: number,
   status: string,
   run?: LiveRun | null,
-): string {
+): DetailRender {
   if (!agent) {
-    return clipBytes(
-      'Agents\n------------------\nSelect or create an agent\nfrom the menu, or build one\nin the web app.',
-      MAX_CONTENT_BYTES,
-    );
+    return {
+      text: clipBytes(
+        'Agents\n------------------\nSelect or create an agent\nfrom the menu, or build one\nin the web app.',
+        MAX_CONTENT_BYTES,
+      ),
+      page: 0,
+      pages: 1,
+    };
   }
   const mine = sessions.filter((s) => s.agentId === agent.id);
   const idx = mine.length ? Math.min(mine.length - 1, Math.max(0, sessionCursor)) : 0;
   const latest = mine[idx] ?? null;
   const tools = toolNames.length ? toolNames.join(', ') : 'none';
-  const lines: string[] = [
+  const head = [
     truncate(agent.name || '(unnamed)', 26),
     `tools: ${truncate(tools, 30)}`,
     '------------------',
   ];
 
-  // A live run owns the pane while it is in flight — stream the tail each turn.
-  if (run && run.status === 'running') {
-    lines.push(run.statusText || status || 'Thinking…');
-    lines.push(...liveRunLines(run));
-    return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
-  }
-  if (run && run.status === 'error' && !latest) {
-    lines.push(`⚠️ ${truncate(run.error ?? 'run failed', 40)}`);
-    lines.push(...liveRunLines(run));
-    return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
-  }
+  const compactHead = truncate(`${agent.name || '(unnamed)'} · ${idx + 1}/${mine.length}`, 22);
 
-  if (status) lines.push(status);
-  else if (!latest) lines.push('No sessions yet.\nLong-press → Trigger to run.');
-  else {
-    const answer =
-      [...latest.messages].reverse().find((m) => m.role === 'assistant' && !m.tool)?.content ?? '';
-    const body = answer.trim() || '(no answer)';
-    // Fit roughly 6-7 lines of the 368px pane; clip on a byte boundary.
-    const clipped = clipBytes(body, 360);
-    lines.push(clipped + (clipped.length < body.length ? '…' : ''));
-    lines.push(
-      `— session ${idx + 1}/${mine.length} · ${latest.status}${mine.length > 1 ? ' · ▲▼ browse' : ''}`,
+  const render = (bodyLines: string[], footer: string, budget: PageBudget): DetailRender => {
+    const first = paginateLines(bodyLines, budget);
+    // A transcript that does not fit one screen collapses the 3-line header to
+    // a single line, which frees two more rendered lines for the content.
+    let pages = first;
+    let header = head;
+    if (first.length > 1) {
+      const packed = paginateLines(bodyLines, { ...budget, lines: budget.lines + 2 });
+      if (packed.length > 1) {
+        pages = packed;
+        header = [compactHead];
+      }
+    }
+    const p = Math.min(pages.length - 1, Math.max(0, detailPage));
+    const more = pages.length > 1 ? ` (${p + 1}/${pages.length})` : '';
+    const tail = footer ? `${footer}${more}` : more.trim();
+    const lines = tail ? [...header, pages[p], tail] : [...header, pages[p]];
+    return { text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES), page: p, pages: pages.length };
+  };
+
+  // A live run owns the pane while it is in flight — newest turn on page 0.
+  if (run && run.status === 'running') {
+    return render(
+      [run.statusText || status || 'Thinking…', ...transcriptLines(run.messages)],
+      '',
+      { width: DETAIL_W, lines: DETAIL_LINES, bytes: 860 },
     );
   }
-  return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
+  if (run && run.status === 'error' && !latest) {
+    return render(
+      [`! ${truncate(run.error ?? 'run failed', 40)}`, ...transcriptLines(run.messages)],
+      '',
+      { width: DETAIL_W, lines: DETAIL_LINES, bytes: 860 },
+    );
+  }
+
+  if (status) return { text: clipBytes([...head, status].join('\n'), MAX_CONTENT_BYTES), page: 0, pages: 1 };
+  if (!latest) {
+    return {
+      text: clipBytes(
+        [...head, 'No sessions yet.\nLong-press → Trigger to run.'].join('\n'),
+        MAX_CONTENT_BYTES,
+      ),
+      page: 0,
+      pages: 1,
+    };
+  }
+
+  // A stored session pages through the WHOLE transcript (newest first) so the
+  // glasses show what the web panel's Transcript shows, not just a clipped
+  // answer. The footer is built first so the page budget can reserve its line.
+  const footer = joinFit(
+    [`${latest.status}`, `session ${idx + 1}/${mine.length}`, '▲▼ pages'],
+    40,
+  );
+  return render(
+    transcriptLines(latest.messages),
+    footer,
+    {
+      width: DETAIL_W,
+      lines: footer ? DETAIL_BODY_LINES : DETAIL_COMPACT_BODY_LINES,
+      bytes: DETAIL_PAGE_BYTES,
+    },
+  );
 }
 
 /**
@@ -567,18 +699,22 @@ export function agentsMasterDetailView(
   const sessionCursor = mine.length
     ? Math.min(mine.length - 1, Math.max(0, input.sessionCursor ?? 0))
     : 0;
+  const detail = agentDetailView(
+    agent,
+    sessions,
+    toolNames,
+    sessionCursor,
+    input.detailPage ?? 0,
+    input.status ?? '',
+    input.run ?? null,
+  );
   return {
     master: agentListView(agents, clamped, focus),
-    detail: agentDetailView(
-      agent,
-      sessions,
-      toolNames,
-      sessionCursor,
-      input.status ?? '',
-      input.run ?? null,
-    ),
+    detail: detail.text,
     cursor: clamped,
     sessionCursor,
+    detailPage: detail.page,
+    detailPages: detail.pages,
     canPrev: clamped > 0,
     canNext: clamped < agents.length - 1,
   };
@@ -586,6 +722,6 @@ export function agentsMasterDetailView(
 
 /** One-line status for the master footer (e.g. "running…"). */
 export function agentsStatusLine(running: boolean, error?: string): string {
-  if (error) return `⚠️ ${truncate(error, 30)}`;
+  if (error) return `! ${truncate(error, 30)}`;
   return running ? 'Thinking…' : '';
 }

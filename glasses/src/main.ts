@@ -218,6 +218,10 @@ async function main(): Promise<void> {
   let agentRunId: string | null = null;
   /** Which of the (max 5) stored sessions the detail pane is showing. */
   let agentSessionCursor = 0;
+  /** Page of the detail pane's transcript (0 = newest content). */
+  let agentDetailPage = 0;
+  /** Pages the last detail render produced — bounds the paging swipes. */
+  let agentDetailPages = 1;
 
   // R1-ring dictation overlay (contextual menu → Dictate). While active the
   // glasses show a live status/interim view and a tap stops + commits.
@@ -303,6 +307,7 @@ async function main(): Promise<void> {
         cursor: agentCursor,
         focus: agentFocus,
         sessionCursor: agentSessionCursor,
+        detailPage: agentDetailPage,
         status: agentStatus || agentsStatusLine(agentRunning, agentError),
         run: liveRunFor(a.agents[agentCursor]?.id),
       },
@@ -310,6 +315,8 @@ async function main(): Promise<void> {
     );
     agentCursor = view.cursor;
     agentSessionCursor = view.sessionCursor;
+    agentDetailPage = view.detailPage;
+    agentDetailPages = view.detailPages;
     const masterFocus = agentFocus === 'master';
     return [
       new TextContainerProperty({
@@ -796,6 +803,8 @@ async function main(): Promise<void> {
   function agentsSelect(): void {
     agentFocus = 'master';
     agentCursor = 0;
+    agentSessionCursor = 0;
+    agentDetailPage = 0;
     void renderGlasses();
   }
 
@@ -844,6 +853,7 @@ async function main(): Promise<void> {
     agentStatus = 'Thinking…';
     agentFocus = 'detail';
     agentSessionCursor = 0;
+    agentDetailPage = 0;
     void renderGlasses();
     const started = await startRun({
       agent: {
@@ -919,6 +929,10 @@ async function main(): Promise<void> {
       agentRunning = false;
       agentStatus = '';
       agentError = run.status === 'error' ? (run.error ?? 'failed') : '';
+      // The finished transcript just became session 0 — show its newest page
+      // instead of leaving the pane on an older page/session.
+      agentSessionCursor = 0;
+      agentDetailPage = 0;
     }
   }
 
@@ -939,6 +953,7 @@ async function main(): Promise<void> {
     agentFocus = 'master';
     agentCursor = 0;
     agentSessionCursor = 0;
+    agentDetailPage = 0;
     agentStatus = '';
     agentError = '';
     update((s) => ({ ...s, activeSection: next }));
@@ -1022,19 +1037,34 @@ async function main(): Promise<void> {
         if (next !== agentCursor) {
           agentCursor = next;
           agentSessionCursor = 0;
+          agentDetailPage = 0;
           void renderGlasses();
         }
       } else {
+        // Detail pane: ▼ (dir 1) pages FORWARD through the transcript and ▲
+        // (dir -1) pages back. Page 0 is the newest turn and higher pages are
+        // older turns, so this reads like the docs pager (newest first) and the
+        // user lands on the answer when the pane opens.
+        // Paging WRAPS across sessions: running past either end moves to the
+        // older/newer stored session, so the whole history is reachable with
+        // one gesture instead of needing a separate "browse sessions" mode.
         const agent = agentSelected();
         const n = agent
           ? getAgents().sessions.filter((s) => s.agentId === agent.id).length
           : 0;
-        if (n <= 1) return;
-        const next = Math.min(n - 1, Math.max(0, agentSessionCursor + dir));
-        if (next !== agentSessionCursor) {
-          agentSessionCursor = next;
+        const next = agentDetailPage + dir;
+        if (next >= 0 && next < agentDetailPages) {
+          agentDetailPage = next;
           void renderGlasses();
+          return;
         }
+        if (n <= 1) return;
+        const sNext = Math.min(n - 1, Math.max(0, agentSessionCursor + dir));
+        if (sNext === agentSessionCursor) return;
+        agentSessionCursor = sNext;
+        // Enter the new session from the end the gesture came from.
+        agentDetailPage = dir === 1 ? 0 : Number.MAX_SAFE_INTEGER;
+        void renderGlasses();
       }
       return;
     }
@@ -1082,6 +1112,7 @@ async function main(): Promise<void> {
       if (agentFocus === 'master' && agentSelected()) {
         agentFocus = 'detail';
         agentSessionCursor = 0;
+        agentDetailPage = 0;
         void renderGlasses();
       }
       return;
