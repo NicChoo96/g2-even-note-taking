@@ -56,7 +56,12 @@ export const MENU = {
   AGENT_SELECT: 30,
   AGENT_NEW: 31,
   AGENT_DELETE: 32,
+  /** Legacy id for the old dictation-based Run item. */
   AGENT_RUN: 33,
+  /** Run the selected agent's SAVED prompt (no dictation needed). */
+  AGENT_TRIGGER: 34,
+  /** Cancel the in-flight run. */
+  AGENT_STOP: 35,
 } as const;
 
 /**
@@ -68,8 +73,10 @@ export interface MenuState {
   section: SectionId;
   /** Whether the docs library has any docs (Select/Delete need at least one). */
   hasDocs: boolean;
-  /** Whether any agents exist (Select/Delete/Run need at least one). */
+  /** Whether any agents exist (Select/Delete/Trigger need at least one). */
   hasAgents?: boolean;
+  /** True while a server-side agent run is in flight → show Stop instead. */
+  agentRunning?: boolean;
 }
 
 /**
@@ -78,7 +85,9 @@ export interface MenuState {
  *
  *   • **Dictate is always the FIRST item** so a long-press reaches it instantly.
  *   • **Docs tab** → Dictate · Back · New Docs · Select Docs · Delete Docs.
- *   • **Agents tab** → Dictate · Back · Select Agents · New Agents · Delete/Run.
+ *   • **Agents tab** → Dictate · Back · Select Agents · New Agents · Delete Agents
+ *     · Trigger (becomes Stop while a run is in flight). Trigger runs the
+ *     agent's SAVED prompt — no dictation needed on this tab.
  *     The section switchers are hidden here to keep the menu short; use Back to
  *     return to the last non-special tab.
  *   • **Any other tab** → Dictate · To-Do · Docs · Notes · Agents.
@@ -103,14 +112,20 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
       items.push(new MenuItemProperty({ itemName: 'Delete Docs', itemID: MENU.DOC_DELETE }));
     }
   } else if (state.section === 'agents') {
-    // Agents-scoped actions only. Select moves the ring to the master panel,
-    // Run prompts the highlighted agent (dictation captures the prompt).
+    // Agents-scoped actions only. Select moves the ring to the master panel;
+    // Trigger fires the highlighted agent's SAVED prompt server-side (so it
+    // keeps running if the glasses page is backgrounded) and streams the
+    // transcript back into the detail panel.
     items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
     items.push(new MenuItemProperty({ itemName: 'Select Agents', itemID: MENU.AGENT_SELECT }));
     items.push(new MenuItemProperty({ itemName: 'New Agents', itemID: MENU.AGENT_NEW }));
     if (state.hasAgents) {
       items.push(new MenuItemProperty({ itemName: 'Delete Agents', itemID: MENU.AGENT_DELETE }));
-      items.push(new MenuItemProperty({ itemName: 'Run', itemID: MENU.AGENT_RUN }));
+      items.push(
+        state.agentRunning
+          ? new MenuItemProperty({ itemName: 'Stop', itemID: MENU.AGENT_STOP })
+          : new MenuItemProperty({ itemName: 'Trigger', itemID: MENU.AGENT_TRIGGER }),
+      );
     }
   } else {
     // Section switchers (Dictate is already first, so it is not repeated).
@@ -389,6 +404,15 @@ export interface AgentsView {
   canNext: boolean;
 }
 
+/** Minimal shape of a live run — kept local so this module stays store-free. */
+export interface LiveRun {
+  id: string;
+  status: string;
+  statusText: string;
+  error?: string;
+  messages: { role: string; content: string; tool?: string }[];
+}
+
 export interface AgentsViewInput {
   agents: AgentDef[];
   sessions: AgentSession[];
@@ -398,6 +422,52 @@ export interface AgentsViewInput {
   sessionCursor?: number;
   /** Transient status line while a run is in flight ("Thinking…"). */
   status?: string;
+  /** The relay-owned live run for the selected agent, if any. */
+  run?: LiveRun | null;
+}
+
+/** Inner width of the 368px detail panel (paddingLength 4 each side). */
+const DETAIL_W = 360;
+const DETAIL_LINES = 8; // body lines that fit under the 3-line header
+
+/** Greedy word-wrap to a pixel width, LVGL-accurate via pretext. */
+function wrapToWidth(s: string, width: number): string[] {
+  const out: string[] = [];
+  for (const para of s.split('\n')) {
+    let line = '';
+    for (const word of para.split(/\s+/).filter(Boolean)) {
+      const next = line ? `${line} ${word}` : word;
+      let lines = 1;
+      try {
+        lines = measureTextWrap(next, width).lineCount;
+      } catch {
+        lines = 1;
+      }
+      if (lines > 1 && line) {
+        out.push(line);
+        line = word;
+      } else {
+        line = next;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+/**
+ * Flatten a run into wrapped lines and keep only the TAIL, so the newest turn
+ * is always on screen as the run streams (the user asked for per-turn output).
+ */
+function liveRunLines(run: LiveRun): string[] {
+  const out: string[] = [];
+  for (const m of run.messages) {
+    const label = m.role === 'user' ? 'You: ' : m.role === 'tool' ? `🔧 ${m.tool ?? 'tool'}: ` : '';
+    const text = `${label}${m.content}`.replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    out.push(...wrapToWidth(text, DETAIL_W));
+  }
+  return out.slice(-DETAIL_LINES);
 }
 
 /** Left panel: numbered agent list with a ▶ cursor on the highlighted agent. */
@@ -424,13 +494,14 @@ function agentListView(agents: AgentDef[], cursor: number, focus: AgentFocus): s
   return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
 }
 
-/** Right panel: the selected agent's setup + the chosen session output. */
+/** Right panel: the selected agent's setup + live run output or chosen session. */
 function agentDetailView(
   agent: AgentDef | null,
   sessions: AgentSession[],
   toolNames: string[],
   sessionCursor: number,
   status: string,
+  run?: LiveRun | null,
 ): string {
   if (!agent) {
     return clipBytes(
@@ -447,8 +518,21 @@ function agentDetailView(
     `tools: ${truncate(tools, 30)}`,
     '------------------',
   ];
+
+  // A live run owns the pane while it is in flight — stream the tail each turn.
+  if (run && run.status === 'running') {
+    lines.push(run.statusText || status || 'Thinking…');
+    lines.push(...liveRunLines(run));
+    return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
+  }
+  if (run && run.status === 'error' && !latest) {
+    lines.push(`⚠️ ${truncate(run.error ?? 'run failed', 40)}`);
+    lines.push(...liveRunLines(run));
+    return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
+  }
+
   if (status) lines.push(status);
-  else if (!latest) lines.push('No sessions yet.\nLong-press → Run to ask.');
+  else if (!latest) lines.push('No sessions yet.\nLong-press → Trigger to run.');
   else {
     const answer =
       [...latest.messages].reverse().find((m) => m.role === 'assistant' && !m.tool)?.content ?? '';
@@ -485,7 +569,14 @@ export function agentsMasterDetailView(
     : 0;
   return {
     master: agentListView(agents, clamped, focus),
-    detail: agentDetailView(agent, sessions, toolNames, sessionCursor, input.status ?? ''),
+    detail: agentDetailView(
+      agent,
+      sessions,
+      toolNames,
+      sessionCursor,
+      input.status ?? '',
+      input.run ?? null,
+    ),
     cursor: clamped,
     sessionCursor,
     canPrev: clamped > 0,

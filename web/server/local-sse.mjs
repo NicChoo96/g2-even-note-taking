@@ -46,6 +46,53 @@ import { createPublicKey, createVerify, randomBytes, createHash } from 'node:cry
 import { extname, join, normalize, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// ── Local env file loader (zero dependencies) ────────────────────────────────
+// Lets ONE gitignored file hold every key for local development, so nothing has
+// to be exported by hand before `npm start`:
+//
+//   web/.env.local   ← your real keys (gitignored, NEVER committed)
+//   web/.env         ← optional shared defaults (also gitignored)
+//
+// Precedence (highest first): real process env > .env.local > .env.
+// That way a host (Railway/Render/Docker) that injects env vars always wins,
+// and CI never needs the file at all. Values may be quoted; `export ` prefixes
+// and `#` comments are tolerated. Nothing is ever logged.
+function loadEnvFiles() {
+  const dirs = [process.cwd(), fileURLToPath(new URL('..', import.meta.url))];
+  // .env.local is read FIRST so it wins over the shared .env (Vite convention).
+  for (const name of ['.env.local', '.env']) {
+    for (const dir of dirs) {
+      const file = join(dir, name);
+      if (!existsSync(file)) continue;
+      let raw;
+      try {
+        raw = readFileSync(file, 'utf8');
+      } catch {
+        continue;
+      }
+      for (const line of raw.split(/\r?\n/)) {
+        const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+        if (!m) continue; // comment / blank / malformed
+        const key = m[1];
+        if (process.env[key] !== undefined) continue; // real env always wins
+        let value = m[2].trim();
+        if (
+          (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
+          (value.startsWith("'") && value.endsWith("'") && value.length > 1)
+        ) {
+          value = value.slice(1, -1);
+        } else {
+          value = value.replace(/\s+#.*$/, '').trim(); // trailing comment
+        }
+        process.env[key] = value;
+      }
+      console.log(`[g2-hub] env ← ${name}`);
+      break; // first directory that has the file wins
+    }
+  }
+}
+loadEnvFiles();
+
 // ── Google ID token verification (RS256, zero dependencies) ──────────────────
 const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
 let jwksCache = { keys: [], fetchedAt: 0 };
@@ -183,6 +230,14 @@ function requireOwner(req, url) {
   return p && p.kind === 'owner' ? p : null;
 }
 
+// Agent runs may be started from EITHER UI: a signed-in owner browser, or an
+// owner-APPROVED device (the glasses). The device is already trusted by the
+// owner, and the provider keys never leave this process, so a device token is
+// enough to run an agent. Settings/key mutation still requires a real owner.
+function requirePrincipal(req, url) {
+  return principalFromToken(readToken(req, url));
+}
+
 // ── Speech-to-text proxy ─────────────────────────────────────────────────────
 // The glasses/browser mic audio is POSTed here as raw bytes; this process holds
 // the provider API key (never shipped in the client bundle) and returns the
@@ -226,7 +281,7 @@ loadAuthStore();
 // They are never sent to a client, never logged, and never included in any
 // response body — clients only ever learn the boolean `hasKey`.
 const SECRETS_FILE = process.env.SECRETS_FILE || join(process.cwd(), '.g2-hub-secrets.json');
-const DEFAULT_MODEL = 'nvidia/nemotron-3.5-lightning:free';
+const DEFAULT_MODEL = 'inclusionai/ling-3.0-flash-sante:free';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const TAVILY_URL = 'https://api.tavily.com/search';
 const LLM_MAX_BYTES = 512 * 1024;
@@ -294,6 +349,240 @@ function openrouterHeaders(cfg) {
     ...(cfg.referer ? { 'HTTP-Referer': cfg.referer } : {}),
     ...(cfg.title ? { 'X-OpenRouter-Title': cfg.title } : {}),
   };
+}
+
+// ── Server-side agent run engine ─────────────────────────────────────────────
+// The agent loop runs HERE, not in the WebView, for three reasons:
+//   1. it survives the glasses page being backgrounded (a run is not tied to a
+//      UI lifecycle),
+//   2. the glasses and the browser watch the SAME transcript live,
+//   3. the model/tool keys never leave this process — the client only ever sends
+//      the prompt and tool metadata.
+// Runs are transient: they are broadcast on the 'agents' channel as
+// `{ type: 'run', run }` frames and kept in a small ring for replay. The final
+// transcript is persisted by the CLIENTS as a normal session (capped at 5).
+const MAX_STEPS = 5;
+const MAX_RUNS = 8;
+const RUN_TTL_MS = 30 * 60e3; // drop finished runs after 30 min
+const RUN_MAX_BYTES = 256 * 1024;
+const runs = new Map(); // runId -> run
+const runAbort = new Map(); // runId -> AbortController
+
+function pruneRuns() {
+  const now = Date.now();
+  for (const [id, run] of runs) {
+    if (run.status !== 'running' && now - run.updatedAt > RUN_TTL_MS) runs.delete(id);
+  }
+  while (runs.size > MAX_RUNS) {
+    // Never evict an in-flight run.
+    const victim = [...runs.values()]
+      .filter((r) => r.status !== 'running')
+      .sort((a, b) => a.updatedAt - b.updatedAt)[0];
+    if (!victim) break;
+    runs.delete(victim.id);
+  }
+}
+
+function runSnapshot() {
+  return [...runs.values()].sort((a, b) => b.startedAt - a.startedAt);
+}
+
+/** Broadcast a run frame to every agents-channel subscriber (both clients). */
+function broadcastRun(run) {
+  run.updatedAt = Date.now();
+  const frame = { type: 'run', run };
+  for (const client of [...getChannel('agents').clients]) send(client, frame);
+}
+
+/** OpenAI-style tool schema — mirrors glasses/src/agents.ts toolSchema(). */
+function toolSchemaFor(t) {
+  if (t?.kind === 'tavily') {
+    return {
+      type: 'function',
+      function: {
+        name: t.name || 'tavily_search',
+        description: t.description || 'Search the web for current information.',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string', description: 'The search query.' } },
+          required: ['query'],
+        },
+      },
+    };
+  }
+  return {
+    type: 'function',
+    function: {
+      name: t?.name || 'http_tool',
+      description: t?.description || 'Call an external HTTP API.',
+      parameters: {
+        type: 'object',
+        properties: {
+          body: { type: 'object', description: 'JSON request body / query parameters.' },
+        },
+        required: [],
+      },
+    },
+  };
+}
+
+/** One chat completion through the server-side OpenRouter config. */
+async function llmOnce(model, messages, tools, signal) {
+  const cfg = llmConfig();
+  const payload = {
+    model: model || cfg.model,
+    messages,
+    ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
+  };
+  const r = await fetch(OPENROUTER_URL, {
+    method: 'POST',
+    headers: openrouterHeaders(cfg),
+    body: JSON.stringify(payload),
+    signal,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error?.message || `OpenRouter ${r.status}`);
+  const choice = j?.choices?.[0]?.message ?? {};
+  return {
+    content: String(choice.content ?? ''),
+    toolCalls: Array.isArray(choice.tool_calls) ? choice.tool_calls : [],
+  };
+}
+
+/** Execute one tool call server-side (Tavily, or a generic REST endpoint). */
+async function runToolOnce(tool, rawArgs, signal) {
+  let args = {};
+  try {
+    args = JSON.parse(rawArgs || '{}');
+  } catch {
+    /* keep empty */
+  }
+  if (!tool) return `Unknown tool.`;
+  if (tool.kind === 'tavily') {
+    const tv = tavilyConfig();
+    if (!tv.key) return 'tool error: Tavily not configured';
+    const query = String(args.query ?? args.input ?? '').trim();
+    if (!query) return 'tool error: query is required';
+    const depth =
+      args.search_depth === 'advanced' || args.search_depth === 'basic'
+        ? args.search_depth
+        : tool.searchDepth === 'advanced'
+          ? 'advanced'
+          : tv.depth;
+    const r = await fetch(TAVILY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tv.key}` },
+      body: JSON.stringify({ query, search_depth: depth }),
+      signal,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return `tool error: ${j?.detail?.error || j?.error || `Tavily ${r.status}`}`;
+    const results = Array.isArray(j?.results) ? j.results.slice(0, 5) : [];
+    const lines = results.map(
+      (x, i) =>
+        `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, 500)}`,
+    );
+    const answer = j?.answer ? `Answer: ${j.answer}\n\n` : '';
+    return clipText(`${answer}${lines.join('\n\n')}` || 'No results.', 4000);
+  }
+  const target = String(tool.url || '').trim();
+  if (!/^https:\/\//i.test(target)) return 'tool error: tool url must be https://';
+  const method = tool.method === 'GET' ? 'GET' : 'POST';
+  const token = (tool.id && toolTokens.get(tool.id)) || '';
+  const headers = { Accept: 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  let url = target;
+  const init = { method, headers };
+  if (method === 'GET') {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(args)) qs.set(k, String(v));
+    url = `${target}${target.includes('?') ? '&' : '?'}${qs.toString()}`;
+  } else {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(args);
+  }
+  const r = await fetch(url, { ...init, signal });
+  const text = await r.text().catch(() => '');
+  if (!r.ok) return `tool error: HTTP ${r.status} ${clipText(text, 300)}`;
+  return clipText(text, 4000);
+}
+
+/**
+ * Run the agent loop and stream every turn to both clients. Never throws: the
+ * failure is recorded on the run so the glasses and the browser both show it.
+ */
+async function executeRun(run) {
+  const push = (m) => {
+    run.messages.push(m);
+    broadcastRun(run);
+  };
+  const wire = [
+    { role: 'system', content: run.systemPrompt || 'You are a helpful assistant.' },
+    { role: 'user', content: run.prompt },
+  ];
+  const schemas = run.tools.map(toolSchemaFor);
+  const ac = new AbortController();
+  runAbort.set(run.id, ac);
+  try {
+    for (let step = 0; step < MAX_STEPS; step++) {
+      if (run.status === 'stopped') return;
+      run.statusText = step === 0 ? 'Thinking…' : 'Reasoning…';
+      broadcastRun(run);
+      const { content, toolCalls } = await llmOnce(run.model, wire, schemas, ac.signal);
+
+      if (!toolCalls.length) {
+        run.messages.push({
+          role: 'assistant',
+          content: content.trim() || '(no answer)',
+          at: Date.now(),
+        });
+        run.status = 'done';
+        run.statusText = '';
+        broadcastRun(run);
+        return;
+      }
+
+      wire.push({ role: 'assistant', content, tool_calls: toolCalls });
+      for (const call of toolCalls) {
+        if (run.status === 'stopped') return;
+        const name = call?.function?.name ?? '';
+        const rawArgs = call?.function?.arguments ?? '{}';
+        push({
+          role: 'assistant',
+          content: content || `Calling ${name}…`,
+          tool: name,
+          args: clipText(String(rawArgs).replace(/\s+/g, ' '), 160),
+          at: Date.now(),
+        });
+        run.statusText = `Searching · ${name}…`;
+        broadcastRun(run);
+        const tool = run.tools.find((t) => t.name === name);
+        const result = await runToolOnce(tool, rawArgs, ac.signal);
+        wire.push({ role: 'tool', content: result, tool_call_id: call.id });
+        push({ role: 'tool', content: clipText(result, 600), tool: name, at: Date.now() });
+      }
+    }
+    run.messages.push({
+      role: 'assistant',
+      content: 'Stopped after too many tool calls. Try a simpler prompt.',
+      at: Date.now(),
+    });
+    run.status = 'error';
+    run.error = 'max steps';
+    run.statusText = '';
+    broadcastRun(run);
+  } catch (err) {
+    if (run.status === 'stopped') return; // user pressed Stop
+    const message = err instanceof Error ? err.message : String(err);
+    run.messages.push({ role: 'assistant', content: `⚠️ ${message}`, at: Date.now() });
+    run.status = 'error';
+    run.error = message;
+    run.statusText = '';
+    broadcastRun(run);
+  } finally {
+    runAbort.delete(run.id);
+    pruneRuns();
+  }
 }
 
 async function readJsonBody(req, limit) {
@@ -581,6 +870,12 @@ const server = createServer(async (req, res) => {
     });
     channel.clients.add(res);
     if (channel.lastState) send(res, { type: 'init', state: channel.lastState });
+    // Agents channel also replays in-flight/recent runs so a client that just
+    // came back from the background can rebuild the live transcript.
+    if (channel.name === 'agents') {
+      const live = runSnapshot().filter((r) => r.status === 'running');
+      if (live.length) send(res, { type: 'runInit', runs: live });
+    }
     req.on('close', () => channel.clients.delete(res));
     return;
   }
@@ -905,6 +1200,102 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // ── Agent runs (server-side, survives backgrounding) ───────────────────────
+  // POST /api/agent/run  -> start a run, returns { ok, runId }
+  // POST /api/agent/stop -> cancel a run
+  // GET  /api/agent/runs -> replay current runs
+  if (url.pathname === '/api/agent/run' && req.method === 'POST') {
+    const owner = requirePrincipal(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    const cfg = llmConfig();
+    if (!cfg.key) {
+      json(res, 501, {
+        ok: false,
+        error: 'LLM not configured — set OPENROUTER_API_KEY or save it in Settings',
+      });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, RUN_MAX_BYTES);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON or body too large' });
+      return;
+    }
+    const prompt = String(body?.prompt ?? '').trim();
+    const agent = body?.agent ?? {};
+    if (!prompt) {
+      json(res, 400, { ok: false, error: 'prompt is required' });
+      return;
+    }
+    const tools = Array.isArray(body?.tools)
+      ? body.tools.filter((t) => t && typeof t.name === 'string').slice(0, 10)
+      : [];
+    const run = {
+      id: randomBytes(8).toString('hex'),
+      agentId: String(agent.id ?? ''),
+      agentName: String(agent.name ?? 'Agent'),
+      systemPrompt: String(agent.systemPrompt ?? ''),
+      model: String(body?.model || agent.model || cfg.model),
+      prompt,
+      title: prompt.slice(0, 48),
+      tools,
+      messages: [{ role: 'user', content: prompt, at: Date.now() }],
+      status: 'running',
+      statusText: 'Thinking…',
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    runs.set(run.id, run);
+    pruneRuns();
+    json(res, 200, { ok: true, runId: run.id });
+    broadcastRun(run);
+    void executeRun(run);
+    return;
+  }
+
+  if (url.pathname === '/api/agent/stop' && req.method === 'POST') {
+    const owner = requirePrincipal(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 4 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    const run = runs.get(String(body?.runId ?? ''));
+    if (!run) {
+      json(res, 404, { ok: false, error: 'run not found' });
+      return;
+    }
+    if (run.status === 'running') {
+      run.status = 'stopped';
+      run.statusText = '';
+      runAbort.get(run.id)?.abort();
+      broadcastRun(run);
+    }
+    json(res, 200, { ok: true, runId: run.id, status: run.status });
+    return;
+  }
+
+  if (url.pathname === '/api/agent/runs' && req.method === 'GET') {
+    const owner = requirePrincipal(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    pruneRuns();
+    json(res, 200, { ok: true, runs: runSnapshot() });
+    return;
+  }
+
   // Owner-only: store the LLM/tool keys + model in .g2-hub-secrets.json.
   // Values are write-only — the response only reports booleans.
   if (req.method === 'POST' && url.pathname === '/api/settings') {
@@ -1062,8 +1453,8 @@ const server = createServer(async (req, res) => {
             : tv.depth;
         const r = await fetch(TAVILY_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey: tv.key, query, search_depth: depth }),
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tv.key}` },
+          body: JSON.stringify({ query, search_depth: depth }),
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) {

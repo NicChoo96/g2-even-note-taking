@@ -42,7 +42,7 @@ function loadLocal(): AgentsState {
     if (!raw) return base;
     const parsed = JSON.parse(raw) as Partial<AgentsState>;
     const agents: AgentDef[] = Array.isArray(parsed.agents)
-      ? parsed.agents.filter((a) => a && typeof a.id === 'string')
+      ? parsed.agents.filter((a) => a && typeof a.id === 'string').map(normalizeAgent)
       : [];
     let tools: ToolDef[] = Array.isArray(parsed.tools)
       ? parsed.tools.filter((t) => t && typeof t.id === 'string')
@@ -73,6 +73,14 @@ function persist(s: AgentsState): void {
 
 function emit(): void {
   for (const l of [...listeners]) l();
+}
+
+/**
+ * Agents persisted before the Trigger prompt existed have no `prompt`; the
+ * glasses menu calls `.trim()` on it, so backfill it on every ingress path.
+ */
+function normalizeAgent(a: AgentDef): AgentDef {
+  return { ...a, prompt: typeof a.prompt === 'string' ? a.prompt : '' };
 }
 
 function schedulePublish(): void {
@@ -111,7 +119,7 @@ export function applyRemoteAgents(next: AgentsState): void {
   if (next.updatedAt === lastPublishedAt) return; // our own echo — already applied
   const base = emptyAgentsState();
   state = {
-    agents: next.agents,
+    agents: next.agents.map(normalizeAgent),
     tools: next.tools?.length ? next.tools : base.tools,
     llm: { ...base.llm, ...(next.llm ?? {}) },
     sessions: pruneSessions(next.sessions ?? []),
@@ -141,7 +149,9 @@ export async function hydrateAgentsDurable(): Promise<void> {
   const [saved, sessions] = await Promise.all([loadAgentsDurable(), loadSessionsDurable()]);
   if (!saved && !sessions) return;
   state = {
-    agents: saved?.agents ?? state.agents,
+    // Normalize: a durable snapshot written before 0.3.5 has no `prompt`, and
+    // the glasses menu calls `.trim()` on it.
+    agents: saved?.agents ? saved.agents.map(normalizeAgent) : state.agents,
     tools: saved?.tools?.length ? saved.tools : state.tools,
     llm: { ...state.llm, ...(saved?.llm ?? {}) },
     sessions: pruneSessions(sessions ?? state.sessions),

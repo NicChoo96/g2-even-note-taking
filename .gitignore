@@ -40,3 +40,9 @@ qr-prototype.png
 
 # Watchdog-sim test artifacts (generated/downloaded wav)
 glasses/tools/*.wav
+
+# python bytecode
+__pycache__/
+*.pyc
+probe-result.txt
+tavily-probe.txt

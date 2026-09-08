@@ -19,7 +19,7 @@ Simulator facts this harness is built around
 Menu layouts (sections.ts sectionMenu)
   * Any tab    : Dictate(20) To-Do(1) Docs(2) Notes(3) Agents(4)
   * Agents tab : Dictate(20) Back(21) Select Agents(30) New Agents(31)
-                 [Delete Agents(32) Run(33) when agents exist]
+                 [Delete Agents(32) Trigger(34) | Stop(35) when agents exist]
 
 Run the seed first:  python tools/seed-agents-state.py
 Usage:              python tools/agents-simulator-check.py [--exit]
@@ -33,6 +33,8 @@ import urllib.request
 import zlib
 
 BASE = "http://127.0.0.1:9898"
+RELAY = "http://127.0.0.1:5198"
+RELAY_TOKEN = "devownerecb53dde7bf41d07"
 FAIL = 0
 _last_id = 0
 
@@ -153,6 +155,19 @@ def menu_items(msgs):
 
 def agent_rebuilds(msgs):
     return [m for m in msgs if "[hub] rebuildPageContainer (agents)" in m]
+
+
+def relay_runs():
+    """The relay's run store (proves the run left the WebView and went server-side)."""
+    req = urllib.request.Request(
+        RELAY + "/api/agent/runs",
+        headers={"Authorization": f"Bearer {RELAY_TOKEN}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read()).get("runs", [])
+    except Exception:
+        return []
 
 
 def agent_focus(msgs):
@@ -288,14 +303,40 @@ check(
     json.dumps(r[-1]) if r else "",
 )
 
-# ── 9. Agents menu -> Run (33) starts dictation to capture the prompt ───────
+# ── 9. Agents menu -> Trigger (34) runs the agent's SAVED prompt ────────────
+# No dictation: the run is POSTed to the relay (server-side), which streams the
+# transcript back as `run` frames the detail pane renders turn by turn.
 pick(4)  # back into agents
+runs_before = {r.get("id") for r in relay_runs()}
 ids, msgs = pick(5)
-check("agents menu delivered Run (33)", 33 in ids, str(ids))
+check("agents menu delivered Trigger (34)", 34 in ids, str(ids))
 check(
-    "Run starts dictation to capture the prompt",
-    any("[dictate]" in m for m in msgs),
+    "Trigger does NOT open dictation",
+    not any("[dictate]" in m for m in msgs),
     " | ".join(m[:70] for m in msgs if "[dictate]" in m)[:140],
+)
+run_msgs = drain(22.0)  # a real run does LLM -> tool HTTP -> LLM; allow it to finish
+reb = agent_rebuilds(run_msgs)
+check(
+    "Trigger repaints the detail pane with run output",
+    any(("Thinking" in m) or ("You:" in m) or ("arching" in m) for m in reb),
+    " | ".join(m[-110:] for m in reb)[:200],
+)
+new_runs = [r for r in relay_runs() if r.get("id") not in runs_before and r.get("agentId") == "ag1"]
+check(
+    "relay recorded the run (GET /api/agent/runs)",
+    bool(new_runs),
+    json.dumps([(r.get("agentId"), r.get("status"), r.get("prompt", "")[:24]) for r in new_runs]),
+)
+check(
+    "relay ran the agent's SAVED prompt",
+    any("AI this week" in (r.get("prompt") or "") for r in new_runs),
+    json.dumps([r.get("prompt") for r in new_runs])[:160],
+)
+check(
+    "relay run finished cleanly (no guardrail/key error)",
+    bool(new_runs) and not any(r.get("error") for r in new_runs),
+    json.dumps([(r.get("status"), (r.get("error") or "")[:80]) for r in new_runs])[:240],
 )
 
 # ── 10. No uncaught errors in the WebView console ───────────────────────────

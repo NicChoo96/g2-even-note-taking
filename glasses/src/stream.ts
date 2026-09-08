@@ -1,4 +1,4 @@
-import type { AgentsState, HubState, StreamFrame } from './types';
+import type { AgentsState, HubState } from './types';
 import { getStreamToken, notifyAuthRejected } from './auth-token';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
@@ -101,17 +101,30 @@ async function credentialStillValid(): Promise<boolean> {
  * but we manage re-creation to surface status changes).
  */
 export function connectStream(handlers: StreamHandlers): () => void {
-  return connectSse<HubState>(streamUrl, (frame) => frame.state, handlers);
+  return connectSse<HubState>(
+    streamUrl,
+    (frame) => frame.state as HubState,
+    handlers,
+  );
 }
 
 /** Same SSE client, pointed at the separate 'agents' channel. */
 export function connectAgentsStream(handlers: AgentsStreamHandlers): () => void {
-  return connectSse<AgentsState>(agentsStreamUrl, (frame) => frame.state, handlers);
+  return connectSse<AgentsState>(
+    agentsStreamUrl,
+    (frame) => frame.state as AgentsState,
+    handlers,
+  );
 }
 
+/**
+ * Shared SSE client. `pick` turns a raw frame into the value to deliver, or
+ * `undefined` to ignore it (the agents channel carries BOTH state snapshots and
+ * transient run frames, so the picker decides which one this subscriber wants).
+ */
 function connectSse<T>(
   urlFn: () => string,
-  pick: (frame: StreamFrame<T>) => T,
+  pick: (frame: Record<string, unknown>) => T | undefined,
   handlers: { onState(state: T): void; onStatus?(status: 'connecting' | 'open' | 'error'): void },
 ): () => void {
   let es: EventSource | null = null;
@@ -147,9 +160,9 @@ function connectSse<T>(
 
     es.onmessage = (e) => {
       try {
-        const frame = JSON.parse(e.data as string) as StreamFrame<T>;
-        const state = pick(frame);
-        if (state) handlers.onState(state);
+        const frame = JSON.parse(e.data as string) as Record<string, unknown>;
+        const value = pick(frame);
+        if (value !== undefined) handlers.onState(value);
       } catch {
         // ignore malformed frames
       }
@@ -163,4 +176,105 @@ function connectSse<T>(
     es?.close();
     es = null;
   };
+}
+
+// ── Live agent runs (transient — never part of the synced agents state) ──────
+// A run executes SERVER-SIDE in the relay, so it survives the glasses page
+// being backgrounded and BOTH the glasses detail pane and the browser watch the
+// same transcript as it is produced. Frames ride the agents channel as
+// `{ type: 'run', run }`; the client replays in-flight runs on (re)connect.
+export type RunStatus = 'running' | 'done' | 'error' | 'stopped';
+
+export interface RunMessage {
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool?: string;
+  args?: string;
+  at: number;
+}
+
+/** One server-side agent execution. Mirrors AgentSession but is NOT persisted. */
+export interface AgentRun {
+  id: string;
+  agentId: string;
+  agentName: string;
+  prompt: string;
+  title: string;
+  messages: RunMessage[];
+  status: RunStatus;
+  statusText: string;
+  error?: string;
+  startedAt: number;
+  updatedAt: number;
+}
+
+/** Frames the relay pushes for a run, plus the replay snapshot. */
+export type RunFrame =
+  | { type: 'run'; run: AgentRun }
+  | { type: 'runInit'; runs: AgentRun[] };
+
+/** Ask the relay to execute an agent. Returns the new run id (or null). */
+export async function startRun(args: {
+  agent: { id: string; name: string; systemPrompt: string; model?: string };
+  tools: unknown[];
+  prompt: string;
+  model: string;
+}): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+      body: JSON.stringify(args),
+    });
+    if (res.status === 401) notifyAuthRejected();
+    const j = (await res.json().catch(() => ({}))) as { ok?: boolean; runId?: string };
+    return j?.ok && j.runId ? j.runId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Ask the relay to stop an in-flight run. */
+export async function stopRun(runId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+      body: JSON.stringify({ runId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Replay every run the relay still remembers (used after a background gap). */
+export async function fetchRuns(): Promise<AgentRun[]> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/runs`, { headers: authHeader() });
+    if (res.status === 401) notifyAuthRejected();
+    if (!res.ok) return [];
+    const j = (await res.json()) as { ok?: boolean; runs?: AgentRun[] };
+    return j?.runs ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function authHeader(): Record<string, string> {
+  const token = getStreamToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/** Subscribe to run frames on the agents channel. Returns an unsubscribe fn. */
+export function connectRuns(handlers: {
+  onRun?(run: AgentRun): void;
+  onInit?(runs: AgentRun[]): void;
+}): () => void {
+  return connectSse<RunFrame>(agentsStreamUrl, (frame) => frame as unknown as RunFrame, {
+    onState: (frame) => {
+      if (frame.type === 'run' && frame.run) handlers.onRun?.(frame.run);
+      else if (frame.type === 'runInit') handlers.onInit?.(frame.runs ?? []);
+    },
+  });
 }

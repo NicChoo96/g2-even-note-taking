@@ -6,23 +6,9 @@
 // synced state or the glasses bundle. The response only reports booleans.
 import { useEffect, useState } from 'react';
 import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
+import { FREE_TOOL_MODELS } from '../models';
 import { DEFAULT_MODEL } from '../types';
 import { fetchAgentStatus, saveSettings, type AgentStatus } from './agents-client';
-
-const FREE_TOOL_MODELS = [
-  'nvidia/nemotron-3.5-lightning:free',
-  'nvidia/nemotron-3-super-120b-a12b:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
-  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-  'google/gemma-4-31b-it:free',
-  'google/gemma-4-26b-a4b-it:free',
-  'thinkingmachines/inkling:free',
-  'thinkingmachines/inkling-small:free',
-  'cohere/north-mini-code:free',
-  'liquid/lfm-2.5-2.6b:free',
-  'poolside/laguna-s-2.1:free',
-  'poolside/laguna-xs-2.1:free',
-];
 
 export function SettingsPanel() {
   const [info, setInfo] = useState<AgentStatus | null>(null);
@@ -133,12 +119,12 @@ export function SettingsPanel() {
         </button>
         <button onClick={() => void refresh()}>Refresh status</button>
       </div>
-      {msg && <p style={{ color: 'var(--accent)', fontSize: 12 }}>{msg}</p>}
-      {err && <p style={{ color: 'var(--danger)', fontSize: 12 }}>⚠️ {err}</p>}
+      {msg && <p className="hint-line ok-line">{msg}</p>}
+      {err && <p className="warn-line">⚠️ {err}</p>}
       <p className="hint-line">
         Keys are written to <code>.g2-hub-secrets.json</code> on the relay (never synced, never in
-        the glasses bundle). Set <code>OPENROUTER_API_KEY</code> / <code>TAVILY_API_KEY</code> as
-        env vars to override.
+        the glasses bundle). Set <code>OPENROUTER_API_KEY</code> / <code>TAVILY_API_KEY</code> in
+        <code> web/.env.local</code> to override.
       </p>
     </div>
   );

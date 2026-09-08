@@ -38,6 +38,7 @@ AGENTS = {
             "id": "ag1",
             "name": "Researcher",
             "systemPrompt": "You are a concise research assistant. Use the available tools when you need current information, then answer briefly in plain text.",
+            "prompt": "What is new in AI this week?",
             "toolIds": ["tool-tavily"],
             "createdAt": NOW,
         },
@@ -45,6 +46,7 @@ AGENTS = {
             "id": "ag2",
             "name": "Summarizer",
             "systemPrompt": "Summarise the user's text in three bullet points.",
+            "prompt": "Summarise the latest G2 release notes.",
             "toolIds": [],
             "createdAt": NOW,
         },
@@ -61,7 +63,9 @@ AGENTS = {
     ],
     "llm": {
         "provider": "openrouter",
-        "model": "nvidia/nemotron-3.5-lightning:free",
+        # Must pass the account's ZDR guardrail or every run dies with
+        # "0 endpoints out of 1 requested are available". See glasses/src/models.ts.
+        "model": "inclusionai/ling-3.0-flash-sante:free",
         "hasKey": True,
     },
     "sessions": [

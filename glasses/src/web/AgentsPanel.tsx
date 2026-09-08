@@ -12,7 +12,9 @@ import {
   subscribeAgents,
   updateAgents,
 } from '../agents-store';
-import { runAgent } from '../agents';
+import { getRuns, subscribeRuns } from '../agent-runs';
+import { startRun, stopRun } from '../stream';
+import { FREE_TOOL_MODELS } from '../models';
 import {
   emptyAgent,
   emptyLlmSettings,
@@ -27,27 +29,13 @@ import {
 import { MicButton } from './Dictate';
 import { fetchAgentStatus, saveSettings, type AgentStatus } from './agents-client';
 
-/** Free OpenRouter models that actually support tool calling (probed live). */
-const FREE_TOOL_MODELS = [
-  'nvidia/nemotron-3.5-lightning:free',
-  'nvidia/nemotron-3-super-120b-a12b:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
-  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-  'google/gemma-4-31b-it:free',
-  'google/gemma-4-26b-a4b-it:free',
-  'thinkingmachines/inkling:free',
-  'thinkingmachines/inkling-small:free',
-  'cohere/north-mini-code:free',
-  'liquid/lfm-2.5-2.6b:free',
-  'poolside/laguna-s-2.1:free',
-  'poolside/laguna-xs-2.1:free',
-  'dots-studio/dots-3-note-preview:free',
-  'inclusionai/ling-3.0-flash-fin:free',
-  'inclusionai/ling-3.0-flash-sante:free',
-];
-
 function useAgents(): AgentsState {
   return useSyncExternalStore(subscribeAgents, getAgents);
+}
+
+/** Live relay runs (transient — the finished transcript becomes a session). */
+function useRuns() {
+  return useSyncExternalStore(subscribeRuns, getRuns);
 }
 
 function relTime(ts: number): string {
@@ -111,6 +99,21 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         value={agent.systemPrompt}
         onChange={(e) => patch({ systemPrompt: e.target.value })}
         placeholder="You are a concise research assistant. Search the web when facts are needed, then answer in 3 bullet points."
+      />
+
+      <label className="field-label">Trigger prompt</label>
+      <p className="hint-line">
+        What the glasses run when you pick this agent and choose <strong>Trigger</strong>.
+      </p>
+      <div className="field-toolbar">
+        <MicButton compact onText={(t) => patch({ prompt: `${agent.prompt}\n${t}`.trim() })} />
+      </div>
+      <textarea
+        className="doc-textarea"
+        rows={3}
+        value={agent.prompt}
+        onChange={(e) => patch({ prompt: e.target.value })}
+        placeholder="What is new in AI this week?"
       />
 
       <label className="field-label">Tools</label>
@@ -239,14 +242,14 @@ function ToolEditor({ tool }: { tool: ToolDef }) {
 
 export function AgentsPanel() {
   const state = useAgents();
+  const runs = useRuns();
   const [selected, setSelected] = useState<string | null>(null);
   const [prompt, setPrompt] = useState('');
-  const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState('');
-  const [live, setLive] = useState<AgentMessage[] | null>(null);
   const [error, setError] = useState('');
   const [statusInfo, setStatusInfo] = useState<AgentStatus | null>(null);
   const [openSession, setOpenSession] = useState<string | null>(null);
+  /** Run id this tab started, so we only save the session once. */
+  const [myRunId, setMyRunId] = useState<string | null>(null);
 
   useEffect(() => {
     void fetchAgentStatus().then(setStatusInfo);
@@ -256,6 +259,39 @@ export function AgentsPanel() {
   const sessions = agent ? state.sessions.filter((s) => s.agentId === agent.id) : [];
   const shown: AgentSession | null =
     sessions.find((s) => s.id === openSession) ?? sessions[0] ?? null;
+
+  // A run started HERE (or on the glasses) streams in over SSE. Show the newest
+  // one for this agent, running or just-finished.
+  const live = agent
+    ? (runs.find((r) => r.agentId === agent.id && r.status === 'running') ??
+      runs.find((r) => r.id === myRunId) ??
+      null)
+    : null;
+  const running = live?.status === 'running';
+  const status = live?.statusText ?? '';
+
+  // Persist the transcript as a session exactly once, using the RUN id so the
+  // browser and the glasses converge on the same session id.
+  useEffect(() => {
+    if (!live || live.status === 'running' || live.id !== myRunId) return;
+    setMyRunId(null);
+    setError(live.status === 'error' ? (live.error ?? 'run failed') : '');
+    setOpenSession(
+      recordSession({
+        id: live.id,
+        agentId: live.agentId,
+        title: live.title || live.prompt.slice(0, 48),
+        messages: live.messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          tool: m.tool,
+          args: m.args,
+          at: m.at,
+        })),
+        status: live.status === 'done' ? 'done' : 'error',
+      }),
+    );
+  }, [live, myRunId]);
 
   const addAgent = () => {
     const a = emptyAgent(`Agent ${state.agents.length + 1}`);
@@ -288,27 +324,33 @@ export function AgentsPanel() {
       ],
     }));
 
-  const run = async () => {
-    if (!agent || !prompt.trim() || running) return;
+  /**
+   * Runs go to the RELAY, not this tab: the loop keeps executing if the phone
+   * backgrounds, and both the glasses detail pane and this panel watch the same
+   * transcript arrive over SSE.
+   */
+  const run = async (text?: string) => {
+    const body = (text ?? prompt).trim();
+    if (!agent || !body || running) return;
     const tools = state.tools.filter((t) => agent.toolIds.includes(t.id));
-    setRunning(true);
     setError('');
-    setLive([{ role: 'user', content: prompt.trim(), at: Date.now() }]);
-    const res = await runAgent(agent, tools, agent.model || state.llm.model, prompt.trim(), {
-      onStatus: setStatus,
-      onMessage: (m) => setLive((prev) => [...(prev ?? []), m]),
+    const runId = await startRun({
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        systemPrompt: agent.systemPrompt,
+        model: agent.model,
+      },
+      tools,
+      prompt: body,
+      model: agent.model || state.llm.model,
     });
-    setRunning(false);
-    setStatus('');
-    setError(res.ok ? '' : (res.error ?? 'run failed'));
-    const id = recordSession({
-      agentId: agent.id,
-      title: prompt.trim().slice(0, 48),
-      messages: res.messages,
-      status: res.ok ? 'done' : 'error',
-    });
-    setOpenSession(id);
-    setPrompt('');
+    if (!runId) {
+      setError('relay refused the run — is it running and are you signed in?');
+      return;
+    }
+    setMyRunId(runId);
+    if (!text) setPrompt('');
   };
 
   return (
@@ -347,7 +389,7 @@ export function AgentsPanel() {
             + New agent
           </button>
 
-          <div className="panel-label" style={{ marginTop: 18 }}>
+          <div className="panel-label spaced">
             Tools
           </div>
           {state.tools.map((t) => (
@@ -368,7 +410,7 @@ export function AgentsPanel() {
             </button>
           </div>
 
-          <div className="panel-label" style={{ marginTop: 18 }}>
+          <div className="panel-label spaced">
             Model
           </div>
           <input
@@ -398,7 +440,7 @@ export function AgentsPanel() {
             <>
               <AgentEditor agent={agent} />
 
-              <div className="panel-label" style={{ marginTop: 18 }}>
+              <div className="panel-label spaced">
                 Run
               </div>
               <div className="field-toolbar">
@@ -418,17 +460,38 @@ export function AgentsPanel() {
                 <button className="primary" onClick={() => void run()} disabled={running || !prompt.trim()}>
                   {running ? `Running… ${status}` : '▶ Run agent'}
                 </button>
+                <button
+                  onClick={() => void run(agent.prompt)}
+                  disabled={running || !agent.prompt.trim()}
+                  title="Run the saved Trigger prompt (same as the glasses menu)"
+                >
+                  ⚡ Trigger prompt
+                </button>
+                {running && live && (
+                  <button onClick={() => void stopRun(live.id)}>■ Stop</button>
+                )}
               </div>
-              {error && <p style={{ color: 'var(--danger)', fontSize: 12 }}>⚠️ {error}</p>}
+              {error && <p className="warn-line">⚠️ {error}</p>}
 
               {live && (
                 <div className="agent-output">
-                  <div className="panel-label">Live run</div>
-                  <Transcript messages={live} />
+                  <div className="panel-label">
+                    Live run · {live.status}
+                    {live.status === 'running' ? ` · ${live.statusText}` : ''}
+                  </div>
+                  <Transcript
+                    messages={live.messages.map((m) => ({
+                      role: m.role,
+                      content: m.content,
+                      tool: m.tool,
+                      args: m.args,
+                      at: m.at,
+                    }))}
+                  />
                 </div>
               )}
 
-              <div className="panel-label" style={{ marginTop: 18 }}>
+              <div className="panel-label spaced">
                 History · last {sessions.length}/5
               </div>
               {sessions.length === 0 ? (

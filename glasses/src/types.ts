@@ -120,6 +120,11 @@ export interface AgentDef {
   name: string;
   /** System prompt — the agent's instructions. */
   systemPrompt: string;
+  /**
+   * Saved task prompt. Selecting the agent on the glasses and choosing
+   * "Trigger" runs THIS text — no dictation, no typing on the glasses.
+   */
+  prompt: string;
   /** Ids of the ToolDefs this agent may call. */
   toolIds: string[];
   /** Optional per-agent model override (falls back to LlmSettings.model). */
@@ -165,7 +170,7 @@ export interface AgentsState {
 export const MAX_SESSIONS = 5;
 
 /** Free OpenRouter model that actually supports tool calling. */
-export const DEFAULT_MODEL = 'nvidia/nemotron-3.5-lightning:free';
+export const DEFAULT_MODEL = 'inclusionai/ling-3.0-flash-sante:free';
 
 export function emptyLlmSettings(): LlmSettings {
   return { provider: 'openrouter', model: DEFAULT_MODEL, hasKey: false };
@@ -201,6 +206,7 @@ export function emptyAgent(name = 'New Agent'): AgentDef {
     systemPrompt:
       'You are a concise research assistant. Use the available tools when you need ' +
       'current information, then answer briefly in plain text.',
+    prompt: 'What is new in AI this week?',
     toolIds: [],
     createdAt: Date.now(),
   };

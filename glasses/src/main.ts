@@ -9,7 +9,8 @@ import {
   type EvenAppBridge,
   type MenuContainerProperty,
 } from '@evenrealities/even_hub_sdk';
-import { connectAgentsStream, connectStream } from './stream';
+import { connectAgentsStream, connectStream, startRun, stopRun, type AgentRun } from './stream';
+import { getRuns, subscribeRuns } from './agent-runs';
 import {
   AGENT_LAYOUT,
   agentsMasterDetailView,
@@ -35,7 +36,6 @@ import {
   subscribeAgents,
   updateAgents,
 } from './agents-store';
-import { runAgent } from './agents';
 import { getStreamToken, onStreamToken } from './auth-token';
 import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
 import {
@@ -112,6 +112,9 @@ async function main(): Promise<void> {
       onState: (next) => applyRemoteAgents(next),
       onStatus: (s) => setAgentsConn(s),
     });
+    // Live agent runs are TRANSIENT frames on the same channel: a run executes
+    // in the relay, so the detail pane streams even if this page was
+    // backgrounded mid-run. `subscribeRuns` (below) owns that connection.
     // Seed the relay from local data if the server has none yet.
     window.setTimeout(() => seedIfEmpty(), 1000);
     window.setTimeout(() => seedAgentsIfEmpty(), 1200);
@@ -198,7 +201,8 @@ async function main(): Promise<void> {
   let agentRunning = false;
   let agentStatus = '';
   let agentError = '';
-  let agentRunSessionId: string | null = null;
+  /** Relay run id we started, until its transcript is saved as a session. */
+  let agentRunId: string | null = null;
   /** Which of the (max 5) stored sessions the detail pane is showing. */
   let agentSessionCursor = 0;
 
@@ -213,8 +217,6 @@ async function main(): Promise<void> {
   // Accumulates per-phrase commits during a session; committed as ONE block at
   // the end so todo stays a single task and notes/docs read as flowing text.
   let dictationDraft = '';
-  /** What the captured speech is for: the active section, or an agent prompt. */
-  let dictationPurpose: 'section' | 'agent' = 'section';
   // Main-side watchdog: guarantees a requested stop (R1 tap) is delivered even
   // if the engine is busy; dictation itself is tap-to-stop (no auto-stop).
   let dictationTimer: number | null = null;
@@ -289,6 +291,7 @@ async function main(): Promise<void> {
         focus: agentFocus,
         sessionCursor: agentSessionCursor,
         status: agentStatus || agentsStatusLine(agentRunning, agentError),
+        run: liveRunFor(a.agents[agentCursor]?.id),
       },
       (id) => a.tools.find((t) => t.id === id)?.name ?? id,
     );
@@ -334,6 +337,7 @@ async function main(): Promise<void> {
       section: st.activeSection,
       hasDocs: st.sections.docs.length > 0,
       hasAgents: getAgents().agents.length > 0,
+      agentRunning: getRuns().some((r) => r.status === 'running'),
     });
   }
 
@@ -543,17 +547,11 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Drop a transcript into whatever the dictation was started for: the active
-   * section (To-Do → new task, etc.) or the pending agent run.
+   * Drop a transcript into the active section (To-Do → new task, etc.).
+   * Dictation is never used to prompt an agent — the Agents tab uses the
+   * agent's saved prompt via the Trigger menu item.
    */
   function commitSpeechToSection(text: string): void {
-    // Dictation started from "Run" captures the agent prompt instead.
-    if (dictationPurpose === 'agent') {
-      dictationPurpose = 'section';
-      agentRunSessionId = null;
-      void startAgentRun(text);
-      return;
-    }
     const st = getState();
     if (st.activeSection === 'todo') {
       const item: TodoItem = { id: uid(), text, done: false };
@@ -811,22 +809,21 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Contextual menu → "Run": the glasses have no keyboard, so the prompt is
-   * captured with the existing dictation engine (glasses or phone mic) and then
-   * the agent loop runs. Progress + the final answer stream into the detail pane.
+   * Contextual menu → "Trigger": run the highlighted agent's SAVED prompt.
+   *
+   * The run itself executes SERVER-SIDE in the relay, so it keeps going when the
+   * glasses page is backgrounded, and BOTH the detail pane here and the browser
+   * companion UI watch the same transcript stream in (see connectRuns).
    */
-  function agentsRun(): void {
-    if (agentRunning) return;
-    if (!agentSelected()) return;
-    if (isDictating()) return;
-    dictationPurpose = 'agent';
-    startGlassesDictation();
-  }
-
-  /** Execute the agent loop and record the session (capped at 5). */
-  async function startAgentRun(prompt: string): Promise<void> {
+  async function agentsTrigger(): Promise<void> {
     const agent = agentSelected();
     if (!agent || agentRunning) return;
+    if (!agent.prompt.trim()) {
+      agentError = 'no saved prompt';
+      agentFocus = 'detail';
+      void renderGlasses();
+      return;
+    }
     const st = getAgents();
     const tools = st.tools.filter((t) => agent.toolIds.includes(t.id));
     agentRunning = true;
@@ -835,24 +832,81 @@ async function main(): Promise<void> {
     agentFocus = 'detail';
     agentSessionCursor = 0;
     void renderGlasses();
-    const res = await runAgent(agent, tools, agent.model || st.llm.model, prompt, {
-      onStatus: (s) => {
-        agentStatus = s;
-        void renderGlasses();
+    const runId = await startRun({
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        systemPrompt: agent.systemPrompt,
+        model: agent.model,
       },
+      tools,
+      prompt: agent.prompt.trim(),
+      model: agent.model || st.llm.model,
     });
-    agentRunning = false;
-    agentStatus = '';
-    agentError = res.ok ? '' : (res.error ?? 'failed');
-    recordSession({
-      id: agentRunSessionId ?? undefined,
-      agentId: agent.id,
-      title: prompt.slice(0, 48) || 'Session',
-      messages: res.messages,
-      status: res.ok ? 'done' : 'error',
-    });
-    agentRunSessionId = null;
+    if (!runId) {
+      agentRunning = false;
+      agentStatus = '';
+      agentError = 'relay refused the run';
+      void renderGlasses();
+      return;
+    }
+    agentRunId = runId;
+  }
+
+  /** Contextual menu → "Stop": cancel the in-flight run. */
+  async function agentsStop(): Promise<void> {
+    const active = getRuns().find((r) => r.status === 'running');
+    if (!active) return;
+    agentStatus = 'Stopping…';
     void renderGlasses();
+    await stopRun(active.id);
+  }
+
+  /**
+   * The live run for an agent, if the relay is still executing one. Read by the
+   * detail pane so the transcript streams in turn by turn.
+   */
+  function liveRunFor(agentId: string | undefined): AgentRun | null {
+    if (!agentId) return null;
+    return (
+      getRuns().find((r) => r.agentId === agentId && r.status === 'running') ??
+      (agentRunId ? (getRuns().find((r) => r.id === agentRunId) ?? null) : null)
+    );
+  }
+
+  /**
+   * A finished run becomes a session. The RUN id is the session id, so the
+   * browser and the glasses converge on ONE entry (and re-recording is a no-op
+   * once it exists, which stops the store→SSE→store feedback loop).
+   */
+  function settleRun(run: AgentRun): void {
+    if (run.status === 'running') return;
+    const already = getAgents().sessions.some((s) => s.id === run.id);
+    if (already) {
+      if (run.id === agentRunId) agentRunId = null;
+      return;
+    }
+    const selected = agentSelected();
+    const mine = run.id === agentRunId || (!!selected && selected.id === run.agentId);
+    recordSession({
+      id: run.id,
+      agentId: run.agentId,
+      title: run.title || run.prompt.slice(0, 48) || 'Session',
+      messages: run.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        tool: m.tool,
+        args: m.args,
+        at: m.at,
+      })),
+      status: run.status === 'done' ? 'done' : 'error',
+    });
+    if (run.id === agentRunId) agentRunId = null;
+    if (mine && selected?.id === run.agentId) {
+      agentRunning = false;
+      agentStatus = '';
+      agentError = run.status === 'error' ? (run.error ?? 'failed') : '';
+    }
   }
 
   /**
@@ -1048,6 +1102,18 @@ async function main(): Promise<void> {
     void renderGlasses();
   });
 
+  // Live run frames (server-side execution) re-render the detail pane so each
+  // turn appears as it is produced, and settle the run into a session once.
+  subscribeRuns(() => {
+    const active = getRuns().find((r) => r.status === 'running');
+    if (active && active.agentId === agentSelected()?.id) {
+      agentRunning = true;
+      agentStatus = active.statusText || 'Thinking…';
+    }
+    for (const run of getRuns()) settleRun(run);
+    void renderGlasses();
+  });
+
   // R1 ring / G2 touchpad: swipe up/down moves the todo cursor (or flips a
   // docs/notes page, or moves the doc picker), single tap toggles/opens, and
   // double-tap exits.
@@ -1089,8 +1155,18 @@ async function main(): Promise<void> {
         agentsDelete();
         return;
       }
+      if (itemID === MENU.AGENT_TRIGGER) {
+        void agentsTrigger();
+        return;
+      }
+      if (itemID === MENU.AGENT_STOP) {
+        void agentsStop();
+        return;
+      }
+      // Legacy: the old dictation-driven Run item, kept so an installed page
+      // with the previous menu still works until the next rebuild.
       if (itemID === MENU.AGENT_RUN) {
-        agentsRun();
+        void agentsTrigger();
         return;
       }
       // Section switchers (To-Do / Docs / Notes / Agents) also cancel any picker.
