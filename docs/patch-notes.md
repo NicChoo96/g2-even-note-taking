@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.9
+
+v0.3.9 - Leaner Agents menu, double-tap back
+
+- The Agents menu now carries only Trigger (or Stop while a run is live), so the run control is never buried.
+- Tap the agent list to open the detail pane; double-tap returns to the list instead of closing the app.
+- Double-tap on the agent list itself still closes the app.
+
 ## 0.3.8
 
 v0.3.8 - Full transcripts on the glasses

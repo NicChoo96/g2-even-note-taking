@@ -43,13 +43,11 @@ import {
   seedAgentsIfEmpty,
   setAgentsConn,
   subscribeAgents,
-  updateAgents,
 } from './agents-store';
 import { getStreamToken, onStreamToken } from './auth-token';
 import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
 import {
   activeDoc,
-  emptyAgent,
   emptyDoc,
   uid,
   upsertDoc,
@@ -799,37 +797,6 @@ async function main(): Promise<void> {
     return a.agents[Math.min(a.agents.length - 1, Math.max(0, agentCursor))];
   }
 
-  /** Contextual menu → "Select Agents": hand R1 control to the master list. */
-  function agentsSelect(): void {
-    agentFocus = 'master';
-    agentCursor = 0;
-    agentSessionCursor = 0;
-    agentDetailPage = 0;
-    void renderGlasses();
-  }
-
-  /** Contextual menu → "New Agents": create an empty agent and highlight it. */
-  function agentsNew(): void {
-    const agent = emptyAgent();
-    updateAgents((s) => ({ ...s, agents: [...s.agents, agent] }));
-    agentCursor = Math.max(0, getAgents().agents.length - 1);
-    agentFocus = 'master';
-    void renderGlasses();
-  }
-
-  /** Contextual menu → "Delete Agents": remove the highlighted agent. */
-  function agentsDelete(): void {
-    const target = agentSelected();
-    if (!target) return;
-    updateAgents((s) => ({
-      ...s,
-      agents: s.agents.filter((a) => a.id !== target.id),
-      sessions: s.sessions.filter((x) => x.agentId !== target.id),
-    }));
-    agentCursor = Math.max(0, agentCursor - 1);
-    void renderGlasses();
-  }
-
   /**
    * Contextual menu → "Trigger": run the highlighted agent's SAVED prompt.
    *
@@ -1160,7 +1127,8 @@ async function main(): Promise<void> {
 
   // R1 ring / G2 touchpad: swipe up/down moves the todo cursor (or flips a
   // docs/notes page, or moves the doc picker), single tap toggles/opens, and
-  // double-tap exits.
+  // double-tap steps BACK (detail pane → master list) or, from the master
+  // pane / any other tab, exits the app.
   const unsubscribeEvents = b.onEvenHubEvent(async (event) => {
     // OS contextual menu selections arrive even while a picker is showing.
     if (event.menuItemClickEvent) {
@@ -1187,30 +1155,12 @@ async function main(): Promise<void> {
         goBack();
         return;
       }
-      if (itemID === MENU.AGENT_SELECT) {
-        agentsSelect();
-        return;
-      }
-      if (itemID === MENU.AGENT_NEW) {
-        agentsNew();
-        return;
-      }
-      if (itemID === MENU.AGENT_DELETE) {
-        agentsDelete();
-        return;
-      }
       if (itemID === MENU.AGENT_TRIGGER) {
         void agentsTrigger();
         return;
       }
       if (itemID === MENU.AGENT_STOP) {
         void agentsStop();
-        return;
-      }
-      // Legacy: the old dictation-driven Run item, kept so an installed page
-      // with the previous menu still works until the next rebuild.
-      if (itemID === MENU.AGENT_RUN) {
-        void agentsTrigger();
         return;
       }
       // Section switchers (To-Do / Docs / Notes / Agents) also cancel any picker.
@@ -1234,6 +1184,15 @@ async function main(): Promise<void> {
       return;
     }
     if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+      // Double-tap is a BACK gesture first: while the Agents detail pane holds
+      // the ring, return to the master list so the agent selection is
+      // reachable again. Only when there is nowhere to go back to (master pane,
+      // or any non-agents tab) does it shut the page down.
+      if (getState().activeSection === 'agents' && agentFocus === 'detail') {
+        agentFocus = 'master';
+        void renderGlasses();
+        return;
+      }
       await b.shutDownPageContainer(1);
       return;
     }

@@ -52,12 +52,9 @@ export const MENU = {
   DICTATE: 20,
   /** Return to the last non-special tab (switchers are hidden there). */
   BACK: 21,
-  // Agents-tab actions.
-  AGENT_SELECT: 30,
-  AGENT_NEW: 31,
-  AGENT_DELETE: 32,
-  /** Legacy id for the old dictation-based Run item. */
-  AGENT_RUN: 33,
+  // Agents-tab actions. Select / New / Delete live in the WEB app now, so the
+  // glasses menu only carries the run controls; ids 30–33 stay reserved so an
+  // installed page with the previous menu still maps to something sensible.
   /** Run the selected agent's SAVED prompt (no dictation needed). */
   AGENT_TRIGGER: 34,
   /** Cancel the in-flight run. */
@@ -85,11 +82,11 @@ export interface MenuState {
  *
  *   • **Dictate is always the FIRST item** so a long-press reaches it instantly.
  *   • **Docs tab** → Dictate · Back · New Docs · Select Docs · Delete Docs.
- *   • **Agents tab** → Dictate · Back · Select Agents · New Agents · Delete Agents
- *     · Trigger (becomes Stop while a run is in flight). Trigger runs the
- *     agent's SAVED prompt — no dictation needed on this tab.
- *     The section switchers are hidden here to keep the menu short; use Back to
- *     return to the last non-special tab.
+ *   • **Agents tab** → Dictate · Trigger (becomes Stop while a run is in flight).
+ *     Trigger runs the highlighted agent's SAVED prompt — no dictation needed
+ *     on this tab. Select / New / Delete were removed: agent CRUD lives in the
+ *     web app, and the ring already moves between the master list and the
+ *     detail pane without a menu item (tap into the detail, double-tap back).
  *   • **Any other tab** → Dictate · To-Do · Docs · Notes · Agents.
  *
  * The menu is applied on the startup page and REPLACED wholesale on every
@@ -112,15 +109,12 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
       items.push(new MenuItemProperty({ itemName: 'Delete Docs', itemID: MENU.DOC_DELETE }));
     }
   } else if (state.section === 'agents') {
-    // Agents-scoped actions only. Select moves the ring to the master panel;
-    // Trigger fires the highlighted agent's SAVED prompt server-side (so it
-    // keeps running if the glasses page is backgrounded) and streams the
-    // transcript back into the detail panel.
-    items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
-    items.push(new MenuItemProperty({ itemName: 'Select Agents', itemID: MENU.AGENT_SELECT }));
-    items.push(new MenuItemProperty({ itemName: 'New Agents', itemID: MENU.AGENT_NEW }));
+    // Agents-scoped action: ONLY the run control. Trigger fires the highlighted
+    // agent's SAVED prompt server-side (so it keeps running if the glasses page
+    // is backgrounded) and streams the transcript back into the detail panel.
+    // The master↔detail move is a gesture now (tap in, double-tap back), so the
+    // menu stays at two items and a long-press never buries the run control.
     if (state.hasAgents) {
-      items.push(new MenuItemProperty({ itemName: 'Delete Agents', itemID: MENU.AGENT_DELETE }));
       items.push(
         state.agentRunning
           ? new MenuItemProperty({ itemName: 'Stop', itemID: MENU.AGENT_STOP })
@@ -544,7 +538,7 @@ function agentListView(agents: AgentDef[], cursor: number, focus: AgentFocus): s
   const head = `Agents ${agents.length}${focus === 'master' ? ' ◀' : ''}`;
   if (agents.length === 0) {
     return clipBytes(
-      `${head}\n------------------\n(no agents yet — long-press\nfor New Agents, or build one\nin the web app)`,
+      `${head}\n------------------\n(no agents yet — build one\nin the web app)`,
       MAX_CONTENT_BYTES,
     );
   }
@@ -559,7 +553,7 @@ function agentListView(agents: AgentDef[], cursor: number, focus: AgentFocus): s
     const sel = i === clamped ? '▶' : ' ';
     lines.push(`${sel}${i + 1}.${truncate(agents[i].name || '(unnamed)', AGENT_ITEM_TEXT)}`);
   }
-  lines.push(focus === 'master' ? '▲▼ move' : 'Select Agents');
+  lines.push(focus === 'master' ? '▲▼ move · tap open' : 'double-tap = back');
   return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
 }
 
@@ -594,7 +588,7 @@ function agentDetailView(
   if (!agent) {
     return {
       text: clipBytes(
-        'Agents\n------------------\nSelect or create an agent\nfrom the menu, or build one\nin the web app.',
+        'Agents\n------------------\nNo agent selected.\nBuild one in the web app.',
         MAX_CONTENT_BYTES,
       ),
       page: 0,

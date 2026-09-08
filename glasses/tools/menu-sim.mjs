@@ -73,29 +73,24 @@ check('docs (empty)', names(sectionMenu({ section: 'docs', hasDocs: false })), [
 ]);
 
 // ── Agents tab ──────────────────────────────────────────────────────────────
+// The Agents menu carries ONLY the run control: agent CRUD lives in the web
+// app and the master↔detail move is a gesture (tap in, double-tap back).
 const agents = sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true });
-check('agents (has agents)', names(agents), [
-  'Dictate',
-  'Back',
-  'Select Agents',
-  'New Agents',
-  'Delete Agents',
-  'Trigger',
-]);
-check('agents ids', ids(agents), [
-  MENU.DICTATE,
-  MENU.BACK,
-  MENU.AGENT_SELECT,
-  MENU.AGENT_NEW,
-  MENU.AGENT_DELETE,
-  MENU.AGENT_TRIGGER,
-]);
+check('agents (has agents)', names(agents), ['Dictate', 'Trigger']);
+check('agents ids', ids(agents), [MENU.DICTATE, MENU.AGENT_TRIGGER]);
+check(
+  'agents (running) shows Stop',
+  names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true, agentRunning: true })),
+  ['Dictate', 'Stop'],
+);
 check('agents (empty)', names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: false })), [
   'Dictate',
-  'Back',
-  'Select Agents',
-  'New Agents',
 ]);
+assert(
+  'agents menu drops Select/New/Delete',
+  !names(agents).some((n) => /Select|New|Delete/.test(n)),
+  names(agents).join(','),
+);
 
 // ── Plain tabs ──────────────────────────────────────────────────────────────
 const switchers = ['Dictate', 'To-Do', 'Docs', 'Notes', 'Agents'];
