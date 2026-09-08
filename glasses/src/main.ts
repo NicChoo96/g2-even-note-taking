@@ -58,6 +58,7 @@ import {
 } from './types';
 import {
   dictationSnapshot,
+  dictationText,
   isDictating,
   lastDictationLog,
   lastDictationReason,
@@ -222,16 +223,16 @@ async function main(): Promise<void> {
   let agentDetailPages = 1;
 
   // R1-ring dictation overlay (contextual menu → Dictate). While active the
-  // glasses show a live status/interim view and a tap stops + commits.
+  // glasses show a live status + running transcript and a tap stops + commits.
   let dictationActive = false;
   let dictationStatus = '';
+  // Running transcript for DISPLAY. Nothing is written to the active section
+  // until the session ends — a field write re-renders the page, and a page
+  // write while the mic is open makes the host drop the audio stream.
   let dictationInterim = '';
   let dictationStartedAt = 0;
   let dictationGotFinal = false;
   let dictationTapStop = false;
-  // Accumulates per-phrase commits during a session; committed as ONE block at
-  // the end so todo stays a single task and notes/docs read as flowing text.
-  let dictationDraft = '';
   // Main-side watchdog: guarantees a requested stop (R1 tap) is delivered even
   // if the engine is busy; dictation itself is tap-to-stop (no auto-stop).
   let dictationTimer: number | null = null;
@@ -400,7 +401,7 @@ async function main(): Promise<void> {
     return res;
   }
 
-  // R1-ring dictation: a compact full-screen overlay (status + live interim).
+  // R1-ring dictation: a compact full-screen overlay (status + running text).
   function dictationView(): SectionView {
     const status = dictationStatus || 'Starting mic…';
     const interim = dictationInterim.trim();
@@ -420,7 +421,7 @@ async function main(): Promise<void> {
   function dictationForeignView(): SectionView {
     const s = dictationSnapshot();
     const status = s.detail ? `${s.detail} · tap R1 to stop` : 'Listening… tap R1 to stop';
-    const interim = (s.interim || '').trim();
+    const interim = (s.text || s.interim || '').trim();
     const body = interim ? `${status}\n\n${clipBytes(interim, 380)}` : status;
     return { text: `>> Dictate\n${body}`, todoCursor: 0, canPrev: false, canNext: false };
   }
@@ -437,8 +438,9 @@ async function main(): Promise<void> {
       dictationTimer = null;
     }
     if (!dictationActive) return;
-    const draft = dictationDraft.trim();
-    dictationDraft = '';
+    // The user DID stop (this only runs after a requested stop), so the running
+    // transcript is written — the engine may still be flushing its last phrase.
+    const draft = dictationText().trim();
     dictationInterim = '';
     dictationActive = false;
     if (draft) commitSpeechToSection(draft);
@@ -496,7 +498,6 @@ async function main(): Promise<void> {
     dictationStartedAt = Date.now();
     dictationGotFinal = false;
     dictationTapStop = false;
-    dictationDraft = '';
     dictationDiagText = '';
     dictationStopAt = 0;
     // Grace from the very start: the press that confirmed the menu item can be
@@ -516,27 +517,31 @@ async function main(): Promise<void> {
           dictationStatus = 'Transcribing…';
           dictationStopAfter = Date.now() + 60000; // don't stop mid-transcribe
         } else if (s === 'error' || s === 'unsupported') {
-          // Commit whatever phrases were already heard, then show the reason.
-          const had = dictationDraft.trim();
-          dictationDraft = '';
+          // Commit whatever was heard before the failure, then show the reason.
+          // (The engine only publishes the transcript at the end; read the
+          // snapshot so a partial utterance is not lost.)
+          const had = dictationText().trim();
           if (had) commitSpeechToSection(had);
           dictationStatus = detail || 'Voice unavailable';
           dictationStopAfter = 0;
           // Persist the reason + session log on the glasses until the user taps.
           showDictationDiag(detail);
         } else if (s === 'idle') {
-          // Continuous streaming ended: explicit tap or a cap. Commit the whole
-          // draft once as a single block, then leave.
-          const draft = dictationDraft.trim();
-          dictationDraft = '';
+          // The session is over (explicit stop or a cap). THIS is the only place
+          // the utterance is written to the active section — committing per
+          // phrase would re-render the page and kill the live mic.
+          const snap = dictationSnapshot();
+          const draft = snap.commit ? snap.text.trim() : '';
           dictationInterim = '';
           dictationActive = false;
           if (dictationTimer !== null) {
             window.clearInterval(dictationTimer);
             dictationTimer = null;
           }
-          if (draft) commitSpeechToSection(draft);
-          if (!draft && !dictationTapStop) {
+          if (draft) {
+            dictationGotFinal = true;
+            commitSpeechToSection(draft);
+          } else if (!dictationTapStop) {
             // Ended without hearing anything — surface why.
             showDictationDiag();
           } else {
@@ -547,18 +552,18 @@ async function main(): Promise<void> {
         }
       },
       onPartial: (t) => {
-        if (dictationActive) {
-          dictationStatus = 'Listening… tap R1 to stop';
-          dictationInterim = t;
-          void renderGlasses();
-        }
+        if (!dictationActive) return;
+        dictationStatus = 'Listening… tap R1 to stop';
+        dictationInterim = t;
+        void renderGlasses();
       },
-      onFinal: (t) => {
-        // Per-phrase commit (continuous streaming) — keep the session listening.
-        const text = (t || '').trim();
-        if (!text) return;
-        dictationGotFinal = true;
-        dictationDraft = dictationDraft ? `${dictationDraft} ${text}` : text;
+      onText: (full) => {
+        // Running transcript — DISPLAY ONLY. The section is written once, in the
+        // idle handler above, so no field/page write happens while the mic is
+        // open (that is what used to drop the audio stream mid-utterance).
+        if (!dictationActive) return;
+        dictationInterim = full;
+        if (full.trim()) dictationGotFinal = true;
         void renderGlasses();
       },
     });
@@ -657,6 +662,9 @@ async function main(): Promise<void> {
     // screen, a mirror of a dictation started elsewhere (web/phone MicButton),
     // or the normal renderer.
     const foreignActive = !dictationActive && !dictationDiagText && dictationSnapshot().active;
+    // Any of these takes over the WHOLE screen, so it must bypass the Agents
+    // dual-pane renderer below (which otherwise wins and hides the overlay).
+    const overlayActive = pickerActive || dictationActive || !!dictationDiagText || foreignActive;
     const view = pickerActive
       ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
       : dictationActive
@@ -668,7 +676,7 @@ async function main(): Promise<void> {
             : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
-    else if (!dictationActive && !dictationDiagText && !foreignActive) todoCursor = view.todoCursor;
+    else if (!overlayActive) todoCursor = view.todoCursor;
     const text = view.text;
     console.log('[hub] render', {
       started,
@@ -696,11 +704,12 @@ async function main(): Promise<void> {
 
     const menu = currentSectionMenu();
     const sig = menuSignature(menu);
-    const agentsTab = getState().activeSection === 'agents';
+    const agentsTab = getState().activeSection === 'agents' && !overlayActive;
 
     // Agents tab: two panes whose BORDERS encode the focused pane, so any focus
     // or cursor change needs a rebuild. The master list and the output pane are
     // independent containers; the menu is replaced at the same time.
+    // Skipped while an overlay is up — those render as a single container.
     if (agentsTab) {
       const containers = agentContainers();
       const asig = agentSignature(containers);

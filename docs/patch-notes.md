@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.11
+
+v0.3.11 - Dictation commits only when you stop
+
+- Dictation no longer writes to the target field while you are still speaking, which was ending the session early.
+- Your words now stream live on the glasses; the finished transcript is saved in one go when you stop (or when the session auto-ends).
+- Fixed the dictation screen not appearing on the Agents tab.
+- Applies everywhere: the Dictate menu item and every mic button in the app.
+
 ## 0.3.10
 
 v0.3.10 - Back returns to the Agents menu

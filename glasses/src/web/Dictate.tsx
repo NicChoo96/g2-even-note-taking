@@ -2,10 +2,17 @@
 //
 // Mount a <MicButton onText={...} /> next to ANY text box / input to give it
 // speech-to-text: tap the mic, talk (glasses/phone mic in the Even App, or the
-// browser mic on the web), and the transcript is delivered to onText. The heavy
-// lifting lives in the engine-agnostic module ../dictate.
+// browser mic on the web), and the FINISHED transcript is delivered to onText
+// once — when you stop the mic. The heavy lifting lives in the engine-agnostic
+// module ../dictate.
+//
+// The transcript is deliberately NOT written into the field while listening:
+// a write re-renders the host page, and on the glasses a page write while the
+// mic is open makes the host drop the audio stream mid-utterance. Instead the
+// running transcript is shown next to the mic and committed on stop.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  dictationSnapshot,
   isDictating,
   lastDictationReason,
   startDictation,
@@ -14,7 +21,7 @@ import {
 } from '../dictate';
 
 export interface MicButtonProps {
-  /** Receives each committed transcript chunk — append it to your input. */
+  /** Receives the FINISHED transcript once — when you stop the mic. */
   onText: (text: string) => void;
   /** Short helper text shown next to the mic when idle. */
   hint?: string;
@@ -32,6 +39,10 @@ export function useDictation(onText: (text: string) => void) {
   // end from an abnormal one so failures are never silent.
   const gotFinal = useRef(false);
   const flashTimer = useRef(0);
+  // Keep the latest callback in a ref: `toggle` must stay identity-stable, or
+  // the target field's re-render would restart the session on every keystroke.
+  const onTextRef = useRef(onText);
+  onTextRef.current = onText;
 
   const toggle = useCallback(async () => {
     if (isDictating()) {
@@ -53,6 +64,13 @@ export function useDictation(onText: (text: string) => void) {
           setInterim('');
         } else if (s === 'idle') {
           setInterim('');
+          // Commit ONCE, now that the mic is closed. Writing the field mid-
+          // session re-renders the page and the host drops the audio stream.
+          const snap = dictationSnapshot();
+          if (snap.commit && snap.text) {
+            gotFinal.current = true;
+            onTextRef.current(snap.text);
+          }
           const r = lastDictationReason();
           // Ended without committing anything and NOT by an explicit stop →
           // surface WHY instead of silently returning to the idle mic.
@@ -79,15 +97,10 @@ export function useDictation(onText: (text: string) => void) {
         }
       },
       onPartial: (t) => setInterim(t),
-      onFinal: (t) => {
-        gotFinal.current = true;
-        setInterim('');
-        // Append to the target field — dictation KEEPS RUNNING (only an explicit
-        // stop / ~5s silence / cap ends the session).
-        onText(t);
-      },
+      // Live transcript — shown while speaking, NOT written to the field.
+      onText: (full) => setInterim(full),
     });
-  }, [onText]);
+  }, []);
 
   // Clear any transient error timer on unmount.
   useEffect(() => {

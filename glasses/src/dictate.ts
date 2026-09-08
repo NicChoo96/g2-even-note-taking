@@ -16,9 +16,14 @@
 //   4. media      — a browser without Web Speech (e.g. Firefox/iOS): the same
 //                   granted getUserMedia stream → MediaRecorder → relay.
 //
-// Transcribed text arrives through the onFinal hook. The React wrapper in
-// web/Dictate.tsx turns this into a reusable <MicButton> that drops the text
-// into whichever input it is mounted on.
+// The running transcript arrives through the `onText` hook (DISPLAY only). It is
+// written to the caller's target field exactly ONCE, when the session ends: the
+// caller reads `dictationSnapshot().commit` + `dictationText()` from its
+// `onState('idle')` handler. Committing mid-session re-renders the host page,
+// and on the glasses a page write while the mic is open makes the host drop the
+// audio stream — which is what used to kill dictation mid-utterance. The React
+// wrapper in web/Dictate.tsx turns this into a reusable <MicButton> that drops
+// the finished transcript into whichever input it is mounted on.
 import {
   AudioInputSource,
   type EvenAppBridge,
@@ -33,10 +38,21 @@ export type DictEngine = 'webspeech' | 'bridge' | 'media' | 'none';
 export interface DictHooks {
   /** State transitions (idle/listening/transcribing/error/unsupported). */
   onState?: (state: DictState, detail?: string) => void;
-  /** Interim live text while the user is speaking (Web Speech only). */
+  /** Transient live hypothesis while the user is speaking (Web Speech only). */
   onPartial?: (text: string) => void;
-  /** A committed transcript chunk — insert this into the input. */
-  onFinal?: (text: string) => void;
+  /**
+   * The FULL transcript so far — every committed phrase joined, newest last.
+   * Fires as it grows, and once more with the final value just before
+   * `onState('idle')`, so a listener can render it live.
+   *
+   * This is a DISPLAY channel, NOT a commit channel. A session must never hand
+   * per-phrase text to the caller's target field: writing a field mid-session
+   * re-renders the glasses page, and a page write while the mic is open makes
+   * the host drop the audio stream (the G2 dies mid-utterance). Callers commit
+   * ONCE when the session ends — read `dictationSnapshot().commit` and
+   * `dictationText()` inside `onState('idle')`.
+   */
+  onText?: (full: string) => void;
 }
 
 interface DictController {
@@ -83,13 +99,34 @@ export interface DictationSnapshot {
   active: boolean;
   state: DictState;
   detail: string;
+  /** Transient hypothesis (Web Speech only); the streaming engine leaves this ''. */
   interim: string;
+  /** Every phrase committed so far, joined — the whole utterance. */
+  text: string;
+  /** True when the FINISHED session's `text` should be written to the target. */
+  commit: boolean;
 }
-const snap: DictationSnapshot = { active: false, state: 'idle', detail: '', interim: '' };
+const snap: DictationSnapshot = {
+  active: false,
+  state: 'idle',
+  detail: '',
+  interim: '',
+  text: '',
+  commit: false,
+};
 let snapCb: (() => void) | null = null;
 
 export function dictationSnapshot(): DictationSnapshot {
   return { ...snap };
+}
+
+/**
+ * The full transcript accumulated by the active (or most recently ended)
+ * session. Read this inside `onState('idle')` — together with
+ * `dictationSnapshot().commit` — to write the utterance to the target ONCE.
+ */
+export function dictationText(): string {
+  return snap.text;
 }
 
 /** Register a callback fired whenever the live snapshot changes. Returns unsub. */
@@ -116,7 +153,11 @@ function mirrorHooks(hooks: DictHooks): DictHooks {
       snapCb?.();
       hooks.onPartial?.(t);
     },
-    onFinal: (t) => hooks.onFinal?.(t),
+    onText: (full) => {
+      snap.text = full;
+      snapCb?.();
+      hooks.onText?.(full);
+    },
   };
 }
 
@@ -349,10 +390,12 @@ async function sendToStt(
 export async function startDictation(hooks: DictHooks = {}): Promise<boolean> {
   if (session) return false; // already dictating — call stopDictation() first
 
-  // Fresh diagnostic log for this session.
+  // Fresh diagnostic log + transcript for this session.
   diagStart = Date.now();
   diagLines.length = 0;
   diagReason = 'running';
+  snap.text = '';
+  snap.commit = false;
   dlog('start: inApp=', micTarget() === 'glasses', 'bridge=', !!getDurableBridge(), 'webspeech=', hasWebSpeech());
 
   // Mirror state/interim into the shared snapshot (drives any glasses indicator
@@ -441,7 +484,10 @@ function startWebSpeech(hooks: DictHooks): boolean {
       /* already stopped */
     }
     const text = finalText.trim();
-    if (commit && text) hooks.onFinal?.(text);
+    // Publish the whole utterance + whether it should be written, then go idle.
+    // The caller commits the target field from the idle handler — never here.
+    snap.commit = commit && !!text;
+    hooks.onText?.(text);
     hooks.onPartial?.('');
     hooks.onState?.('idle');
     if (session === ctl) session = null;
@@ -478,7 +524,9 @@ function startWebSpeech(hooks: DictHooks): boolean {
     const live = (finalText + interim).trim();
     if (live) {
       spoken = true;
-      hooks.onPartial?.(live);
+      // Interim is transient; onText is the running transcript (display only).
+      hooks.onPartial?.(interim.trim());
+      hooks.onText?.(live);
     }
   };
   // Some browsers expose SpeechRecognition but its service is unavailable
@@ -559,13 +607,15 @@ function startWebSpeech(hooks: DictHooks): boolean {
 // Even-Realities-style pipeline: a single source of 16k s16le mono frames (Even
 // App glasses/phone mic, or a browser mic downsampled via Web Audio) is
 // VAD-segmented into phrases on short pauses; each finished phrase is
-// transcribed over the relay REST ASR while the user keeps talking. Text grows
-// live (onPartial = running transcript, onFinal = committed phrase). The session
-// is TAP-TO-STOP: it ends only on an explicit stop, or the safety caps (never
+// transcribed over the relay REST ASR while the user keeps talking. The running
+// transcript is published through `onText` as it grows, but NOTHING is written
+// to the caller's target field until the session ENDS — a field write
+// re-renders the glasses page, and a page write while the mic is open makes the
+// host drop the audio stream (dictation dies mid-utterance). The session is
+// TAP-TO-STOP: it ends only on an explicit stop, or the safety caps (never
 // heard anything / 10 min) — never on silence, so pausing to think/read does
 // not end it. EVERY entry point (glasses contextual menu, web/phone MicButton,
-// browser) funnels into this one engine so behaviour — live text, tap-to-stop
-// — is identical everywhere.
+// browser) funnels into this one engine so behaviour is identical everywhere.
 
 /** A live source of 16 kHz s16le mono PCM frames. */
 interface DictStream {
@@ -593,6 +643,7 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
   let queue: Uint8Array[] = []; // finished phrases awaiting transcription
   let busy = false;
   let wantEnd = false;
+  let wantCommit = false; // write the transcript to the target when we end
   let endWhy = 'quiet';
   let stopDeadline = 0; // when the user stopped, cap how long we flush
   let consecErr = 0;
@@ -620,10 +671,16 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
     } catch {
       /* noop */
     }
+    // Publish the FINISHED transcript + whether it should be committed. The
+    // caller writes the target field from here (never mid-session): a field
+    // write re-renders the glasses page, and a page write while the mic is
+    // open makes the host drop the audio stream.
+    snap.commit = wantCommit && transcript.length > 0;
+    hooks.onText?.(transcript);
     hooks.onPartial?.('');
     if (session === ctl) session = null;
     hooks.onState?.('idle');
-    dlog(`finalize why=${why} text=${transcript.length}ch`);
+    dlog(`finalize why=${why} text=${transcript.length}ch commit=${snap.commit}`);
   };
 
   // Transcribe finished phrases one at a time. Every call has a timeout, so a
@@ -642,9 +699,9 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
       consecErr = 0;
       if (text) {
         transcript = transcript ? `${transcript} ${text}` : text;
-        hooks.onPartial?.(transcript);
-        hooks.onFinal?.(text); // commit this phrase to the target live
-        dlog(`phrase ok ch=${text.length}`);
+        // Grow the transcript only — the target field is written once, on end.
+        hooks.onText?.(transcript);
+        dlog(`phrase ok ch=${text.length} total=${transcript.length}`);
       } else {
         dlog('phrase empty (no speech detected server-side)');
       }
@@ -717,11 +774,12 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
     stop: () => {
       if (closed) return;
       wantEnd = true;
+      wantCommit = true; // explicit stop → write the utterance
       endWhy = 'tap';
       stopDeadline = Date.now() + STOP_FLUSH_MS;
       // Stop capturing NOW so the user immediately gets feedback; we still
       // transcribe whatever phrase is in flight / was just spoken.
-      hooks.onPartial?.(transcript);
+      hooks.onPartial?.('');
       hooks.onState?.('transcribing');
       try {
         src.close();
@@ -734,6 +792,7 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
     },
     abort: () => {
       wantEnd = true;
+      wantCommit = false; // discard
       endWhy = 'abort';
       phraseChunks = [];
       queue = [];
@@ -767,11 +826,13 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
     if (!anySpeech && age > NEVER_MS) {
       dlog(`watchdog: never-heard ${Math.round(age)}ms`);
       wantEnd = true;
+      wantCommit = false; // nothing heard — nothing to write
       endWhy = 'never-heard';
       finalize('never-heard');
     } else if (age > CAP_MS) {
       dlog(`watchdog: hard-cap ${Math.round(age)}ms`);
       wantEnd = true;
+      wantCommit = true; // hit the cap mid-utterance → keep what was said
       endWhy = 'cap';
       stopDeadline = Date.now() + STOP_FLUSH_MS;
       if (phraseChunks.length) enqueuePhrase();
@@ -999,6 +1060,8 @@ async function startMedia(hooks: DictHooks): Promise<void> {
     const blob = new Blob(parts, { type });
     const buf = new Uint8Array(await blob.arrayBuffer());
     if (!commit || buf.length < 4096) {
+      snap.commit = false;
+      hooks.onText?.('');
       hooks.onState?.('idle');
       if (session === ctl) session = null;
       return;
@@ -1006,9 +1069,13 @@ async function startMedia(hooks: DictHooks): Promise<void> {
     hooks.onState?.('transcribing');
     try {
       const text = await sendToStt(buf, type);
-      if (text) hooks.onFinal?.(text);
+      // One-shot engine: the whole transcript arrives at once, so publish it
+      // here and let the caller commit from its idle handler.
+      snap.commit = !!text;
+      hooks.onText?.(text);
       hooks.onState?.('idle');
     } catch (err) {
+      snap.commit = false;
       hooks.onState?.('error', errMsg(err));
     } finally {
       if (session === ctl) session = null;
