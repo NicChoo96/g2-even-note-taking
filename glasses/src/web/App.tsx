@@ -2,6 +2,8 @@ import { useEffect, useSyncExternalStore, useState } from 'react';
 import { categorize } from './categorize';
 import { useAuth } from './auth';
 import { MicButton } from './Dictate';
+import { AgentsPanel } from './AgentsPanel';
+import { SettingsPanel } from './SettingsPanel';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
 import type { ConnStatus } from '../store';
 import type { HubState, SectionId, TodoItem } from '../types';
@@ -11,7 +13,17 @@ const SECTION_LABELS: Record<SectionId, string> = {
   todo: 'To-Do',
   docs: 'Docs',
   notes: 'Notes',
+  agents: 'Agents',
 };
+
+/** Local tabs — Settings is browser-only and never becomes the glasses section. */
+type Tab = SectionId | 'settings';
+
+const TAB_ORDER: Tab[] = ['todo', 'docs', 'notes', 'agents', 'settings'];
+
+function tabLabel(id: Tab): string {
+  return id === 'settings' ? 'Settings' : SECTION_LABELS[id];
+}
 
 function useHubState(): HubState {
   return useSyncExternalStore(subscribe, getState);
@@ -95,6 +107,9 @@ export default function App() {
   const [paste, setPaste] = useState('');
   const [detected, setDetected] = useState<SectionId[]>([]);
   const [newTask, setNewTask] = useState('');
+  /** Local tab override — lets Settings show without changing the glasses section. */
+  const [tab, setTab] = useState<Tab | null>(null);
+  const activeTab: Tab = tab ?? state.activeSection;
 
   const handleCategorize = () => {
     if (!paste.trim()) return;
@@ -273,6 +288,7 @@ export default function App() {
   };
 
   const switchSection = (section: SectionId) => {
+    setTab(null); // a real section clears the local Settings override
     update((s) => ({ ...s, activeSection: section }));
   };
 
@@ -334,15 +350,15 @@ export default function App() {
       </section>
 
       <nav className="tabs" role="tablist">
-        {(Object.keys(SECTION_LABELS) as SectionId[]).map((id) => (
+        {TAB_ORDER.map((id) => (
           <button
             key={id}
             role="tab"
-            aria-selected={state.activeSection === id}
-            className={state.activeSection === id ? 'tab active' : 'tab'}
-            onClick={() => switchSection(id)}
+            aria-selected={activeTab === id}
+            className={activeTab === id ? 'tab active' : 'tab'}
+            onClick={() => (id === 'settings' ? setTab('settings') : switchSection(id))}
           >
-            {SECTION_LABELS[id]}
+            {tabLabel(id)}
             {id === 'todo' && state.sections.todo.length > 0 && (
               <span className="count">
                 {pending}/{state.sections.todo.length}
@@ -353,7 +369,11 @@ export default function App() {
       </nav>
 
       <main className="content card">
-        {state.activeSection === 'todo' && (
+        {activeTab === 'settings' && <SettingsPanel />}
+
+        {activeTab === 'agents' && <AgentsPanel />}
+
+        {activeTab === 'todo' && (
           <div className="todo-panel">
             <div className="todo-summary">
               <span>
@@ -400,7 +420,7 @@ export default function App() {
           </div>
         )}
 
-        {state.activeSection === 'docs' && (
+        {activeTab === 'docs' && (
           <div className="docs-manager">
             <div className="panel-label">
               Docs library · auto-saved to storage & synced to all your devices
@@ -464,7 +484,7 @@ export default function App() {
           </div>
         )}
 
-        {state.activeSection === 'notes' && (
+        {activeTab === 'notes' && (
           <div className="text-panel">
             <div className="panel-label">Notes · double-sync with glasses</div>
             <div className="field-toolbar">

@@ -531,3 +531,240 @@ li.empty {
   height: 28px;
   font-size: 13px;
 }
+
+/* ── Agents panel ─────────────────────────────────────────────────────────── */
+.agents-split {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(320px, 2fr);
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .agents-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.agents-master,
+.agents-detail {
+  min-width: 0;
+}
+
+.agent-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 4px 6px;
+}
+
+.agent-row.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.agent-pick {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.agent-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-meta,
+.chip-time {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.chip-time {
+  margin-left: 6px;
+}
+
+.agent-editor,
+.tool-row,
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 12px;
+}
+
+.tool-row {
+  margin-bottom: 8px;
+}
+
+.tool-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.tool-name {
+  flex: 1;
+}
+
+.field-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.inline-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.token-row {
+  display: flex;
+  gap: 6px;
+}
+
+.token-row input {
+  flex: 1;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.agent-output {
+  margin-top: 10px;
+}
+
+.agent-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 10px;
+}
+
+.msg {
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.msg-label {
+  font-size: 11px;
+  color: var(--muted);
+  padding-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg.user .msg-body {
+  color: var(--text);
+}
+
+.msg.assistant .msg-body {
+  color: var(--accent);
+}
+
+.msg.tool .msg-body {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ── Settings panel ───────────────────────────────────────────────────────── */
+.settings-panel {
+  max-width: 620px;
+}
+
+.status-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.pill {
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  color: var(--muted);
+  background: var(--bg);
+}
+
+.pill.ok {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.pill.bad {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.warn-line {
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  background: rgba(229, 83, 75, 0.08);
+  color: var(--text);
+  font-size: 12px;
+  padding: 8px 12px;
+  margin: 0 0 14px;
+}
+
+.hint-line {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 2px 0 0;
+  line-height: 1.5;
+}
+
+.hint-line code {
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 1px 4px;
+}

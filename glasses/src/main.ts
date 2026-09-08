@@ -9,8 +9,11 @@ import {
   type EvenAppBridge,
   type MenuContainerProperty,
 } from '@evenrealities/even_hub_sdk';
-import { connectStream } from './stream';
+import { connectAgentsStream, connectStream } from './stream';
 import {
+  AGENT_LAYOUT,
+  agentsMasterDetailView,
+  agentsStatusLine,
   clipBytes,
   docPickerView,
   MAX_CONTENT_BYTES,
@@ -18,16 +21,30 @@ import {
   sectionByMenuId,
   sectionMenu,
   sectionView,
+  type AgentFocus,
   type SectionView,
 } from './sections';
 import { applyRemote, getState, seedIfEmpty, setConnStatus, subscribe, update } from './store';
+import {
+  applyRemoteAgents,
+  getAgents,
+  hydrateAgentsDurable,
+  recordSession,
+  seedAgentsIfEmpty,
+  setAgentsConn,
+  subscribeAgents,
+  updateAgents,
+} from './agents-store';
+import { runAgent } from './agents';
 import { getStreamToken, onStreamToken } from './auth-token';
 import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
 import {
   activeDoc,
+  emptyAgent,
   emptyDoc,
   uid,
   upsertDoc,
+  type AgentDef,
   type DocEntry,
   type SectionId,
   type TodoItem,
@@ -72,12 +89,15 @@ async function main(): Promise<void> {
   //    torn down and re-created so a kicked device can't keep streaming.
   mountUi();
   let closeStream: (() => void) | null = null;
+  let closeAgentsStream: (() => void) | null = null;
   let lastStreamToken: string | null = null;
   onStreamToken((token) => {
     if (token === lastStreamToken) return; // idempotent
     lastStreamToken = token;
     closeStream?.();
     closeStream = null;
+    closeAgentsStream?.();
+    closeAgentsStream = null;
     if (!token) return; // kicked / not authenticated — no stream
     closeStream = connectStream({
       onState: (next) => applyRemote(next),
@@ -86,8 +106,15 @@ async function main(): Promise<void> {
         setConnStatus(s);
       },
     });
+    // Agents ride a SEPARATE channel so agent/session payloads never bloat the
+    // HubState frame (and API keys never ride either).
+    closeAgentsStream = connectAgentsStream({
+      onState: (next) => applyRemoteAgents(next),
+      onStatus: (s) => setAgentsConn(s),
+    });
     // Seed the relay from local data if the server has none yet.
     window.setTimeout(() => seedIfEmpty(), 1000);
+    window.setTimeout(() => seedAgentsIfEmpty(), 1200);
   });
 
   // 2) Glasses rendering only runs inside the Even App (bridge injected). In a
@@ -133,6 +160,9 @@ async function main(): Promise<void> {
       /* ignore */
     }
   })();
+  // Agent definitions/tools/settings + the last 5 sessions are also mirrored to
+  // the host storage (the WebView can be torn down at any moment).
+  void hydrateAgentsDurable();
 
   let started = false; // createStartUpPageContainer called exactly once
   let renderedText = '';
@@ -141,6 +171,10 @@ async function main(): Promise<void> {
   // this changes (entering/leaving Docs, or docs count crossing 0) — ordinary
   // content updates still use flicker-free textContainerUpgrade.
   let appliedMenuSig = '';
+  /** 'single' = one full-canvas text container; 'dual' = the Agents panes. */
+  let appliedLayout: 'single' | 'dual' = 'single';
+  /** Focus+cursor+border signature of the dual pane layout. */
+  let appliedAgentSig = '';
   let todoCursor = 0; // selected todo row
   let docPage = 0; // current docs/notes page
   let lastView: SectionView | null = null;
@@ -155,6 +189,19 @@ async function main(): Promise<void> {
   let pickerIntent: 'open' | 'delete' = 'open';
   let pickerCursor = 0;
 
+  // Agents tab — master–detail. The contextual menu moves R1 control between
+  // the left agent list (focus 'master') and the right output pane ('detail'):
+  // "Select Agents" → master, picking an agent → detail. Only ONE container may
+  // be isEventCapture:1, so the ring is routed by this flag, not by the event.
+  let agentFocus: AgentFocus = 'master';
+  let agentCursor = 0;
+  let agentRunning = false;
+  let agentStatus = '';
+  let agentError = '';
+  let agentRunSessionId: string | null = null;
+  /** Which of the (max 5) stored sessions the detail pane is showing. */
+  let agentSessionCursor = 0;
+
   // R1-ring dictation overlay (contextual menu → Dictate). While active the
   // glasses show a live status/interim view and a tap stops + commits.
   let dictationActive = false;
@@ -166,6 +213,8 @@ async function main(): Promise<void> {
   // Accumulates per-phrase commits during a session; committed as ONE block at
   // the end so todo stays a single task and notes/docs read as flowing text.
   let dictationDraft = '';
+  /** What the captured speech is for: the active section, or an agent prompt. */
+  let dictationPurpose: 'section' | 'agent' = 'section';
   // Main-side watchdog: guarantees a requested stop (R1 tap) is delivered even
   // if the engine is busy; dictation itself is tap-to-stop (no auto-stop).
   let dictationTimer: number | null = null;
@@ -205,7 +254,7 @@ async function main(): Promise<void> {
     }
   }
 
-  /** The G2 page text container — exactly one, event-capturing, byte-clipped. */
+  /** The G2 page text container — event-capturing, byte-clipped. */
   function textContainer(content: string): TextContainerProperty {
     return new TextContainerProperty({
       xPosition: 0,
@@ -222,12 +271,69 @@ async function main(): Promise<void> {
     });
   }
 
-  /** Contextual menu for the current state (docs actions only in the Docs tab). */
+  /**
+   * Master–detail panes for the Agents tab. Two containers, 4px gutters:
+   *   • left  x0   w200 — the agent list (event-capturing while focus='master')
+   *   • right x208 w368 — the selected agent's output (event-capturing otherwise)
+   * Exactly one container may be isEventCapture:1, so R1 input is routed by
+   * `agentFocus` rather than by which container was touched. The focused pane
+   * gets a 2px border as the documented selection highlight.
+   */
+  function agentContainers(): TextContainerProperty[] {
+    const a = getAgents();
+    const view = agentsMasterDetailView(
+      {
+        agents: a.agents,
+        sessions: a.sessions,
+        cursor: agentCursor,
+        focus: agentFocus,
+        sessionCursor: agentSessionCursor,
+        status: agentStatus || agentsStatusLine(agentRunning, agentError),
+      },
+      (id) => a.tools.find((t) => t.id === id)?.name ?? id,
+    );
+    agentCursor = view.cursor;
+    agentSessionCursor = view.sessionCursor;
+    const masterFocus = agentFocus === 'master';
+    return [
+      new TextContainerProperty({
+        xPosition: AGENT_LAYOUT.masterX,
+        yPosition: 0,
+        width: AGENT_LAYOUT.masterW,
+        height: AGENT_LAYOUT.height,
+        borderWidth: masterFocus ? 2 : 0,
+        borderColor: 5,
+        borderRadius: 0,
+        paddingLength: 4,
+        containerID: 1,
+        containerName: 'master',
+        isEventCapture: masterFocus ? 1 : 0,
+        content: clipBytes(view.master, MAX_CONTENT_BYTES),
+      }),
+      new TextContainerProperty({
+        xPosition: AGENT_LAYOUT.detailX,
+        yPosition: 0,
+        width: AGENT_LAYOUT.detailW,
+        height: AGENT_LAYOUT.height,
+        borderWidth: masterFocus ? 0 : 2,
+        borderColor: 5,
+        borderRadius: 0,
+        paddingLength: 4,
+        containerID: 2,
+        containerName: 'detail',
+        isEventCapture: masterFocus ? 0 : 1,
+        content: clipBytes(view.detail, MAX_CONTENT_BYTES),
+      }),
+    ];
+  }
+
+  /** Contextual menu for the current state (docs/agents actions in their tabs). */
   function currentSectionMenu(): MenuContainerProperty {
     const st = getState();
     return sectionMenu({
       section: st.activeSection,
       hasDocs: st.sections.docs.length > 0,
+      hasAgents: getAgents().agents.length > 0,
     });
   }
 
@@ -238,17 +344,37 @@ async function main(): Promise<void> {
       .join('|');
   }
 
+  /**
+   * Identity of the dual-pane layout: geometry + which pane captures events +
+   * the rendered text. A change means the page must be rebuilt (the border that
+   * highlights the focused pane is only settable on create/rebuild).
+   */
+  function agentSignature(containers: TextContainerProperty[]): string {
+    return containers
+      .map(
+        (c) =>
+          `${c.containerID}:${c.xPosition}:${c.width}:${c.borderWidth}:${c.isEventCapture}:${c.content ?? ''}`,
+      )
+      .join('|');
+  }
+
   async function createPage(content: string): Promise<StartUpPageCreateResult> {
     const menu = currentSectionMenu();
+    const agents = getState().activeSection === 'agents';
+    const containers = agents ? agentContainers() : [textContainer(content)];
     const res = await b.createStartUpPageContainer(
       new CreateStartUpPageContainer({
-        containerTotalNum: 1,
-        textObject: [textContainer(content)],
-        // OS contextual menu — state-aware: docs actions only in the Docs tab.
+        containerTotalNum: containers.length,
+        textObject: containers,
+        // OS contextual menu — state-aware: docs/agents actions only in their tab.
         menuObject: menu,
       }),
     );
-    if (res === StartUpPageCreateResult.success) appliedMenuSig = menuSignature(menu);
+    if (res === StartUpPageCreateResult.success) {
+      appliedMenuSig = menuSignature(menu);
+      appliedLayout = agents ? 'dual' : 'single';
+      appliedAgentSig = agents ? agentSignature(containers) : '';
+    }
     return res;
   }
 
@@ -416,8 +542,18 @@ async function main(): Promise<void> {
     });
   }
 
-  /** Drop a transcript into whatever section is active (To-Do → new task, etc.). */
+  /**
+   * Drop a transcript into whatever the dictation was started for: the active
+   * section (To-Do → new task, etc.) or the pending agent run.
+   */
   function commitSpeechToSection(text: string): void {
+    // Dictation started from "Run" captures the agent prompt instead.
+    if (dictationPurpose === 'agent') {
+      dictationPurpose = 'section';
+      agentRunSessionId = null;
+      void startAgentRun(text);
+      return;
+    }
     const st = getState();
     if (st.activeSection === 'todo') {
       const item: TodoItem = { id: uid(), text, done: false };
@@ -533,7 +669,7 @@ async function main(): Promise<void> {
         `🖼 createStartUpPageContainer -> ${res}${res === StartUpPageCreateResult.success ? '' : ' (REJECTED — nothing will draw on glasses)'}`,
       );
       started = res === StartUpPageCreateResult.success;
-      if (started) setStartupReady();
+      if (started) setStartupReady(); // createPage() already recorded the layout signature
       if (!started) {
         console.log('[hub] WARNING: startup page rejected');
         return;
@@ -542,12 +678,61 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Already created — if the contextual menu needs to change (entered/left
-    // the Docs tab, or the docs count crossed zero), REBUILD the page with the
-    // new menuObject. menuObject is replaced wholesale on rebuild (never merged),
-    // so we always pass the fresh menu for the current section.
     const menu = currentSectionMenu();
     const sig = menuSignature(menu);
+    const agentsTab = getState().activeSection === 'agents';
+
+    // Agents tab: two panes whose BORDERS encode the focused pane, so any focus
+    // or cursor change needs a rebuild. The master list and the output pane are
+    // independent containers; the menu is replaced at the same time.
+    if (agentsTab) {
+      const containers = agentContainers();
+      const asig = agentSignature(containers);
+      if (appliedLayout !== 'dual' || asig !== appliedAgentSig || sig !== appliedMenuSig) {
+        const ok = await b.rebuildPageContainer(
+          new RebuildPageContainer({
+            containerTotalNum: 2,
+            textObject: containers,
+            menuObject: menu,
+          }),
+        );
+        // The signature carries both pane contents (master | detail) — log enough
+        // of it to see what the panes actually show when debugging.
+        console.log('[hub] rebuildPageContainer (agents) ->', ok, agentFocus, asig.slice(0, 240));
+        if (ok) {
+          appliedLayout = 'dual';
+          appliedAgentSig = asig;
+          appliedMenuSig = sig;
+          renderedText = text;
+        }
+      }
+      return;
+    }
+
+    // Left the Agents tab (or a non-agents view is showing) — the page must go
+    // back to ONE container before the single-container update path can run.
+    if (appliedLayout !== 'single') {
+      const ok = await b.rebuildPageContainer(
+        new RebuildPageContainer({
+          containerTotalNum: 1,
+          textObject: [textContainer(text)],
+          menuObject: menu,
+        }),
+      );
+      console.log('[hub] rebuildPageContainer (single) ->', ok);
+      if (ok) {
+        appliedLayout = 'single';
+        appliedAgentSig = '';
+        appliedMenuSig = sig;
+        renderedText = text;
+      }
+      return;
+    }
+
+    // Already created — if the contextual menu needs to change (entered/left
+    // the Docs/Agents tab, or a collection count crossed zero), REBUILD the page
+    // with the new menuObject. menuObject is replaced wholesale on rebuild
+    // (never merged), so we always pass the fresh menu for the current section.
     if (sig !== appliedMenuSig) {
       const ok = await b.rebuildPageContainer(
         new RebuildPageContainer({
@@ -588,6 +773,88 @@ async function main(): Promise<void> {
     void renderGlasses();
   }
 
+  // ── Agents actions ─────────────────────────────────────────────────────────
+  /** The agent currently under the master-panel cursor. */
+  function agentSelected(): AgentDef | null {
+    const a = getAgents();
+    if (!a.agents.length) return null;
+    return a.agents[Math.min(a.agents.length - 1, Math.max(0, agentCursor))];
+  }
+
+  /** Contextual menu → "Select Agents": hand R1 control to the master list. */
+  function agentsSelect(): void {
+    agentFocus = 'master';
+    agentCursor = 0;
+    void renderGlasses();
+  }
+
+  /** Contextual menu → "New Agents": create an empty agent and highlight it. */
+  function agentsNew(): void {
+    const agent = emptyAgent();
+    updateAgents((s) => ({ ...s, agents: [...s.agents, agent] }));
+    agentCursor = Math.max(0, getAgents().agents.length - 1);
+    agentFocus = 'master';
+    void renderGlasses();
+  }
+
+  /** Contextual menu → "Delete Agents": remove the highlighted agent. */
+  function agentsDelete(): void {
+    const target = agentSelected();
+    if (!target) return;
+    updateAgents((s) => ({
+      ...s,
+      agents: s.agents.filter((a) => a.id !== target.id),
+      sessions: s.sessions.filter((x) => x.agentId !== target.id),
+    }));
+    agentCursor = Math.max(0, agentCursor - 1);
+    void renderGlasses();
+  }
+
+  /**
+   * Contextual menu → "Run": the glasses have no keyboard, so the prompt is
+   * captured with the existing dictation engine (glasses or phone mic) and then
+   * the agent loop runs. Progress + the final answer stream into the detail pane.
+   */
+  function agentsRun(): void {
+    if (agentRunning) return;
+    if (!agentSelected()) return;
+    if (isDictating()) return;
+    dictationPurpose = 'agent';
+    startGlassesDictation();
+  }
+
+  /** Execute the agent loop and record the session (capped at 5). */
+  async function startAgentRun(prompt: string): Promise<void> {
+    const agent = agentSelected();
+    if (!agent || agentRunning) return;
+    const st = getAgents();
+    const tools = st.tools.filter((t) => agent.toolIds.includes(t.id));
+    agentRunning = true;
+    agentError = '';
+    agentStatus = 'Thinking…';
+    agentFocus = 'detail';
+    agentSessionCursor = 0;
+    void renderGlasses();
+    const res = await runAgent(agent, tools, agent.model || st.llm.model, prompt, {
+      onStatus: (s) => {
+        agentStatus = s;
+        void renderGlasses();
+      },
+    });
+    agentRunning = false;
+    agentStatus = '';
+    agentError = res.ok ? '' : (res.error ?? 'failed');
+    recordSession({
+      id: agentRunSessionId ?? undefined,
+      agentId: agent.id,
+      title: prompt.slice(0, 48) || 'Session',
+      messages: res.messages,
+      status: res.ok ? 'done' : 'error',
+    });
+    agentRunSessionId = null;
+    void renderGlasses();
+  }
+
   /**
    * Reusable tab switch: resets navigation state so the new section starts at
    * its first item/page, and remembers the last non-Docs tab so the Docs
@@ -601,12 +868,20 @@ async function main(): Promise<void> {
     todoCursor = 0;
     docPage = 0;
     lastView = null;
+    // Agents pane navigation is per-visit; reset so each entry starts clean.
+    agentFocus = 'master';
+    agentCursor = 0;
+    agentSessionCursor = 0;
+    agentStatus = '';
+    agentError = '';
     update((s) => ({ ...s, activeSection: next }));
   }
 
-  /** Docs tab → "Back": return to the last non-Docs tab. */
+  /** Menu → "Back": Docs returns to the previous tab, Agents to the first tab. */
   function goBack(): void {
-    switchSection(lastNonDocsSection);
+    const cur = getState().activeSection;
+    if (cur === 'agents') switchSection('todo');
+    else switchSection(lastNonDocsSection);
   }
 
   function newDoc(): void {
@@ -671,6 +946,31 @@ async function main(): Promise<void> {
       }
       return;
     }
+    // Agents — master cursor moves the selection; detail browses stored sessions.
+    if (getState().activeSection === 'agents') {
+      if (agentFocus === 'master') {
+        const n = getAgents().agents.length;
+        if (!n) return;
+        const next = Math.min(n - 1, Math.max(0, agentCursor + dir));
+        if (next !== agentCursor) {
+          agentCursor = next;
+          agentSessionCursor = 0;
+          void renderGlasses();
+        }
+      } else {
+        const agent = agentSelected();
+        const n = agent
+          ? getAgents().sessions.filter((s) => s.agentId === agent.id).length
+          : 0;
+        if (n <= 1) return;
+        const next = Math.min(n - 1, Math.max(0, agentSessionCursor + dir));
+        if (next !== agentSessionCursor) {
+          agentSessionCursor = next;
+          void renderGlasses();
+        }
+      }
+      return;
+    }
     // docs / notes — flip pages.
     if (!lastView) return;
     if (dir === -1 && lastView.canPrev) {
@@ -710,6 +1010,15 @@ async function main(): Promise<void> {
       onPickerTap();
       return;
     }
+    // Agents: tapping the master list moves control to the detail pane.
+    if (getState().activeSection === 'agents') {
+      if (agentFocus === 'master' && agentSelected()) {
+        agentFocus = 'detail';
+        agentSessionCursor = 0;
+        void renderGlasses();
+      }
+      return;
+    }
     if (getState().activeSection !== 'todo') return;
     const items = getState().sections.todo;
     if (!items.length || todoCursor >= items.length) return;
@@ -732,6 +1041,11 @@ async function main(): Promise<void> {
       saveDocsTimer = null;
       void saveDocsDurable(getState().sections.docs);
     }, 400);
+  });
+
+  // Any agents change (glasses edit, web edit, remote frame) re-renders.
+  subscribeAgents(() => {
+    void renderGlasses();
   });
 
   // R1 ring / G2 touchpad: swipe up/down moves the todo cursor (or flips a
@@ -763,7 +1077,23 @@ async function main(): Promise<void> {
         goBack();
         return;
       }
-      // Section switchers (To-Do / Docs / Notes) also cancel any picker.
+      if (itemID === MENU.AGENT_SELECT) {
+        agentsSelect();
+        return;
+      }
+      if (itemID === MENU.AGENT_NEW) {
+        agentsNew();
+        return;
+      }
+      if (itemID === MENU.AGENT_DELETE) {
+        agentsDelete();
+        return;
+      }
+      if (itemID === MENU.AGENT_RUN) {
+        agentsRun();
+        return;
+      }
+      // Section switchers (To-Do / Docs / Notes / Agents) also cancel any picker.
       const def = sectionByMenuId(itemID);
       if (def) switchSection(def.id);
       return;

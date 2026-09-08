@@ -1,4 +1,4 @@
-import type { HubState, StreamFrame } from './types';
+import type { AgentsState, HubState, StreamFrame } from './types';
 import { getStreamToken, notifyAuthRejected } from './auth-token';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
@@ -10,12 +10,25 @@ export const STREAM_URL: string =
 // Base origin of the relay API (auth / config / stream). Same-origin by default.
 export const API_BASE: string = STREAM_URL.split('/api/')[0];
 
+// Agents ride a SEPARATE channel: agent configs + session transcripts must not
+// bloat or leak through the hub channel (HubState is broadcast + persisted).
+export const AGENTS_STREAM_URL: string =
+  (import.meta.env.VITE_HUB_AGENTS_URL as string | undefined) ?? '/api/stream?channel=agents';
+
 /** The SSE/state URL with the current stream credential appended. */
 export function streamUrl(): string {
+  return withToken(STREAM_URL);
+}
+
+export function agentsStreamUrl(): string {
+  return withToken(AGENTS_STREAM_URL);
+}
+
+function withToken(url: string): string {
   const token = getStreamToken();
-  if (!token) return STREAM_URL;
-  const sep = STREAM_URL.includes('?') ? '&' : '?';
-  return `${STREAM_URL}${sep}token=${encodeURIComponent(token)}`;
+  if (!token) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(token)}`;
 }
 
 export interface StreamHandlers {
@@ -23,15 +36,29 @@ export interface StreamHandlers {
   onStatus?(status: 'connecting' | 'open' | 'error'): void;
 }
 
+export interface AgentsStreamHandlers {
+  onState(state: AgentsState): void;
+  onStatus?(status: 'connecting' | 'open' | 'error'): void;
+}
+
 /** Publish the full HubState snapshot to the relay (broadcast to all devices). */
 export async function publishState(state: HubState): Promise<boolean> {
+  return postJson(STREAM_URL, state);
+}
+
+/** Publish the agents snapshot (configs + the last 5 sessions) to the relay. */
+export async function publishAgents(state: AgentsState): Promise<boolean> {
+  return postJson(AGENTS_STREAM_URL, state);
+}
+
+async function postJson(url: string, body: unknown): Promise<boolean> {
   const token = getStreamToken();
   if (!token) return false; // not authorized yet — nothing to publish to
   try {
-    const res = await fetch(streamUrl(), {
+    const res = await fetch(withToken(url), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(state),
+      body: JSON.stringify(body),
     });
     if (res.status === 401) notifyAuthRejected(); // credential no longer valid
     return res.ok;
@@ -74,6 +101,19 @@ async function credentialStillValid(): Promise<boolean> {
  * but we manage re-creation to surface status changes).
  */
 export function connectStream(handlers: StreamHandlers): () => void {
+  return connectSse<HubState>(streamUrl, (frame) => frame.state, handlers);
+}
+
+/** Same SSE client, pointed at the separate 'agents' channel. */
+export function connectAgentsStream(handlers: AgentsStreamHandlers): () => void {
+  return connectSse<AgentsState>(agentsStreamUrl, (frame) => frame.state, handlers);
+}
+
+function connectSse<T>(
+  urlFn: () => string,
+  pick: (frame: StreamFrame<T>) => T,
+  handlers: { onState(state: T): void; onStatus?(status: 'connecting' | 'open' | 'error'): void },
+): () => void {
   let es: EventSource | null = null;
   let closed = false;
   let retry = 0;
@@ -81,7 +121,7 @@ export function connectStream(handlers: StreamHandlers): () => void {
   const connect = () => {
     if (closed) return;
     handlers.onStatus?.('connecting');
-    es = new EventSource(streamUrl());
+    es = new EventSource(urlFn());
 
     es.onopen = () => {
       retry = 0;
@@ -107,8 +147,9 @@ export function connectStream(handlers: StreamHandlers): () => void {
 
     es.onmessage = (e) => {
       try {
-        const frame = JSON.parse(e.data as string) as StreamFrame;
-        if (frame?.state) handlers.onState(frame.state);
+        const frame = JSON.parse(e.data as string) as StreamFrame<T>;
+        const state = pick(frame);
+        if (state) handlers.onState(state);
       } catch {
         // ignore malformed frames
       }

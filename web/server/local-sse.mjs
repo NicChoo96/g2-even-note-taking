@@ -20,17 +20,24 @@
 //   GET  /api/stt/status          -> is a speech provider configured?
 //   POST /api/stt                 -> raw audio bytes -> transcribed text
 //                                     (auth required; key stays server-side)
+//   GET  /api/agent/status        -> are the LLM + Tavily keys configured?
+//   POST /api/settings            -> owner sets model / keys (never echoed back)
+//   POST /api/llm                 -> OpenRouter chat-completions proxy (tools ok)
+//   POST /api/tool                -> Tavily web search / generic REST tool proxy
 //
 // SECURITY: /api/stream (GET + POST) requires a valid owner session token OR an
 // approved per-device ID. Browsers authenticate via Google SSO; each glasses
 // device gets its own unguessable deviceId that the owner approves from a
 // logged-in browser. There is NO anonymous read of the stream and NO shared
-// device login. /api/stt is protected the same way so randos can't spend your
-// speech-provider key.
+// device login. /api/stt, /api/llm and /api/tool are protected the same way so
+// randos can't spend your provider keys — and those keys live ONLY in this
+// process (env or .g2-hub-secrets.json), never in the client bundle.
 //
 // Env: PORT, STATE_FILE, AUTH_FILE, GOOGLE_CLIENT_ID, ALLOWED_EMAILS
 // (comma-separated), OPENAI_API_KEY (Whisper) or DEEPGRAM_API_KEY (Nova-2) for
-// voice dictation. Zero runtime dependencies (node built-ins only). Run:
+// voice dictation; OPENROUTER_API_KEY + TAVILY_API_KEY (+ optional
+// OPENROUTER_MODEL, OPENROUTER_REFERER, OPENROUTER_TITLE, TAVILY_SEARCH_DEPTH)
+// for the Agents feature. Zero runtime dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -212,6 +219,107 @@ function openaiMultipart(audio, contentType) {
 }
 
 loadAuthStore();
+
+// ── Agents: LLM + tool proxy ─────────────────────────────────────────────────
+// The OpenRouter and Tavily keys live ONLY here (env vars, or a gitignored
+// .g2-hub-secrets.json written by POST /api/settings from the owner's browser).
+// They are never sent to a client, never logged, and never included in any
+// response body — clients only ever learn the boolean `hasKey`.
+const SECRETS_FILE = process.env.SECRETS_FILE || join(process.cwd(), '.g2-hub-secrets.json');
+const DEFAULT_MODEL = 'nvidia/nemotron-3.5-lightning:free';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const TAVILY_URL = 'https://api.tavily.com/search';
+const LLM_MAX_BYTES = 512 * 1024;
+const TOOL_MAX_BYTES = 32 * 1024;
+
+/** Persisted overrides (model/referer/title/depth + keys) — see loadSecrets(). */
+const secrets = { openrouterKey: '', tavilyKey: '', model: '', referer: '', title: '', depth: '' };
+
+/** Per-tool bearer tokens for generic REST tools: { [toolId]: token }. */
+const toolTokens = new Map();
+
+function loadSecrets() {
+  try {
+    const raw = readFileSync(SECRETS_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    for (const k of Object.keys(secrets)) {
+      if (typeof data?.[k] === 'string' && data[k]) secrets[k] = data[k];
+    }
+    if (data?.toolTokens && typeof data.toolTokens === 'object') {
+      for (const [id, token] of Object.entries(data.toolTokens)) {
+        if (typeof token === 'string') toolTokens.set(id, token);
+      }
+    }
+    console.log(`[g2-hub] loaded agent secrets from ${SECRETS_FILE}`);
+  } catch {
+    /* none yet — env vars or the settings page can provide them */
+  }
+}
+
+function persistSecrets() {
+  try {
+    writeFileSync(
+      SECRETS_FILE,
+      JSON.stringify({ ...secrets, toolTokens: Object.fromEntries(toolTokens) }, null, 2),
+      { mode: 0o600 },
+    );
+  } catch (err) {
+    console.warn('[g2-hub] could not persist secrets:', err?.message || err);
+  }
+}
+
+/** Effective config — env wins over the persisted file, so hosts can override. */
+function llmConfig() {
+  return {
+    key: process.env.OPENROUTER_API_KEY || secrets.openrouterKey || '',
+    model: process.env.OPENROUTER_MODEL || secrets.model || DEFAULT_MODEL,
+    referer: process.env.OPENROUTER_REFERER || secrets.referer || '',
+    title: process.env.OPENROUTER_TITLE || secrets.title || 'G2 Even Reality Hub',
+  };
+}
+
+function tavilyConfig() {
+  return {
+    key: process.env.TAVILY_API_KEY || secrets.tavilyKey || '',
+    depth:
+      process.env.TAVILY_SEARCH_DEPTH || secrets.depth || 'basic', // default: basic
+  };
+}
+
+/** OpenRouter attribution headers (required for free-tier routing). */
+function openrouterHeaders(cfg) {
+  return {
+    Authorization: `Bearer ${cfg.key}`,
+    'Content-Type': 'application/json',
+    ...(cfg.referer ? { 'HTTP-Referer': cfg.referer } : {}),
+    ...(cfg.title ? { 'X-OpenRouter-Title': cfg.title } : {}),
+  };
+}
+
+async function readJsonBody(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error('body too large');
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function json(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
+}
+
+/** Keep tool results bounded — they are fed straight back into the model. */
+function clipText(s, n) {
+  const t = String(s ?? '');
+  return t.length > n ? `${t.slice(0, n)}…[truncated]` : t;
+}
+
+loadSecrets();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -775,6 +883,236 @@ const server = createServer(async (req, res) => {
           error: err instanceof Error ? err.message : String(err),
         }),
       );
+    }
+    return;
+  }
+
+  // Agents capability probe — the web UI shows setup hints and the glasses app
+  // refuses to run an agent when the keys are missing.
+  if (req.method === 'GET' && url.pathname === '/api/agent/status') {
+    const llm = llmConfig();
+    const tv = tavilyConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        llm: Boolean(llm.key),
+        tavily: Boolean(tv.key),
+        model: llm.model,
+        depth: tv.depth,
+      }),
+    );
+    return;
+  }
+
+  // Owner-only: store the LLM/tool keys + model in .g2-hub-secrets.json.
+  // Values are write-only — the response only reports booleans.
+  if (req.method === 'POST' && url.pathname === '/api/settings') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 8 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    const map = {
+      openrouterKey: 'openrouterKey',
+      tavilyKey: 'tavilyKey',
+      model: 'model',
+      referer: 'referer',
+      title: 'title',
+      depth: 'depth',
+    };
+    let touched = false;
+    for (const [field, slot] of Object.entries(map)) {
+      if (typeof body[field] === 'string') {
+        secrets[slot] = body[field].trim();
+        touched = true;
+      }
+    }
+    // Generic REST tools: store each tool's bearer token keyed by tool id.
+    if (body?.toolTokens && typeof body.toolTokens === 'object') {
+      for (const [id, token] of Object.entries(body.toolTokens)) {
+        if (typeof token !== 'string') continue;
+        if (token) toolTokens.set(id, token);
+        else toolTokens.delete(id);
+        touched = true;
+      }
+    }
+    if (touched) persistSecrets();
+    const llm = llmConfig();
+    const tv = tavilyConfig();
+    json(res, 200, {
+      ok: true,
+      llm: Boolean(llm.key),
+      tavily: Boolean(tv.key),
+      model: llm.model,
+      depth: tv.depth,
+    });
+    return;
+  }
+
+  // OpenRouter chat-completions proxy. Auth required; the API key never leaves
+  // this process. Supports the OpenAI `tools` / `tool_calls` protocol so the
+  // hand-rolled agent loop in glasses/src/agents.ts can do multi-step reasoning.
+  if (req.method === 'POST' && url.pathname === '/api/llm') {
+    const principal = principalFromToken(readToken(req, url));
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+    const cfg = llmConfig();
+    if (!cfg.key) {
+      json(res, 501, {
+        ok: false,
+        error: 'LLM not configured — set OPENROUTER_API_KEY or save it in Settings',
+      });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, LLM_MAX_BYTES);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid or oversized JSON' });
+      return;
+    }
+    if (!Array.isArray(body?.messages) || !body.messages.length) {
+      json(res, 400, { ok: false, error: 'messages[] is required' });
+      return;
+    }
+    const payload = {
+      model: typeof body.model === 'string' && body.model ? body.model : cfg.model,
+      messages: body.messages,
+      ...(Array.isArray(body.tools) && body.tools.length
+        ? { tools: body.tools, tool_choice: body.tool_choice || 'auto' }
+        : {}),
+      ...(typeof body.temperature === 'number' ? { temperature: body.temperature } : {}),
+    };
+    try {
+      const r = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: openrouterHeaders(cfg),
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        json(res, 502, {
+          ok: false,
+          error: j?.error?.message || `OpenRouter ${r.status}`,
+        });
+        return;
+      }
+      const choice = j?.choices?.[0]?.message ?? {};
+      json(res, 200, {
+        ok: true,
+        model: j?.model || payload.model,
+        message: {
+          role: 'assistant',
+          content: String(choice.content ?? ''),
+          ...(Array.isArray(choice.tool_calls) ? { tool_calls: choice.tool_calls } : {}),
+        },
+        usage: j?.usage ?? null,
+      });
+    } catch (err) {
+      json(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+    return;
+  }
+
+  // Tool proxy — Tavily web search (key + default depth server-side) and any
+  // generic REST endpoint with an optional bearer token, so the WebView never
+  // hits CORS or needs the URL in the manifest whitelist.
+  if (req.method === 'POST' && url.pathname === '/api/tool') {
+    const principal = principalFromToken(readToken(req, url));
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, TOOL_MAX_BYTES);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid or oversized JSON' });
+      return;
+    }
+    const args = body?.args && typeof body.args === 'object' ? body.args : {};
+    try {
+      if (body?.kind === 'tavily') {
+        const tv = tavilyConfig();
+        if (!tv.key) {
+          json(res, 501, {
+            ok: false,
+            error: 'Tavily not configured — set TAVILY_API_KEY or save it in Settings',
+          });
+          return;
+        }
+        const query = String(args.query ?? args.input ?? '').trim();
+        if (!query) {
+          json(res, 400, { ok: false, error: 'query is required' });
+          return;
+        }
+        const depth =
+          args.search_depth === 'advanced' || args.search_depth === 'basic'
+            ? args.search_depth
+            : tv.depth;
+        const r = await fetch(TAVILY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey: tv.key, query, search_depth: depth }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          json(res, 502, {
+            ok: false,
+            error: j?.detail?.error || j?.error || `Tavily ${r.status}`,
+          });
+          return;
+        }
+        // Compact the payload: the model only needs title/url/snippet.
+        const results = Array.isArray(j?.results) ? j.results.slice(0, 5) : [];
+        const lines = results.map(
+          (x, i) =>
+            `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, 500)}`,
+        );
+        const answer = j?.answer ? `Answer: ${j.answer}\n\n` : '';
+        json(res, 200, {
+          ok: true,
+          result: clipText(`${answer}${lines.join('\n\n')}` || 'No results.', 4000),
+        });
+        return;
+      }
+
+      // Generic REST tool: the model supplies the JSON body / query params.
+      const target = String(body?.url || '').trim();
+      if (!/^https:\/\//i.test(target)) {
+        json(res, 400, { ok: false, error: 'tool url must be https://' });
+        return;
+      }
+      const method = body?.method === 'GET' ? 'GET' : 'POST';
+      const toolId = typeof body?.toolId === 'string' ? body.toolId : '';
+      const token = (toolId && toolTokens.get(toolId)) || '';
+      const headers = { Accept: 'application/json' };
+      if (token) headers.Authorization = `Bearer ${token}`;
+      let finalUrl = target;
+      const init = { method, headers };
+      if (method === 'GET') {
+        const qs = new URLSearchParams();
+        for (const [k, v] of Object.entries(args)) qs.set(k, String(v));
+        if ([...qs].length) finalUrl += (target.includes('?') ? '&' : '?') + qs.toString();
+      } else {
+        headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(args);
+      }
+      const r = await fetch(finalUrl, init);
+      const text = await r.text();
+      json(res, 200, { ok: r.ok, result: clipText(text, 4000) });
+    } catch (err) {
+      json(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
     }
     return;
   }
