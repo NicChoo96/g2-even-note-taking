@@ -45,6 +45,10 @@ import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { createPublicKey, createVerify, randomBytes, createHash } from 'node:crypto';
 import { extname, join, normalize, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// The clock the model never had. Stamps every system prompt with the exact
+// date/time a run started and resolves relative phrases in the user prompt
+// BEFORE the first tool call (see datetime.mjs).
+import { preprocessText, withDateTime, withDateTimeMessages } from './datetime.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -558,10 +562,26 @@ async function executeRun(run) {
     run.messages.push(m);
     broadcastRun(run);
   };
+  // The clock is fixed at trigger time so every step of the loop (including
+  // the tools) reasons about the same "now".
+  const now = new Date(run.startedAt);
+  const resolved = preprocessText(run.prompt, now);
   const wire = [
-    { role: 'system', content: run.systemPrompt || 'You are a helpful assistant.' },
-    { role: 'user', content: run.prompt },
+    { role: 'system', content: withDateTime(run.systemPrompt || 'You are a helpful assistant.', now) },
+    { role: 'user', content: resolved.text },
   ];
+  // Show the resolutions in the transcript so it is obvious the model was not
+  // left to guess. Runs with no relative words gain nothing and stay clean.
+  // NOTE: ASCII only — the G2 firmware font has no emoji glyphs, so a clock
+  // emoji here would render as a missing-glyph box on the glasses.
+  if (resolved.notes.length) {
+    run.messages.push({
+      role: 'assistant',
+      content: `[time] ${resolved.notes.join('; ')}`,
+      at: Date.now(),
+    });
+    broadcastRun(run);
+  }
   const schemas = run.tools.map(toolSchemaFor);
   const ac = new AbortController();
   runAbort.set(run.id, ac);
@@ -1422,7 +1442,7 @@ const server = createServer(async (req, res) => {
     }
     const payload = {
       model: typeof body.model === 'string' && body.model ? body.model : cfg.model,
-      messages: body.messages,
+      messages: withDateTimeMessages(body.messages, new Date()),
       ...(Array.isArray(body.tools) && body.tools.length
         ? { tools: body.tools, tool_choice: body.tool_choice || 'auto' }
         : {}),
@@ -1486,7 +1506,7 @@ const server = createServer(async (req, res) => {
           });
           return;
         }
-        const query = String(args.query ?? args.input ?? '').trim();
+        const query = preprocessText(String(args.query ?? args.input ?? '').trim(), new Date()).text;
         if (!query) {
           json(res, 400, { ok: false, error: 'query is required' });
           return;
@@ -1533,15 +1553,24 @@ const server = createServer(async (req, res) => {
       const token = (toolId && toolTokens.get(toolId)) || '';
       const headers = { Accept: 'application/json' };
       if (token) headers.Authorization = `Bearer ${token}`;
+      // Resolve relative dates in the model's own arguments too — a custom
+      // REST tool is just as date-sensitive as a web search.
+      const now = new Date();
+      const resolvedArgs = Object.fromEntries(
+        Object.entries(args).map(([k, v]) => [
+          k,
+          typeof v === 'string' ? preprocessText(v, now).text : v,
+        ]),
+      );
       let finalUrl = target;
       const init = { method, headers };
       if (method === 'GET') {
         const qs = new URLSearchParams();
-        for (const [k, v] of Object.entries(args)) qs.set(k, String(v));
+        for (const [k, v] of Object.entries(resolvedArgs)) qs.set(k, String(v));
         if ([...qs].length) finalUrl += (target.includes('?') ? '&' : '?') + qs.toString();
       } else {
         headers['Content-Type'] = 'application/json';
-        init.body = JSON.stringify(args);
+        init.body = JSON.stringify(resolvedArgs);
       }
       const r = await fetch(finalUrl, init);
       const text = await r.text();

@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.12
+
+v0.3.12 - Agents know the date
+
+- Agents were guessing the date, so "today", "this week", "last week" and "past 1 year" returned the wrong period.
+- Every run now carries the exact date and time from your device, and those phrases are resolved to real dates before any search runs.
+- The resolved range is shown in the transcript so you can see what was used.
+- Applies to agent runs, chat, and web search.
+
 ## 0.3.11
 
 v0.3.11 - Dictation commits only when you stop
