@@ -82,11 +82,12 @@ export interface MenuState {
  *
  *   • **Dictate is always the FIRST item** so a long-press reaches it instantly.
  *   • **Docs tab** → Dictate · Back · New Docs · Select Docs · Delete Docs.
- *   • **Agents tab** → Dictate · Trigger (becomes Stop while a run is in flight).
- *     Trigger runs the highlighted agent's SAVED prompt — no dictation needed
- *     on this tab. Select / New / Delete were removed: agent CRUD lives in the
- *     web app, and the ring already moves between the master list and the
- *     detail pane without a menu item (tap into the detail, double-tap back).
+ *   • **Agents tab** → Dictate · Back · Trigger (becomes Stop while a run is in
+ *     flight). Trigger runs the highlighted agent's SAVED prompt — no dictation
+ *     needed on this tab. Select / New / Delete were removed: agent CRUD lives
+ *     in the web app, and the ring already moves between the master list and
+ *     the detail pane without a menu item (tap into the detail, double-tap
+ *     back). Back is KEPT — it is the only way off this tab.
  *   • **Any other tab** → Dictate · To-Do · Docs · Notes · Agents.
  *
  * The menu is applied on the startup page and REPLACED wholesale on every
@@ -109,11 +110,13 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
       items.push(new MenuItemProperty({ itemName: 'Delete Docs', itemID: MENU.DOC_DELETE }));
     }
   } else if (state.section === 'agents') {
-    // Agents-scoped action: ONLY the run control. Trigger fires the highlighted
-    // agent's SAVED prompt server-side (so it keeps running if the glasses page
-    // is backgrounded) and streams the transcript back into the detail panel.
-    // The master↔detail move is a gesture now (tap in, double-tap back), so the
-    // menu stays at two items and a long-press never buries the run control.
+    // Back is the ONLY way off this tab (the switchers are hidden here), so it
+    // stays. Then the run control: Trigger fires the highlighted agent's SAVED
+    // prompt server-side (so it keeps running if the glasses page is
+    // backgrounded) and streams the transcript back into the detail panel.
+    // The master↔detail move is a gesture now (tap in, double-tap back), so
+    // Select/New/Delete Agents are gone and the menu stays three items long.
+    items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
     if (state.hasAgents) {
       items.push(
         state.agentRunning

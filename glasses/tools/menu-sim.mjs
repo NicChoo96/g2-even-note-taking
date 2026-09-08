@@ -73,19 +73,26 @@ check('docs (empty)', names(sectionMenu({ section: 'docs', hasDocs: false })), [
 ]);
 
 // ── Agents tab ──────────────────────────────────────────────────────────────
-// The Agents menu carries ONLY the run control: agent CRUD lives in the web
-// app and the master↔detail move is a gesture (tap in, double-tap back).
+// The Agents menu carries Back + the run control: agent CRUD lives in the web
+// app and the master↔detail move is a gesture (tap in, double-tap back). Back
+// stays because it is the only way off this tab.
 const agents = sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true });
-check('agents (has agents)', names(agents), ['Dictate', 'Trigger']);
-check('agents ids', ids(agents), [MENU.DICTATE, MENU.AGENT_TRIGGER]);
+check('agents (has agents)', names(agents), ['Dictate', 'Back', 'Trigger']);
+check('agents ids', ids(agents), [MENU.DICTATE, MENU.BACK, MENU.AGENT_TRIGGER]);
 check(
   'agents (running) shows Stop',
   names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true, agentRunning: true })),
-  ['Dictate', 'Stop'],
+  ['Dictate', 'Back', 'Stop'],
 );
 check('agents (empty)', names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: false })), [
   'Dictate',
+  'Back',
 ]);
+assert(
+  'agents menu keeps Back (only way off the tab)',
+  names(agents).includes('Back'),
+  names(agents).join(','),
+);
 assert(
   'agents menu drops Select/New/Delete',
   !names(agents).some((n) => /Select|New|Delete/.test(n)),

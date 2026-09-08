@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.10
+
+v0.3.10 - Back returns to the Agents menu
+
+- Restored the Back item on the Agents menu so you can leave the tab without closing the app.
+- The menu is now Dictate, Back, and Trigger (or Stop while a run is live).
+- Tap the agent list to open the detail pane; double-tap returns to the list.
+
 ## 0.3.9
 
 v0.3.9 - Leaner Agents menu, double-tap back
