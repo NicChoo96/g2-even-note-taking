@@ -323,21 +323,63 @@ function persistSecrets() {
   }
 }
 
-/** Effective config — env wins over the persisted file, so hosts can override. */
+/**
+ * Effective config — env wins over the persisted file, so a host (Railway,
+ * Docker, systemd…) can own the keys and the settings page cannot shadow them.
+ * `source` records WHICH layer won for each field so the UI can say "managed by
+ * the server environment" instead of showing an empty box and a false
+ * "no key" warning. Values themselves are still never echoed to a client.
+ */
 function llmConfig() {
+  const envKey = process.env.OPENROUTER_API_KEY || '';
+  const fileKey = secrets.openrouterKey || '';
+  const envModel = process.env.OPENROUTER_MODEL || '';
+  const fileModel = secrets.model || '';
+  const envReferer = process.env.OPENROUTER_REFERER || '';
+  const envTitle = process.env.OPENROUTER_TITLE || '';
   return {
-    key: process.env.OPENROUTER_API_KEY || secrets.openrouterKey || '',
-    model: process.env.OPENROUTER_MODEL || secrets.model || DEFAULT_MODEL,
-    referer: process.env.OPENROUTER_REFERER || secrets.referer || '',
-    title: process.env.OPENROUTER_TITLE || secrets.title || 'G2 Even Reality Hub',
+    key: envKey || fileKey || '',
+    model: envModel || fileModel || DEFAULT_MODEL,
+    referer: envReferer || secrets.referer || '',
+    title: envTitle || secrets.title || 'G2 Even Reality Hub',
+    source: {
+      key: envKey ? 'env' : fileKey ? 'settings' : 'none',
+      model: envModel ? 'env' : fileModel ? 'settings' : 'default',
+      referer: envReferer ? 'env' : secrets.referer ? 'settings' : 'none',
+      title: envTitle ? 'env' : secrets.title ? 'settings' : 'default',
+    },
   };
 }
 
 function tavilyConfig() {
+  const envKey = process.env.TAVILY_API_KEY || '';
+  const fileKey = secrets.tavilyKey || '';
+  const envDepth = process.env.TAVILY_SEARCH_DEPTH || '';
   return {
-    key: process.env.TAVILY_API_KEY || secrets.tavilyKey || '',
-    depth:
-      process.env.TAVILY_SEARCH_DEPTH || secrets.depth || 'basic', // default: basic
+    key: envKey || fileKey || '',
+    depth: envDepth || secrets.depth || 'basic', // default: basic
+    source: {
+      key: envKey ? 'env' : fileKey ? 'settings' : 'none',
+      depth: envDepth ? 'env' : secrets.depth ? 'settings' : 'default',
+    },
+  };
+}
+
+/**
+ * The only capability shape any client ever sees: booleans + provenance, never
+ * a key value. Shared by /api/agent/status and /api/settings so the two can
+ * never disagree about what is configured.
+ */
+function agentStatusPayload() {
+  const llm = llmConfig();
+  const tv = tavilyConfig();
+  return {
+    ok: true,
+    llm: Boolean(llm.key),
+    tavily: Boolean(tv.key),
+    model: llm.model,
+    depth: tv.depth,
+    source: { llm: llm.source, tavily: tv.source },
   };
 }
 
@@ -1183,20 +1225,10 @@ const server = createServer(async (req, res) => {
   }
 
   // Agents capability probe — the web UI shows setup hints and the glasses app
-  // refuses to run an agent when the keys are missing.
+  // refuses to run an agent when the keys are missing. Unauthenticated on
+  // purpose: it exposes only booleans and provenance, never a key.
   if (req.method === 'GET' && url.pathname === '/api/agent/status') {
-    const llm = llmConfig();
-    const tv = tavilyConfig();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        ok: true,
-        llm: Boolean(llm.key),
-        tavily: Boolean(tv.key),
-        model: llm.model,
-        depth: tv.depth,
-      }),
-    );
+    json(res, 200, agentStatusPayload());
     return;
   }
 
@@ -1336,15 +1368,7 @@ const server = createServer(async (req, res) => {
       }
     }
     if (touched) persistSecrets();
-    const llm = llmConfig();
-    const tv = tavilyConfig();
-    json(res, 200, {
-      ok: true,
-      llm: Boolean(llm.key),
-      tavily: Boolean(tv.key),
-      model: llm.model,
-      depth: tv.depth,
-    });
+    json(res, 200, agentStatusPayload());
     return;
   }
 

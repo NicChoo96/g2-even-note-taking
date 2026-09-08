@@ -304,7 +304,10 @@ export default function App() {
           : { cls: '', label: 'Ready' };
 
   return (
-    <div className="app">
+    // `app-wide` widens the shell for the Agents tab only: its two-pane editor
+    // needs ~1040px, and the 760px reading width that suits notes/docs/docs
+    // would otherwise squeeze the master list and the form fields.
+    <div className={`app${activeTab === 'agents' ? ' app-wide' : ''}`}>
       <header className="app-header">
         <div>
           <h1>🥽 G2 Even Reality Hub</h1>

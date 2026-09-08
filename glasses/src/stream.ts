@@ -149,7 +149,9 @@ function connectSse<T>(
         retry += 1;
         // After a few failed reconnects, confirm the credential is still valid;
         // a 401 (reset auth store) otherwise shows as a misleading "Offline".
-        if (retry === 3) {
+        // Only meaningful when we actually HAVE a credential — a reconnect that
+        // raced ahead of session restore must not be read as "signed out".
+        if (retry === 3 && getStreamToken()) {
           void credentialStillValid().then((ok) => {
             if (!ok) notifyAuthRejected();
           });
@@ -226,7 +228,7 @@ export async function startRun(args: {
       headers: { 'Content-Type': 'application/json', ...authHeader() },
       body: JSON.stringify(args),
     });
-    if (res.status === 401) notifyAuthRejected();
+    if (res.status === 401) notifyIfCredentialWasSent();
     const j = (await res.json().catch(() => ({}))) as { ok?: boolean; runId?: string };
     return j?.ok && j.runId ? j.runId : null;
   } catch {
@@ -252,7 +254,7 @@ export async function stopRun(runId: string): Promise<boolean> {
 export async function fetchRuns(): Promise<AgentRun[]> {
   try {
     const res = await fetch(`${API_BASE}/api/agent/runs`, { headers: authHeader() });
-    if (res.status === 401) notifyAuthRejected();
+    if (res.status === 401) notifyIfCredentialWasSent();
     if (!res.ok) return [];
     const j = (await res.json()) as { ok?: boolean; runs?: AgentRun[] };
     return j?.runs ?? [];
@@ -264,6 +266,17 @@ export async function fetchRuns(): Promise<AgentRun[]> {
 function authHeader(): Record<string, string> {
   const token = getStreamToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * A 401 only means "your credential is bad" if we actually SENT one. Boot-time
+ * requests (connectRuns/fetchRuns fire before a session is restored) used to
+ * trip this and revoke a perfectly valid session, which is why the agents panel
+ * showed "session failed to fetch". Anonymous 401s are ignored here; the SSE
+ * path still re-checks the credential after repeated reconnect failures.
+ */
+function notifyIfCredentialWasSent(): void {
+  if (getStreamToken()) notifyAuthRejected();
 }
 
 /** Subscribe to run frames on the agents channel. Returns an unsubscribe fn. */

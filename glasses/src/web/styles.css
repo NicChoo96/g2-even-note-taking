@@ -41,6 +41,12 @@ body {
   min-height: 100%;
 }
 
+/* The Agents tab is an editor, not a reading column: give it room so the
+   master list and the form fields are not crushed by the 760px prose width. */
+.app-wide {
+  max-width: 1060px;
+}
+
 /* Header */
 .app-header {
   display: flex;
@@ -213,10 +219,15 @@ textarea::placeholder {
   opacity: 0.75;
 }
 
+/* Env-managed inputs stay readable (dashed, muted) rather than being dimmed to
+   the point of looking broken. */
 input:disabled,
 select:disabled,
 textarea:disabled {
-  opacity: 0.5;
+  opacity: 1;
+  color: var(--muted);
+  background: var(--bg);
+  border-style: dashed;
   cursor: not-allowed;
 }
 
@@ -356,6 +367,16 @@ select {
   width: 26px;
   height: 26px;
   border-radius: 6px;
+  flex: none;
+}
+
+/* Same muted/danger look, but sized for a text label instead of a glyph. */
+.icon-btn.wide {
+  width: auto;
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12px;
+  border: 1px solid var(--border);
 }
 
 .icon-btn:hover {
@@ -390,6 +411,15 @@ li.empty {
   padding: 12px;
   font: inherit;
   line-height: 1.6;
+}
+
+/* The 320px min-height above suits the single-document Notes/Docs editor, but
+   the Agents editor stacks FOUR of these (system prompt, trigger prompt, run
+   box…) — 320px each made the pane metres long and pushed Run off-screen on a
+   phone. Let the `rows` attribute win here. */
+.agent-editor .doc-textarea,
+.agents-detail .doc-textarea {
+  min-height: 0;
 }
 
 /* Footer */
@@ -523,6 +553,9 @@ li.empty {
 .docs-actions {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }
 
 /* ── Voice input (MicButton) ──────────────────────────────────────────────── */
@@ -610,21 +643,74 @@ li.empty {
 }
 
 /* ── Agents panel ─────────────────────────────────────────────────────────── */
+.agents-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .agents-split {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(320px, 2fr);
-  gap: 18px;
+  /* Master is fixed-ish and the detail pane takes the rest; minmax(0, …) lets
+     both panes actually shrink instead of forcing the grid wider than its box. */
+  grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
+  gap: 20px;
   align-items: start;
+  min-width: 0;
 }
 
 @media (max-width: 860px) {
   .agents-split {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Five tabs at 375px overflowed the page and gave the WHOLE app a horizontal
+     scrollbar (the tab row was 79px wider than the viewport). Wrap them onto two
+     rows so every tab stays visible and tappable — a hidden scroll would bury
+     the Agents/Settings tabs off-screen on a phone. */
+  .tabs {
+    flex-wrap: wrap;
+  }
+
+  .tab {
+    flex: 1 1 28%;
+    min-width: 0;
+    padding: 9px 6px;
+    font-size: 13px;
+  }
+
+  /* Stacked panes: the master list is a short picker, so cap it and let the
+     detail pane (the thing you actually type into) have the rest of the page. */
+  .agent-list {
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  /* Primary actions go full width on a phone so "Run agent" is a real target
+     instead of a 90px pill in the corner. */
+  .agents-detail .docs-actions,
+  .agent-editor .docs-actions {
+    justify-content: stretch;
+  }
+
+  .agents-detail .docs-actions > button,
+  .agent-editor .docs-actions > button {
+    flex: 1 1 auto;
   }
 }
 
 .agents-master,
 .agents-detail {
+  min-width: 0;
+}
+
+/* Grid/flex children default to min-content width, which is what let long
+   values (model ids, tool names) push the panes wider than their container.
+   Every scroll container here must be allowed to shrink and clip. */
+.agents-master > *,
+.agents-detail > *,
+.agent-editor > *,
+.tool-row > * {
   min-width: 0;
 }
 
@@ -654,6 +740,7 @@ li.empty {
 
 .agent-pick {
   flex: 1;
+  min-width: 0;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -669,6 +756,7 @@ li.empty {
 
 .agent-name {
   font-weight: 600;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -678,6 +766,7 @@ li.empty {
 .chip-time {
   font-size: 11px;
   color: var(--muted);
+  flex: none;
 }
 
 .chip-time {
@@ -704,10 +793,22 @@ li.empty {
   display: flex;
   gap: 6px;
   align-items: center;
+  min-width: 0;
 }
 
+/* The name is the flexible field; the kind <select> and the ✕ keep their size
+   instead of squeezing the name down to a few characters. */
 .tool-name {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tool-head select {
+  flex: 0 0 auto;
+}
+
+.tool-head .icon-btn {
+  flex: none;
 }
 
 .field-label {
@@ -718,21 +819,84 @@ li.empty {
   margin-top: 6px;
 }
 
+/* The editor boxes (.agent-editor / .tool-row / .settings-panel) already use
+   --panel-2, so a --panel-2 input inside them is invisible — the fields looked
+   like loose text. Drop the controls to --bg (same as .paste-panel textarea and
+   the transcript) so every field reads as a field and picks up the green focus
+   ring like the rest of the app. */
+.agent-editor input,
+.agent-editor select,
+.agent-editor textarea,
+.tool-row input,
+.tool-row select,
+.tool-row textarea,
+.settings-panel input,
+.settings-panel select,
+.settings-panel textarea {
+  background: var(--bg);
+}
+
+.agent-editor input:focus,
+.agent-editor select:focus,
+.agent-editor textarea:focus,
+.tool-row input:focus,
+.tool-row select:focus,
+.tool-row textarea:focus,
+.settings-panel input:focus,
+.settings-panel select:focus,
+.settings-panel textarea:focus {
+  background: var(--bg);
+  border-color: var(--accent-dim);
+}
+
+/* Controls that are direct children of a pane/editor span the full pane. The
+   Agents editor and tool rows render bare inputs without a .field wrapper. */
+.agents-master > input,
+.agents-master > select,
+.agents-master > textarea,
+.agents-detail > input,
+.agents-detail > select,
+.agents-detail > textarea,
+.agent-editor > input,
+.agent-editor > select,
+.agent-editor > textarea,
+.tool-row > input,
+.tool-row > select,
+.tool-row > textarea {
+  width: 100%;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
 .inline-field {
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 12px;
   color: var(--muted);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.inline-field input,
+.inline-field select {
+  flex: 1 1 120px;
+  min-width: 0;
 }
 
 .token-row {
   display: flex;
   gap: 6px;
+  min-width: 0;
 }
 
 .token-row input {
   flex: 1;
+  min-width: 0;
+}
+
+.token-row button {
+  flex: none;
 }
 
 .chip-row {
@@ -743,6 +907,7 @@ li.empty {
 
 .agent-output {
   margin-top: 10px;
+  min-width: 0;
 }
 
 .agent-transcript {
@@ -751,18 +916,21 @@ li.empty {
   gap: 8px;
   max-height: 340px;
   overflow-y: auto;
+  overflow-wrap: anywhere;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg);
   padding: 10px;
+  min-width: 0;
 }
 
 .msg {
   display: grid;
-  grid-template-columns: 78px 1fr;
+  grid-template-columns: minmax(0, 78px) minmax(0, 1fr);
   gap: 8px;
   font-size: 13px;
   line-height: 1.45;
+  min-width: 0;
 }
 
 .msg-label {
@@ -777,6 +945,7 @@ li.empty {
 .msg-body {
   white-space: pre-wrap;
   word-break: break-word;
+  min-width: 0;
 }
 
 .msg.user .msg-body {
@@ -850,4 +1019,49 @@ li.empty {
 .ok-line {
   color: var(--accent);
   font-size: 12px;
+}
+
+/* Provenance badge — which layer supplied a value (env / settings / default).
+   Env is the G2 green because it is the authoritative source. */
+.source-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+.source-badge.env {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.source-badge.settings {
+  border-color: #2f403a;
+  color: var(--text);
+}
+
+/* A field the server environment owns: shown instead of an input. */
+.locked-field {
+  margin: 0;
+  padding: 9px 12px;
+  border: 1px dashed var(--accent-dim);
+  border-radius: 8px;
+  background: rgba(61, 220, 132, 0.06);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.locked-field code {
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 1px 4px;
+  color: var(--accent);
 }

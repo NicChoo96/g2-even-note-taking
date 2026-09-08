@@ -7,12 +7,20 @@
 import { getStreamToken } from '../auth-token';
 import { API_BASE } from '../stream';
 
+/** Where a value came from: the host env wins over the settings page. */
+export type ValueSource = 'env' | 'settings' | 'default' | 'none';
+
 export interface AgentStatus {
   ok: boolean;
   llm: boolean;
   tavily: boolean;
   model: string;
   depth: string;
+  /** Provenance per field, so the UI can lock env-managed inputs. */
+  source?: {
+    llm?: { key?: ValueSource; model?: ValueSource; referer?: ValueSource; title?: ValueSource };
+    tavily?: { key?: ValueSource; depth?: ValueSource };
+  };
 }
 
 export interface SettingsPatch {

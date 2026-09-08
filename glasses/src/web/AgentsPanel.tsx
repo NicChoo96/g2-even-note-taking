@@ -355,14 +355,24 @@ export function AgentsPanel() {
 
   return (
     <div className="agents-panel">
-      {!statusInfo?.llm && (
+      {/* Only warn once the status probe has actually answered — an unresolved
+          probe used to read as "no key", which is wrong on a hosted relay whose
+          keys come from the server environment. */}
+      {statusInfo && !statusInfo.llm && (
         <p className="warn-line">
-          ⚠️ No OpenRouter key yet — open <strong>Settings</strong> to add one. Agents can be built
-          and saved without it.
+          ⚠️ No OpenRouter key yet — open <strong>Settings</strong> to add one, or set{' '}
+          <code>OPENROUTER_API_KEY</code> in the server environment. Agents can be built and saved
+          without it.
         </p>
       )}
       {statusInfo?.llm && !statusInfo.tavily && (
         <p className="warn-line">⚠️ Tavily key missing — web-search tools will fail until it is set.</p>
+      )}
+      {statusInfo?.llm && statusInfo.source?.llm?.key === 'env' && (
+        <p className="hint-line">
+          ✓ LLM key provided by the server environment
+          {statusInfo.source?.tavily?.key === 'env' ? ' (Tavily too)' : ''}.
+        </p>
       )}
 
       <div className="agents-split">
@@ -518,7 +528,7 @@ export function AgentsPanel() {
                   )}
                   <div className="docs-actions">
                     <button
-                      className="icon-btn danger"
+                      className="icon-btn wide danger"
                       onClick={() =>
                         updateAgents((s) => ({
                           ...s,
