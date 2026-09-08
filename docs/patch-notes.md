@@ -2,14 +2,22 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.13
+
+v0.3.13 - Dictation no longer stops itself
+
+- Dictation stopped by itself after about 2 seconds. The mic frames were being misread as taps, which ended the session. Fixed.
+- It now keeps listening until you tap to stop, and waits longer for a slow speech service instead of giving up.
+- A dropped phrase no longer ends the session; you keep talking and it recovers.
+
 ## 0.3.12
 
 v0.3.12 - Agents know the date
 
-- Agents were guessing the date, so "today", "this week", "last week" and "past 1 year" returned the wrong period.
-- Every run now carries the exact date and time from your device, and those phrases are resolved to real dates before any search runs.
-- The resolved range is shown in the transcript so you can see what was used.
-- Applies to agent runs, chat, and web search.
+- Agents guessed the date, so "today", "this week" and "last week" returned the wrong period.
+- Every run now gets the exact date and time from your device, and those phrases are resolved to real dates before any search runs.
+- The resolved range is shown in the transcript.
+- Applies to agent runs, chat and web search.
 
 ## 0.3.11
 

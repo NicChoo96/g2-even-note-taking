@@ -657,8 +657,18 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
   // so pausing to think/read never ends it. Only safety nets remain below.
   const NEVER_MS = 90000; // opened but never heard anything → idle (90s)
   const CAP_MS = 600000; // hard cap (10 min)
-  const STT_TIMEOUT_MS = 8000; // a hung server call must never wedge the session
-  const STOP_FLUSH_MS = 5000; // worst-case time to finish after a stop
+  // A single STT round-trip may legitimately take a while (Deepgram can hold a
+  // connection open until its own endpointing fires). Anything shorter than
+  // ~10s aborts calls that were still going to succeed, and three aborts in a
+  // row used to end the session — which is exactly what made dictation appear
+  // to "self-stop after 2 seconds". 15s is comfortably past Deepgram's own
+  // silence timeout and still bounds a truly wedged server.
+  const STT_TIMEOUT_MS = 15000; // >=10s debounce on a silent Deepgram response
+  const STOP_FLUSH_MS = 16000; // a stop must still finish its in-flight phrase
+  // Transient STT failures are NOT fatal: a dropped phrase is retried as part
+  // of the running transcript, and the mic stays open so the user can keep
+  // talking. Only a sustained outage with nothing ever transcribed ends it.
+  const MAX_CONSEC_ERR = 8;
 
   const finalize = (why: string) => {
     if (closed) return;
@@ -709,7 +719,12 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
       if (closed) return;
       consecErr++;
       dlog('phrase error', errMsg(err));
-      if (consecErr >= 3) {
+      // Drop the failed phrase and KEEP LISTENING — one bad round-trip (or a
+      // burst while the network settles) must never end the session. Only a
+      // sustained outage that has never produced a single word gives up, so a
+      // partially transcribed session is never discarded either.
+      if (consecErr >= MAX_CONSEC_ERR && transcript.length === 0) {
+        dlog(`stt failing (${consecErr} consecutive, nothing transcribed) -> give up`);
         endWhy = 'stt-failing';
         wantEnd = true;
         finalize('stt-failing');
@@ -810,8 +825,10 @@ async function runStreamingStream(src: DictStream, hooks: DictHooks): Promise<vo
     }
     const age = Date.now() - startedAt;
     // If the source stops delivering frames entirely (OS hiccup), try to reopen
-    // it once so dictation doesn't die after the first captured word.
-    if (anySpeech && !micReopened && Date.now() - lastFrameAt > 2000) {
+    // it once so dictation doesn't die after the first captured word. The
+    // threshold is deliberately generous: reopening CLOSES the mic, so a brief
+    // host hiccup must not cost the user a second of audio.
+    if (anySpeech && !micReopened && Date.now() - lastFrameAt > 4000) {
       micReopened = true;
       dlog('mic frames stalled -> reopening source once');
       try {

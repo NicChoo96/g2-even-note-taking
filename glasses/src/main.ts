@@ -448,8 +448,8 @@ async function main(): Promise<void> {
   }
 
   /** Backstop watchdog: if a stop (R1 tap / Stop button) was requested but the
-   *  engine hasn't finished within a couple of seconds, force-end so the user
-   *  is never stuck. Dictation is tap-to-stop — no silence auto-stop. */
+   *  engine hasn't finished within 18s, force-end so the user is never stuck.
+   *  Dictation is tap-to-stop — no silence auto-stop. */
   function startDictationGuard(): void {
     if (dictationTimer !== null) return;
     dictationTimer = window.setInterval(() => {
@@ -462,8 +462,11 @@ async function main(): Promise<void> {
       }
       const now = Date.now();
       // Force-end if a stop was requested but the engine hasn't delivered idle
-      // within 2.5s — the user must never be stuck in dictation.
-      if (dictationStopAt && now - dictationStopAt > 2500) {
+      // within 18s — the user must never be stuck in dictation. This has to
+      // exceed the engine's own stop-flush budget (it waits up to 16s for an
+      // in-flight Deepgram response), otherwise this backstop would commit
+      // before the last phrase arrived and silently drop it.
+      if (dictationStopAt && now - dictationStopAt > 18000) {
         endDictationForced();
       }
     }, 500);
@@ -1187,7 +1190,18 @@ async function main(): Promise<void> {
       return;
     }
 
-    const sysType = event.sysEvent?.eventType ?? 0;
+    // Only a REAL system event may drive input handling. `CLICK_EVENT` is 0,
+    // so defaulting a missing `sysEvent` to 0 (as this used to) misreads EVERY
+    // non-system event — most importantly each audio frame while dictating —
+    // as a tap. That fired onTap() ~10x/second, which stopped the mic about
+    // 1.7s in (once the tap-grace window expired) and looked like dictation
+    // "self-stopping after 2 seconds". Audio frames carry only `audioEvent`.
+    const sys = event.sysEvent;
+    if (!sys) return;
+    // A single press is documented as arriving as a sysEvent whose `eventType`
+    // is undefined, so `?? 0` is correct HERE — inside a real sysEvent — but
+    // never for the event as a whole.
+    const sysType = sys.eventType ?? OsEventTypeList.CLICK_EVENT;
     if (sysType === OsEventTypeList.CLICK_EVENT) {
       onTap();
       return;
