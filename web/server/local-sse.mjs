@@ -22,7 +22,7 @@
 //                                     (auth required; key stays server-side)
 //   GET  /api/agent/status        -> are the LLM + Tavily keys configured?
 //   POST /api/settings            -> owner sets model / keys (never echoed back)
-//   POST /api/llm                 -> OpenRouter chat-completions proxy (tools ok)
+//   POST /api/llm                 -> OpenRouter/DeepSeek chat-completions proxy (tools ok)
 //   POST /api/tool                -> Tavily web search / generic REST tool proxy
 //
 // SECURITY: /api/stream (GET + POST) requires a valid owner session token OR an
@@ -35,9 +35,11 @@
 //
 // Env: PORT, STATE_FILE, AUTH_FILE, GOOGLE_CLIENT_ID, ALLOWED_EMAILS
 // (comma-separated), OPENAI_API_KEY (Whisper) or DEEPGRAM_API_KEY (Nova-2) for
-// voice dictation; OPENROUTER_API_KEY + TAVILY_API_KEY (+ optional
-// OPENROUTER_MODEL, OPENROUTER_REFERER, OPENROUTER_TITLE, TAVILY_SEARCH_DEPTH)
-// for the Agents feature. Zero runtime dependencies (node built-ins only). Run:
+// voice dictation. Agents LLM: OPENROUTER_API_KEY + TAVILY_API_KEY (+ optional
+// OPENROUTER_MODEL, OPENROUTER_REFERER, OPENROUTER_TITLE, TAVILY_SEARCH_DEPTH),
+// or switch the whole LLM backend to DeepSeek with LLM_PROVIDER=deepseek +
+// DEEPSEEK_API_KEY (+ optional DEEPSEEK_MODEL). Zero runtime dependencies
+// (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -280,19 +282,25 @@ function openaiMultipart(audio, contentType) {
 loadAuthStore();
 
 // ── Agents: LLM + tool proxy ─────────────────────────────────────────────────
-// The OpenRouter and Tavily keys live ONLY here (env vars, or a gitignored
-// .g2-hub-secrets.json written by POST /api/settings from the owner's browser).
-// They are never sent to a client, never logged, and never included in any
-// response body — clients only ever learn the boolean `hasKey`.
+// The LLM (OpenRouter or DeepSeek) and Tavily keys live ONLY here (env vars, or
+// a gitignored .g2-hub-secrets.json written by POST /api/settings from the
+// owner's browser). They are never sent to a client, never logged, and never
+// included in any response body — clients only ever learn the boolean `hasKey`.
+//
+// LLM_PROVIDER selects the backend: 'openrouter' (default) or 'deepseek'.
+// DeepSeek is OpenAI-compatible: POST https://api.deepseek.com/chat/completions
+// with `Authorization: Bearer <key>` (no attribution headers required).
 const SECRETS_FILE = process.env.SECRETS_FILE || join(process.cwd(), '.g2-hub-secrets.json');
 const DEFAULT_MODEL = 'inclusionai/ling-3.0-flash-sante:free';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions';
+const DEEPSEEK_DEFAULT_MODEL = 'deepseek-chat';
 const TAVILY_URL = 'https://api.tavily.com/search';
 const LLM_MAX_BYTES = 512 * 1024;
 const TOOL_MAX_BYTES = 32 * 1024;
 
 /** Persisted overrides (model/referer/title/depth + keys) — see loadSecrets(). */
-const secrets = { openrouterKey: '', tavilyKey: '', model: '', referer: '', title: '', depth: '' };
+const secrets = { openrouterKey: '', deepseekKey: '', tavilyKey: '', model: '', referer: '', title: '', depth: '' };
 
 /** Per-tool bearer tokens for generic REST tools: { [toolId]: token }. */
 const toolTokens = new Map();
@@ -330,27 +338,47 @@ function persistSecrets() {
 /**
  * Effective config — env wins over the persisted file, so a host (Railway,
  * Docker, systemd…) can own the keys and the settings page cannot shadow them.
+ * `LLM_PROVIDER` picks the backend: 'openrouter' (default) or 'deepseek'.
  * `source` records WHICH layer won for each field so the UI can say "managed by
  * the server environment" instead of showing an empty box and a false
  * "no key" warning. Values themselves are still never echoed to a client.
  */
 function llmConfig() {
-  const envKey = process.env.OPENROUTER_API_KEY || '';
-  const fileKey = secrets.openrouterKey || '';
-  const envModel = process.env.OPENROUTER_MODEL || '';
+  const provider = String(process.env.LLM_PROVIDER || 'openrouter').toLowerCase() === 'deepseek'
+    ? 'deepseek'
+    : 'openrouter';
+  const providerFromEnv = Boolean(process.env.LLM_PROVIDER);
+  const isDeepseek = provider === 'deepseek';
+
+  const envKey = isDeepseek
+    ? process.env.DEEPSEEK_API_KEY || ''
+    : process.env.OPENROUTER_API_KEY || '';
+  const fileKey = isDeepseek ? secrets.deepseekKey : secrets.openrouterKey;
+  const envModel = isDeepseek
+    ? process.env.DEEPSEEK_MODEL || ''
+    : process.env.OPENROUTER_MODEL || '';
   const fileModel = secrets.model || '';
   const envReferer = process.env.OPENROUTER_REFERER || '';
   const envTitle = process.env.OPENROUTER_TITLE || '';
+  const defaultModel = isDeepseek ? DEEPSEEK_DEFAULT_MODEL : DEFAULT_MODEL;
+  const openrouterEnvKey = process.env.OPENROUTER_API_KEY || '';
+  const deepseekEnvKey = process.env.DEEPSEEK_API_KEY || '';
+
   return {
+    provider,
+    url: isDeepseek ? DEEPSEEK_URL : OPENROUTER_URL,
     key: envKey || fileKey || '',
-    model: envModel || fileModel || DEFAULT_MODEL,
+    model: envModel || fileModel || defaultModel,
     referer: envReferer || secrets.referer || '',
     title: envTitle || secrets.title || 'G2 Even Reality Hub',
     source: {
+      provider: providerFromEnv ? 'env' : 'default',
       key: envKey ? 'env' : fileKey ? 'settings' : 'none',
       model: envModel ? 'env' : fileModel ? 'settings' : 'default',
       referer: envReferer ? 'env' : secrets.referer ? 'settings' : 'none',
       title: envTitle ? 'env' : secrets.title ? 'settings' : 'default',
+      openrouterKey: openrouterEnvKey ? 'env' : secrets.openrouterKey ? 'settings' : 'none',
+      deepseekKey: deepseekEnvKey ? 'env' : secrets.deepseekKey ? 'settings' : 'none',
     },
   };
 }
@@ -379,6 +407,7 @@ function agentStatusPayload() {
   const tv = tavilyConfig();
   return {
     ok: true,
+    provider: llm.provider,
     llm: Boolean(llm.key),
     tavily: Boolean(tv.key),
     model: llm.model,
@@ -387,14 +416,18 @@ function agentStatusPayload() {
   };
 }
 
-/** OpenRouter attribution headers (required for free-tier routing). */
-function openrouterHeaders(cfg) {
-  return {
+/** Request headers for whichever LLM provider is active. */
+function llmHeaders(cfg) {
+  const h = {
     Authorization: `Bearer ${cfg.key}`,
     'Content-Type': 'application/json',
-    ...(cfg.referer ? { 'HTTP-Referer': cfg.referer } : {}),
-    ...(cfg.title ? { 'X-OpenRouter-Title': cfg.title } : {}),
   };
+  // OpenRouter free-tier routing needs attribution headers; DeepSeek does not.
+  if (cfg.provider === 'openrouter') {
+    if (cfg.referer) h['HTTP-Referer'] = cfg.referer;
+    if (cfg.title) h['X-OpenRouter-Title'] = cfg.title;
+  }
+  return h;
 }
 
 // ── Server-side agent run engine ─────────────────────────────────────────────
@@ -472,7 +505,7 @@ function toolSchemaFor(t) {
   };
 }
 
-/** One chat completion through the server-side OpenRouter config. */
+/** One chat completion through the active LLM backend (OpenRouter or DeepSeek). */
 async function llmOnce(model, messages, tools, signal) {
   const cfg = llmConfig();
   const payload = {
@@ -480,14 +513,14 @@ async function llmOnce(model, messages, tools, signal) {
     messages,
     ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
   };
-  const r = await fetch(OPENROUTER_URL, {
+  const r = await fetch(cfg.url, {
     method: 'POST',
-    headers: openrouterHeaders(cfg),
+    headers: llmHeaders(cfg),
     body: JSON.stringify(payload),
     signal,
   });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j?.error?.message || `OpenRouter ${r.status}`);
+  if (!r.ok) throw new Error(j?.error?.message || `${cfg.provider} ${r.status}`);
   const choice = j?.choices?.[0]?.message ?? {};
   return {
     content: String(choice.content ?? ''),
@@ -1284,9 +1317,10 @@ const server = createServer(async (req, res) => {
     }
     const cfg = llmConfig();
     if (!cfg.key) {
+      const keyEnv = cfg.provider === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'OPENROUTER_API_KEY';
       json(res, 501, {
         ok: false,
-        error: 'LLM not configured — set OPENROUTER_API_KEY or save it in Settings',
+        error: `LLM not configured — set ${keyEnv} or save it in Settings`,
       });
       return;
     }
@@ -1385,6 +1419,7 @@ const server = createServer(async (req, res) => {
     }
     const map = {
       openrouterKey: 'openrouterKey',
+      deepseekKey: 'deepseekKey',
       tavilyKey: 'tavilyKey',
       model: 'model',
       referer: 'referer',
@@ -1412,9 +1447,10 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // OpenRouter chat-completions proxy. Auth required; the API key never leaves
-  // this process. Supports the OpenAI `tools` / `tool_calls` protocol so the
-  // hand-rolled agent loop in glasses/src/agents.ts can do multi-step reasoning.
+  // LLM chat-completions proxy (OpenRouter or DeepSeek, per LLM_PROVIDER). Auth
+  // required; the API key never leaves this process. Supports the OpenAI
+  // `tools` / `tool_calls` protocol so the hand-rolled agent loop in
+  // glasses/src/agents.ts can do multi-step reasoning.
   if (req.method === 'POST' && url.pathname === '/api/llm') {
     const principal = principalFromToken(readToken(req, url));
     if (!principal) {
@@ -1423,9 +1459,10 @@ const server = createServer(async (req, res) => {
     }
     const cfg = llmConfig();
     if (!cfg.key) {
+      const keyEnv = cfg.provider === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'OPENROUTER_API_KEY';
       json(res, 501, {
         ok: false,
-        error: 'LLM not configured — set OPENROUTER_API_KEY or save it in Settings',
+        error: `LLM not configured — set ${keyEnv} or save it in Settings`,
       });
       return;
     }
@@ -1449,16 +1486,16 @@ const server = createServer(async (req, res) => {
       ...(typeof body.temperature === 'number' ? { temperature: body.temperature } : {}),
     };
     try {
-      const r = await fetch(OPENROUTER_URL, {
+      const r = await fetch(cfg.url, {
         method: 'POST',
-        headers: openrouterHeaders(cfg),
+        headers: llmHeaders(cfg),
         body: JSON.stringify(payload),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         json(res, 502, {
           ok: false,
-          error: j?.error?.message || `OpenRouter ${r.status}`,
+          error: j?.error?.message || `${cfg.provider} ${r.status}`,
         });
         return;
       }

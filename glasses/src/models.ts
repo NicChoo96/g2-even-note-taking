@@ -33,3 +33,15 @@ export const FREE_TOOL_MODELS = [
   'thinkingmachines/inkling:free',
   'thinkingmachines/inkling-small:free',
 ];
+
+// DeepSeek models (OpenAI-compatible, base URL https://api.deepseek.com).
+// Selectable when the relay runs with LLM_PROVIDER=deepseek. `deepseek-chat`
+// is the classic general alias and `deepseek-reasoner` the reasoning model;
+// the current DeepSeek lineup also exposes `deepseek-flash` (V4.1 Flash, tool
+// calling + thinking mode) and `deepseek-v4-pro`.
+export const DEEPSEEK_MODELS = [
+  'deepseek-chat',
+  'deepseek-reasoner',
+  'deepseek-flash',
+  'deepseek-v4-pro',
+];

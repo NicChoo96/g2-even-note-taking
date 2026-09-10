@@ -12,19 +12,29 @@ export type ValueSource = 'env' | 'settings' | 'default' | 'none';
 
 export interface AgentStatus {
   ok: boolean;
+  /** Active LLM backend: 'openrouter' (default) or 'deepseek'. */
+  provider?: string;
   llm: boolean;
   tavily: boolean;
   model: string;
   depth: string;
   /** Provenance per field, so the UI can lock env-managed inputs. */
   source?: {
-    llm?: { key?: ValueSource; model?: ValueSource; referer?: ValueSource; title?: ValueSource };
+    llm?: {
+      key?: ValueSource;
+      model?: ValueSource;
+      referer?: ValueSource;
+      title?: ValueSource;
+      openrouterKey?: ValueSource;
+      deepseekKey?: ValueSource;
+    };
     tavily?: { key?: ValueSource; depth?: ValueSource };
   };
 }
 
 export interface SettingsPatch {
   openrouterKey?: string;
+  deepseekKey?: string;
   tavilyKey?: string;
   model?: string;
   referer?: string;

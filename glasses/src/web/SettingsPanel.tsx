@@ -12,7 +12,7 @@
 // deployment never looks like "no key set" and can never be shadowed from here.
 import { useEffect, useState } from 'react';
 import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
-import { FREE_TOOL_MODELS } from '../models';
+import { FREE_TOOL_MODELS, DEEPSEEK_MODELS } from '../models';
 import { DEFAULT_MODEL } from '../types';
 import { fetchAgentStatus, saveSettings, type AgentStatus, type ValueSource } from './agents-client';
 
@@ -31,6 +31,7 @@ function isEnv(source?: ValueSource): boolean {
 export function SettingsPanel() {
   const [info, setInfo] = useState<AgentStatus | null>(null);
   const [openrouterKey, setOpenrouterKey] = useState('');
+  const [deepseekKey, setDeepseekKey] = useState('');
   const [tavilyKey, setTavilyKey] = useState('');
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [depth, setDepth] = useState<'basic' | 'advanced'>('basic');
@@ -57,13 +58,22 @@ export function SettingsPanel() {
   }, []);
 
   const src = info?.source;
-  const keyFromEnv = isEnv(src?.llm?.key);
+  const provider = info?.provider === 'deepseek' ? 'deepseek' : 'openrouter';
+  const openrouterFromEnv = isEnv(src?.llm?.openrouterKey);
+  const deepseekFromEnv = isEnv(src?.llm?.deepseekKey);
+  const openrouterHasKey = (src?.llm?.openrouterKey ?? 'none') !== 'none';
+  const deepseekHasKey = (src?.llm?.deepseekKey ?? 'none') !== 'none';
   const tavilyFromEnv = isEnv(src?.tavily?.key);
   const modelFromEnv = isEnv(src?.llm?.model);
   const depthFromEnv = isEnv(src?.tavily?.depth);
   const refererFromEnv = isEnv(src?.llm?.referer);
   const titleFromEnv = isEnv(src?.llm?.title);
-  const anyEnv = keyFromEnv || tavilyFromEnv || modelFromEnv || depthFromEnv;
+  const anyEnv =
+    openrouterFromEnv ||
+    deepseekFromEnv ||
+    tavilyFromEnv ||
+    modelFromEnv ||
+    depthFromEnv;
 
   const save = async () => {
     setBusy(true);
@@ -75,7 +85,8 @@ export function SettingsPanel() {
     if (!modelFromEnv) patch.model = model;
     if (!depthFromEnv) patch.depth = depth;
     if (!titleFromEnv) patch.title = title;
-    if (!keyFromEnv && openrouterKey.trim()) patch.openrouterKey = openrouterKey.trim();
+    if (!openrouterFromEnv && openrouterKey.trim()) patch.openrouterKey = openrouterKey.trim();
+    if (!deepseekFromEnv && deepseekKey.trim()) patch.deepseekKey = deepseekKey.trim();
     if (!tavilyFromEnv && tavilyKey.trim()) patch.tavilyKey = tavilyKey.trim();
     if (!refererFromEnv && referer.trim()) patch.referer = referer.trim();
     const r = await saveSettings(patch);
@@ -83,6 +94,7 @@ export function SettingsPanel() {
     if (r.ok) {
       setInfo(r);
       setOpenrouterKey('');
+      setDeepseekKey('');
       setTavilyKey('');
       setMsg('Saved server-side ✓');
       updateAgents((s) => ({ ...s, llm: { ...s.llm, model } }));
@@ -100,7 +112,9 @@ export function SettingsPanel() {
         </p>
       )}
 
-      <div className="panel-label">Provider · OpenRouter</div>
+      <div className="panel-label">
+        Provider · {provider === 'deepseek' ? 'DeepSeek' : 'OpenRouter'}
+      </div>
       <div className="status-grid">
         <span className={info?.llm ? 'pill ok' : 'pill bad'}>
           {info?.llm ? '✓ API key set' : '✕ no API key'}
@@ -121,9 +135,9 @@ export function SettingsPanel() {
       </div>
 
       <label className="field-label">
-        OpenRouter API key <SourceBadge source={src?.llm?.key} />
+        OpenRouter API key <SourceBadge source={src?.llm?.openrouterKey} />
       </label>
-      {keyFromEnv ? (
+      {openrouterFromEnv ? (
         <p className="locked-field">
           🔒 Managed by <code>OPENROUTER_API_KEY</code> in the server environment.
         </p>
@@ -132,7 +146,23 @@ export function SettingsPanel() {
           type="password"
           value={openrouterKey}
           onChange={(e) => setOpenrouterKey(e.target.value)}
-          placeholder={info?.llm ? '••••••• (saved — type to replace)' : 'sk-or-v1-…'}
+          placeholder={openrouterHasKey ? '••••••• (saved — type to replace)' : 'sk-or-v1-…'}
+        />
+      )}
+
+      <label className="field-label">
+        DeepSeek API key <SourceBadge source={src?.llm?.deepseekKey} />
+      </label>
+      {deepseekFromEnv ? (
+        <p className="locked-field">
+          🔒 Managed by <code>DEEPSEEK_API_KEY</code> in the server environment.
+        </p>
+      ) : (
+        <input
+          type="password"
+          value={deepseekKey}
+          onChange={(e) => setDeepseekKey(e.target.value)}
+          placeholder={deepseekHasKey ? '••••••• (saved — type to replace)' : 'sk-…'}
         />
       )}
 
@@ -162,13 +192,14 @@ export function SettingsPanel() {
         disabled={modelFromEnv}
       />
       <datalist id="settings-models">
-        {FREE_TOOL_MODELS.map((m) => (
+        {[...FREE_TOOL_MODELS, ...DEEPSEEK_MODELS].map((m) => (
           <option key={m} value={m} />
         ))}
       </datalist>
       <p className="hint-line">
         Free models must advertise <code>tools</code> support or the agent loop will fail. The list
-        above is the verified free + tool-capable set.
+        above is the verified free + tool-capable set, plus DeepSeek models for when the provider
+        is switched to DeepSeek.
       </p>
 
       <label className="field-label">

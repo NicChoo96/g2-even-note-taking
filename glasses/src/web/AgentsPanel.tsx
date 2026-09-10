@@ -360,9 +360,9 @@ export function AgentsPanel() {
           keys come from the server environment. */}
       {statusInfo && !statusInfo.llm && (
         <p className="warn-line">
-          ⚠️ No OpenRouter key yet — open <strong>Settings</strong> to add one, or set{' '}
-          <code>OPENROUTER_API_KEY</code> in the server environment. Agents can be built and saved
-          without it.
+          ⚠️ No LLM key yet — open <strong>Settings</strong> to add one, or set{' '}
+          <code>{statusInfo.provider === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'OPENROUTER_API_KEY'}</code>{' '}
+          in the server environment. Agents can be built and saved without it.
         </p>
       )}
       {statusInfo?.llm && !statusInfo.tavily && (
