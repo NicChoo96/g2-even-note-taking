@@ -19,9 +19,13 @@
  *      chars by the agent loop, which is why the transcript comes back
  *      pre-rendered as a string rather than as JSON.
  *
- *   3. The HUD strip. `aiView` cannot page (canPrev/canNext are false), so the
- *      queue scrolls by ring through `onSwipe`. The strip must also not break the
- *      999-byte container cap or draw unsupported glyphs.
+ *   3. The HUD. `aiView` now PAGES. It renders the FULL transcript (no per-line
+ *      clipping), word-wraps it, and hands the ring index back to the caller
+ *      through `todoCursor` / `canPrev` / `canNext` / `sessionStart`. Those
+ *      units are transcript pages FIRST and then one unit per watched session
+ *      row, so one index walks both. Every page must stay under the 999-byte
+ *      container cap and draw only supported glyphs — an overflowing container
+ *      makes the FIRMWARE scroll it, and that scroll eats the ring's swipe.
  *
  * So this harness drives the real modules with plain objects and asserts the
  * behaviours above. It is the only place the queue's edge-triggering and the
@@ -157,7 +161,6 @@ const {
   getMonitorView,
   ingestMonitoredRuns,
   monitorAge,
-  moveMonitorCursor,
   removeMonitoredRun,
   resetMonitor,
   runAiAgent,
@@ -244,7 +247,7 @@ function unsafeChars(text) {
 // ── 1. Queue mechanics ──────────────────────────────────────────────────────
 console.log('\n── queue mechanics ──');
 resetMonitor();
-check('empty view', getMonitorView(), { rows: [], cursor: 0, unread: 0, running: 0 });
+check('empty view', getMonitorView(), { rows: [], unread: 0, running: 0 });
 
 const row1 = enqueueMonitoredRun({ runId: 'r1', agentId: A1, agentName: 'News', prompt: 'Give me the news' });
 assert('enqueue returns a row', row1 !== null);
@@ -325,9 +328,8 @@ finished = ingestMonitoredRuns([relayRun({ id: 'ghost', status: 'done' })]);
 check('unknown run ignored', finished, []);
 is('unknown run not queued', getMonitorView().rows.length, 1);
 
-is('one row cannot scroll', moveMonitorCursor(1), false);
-
-// Newest first, and a fresh enqueue puts the ring at the top.
+// Newest first. There is no cursor here any more: the HUD's ring index is the
+// only scroll position, and the view owns it (see the paging section below).
 // Explicit timestamps: two enqueues inside the same millisecond tie on
 // `startedAt`, and the tie-break (most recently updated) is not what this
 // assertion is about.
@@ -337,14 +339,9 @@ enqueueMonitoredRun({ runId: 'r1', agentId: A1, agentName: 'News', at: base });
 const row2 = enqueueMonitoredRun({ runId: 'r2', agentId: A2, agentName: 'Mail', at: base + 1000 });
 assert('second enqueue returns a row', row2 !== null);
 check('rows newest first', getMonitorView().rows.map((r) => r.runId), ['r2', 'r1']);
-is('new enqueue resets the cursor', getMonitorView().cursor, 0);
-
-is('scroll forward', moveMonitorCursor(1), true);
-is('cursor at older row', getMonitorView().cursor, 1);
-is('scroll backward', moveMonitorCursor(1), true);
-is('cursor wraps to newest', getMonitorView().cursor, 0);
-is('scroll backward from newest wraps to oldest', moveMonitorCursor(-1), true);
-is('cursor wrapped to oldest', getMonitorView().cursor, 1);
+// Re-enqueuing refreshes the row instead of duplicating it, and must not lose
+// where the ring was — the queue has no position of its own to reset.
+is('re-enqueue refreshes in place', getMonitorView().rows.length, 2);
 
 // Ack only clears the row you point at.
 enqueueMonitoredRun({ runId: 'r3', agentId: A1, agentName: 'News', at: Date.now() });
@@ -527,34 +524,119 @@ ingestMonitoredRuns([
   }),
 ]);
 
-const view = aiView(fakeAi(), { conversing: false, queue: getMonitorView() });
-has('strip shows the position', view.text, 'sessions 1/2');
-has('strip marks the cursor row', view.text, '> Mail');
-has('strip shows status and age', view.text, 'Mail · running · 0s');
-has('strip shows the latest line', view.text, 'Reading the inbox');
-has('hint teaches the scroll', view.text, 'scroll = sessions');is('jarvis hud still cannot page', view.canNext, false);
+// `scroll` is the ring index: pages of the transcript first, then one unit per
+// session row. Every assertion below is at a REAL index, because the view is
+// what clamps it — main.ts echoes `todoCursor` straight back in.
+const opts = (scroll) => ({ conversing: false, queue: getMonitorView(), scroll });
+
+const view = aiView(fakeAi(), opts(0));
+has('the first page keeps the question', view.text, '"run the news agent"');
+has('the first page keeps the chain of thought', view.text, '· Started News');
+has('the first page counts its pages', view.text, 'scroll = steps 1/');
+is('the hud can page now', view.canNext, true);
+is('the first page cannot go back', view.canPrev, false);
 assert('hud under the byte cap', Buffer.byteLength(view.text, 'utf8') <= 999, `${Buffer.byteLength(view.text, 'utf8')} bytes`);
 check('hud has no unsupported glyphs', unsafeChars(view.text), []);
 
-moveMonitorCursor(1);
-const older = aiView(fakeAi(), { conversing: false, queue: getMonitorView() });
-has('scrolling moves the position', older.text, 'sessions 2/2');
-has('scrolling moves the cursor row', older.text, '> News');
-has('scrolling reaches the badge', older.text, 'NEW');
-lacks('cursor row is not repeated', older.text, '> Mail');
+// The transcript region ends where the session rows begin — that boundary is
+// how the caller knows a swipe has moved onto a background run (and should ack
+// it) rather than onto another page of the same run.
+const start = view.sessionStart;
+assert('sessions start after the transcript', start > 0, `sessionStart=${start}`);
+const nearEnd = aiView(fakeAi(), opts(start - 1));
+assert('the page before the sessions is still transcript', nearEnd.todoCursor < nearEnd.sessionStart, `scroll=${nearEnd.todoCursor} start=${nearEnd.sessionStart}`);
+is('the last transcript page can go forward', nearEnd.canNext, true);
 
-const quiet = aiView(fakeAi(), { conversing: false });
-lacks('no queue, no strip', quiet.text, 'session');
+const s1 = aiView(fakeAi(), opts(start));
+has('strip shows the position', s1.text, 'sessions 1/2');
+has('strip marks the newest row', s1.text, '> Mail');
+has('strip shows status and age', s1.text, 'Mail · running · 0s');
+has('strip shows the latest line', s1.text, 'Reading the inbox');
+has('strip teaches the remaining scroll', s1.text, 'scroll = sessions');
+lacks('the transcript is not repeated above the strip', s1.text, '= Started News');
+is('the last unit cannot go forward', s1.canNext, true);
 
-const single = aiView(fakeAi(), { conversing: false, queue: { rows: getMonitorView().rows.slice(0, 1), cursor: 0, unread: 1, running: 0 } });
+const s2 = aiView(fakeAi(), opts(start + 1));
+has('scrolling moves the position', s2.text, 'sessions 2/2');
+has('scrolling moves to the older row', s2.text, '> News');
+has('scrolling reaches the badge', s2.text, 'NEW');
+lacks('the other row is not repeated', s2.text, '> Mail');
+is('the end of the queue', s2.canNext, false);
+assert('the strip page fits too', Buffer.byteLength(s2.text, 'utf8') <= 999, `${Buffer.byteLength(s2.text, 'utf8')} bytes`);
+
+// Clamping lives in the view, not the caller, so a stale index left over from a
+// longer transcript can never strand the ring on a screen that no longer exists.
+is('an over-scroll clamps to the last unit', aiView(fakeAi(), opts(999)).todoCursor, start + 1);
+is('an over-scroll cannot go further', aiView(fakeAi(), opts(999)).canNext, false);
+is('a negative scroll clamps to the first page', aiView(fakeAi(), opts(-5)).todoCursor, 0);
+is('an unset scroll opens on page one', aiView(fakeAi(), { conversing: false, queue: getMonitorView() }).todoCursor, 0);
+is('no queue, sessionStart is unset', aiView(fakeAi(), { conversing: false }).sessionStart, -1);
+
+// ── The actual bug: a long run's reasoning must all be REACHABLE ────────────
+// The old view kept the last two or three steps and clipped each to 44 chars,
+// so most of a run's chain of thought could not be read at any scroll position.
+const LONG = fakeAi({
+  status: 'done',
+  utterance: 'research the port strike',
+  steps: [
+    { kind: 'focus', text: 'agents', at: Date.now() },
+    { kind: 'think', text: 'I should search the web before answering anything.', at: Date.now() },
+    { kind: 'call', text: 'web_search · port strike', at: Date.now() },
+    { kind: 'ok', text: 'three results', at: Date.now() },
+    { kind: 'think', text: 'The budget angle matters most to the wearer.', at: Date.now() },
+    { kind: 'call', text: 'web_search · port strike budget', at: Date.now() },
+    { kind: 'ok', text: 'five results', at: Date.now() },
+    { kind: 'reply', text: 'Drafting the brief now.', at: Date.now() },
+    { kind: 'fail', text: 'tavily key missing, fell back', at: Date.now() },
+  ],
+  result: 'The port strike is about pay.',
+});
+
+// Walk the transcript region exactly the way onSwipe does: ask, then move one
+// unit from the index the view just handed back.
+const walked = [];
+for (let i = 0; i < 40; i += 1) {
+  const v = aiView(LONG, opts(i));
+  if (v.todoCursor !== i) break;
+  if (v.sessionStart >= 0 && i >= v.sessionStart) break;
+  walked.push(v.text);
+}
+assert('a long run needs several pages', walked.length > 1, `${walked.length} page(s)`);
+const all = walked.join('\n');
+has('paging keeps the question', all, 'research the port strike');
+has('paging reaches the FIRST thought', all, 'I should search the web before answering anything.');
+has('paging reaches the LAST thought', all, 'The budget angle matters most to the wearer.');
+has('paging reaches the tool calls', all, 'web_search · port strike budget');
+has('paging reaches a failure line', all, '! tavily key missing, fell back');
+has('paging reaches the answer', all, 'The port strike is about pay.');
+check('every page fits the container', walked.filter((t) => Buffer.byteLength(t, 'utf8') > 999), []);
+check('every page is glyph-safe', walked.flatMap((t) => unsafeChars(t)), []);
+// The answer is the LAST thing in the transcript, so it must be on a page the
+// wearer can actually get to — not clipped off the end of a fixed slice.
+has('the final page carries the answer', walked[walked.length - 1], '= The port strike is about pay.');
+
+const emptyQueue = aiView(fakeAi(), { conversing: false });
+lacks('no queue, no strip', emptyQueue.text, 'session');
+// Same run, but with the strip gone the transcript gets the three lines back —
+// so it fits on one page and the ring has nothing to scroll. The strip is what
+// costs the transcript a page.
+is('without a queue the same run fits one page', emptyQueue.canNext, false);
+
+const single = aiView(fakeAi(), {
+  conversing: false,
+  queue: { rows: getMonitorView().rows.slice(0, 1), unread: 1, running: 0 },
+  scroll: 2,
+});
 has('single row reads as a session', single.text, 'session · new');
-lacks('single row does not advertise scrolling', single.text, 'sessions 1/1');
+lacks('single row does not advertise position', single.text, 'sessions 1/1');
+is('a single session unit still pages the transcript first', single.canPrev, true);
 
 const confirming = aiView(
   fakeAi({ status: 'confirm', pending: { title: 'Delete agent', lines: ['News'] } }),
   { conversing: false, queue: getMonitorView() },
 );
 lacks('a confirm prompt hides the strip', confirming.text, 'sessions');
+is('a confirm prompt is a single screen', confirming.canNext, false);
 
 // ── verdict ─────────────────────────────────────────────────────────────────
 console.log(`\n${fail === 0 ? 'ALL CHECKS PASSED' : `${fail} CHECK(S) FAILED`} — ${pass} passed, ${fail} failed\n`);

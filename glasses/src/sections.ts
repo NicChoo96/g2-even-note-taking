@@ -209,6 +209,13 @@ const VISIBLE_ITEMS = 6; // todo rows in the cursor window
 const INNER_W = 568; // 576 - 2 * paddingLength(4)
 const PAGE_BODY_LINES = 9; // body lines per page; compact 1-line header above
 const PAGE_BYTES = 900; // body byte budget per page (≤ 999 - header)
+// Jarvis HUD. The canvas shows ~10 rendered lines; the HUD spends 3 of them on
+// chrome (header, divider, controls) and up to 3 more on the pinned session
+// strip, so a transcript page gets what is left. Staying UNDER the screen is
+// what makes the ring scroll work: one line over and the firmware scrolls the
+// container instead, swallowing the swipe.
+const AI_SCREEN_LINES = 10;
+const AI_PAGE_BYTES = 880; // under the header + divider + controls bytes
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
@@ -341,10 +348,23 @@ function joinFit(parts: readonly string[], max: number): string {
 /** Result of rendering the active section for the single glasses container. */
 export interface SectionView {
   text: string;
-  /** Clamped todo cursor (todo section only). */
+  /**
+   * Clamped cursor / scroll position THIS view owns. The todo list and doc
+   * picker put a row index on it; the Jarvis HUD puts a SCROLL UNIT on it (one
+   * page of its transcript, or one watched-session row). Same contract either
+   * way: the caller stores whatever comes back, so a list that shrinks under
+   * the ring can never strand the HUD on an empty screen.
+   */
   todoCursor: number;
   canPrev: boolean;
   canNext: boolean;
+  /**
+   * First scroll unit of a Jarvis HUD view that is a watched-session row, or -1
+   * when the view has no queue. Lets the caller tell "the ring is on a session
+   * row, so its unread badge should be acknowledged" from "the ring is still
+   * reading the transcript" — the two regions tap differently.
+   */
+  sessionStart?: number;
 }
 
 function todoView(items: TodoItem[], cursor: number): SectionView {
@@ -456,6 +476,12 @@ export interface AiViewOptions {
    * nothing is being watched, in which case the HUD is exactly as it was.
    */
   queue?: MonitorView;
+  /**
+   * Ring scroll position, in scroll units: `0 .. pages-1` are pages of the
+   * transcript, everything after that is one watched-session row each. Clamped
+   * here and echoed back in `todoCursor`.
+   */
+  scroll?: number;
 }
 
 export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
@@ -467,40 +493,54 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
   // A conversation only exists on the surface that owns the loop — a mirror has
   // no mic to re-arm, so it keeps the plain dismiss hint.
   const conversing = !!opts.conversing && !remote;
+  // Did this run actually touch the app? A run that never called anything was a
+  // CONVERSATION — the wearer asked for nothing to change and the model simply
+  // answered (see ai/converse). "done" claims work happened, so say what really
+  // happened instead; a reply that doubles as a status report is unreadable.
+  const engaged = ai.steps.some(
+    (s) => s.kind === 'call' || s.kind === 'ok' || s.kind === 'fail' || s.kind === 'note',
+  );
   const head =
     ai.status === 'confirm'
       ? 'JARVIS · CONFIRM'
-      : ai.status === 'done'
-        ? 'JARVIS · done'
-        : ai.status === 'error'
-          ? 'JARVIS · failed'
+      : ai.status === 'error'
+        ? 'JARVIS · failed'
+        : ai.status === 'done'
+          ? engaged
+            ? 'JARVIS · done'
+            : 'JARVIS · said'
           : `JARVIS · working ${Math.max(1, ai.turn)}/${Math.max(1, ai.maxSteps)}`;
-  const body: string[] = [];
   // A queue with nothing in it must not change the HUD at all — the strip is
-  // additive, never a permanently empty section.
-  const queue = opts.queue && opts.queue.rows.length ? opts.queue : null;
-  const scrollable = !!queue && queue.rows.length > 1;
+  // additive, never a permanently empty section. `confirm` is excluded too: a
+  // destructive prompt is the one screen where nothing else may compete for
+  // attention, and its tap means something else entirely.
+  const queue = ai.status !== 'confirm' && opts.queue && opts.queue.rows.length ? opts.queue : null;
+  const rows = queue ? queue.rows : [];
   // `2x = end` is not decoration: it is the only exit that does not cost a
   // menu trip, and the menu's own exit is the first item ("Stop AI").
-  const dismissHint =
-    (conversing ? 'tap R1 = speak again · 2x = end' : 'tap R1 = dismiss') +
-    (scrollable ? ' · scroll = sessions' : '');
+  const dismissHint = conversing ? 'tap R1 = speak again · 2x = end' : 'tap R1 = dismiss';
+
+  // ── The transcript ─────────────────────────────────────────────────────────
+  // EVERY line of it, at full length. The previous view kept only the last two
+  // or three steps and clipped each one to 44 characters, which is why a run's
+  // own reasoning was unreadable on the glasses. Length is now handled by
+  // PAGING (below) instead of by throwing text away.
+  const timeline: string[] = [];
+  let footer: string;
+  let sawStep = false;
 
   if (ai.status === 'confirm' && ai.pending) {
-    body.push(...wrapToWidth(stripUnsupported(ai.pending.title).trim(), INNER_W).slice(0, 2));
-    for (const line of ai.pending.lines.slice(0, 2)) {
-      body.push(...wrapToWidth(stripUnsupported(line).trim(), INNER_W).slice(0, 1));
-    }
-    body.push('', remote ? 'from phone · tap = cancel' : 'tap R1 = run · Stop = cancel');
-  } else if (ai.status === 'done') {
-    body.push(...wrapToWidth(stripUnsupported(ai.result || 'Done').trim(), INNER_W).slice(0, 3));
-    body.push('', remote ? 'from phone · tap = dismiss' : dismissHint);
-  } else if (ai.status === 'error') {
-    body.push(...wrapToWidth(stripUnsupported(ai.error || 'Something went wrong').trim(), INNER_W).slice(0, 3));
-    body.push('', remote ? 'from phone · tap = dismiss' : dismissHint);
+    footer = remote ? 'from phone · tap = cancel' : 'tap R1 = run · Stop = cancel';
+    timeline.push(stripUnsupported(ai.pending.title).trim());
+    for (const line of ai.pending.lines.slice(0, 2)) timeline.push(stripUnsupported(line).trim());
   } else {
+    // Working, done and error share ONE record: what was asked, which page it
+    // ran against, and the chain of thought the loop produced. The old view
+    // threw that chain away the moment the run ended and kept only three lines
+    // of reply, so "what did it actually do?" was unanswerable after the fact —
+    // which is the truncation the wearer kept hitting.
     const said = stripUnsupported(ai.utterance).replace(/\s+/g, ' ').trim();
-    if (said) body.push(truncate(`"${said}"`, 42));
+    if (said) timeline.push(`"${said}"`);
     // Layer 1, always on screen. The seed step carries the raw page id (it is
     // written by aiBegin), later ones a title — resolve both through the
     // registry so the line reads the same way the companion panel prints it.
@@ -508,56 +548,88 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
     const current = focuses[focuses.length - 1];
     if (current) {
       const label = stripUnsupported(pageTitle(current.text as PageId)).trim() || current.text;
-      body.push(`→ ${label}`);
+      timeline.push(`→ ${label}`);
     }
-    // Chain of thought + results, newest last, interleaved in the order the
-    // model produced them. `think` is the model's own reasoning, the rest are
-    // our loop's labels for what it did.
-    const shown = ai.steps
-      .filter(
-        (s) => s.kind === 'think' || s.kind === 'ok' || s.kind === 'fail' || s.kind === 'note',
-      )
-      // The queue strip costs lines, and the canvas holds ~10. Give it its own
-      // room rather than letting a chatty run push it off the bottom.
-      .slice(queue ? -2 : -3);
-    for (const s of shown) {
+    // Chain of thought + results, in the order the model produced them. `think`
+    // is the model's own reasoning, the rest are our loop's labels for what it
+    // did; the routing line above already covers `focus`.
+    for (const s of ai.steps) {
+      if (s.kind === 'focus') continue;
       const mark = s.kind === 'ok' ? '·' : s.kind === 'fail' ? '!' : s.kind === 'think' ? '>' : '-';
-      body.push(truncate(`${mark} ${stripUnsupported(s.text).replace(/\s+/g, ' ').trim()}`, 44));
+      const text = stripUnsupported(s.text).replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      timeline.push(`${mark} ${text}`);
+      sawStep = true;
     }
-    if (!shown.length) body.push('··· thinking');
-    body.push('', remote ? 'from phone · tap = stop' : 'tap R1 = stop action');
+    if (ai.status === 'done') {
+      footer = remote ? 'from phone · tap = dismiss' : dismissHint;
+      const answer = stripUnsupported(ai.result || 'Done').trim();
+      if (answer) timeline.push('', `= ${answer}`);
+    } else if (ai.status === 'error') {
+      footer = remote ? 'from phone · tap = dismiss' : dismissHint;
+      const problem = stripUnsupported(ai.error || 'Something went wrong').trim();
+      if (problem) timeline.push('', `! ${problem}`);
+    } else {
+      footer = remote ? 'from phone · tap = stop' : 'tap R1 = stop action';
+      if (!sawStep) timeline.push('··· thinking');
+    }
   }
 
-  // The watched-session strip. `confirm` is excluded on purpose: a destructive
-  // prompt is the one screen where nothing else may compete for attention.
-  // The cursor row is the one the ring points at, and its `latest` is the whole
-  // reason to scroll — "done" alone never told anyone anything.
-  if (queue && ai.status !== 'confirm') {
-    const rows = queue.rows;
-    const at = Math.min(rows.length - 1, Math.max(0, queue.cursor));
+  // Word-wrap FIRST so paging only has to pack whole rendered lines (it hard
+  // splits otherwise, which mid-cuts a word and reads as a typo).
+  const wrapped: string[] = [];
+  for (const line of timeline) wrapped.push(...wrapToWidth(line, INNER_W));
+
+  // Line budget: the canvas shows AI_SCREEN_LINES, the header + divider take 2,
+  // the controls take 1, and the pinned session strip takes up to 3. An OS
+  // scroll would swallow the ring's swipe, so every page is sized to stay under
+  // it rather than relying on the firmware to clip.
+  const bodyLines = Math.max(2, AI_SCREEN_LINES - 3 - (rows.length ? 3 : 1));
+  const pages =
+    ai.status === 'confirm'
+      ? [wrapped.slice(0, bodyLines).join('\n')]
+      : paginateLines(wrapped, { width: INNER_W, lines: bodyLines, bytes: AI_PAGE_BYTES });
+
+  // Ring position. Units are TRANSCRIPT PAGES first, then one unit per watched
+  // session — so ▼ walks the run's own history and then hands over to the
+  // background runs, without a mode switch.
+  const units = pages.length + rows.length;
+  const scroll = Math.min(units - 1, Math.max(0, opts.scroll ?? 0));
+  const onSessions = scroll >= pages.length;
+
+  const at = Math.min(Math.max(0, scroll - pages.length), Math.max(0, rows.length - 1));
+  const strip: string[] = [];
+  if (rows.length) {
     const row = rows[at];
-    body.push(
-      scrollable
-        ? `sessions ${at + 1}/${rows.length}${queue.unread ? ` · ${queue.unread} new` : ''}`
-        : `session${queue.unread ? ' · new' : ''}`,
+    strip.push(
+      rows.length > 1
+        ? `sessions ${at + 1}/${rows.length}${queue!.unread ? ` · ${queue!.unread} new` : ''}`
+        : `session${queue!.unread ? ' · new' : ''}`,
     );
-    // Only the row the ring points at is drawn, and `>` is how every other list
-    // in this app marks its selection — including the doc picker. The position
-    // line above (`sessions 2/3`) is what says which one that is.
-    body.push(
-      truncate(
-        `> ${row.label} · ${row.status} · ${monitorAge(row.updatedAt)}${row.unread ? ' · NEW' : ''}`,
-        44,
-      ),
-    );
-    if (row.latest) body.push(truncate(`  ${row.latest}`, 44));
+    // The row's own `latest` is the whole reason to scroll — "done" alone told
+    // nobody anything. It WRAPS now instead of being clipped at 44 characters.
+    const label = `> ${row.label} · ${row.status} · ${monitorAge(row.updatedAt)}${row.unread ? ' · NEW' : ''}`;
+    strip.push(...wrapToWidth(label, INNER_W));
+    if (row.latest) strip.push(...wrapToWidth(`  ${row.latest}`, INNER_W));
   }
+
+  const scrollHint =
+    units > 1 ? (onSessions ? 'scroll = sessions' : `scroll = steps ${scroll + 1}/${pages.length}`) : '';
+  const controls = scrollHint ? `${footer} · ${scrollHint}` : footer;
+
+  const lines = [head, '------------------'];
+  // In the session region the pinned strip IS the body, so the transcript page
+  // is not repeated above it.
+  if (!onSessions) lines.push(...pages[scroll].split('\n'));
+  if (!rows.length) lines.push('');
+  lines.push(...strip, controls);
 
   return {
-    text: clipBytes(`${head}\n------------------\n${body.join('\n')}`, MAX_CONTENT_BYTES),
-    todoCursor: 0,
-    canPrev: false,
-    canNext: false,
+    text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
+    todoCursor: scroll,
+    canPrev: scroll > 0,
+    canNext: scroll < units - 1,
+    sessionStart: rows.length ? pages.length : -1,
   };
 }
 

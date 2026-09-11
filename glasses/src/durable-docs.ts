@@ -166,3 +166,22 @@ export async function saveOwnerSession(s: OwnerSession): Promise<void> {
 export async function clearOwnerSession(): Promise<void> {
   await durableRemove(OWNER_KEY);
 }
+
+/**
+ * Jarvis conversation memory (see ai/memory.ts). Stored as raw JSON so the
+ * memory module owns its own shape and versioning — this layer only knows how
+ * to move a string in and out of the two storage backends.
+ */
+const MEMORY_KEY = 'hub:ai-memory';
+
+export async function saveMemoryRaw(json: string): Promise<void> {
+  await durableSet(MEMORY_KEY, json);
+}
+
+export async function loadMemoryRaw(): Promise<string | null> {
+  return durableGet(MEMORY_KEY);
+}
+
+export async function clearMemoryRaw(): Promise<void> {
+  await durableRemove(MEMORY_KEY);
+}

@@ -59,7 +59,6 @@ export {
   getMonitorView,
   ingestMonitoredRuns,
   monitorAge,
-  moveMonitorCursor,
   removeMonitoredRun,
   resetMonitor,
   subscribeMonitor,
@@ -69,4 +68,28 @@ export {
   type MonitorView,
   type WatchedRun,
 } from './monitor';
+/**
+ * Conversation memory is public for the same reason the monitor queue is: the
+ * panel shows how full the log is and can empty it. The LOOP writes it through
+ * literal imports, never through this barrel — a re-export would be a cycle
+ * (agent → index → pages → capabilities → agent).
+ */
+export {
+  compactMemory,
+  countWords,
+  getMemoryView,
+  hydrateMemory,
+  isCompacting,
+  memoryMessages,
+  memoryPromptText,
+  rememberExchange,
+  rememberSpoken,
+  resetMemory,
+  subscribeMemory,
+  MEMORY_DIGEST_WORDS,
+  MEMORY_MAX_WORDS,
+  type JarvisMemory,
+  type MemoryTurn,
+  type MemoryView,
+} from './memory';
 export { GLOBAL_PAGE, type Capability, type PageId } from './types';

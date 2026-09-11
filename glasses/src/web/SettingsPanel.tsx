@@ -12,6 +12,7 @@
 // deployment never looks like "no key set" and can never be shadowed from here.
 import { useEffect, useState } from 'react';
 import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
+import { compactMemory, getMemoryView, resetMemory, subscribeMemory, type MemoryView } from '../ai';
 import { FREE_TOOL_MODELS, DEEPSEEK_MODELS } from '../models';
 import { DEFAULT_MODEL } from '../types';
 import { fetchAgentStatus, saveSettings, type AgentStatus, type ValueSource } from './agents-client';
@@ -27,6 +28,85 @@ function SourceBadge({ source }: { source?: ValueSource }) {
 
 function isEnv(source?: ValueSource): boolean {
   return source === 'env';
+}
+
+/**
+ * Jarvis conversation memory (see ../ai/memory). This readout exists because the
+ * log is otherwise invisible: on the glasses it is only ever a prompt block, so
+ * without it the wearer cannot tell "Jarvis forgot" from "Jarvis kept quiet" —
+ * which is exactly the confusion that produced the feature request.
+ */
+function MemoryPanel() {
+  const [view, setView] = useState<MemoryView>(getMemoryView);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const unsub = subscribeMemory(() => setView(getMemoryView()));
+    return () => {
+      unsub();
+    };
+  }, []);
+
+  const empty = !view.turns && !view.folded;
+  const sync = () => setView(getMemoryView());
+  const compact = async () => {
+    setBusy(true);
+    // Runs a REAL summarisation through the relay — the same path an automatic
+    // compaction takes, which is the only way to find out it is broken before
+    // the log is long enough for it to matter.
+    await compactMemory();
+    setBusy(false);
+    sync();
+  };
+
+  return (
+    <>
+      <div className="panel-label">Jarvis memory</div>
+      <div className="status-grid">
+        <span className="pill">{view.turns} turn(s) kept verbatim</span>
+        <span className="pill">
+          {view.words.toLocaleString()} / {view.capWords.toLocaleString()} words
+        </span>
+        <span className="pill">
+          {view.folded ? `${view.folded} turn(s) in the summary` : 'nothing summarised yet'}
+        </span>
+        {view.updatedAt > 0 && (
+          <span className="pill">updated {new Date(view.updatedAt).toLocaleString()}</span>
+        )}
+      </div>
+      <p className="hint-line">
+        Every Jarvis turn is replayed with the tail of this log, and the transcript also carries a
+        summary of what was compacted. Past {view.capWords.toLocaleString()} words the oldest turns
+        are folded into one ~{view.digestWords}-word summary instead of being dropped. It lives on
+        this device, so the next Jarvis session reads it back.
+      </p>
+      {view.digest && <p className="memory-digest">{view.digest}</p>}
+      <div className="docs-actions">
+        <button onClick={() => void compact()} disabled={busy || empty}>
+          {busy ? 'Compacting…' : 'Compact now'}
+        </button>
+        {confirming ? (
+          <>
+            <button
+              onClick={() => {
+                resetMemory();
+                setConfirming(false);
+                sync();
+              }}
+            >
+              Really forget everything
+            </button>
+            <button onClick={() => setConfirming(false)}>Cancel</button>
+          </>
+        ) : (
+          <button onClick={() => setConfirming(true)} disabled={empty}>
+            Forget everything
+          </button>
+        )}
+      </div>
+    </>
+  );
 }
 
 export function SettingsPanel() {
@@ -248,6 +328,8 @@ export function SettingsPanel() {
         the glasses bundle). Set <code>OPENROUTER_API_KEY</code> / <code>TAVILY_API_KEY</code> in
         <code> web/.env.local</code> (or your host's env vars) to override — environment values win.
       </p>
+
+      <MemoryPanel />
 
       <DevicesPanel />
     </div>

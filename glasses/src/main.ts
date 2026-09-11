@@ -81,9 +81,9 @@ import {
   getAi,
   getMonitorView,
   hasUndo,
+  hydrateMemory,
   ingestMonitoredRuns,
   isAiMirrored,
-  moveMonitorCursor,
   requestWebTab,
   runAiAgent,
   setAppBridge,
@@ -215,6 +215,11 @@ async function main(): Promise<void> {
   // Agent definitions/tools/settings + the last 5 sessions are also mirrored to
   // the host storage (the WebView can be torn down at any moment).
   void hydrateAgentsDurable();
+  // Jarvis conversation memory. Hydrated here, next to the bridge call, because
+  // the prompt build reads it SYNCHRONOUSLY on the first turn — a later load
+  // would make the wearer's first question of a session forget the last one,
+  // which is exactly the bug this exists to fix.
+  void hydrateMemory();
 
   let started = false; // createStartUpPageContainer called exactly once
   let renderedText = '';
@@ -229,6 +234,15 @@ async function main(): Promise<void> {
   let appliedAgentSig = '';
   let todoCursor = 0; // selected todo row
   let docPage = 0; // current docs/notes page
+  // Ring position of the Jarvis HUD, in the HUD's own scroll units: transcript
+  // pages first, then one watched-session row each (see aiView). Clamped by the
+  // view on every render, so it can never strand the ring past the last page.
+  let aiScroll = 0;
+  // While following, the HUD shows the NEWEST page — the point of a live run is
+  // watching it think. The first ▲/▼ releases the pin and the position becomes
+  // the wearer's: text must never scroll out from under a finger that is reading
+  // it. Only `aiScroll` matters once this is false.
+  let aiFollow = true;
   let lastView: SectionView | null = null;
   let lastActiveDocId: string | null = null; // reset pagination when doc changes
   // Last non-Docs tab, so the Docs tab's "Back" menu item can return there
@@ -367,6 +381,9 @@ async function main(): Promise<void> {
     jarvisSession = false;
     jarvisLastReply = '';
     jarvisSilentTurns = 0;
+    // The next run opens on its own newest page, not wherever this one was left.
+    aiFollow = true;
+    aiScroll = 0;
     clearAiTimer();
     // A conversation can be ended mid-sentence (Stop AI on the listening
     // screen). The mic must go with it — leaving it open would let the next
@@ -421,6 +438,7 @@ async function main(): Promise<void> {
   async function startAiRun(utterance: string): Promise<void> {
     clearAiTimer();
     pickerActive = false;
+    aiFollow = true;
     const focus = getState().activeSection;
     aiBegin(utterance, focus);
     void renderGlasses();
@@ -690,7 +708,10 @@ async function main(): Promise<void> {
       // it gets the full answer without them having to go looking.
       const q = getMonitorView();
       if (q.rows.length) {
-        const row = q.rows[Math.min(q.cursor, Math.max(0, q.rows.length - 1))];
+        // The run worth naming here is the one that just FINISHED — that is what
+        // "notified, not buried" means. Falling back to the newest row keeps the
+        // line useful while a run is still going.
+        const row = q.rows.find((r) => r.unread) ?? q.rows[0];
         lines.push('', clipBytes(`${q.unread ? '! ' : ''}${row.label} ${row.status}`, 46));
       }
       lines.push('', 'tap R1 = send · Stop AI = end');
@@ -1017,11 +1038,19 @@ async function main(): Promise<void> {
           : foreignActive
             ? dictationForeignView()
             : aiActive
-              ? aiView(ai, { conversing: jarvisSession, queue: getMonitorView() })
+              ? aiView(ai, {
+                  conversing: jarvisSession,
+                  queue: getMonitorView(),
+                  scroll: aiFollow ? Number.MAX_SAFE_INTEGER : aiScroll,
+                })
               : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
     else if (!overlayActive) todoCursor = view.todoCursor;
+    // The HUD clamps its own scroll, so its answer wins: a transcript that grew
+    // a page (or a queue that drained a row) would otherwise leave the stored
+    // index pointing at a screen that no longer exists.
+    if (aiActive) aiScroll = view.todoCursor;
     const text = view.text;
     console.log('[hub] render', {
       started,
@@ -1341,17 +1370,37 @@ async function main(): Promise<void> {
     // it (the user would lose their place with no visual feedback).
     if (dictationActive || dictationDiagText || dictationSnapshot().active) return;
     if (getAi().status !== 'idle') {
-      // …but the HUD is not opaque to the ring: the watched-session strip at the
-      // bottom of it belongs to the wearer, and checking on a background run
-      // mid-conversation must not cost them the conversation. A confirm prompt
-      // is the one exception — that screen has a job and no spare attention.
-      if (getAi().status !== 'confirm' && moveMonitorCursor(dir)) {
-        // Looking at a finished row IS the acknowledgement: there is no room on
-        // a 10-line canvas for a separate dismiss, and a badge nobody can clear
-        // is a badge that gets ignored.
-        ackMonitor();
-        void renderGlasses();
+      // …but the HUD is not opaque to the ring: its transcript is PAGED, and the
+      // watched-session rows at the bottom of it belong to the wearer, so
+      // checking on a background run mid-conversation must not cost them the
+      // conversation. A confirm prompt is the one exception — that screen has a
+      // job and no spare attention.
+      const ai = getAi();
+      if (ai.status === 'confirm') return;
+      const q = getMonitorView();
+      // Resolve where the ring ACTUALLY is first — while following the tail the
+      // stored index is stale by design — then move one unit from there. Asking
+      // the view rather than clamping here is what keeps this honest: only it
+      // knows how many pages the transcript produced, and a swipe at either end
+      // must be a no-op instead of a redraw (a redraw costs a flicker).
+      const here = aiView(ai, {
+        conversing: jarvisSession,
+        queue: q,
+        scroll: aiFollow ? Number.MAX_SAFE_INTEGER : aiScroll,
+      });
+      const view = aiView(ai, { conversing: jarvisSession, queue: q, scroll: here.todoCursor + dir });
+      if (view.todoCursor === here.todoCursor) return;
+      aiFollow = false;
+      aiScroll = view.todoCursor;
+      // Landing on a finished session IS the acknowledgement: there is no room
+      // on a 10-line canvas for a separate dismiss, and a badge nobody can clear
+      // is a badge that gets ignored.
+      const start = view.sessionStart ?? -1;
+      if (start >= 0 && aiScroll >= start) {
+        const row = q.rows[aiScroll - start];
+        if (row) ackMonitor(row.runId);
       }
+      void renderGlasses();
       return;
     }
     if (pickerActive) {

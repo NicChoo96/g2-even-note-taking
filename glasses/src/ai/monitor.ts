@@ -81,9 +81,12 @@ export interface MonitorRow {
 export interface MonitorView {
   /** Newest first — always. `rows[0]` is the run to read. */
   rows: MonitorRow[];
-  /** Which row the ring is pointing at. */
-  cursor: number;
-  /** Finished-but-unread count across the whole queue. */
+  /**
+   * Finished-but-unread count across the whole queue. This — not a per-row
+   * cursor — is what "notify Jarvis" means: the HUD's ring now scrolls ONE
+   * index across both its transcript and these rows, so keeping a second cursor
+   * here would be two sources of truth for the same position.
+   */
   unread: number;
   running: number;
 }
@@ -94,7 +97,6 @@ const MAX_QUEUE = 8;
 const MAX_LATEST = 180;
 
 let queue: MonitoredRun[] = [];
-let cursor = 0;
 let view: MonitorView | null = null;
 const listeners = new Set<() => void>();
 
@@ -153,7 +155,6 @@ export function getMonitorView(): MonitorView {
   }));
   view = {
     rows,
-    cursor: Math.min(Math.max(0, cursor), Math.max(0, rows.length - 1)),
     unread: rows.filter((r) => r.unread).length,
     running: rows.filter((r) => r.status === 'running').length,
   };
@@ -203,8 +204,6 @@ export function enqueueMonitoredRun(input: {
     unread: false,
   };
   queue = sorted([...queue, entry]).slice(0, MAX_QUEUE);
-  // A new run is what the wearer just asked for, so point the ring at it.
-  cursor = 0;
   emit();
   return entry;
 }
@@ -264,29 +263,14 @@ export function ingestMonitoredRuns(runs: readonly WatchedRun[]): MonitoredRun[]
   return finished;
 }
 
-/** Move the ring through the queue. Returns true when the cursor actually moved. */
-export function moveMonitorCursor(dir: -1 | 1): boolean {
-  const n = queue.length;
-  if (n < 2) return false;
-  const current = Math.min(Math.max(0, cursor), n - 1);
-  // Wrap: ▲ at the top lands on the newest, ▼ at the bottom wraps to the oldest,
-  // matching how the agent list itself behaves at both edges.
-  const next = (current + dir + n) % n;
-  if (next === current) return false;
-  cursor = next;
-  emit();
-  return true;
-}
-
 /**
- * Mark the run under the ring as READ, clearing the "notify Jarvis" badge.
- * Called when the wearer scrolls onto a finished row — looking at it IS the
- * acknowledgement, and a badge that needed a separate dismiss would be another
- * button on a screen with no room for one.
+ * Mark a run as READ, clearing the "notify Jarvis" badge. Called when the ring
+ * lands on a finished row — looking at it IS the acknowledgement, and a badge
+ * that needed a separate dismiss would be another button on a screen with no
+ * room for one. With no explicit id, the newest unread row is the one meant.
  */
 export function ackMonitor(runId?: string): boolean {
-  const rows = getMonitorView().rows;
-  const target = runId ?? rows[Math.min(cursor, Math.max(0, rows.length - 1))]?.runId;
+  const target = runId ?? queue.find((r) => r.unread)?.runId;
   if (!target) return false;
   const entry = queue.find((r) => r.runId === target);
   if (!entry?.unread) return false;
@@ -306,7 +290,6 @@ export function removeMonitoredRun(runId: string): void {
 /** Test/teardown reset. */
 export function resetMonitor(): void {
   queue = [];
-  cursor = 0;
   emit();
 }
 

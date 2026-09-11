@@ -32,6 +32,8 @@ import {
   getAiFocus,
   isAiAborted,
 } from './store';
+import { memoryMessages, memoryPromptText, rememberExchange } from './memory';
+import { conversePromptText, isConversational } from './converse';
 import { beginAiBatch, endAiBatch } from './undo';
 import { stripToolMarkup } from './tool-markup';
 
@@ -49,6 +51,13 @@ function wireName(name: string): string {
 /** Tool results are fed back verbatim; keep the context bounded. */
 const MAX_RESULT_CHARS = 1500;
 const MAX_REPLY_CHARS = 240;
+/**
+ * How long a CONVERSATIONAL answer may be (see ./converse). A command earns one
+ * short sentence because the wearer is waiting on an action; a chat needs the
+ * shape of a reply, so it gets two or three. Still a cap rather than a target —
+ * the HUD pages now, but nobody wants to read an essay on a 576x288 screen.
+ */
+const MAX_CHAT_CHARS = 480;
 
 /**
  * Tool budget, highest value first. Page actions sit above the introspection
@@ -91,8 +100,12 @@ function selectTools(focused: PageId): ToolSchema[] {
   return toToolSchemas(ranked.slice(0, MAX_TOOLS));
 }
 
-function systemPrompt(): string {
+function systemPrompt(converse = false): string {
   const focus = getAiFocus();
+  // Everything the wearer said before, folded into a digest plus the last few
+  // turns (see ./memory). Empty until the first exchange, in which case the
+  // prompt is byte-for-byte what it was before memory existed.
+  const mem = memoryPromptText();
   // Action names below are written in WIRE form (`page__action`) because that is
   // exactly how they appear in this turn's tool list; the registry also accepts
   // the dotted form, so either spelling resolves.
@@ -120,7 +133,14 @@ function systemPrompt(): string {
     '- The Jarvis agent queue lists background runs YOU started. If one is finished AND marked [NEW],',
     '  say so in your one short sentence — the wearer cannot otherwise tell that it landed.',
     '- Read a finished run with agents__sessions (newest first, so a fresh run is session "1").',
+    '- "Earlier I said", "what did I tell you", "you remember…" refer to the MEMORY block below. Answer',
+    '  from it in one sentence; never read the whole block back.',
     '',
+    // Placed AFTER the rules so it wins over "answer in ONE short sentence",
+    // and only ever for a turn that named nothing in the app (see ./converse for
+    // why a wrong guess here is guaranteed to be cheap).
+    ...(converse ? [conversePromptText(), ''] : []),
+    ...(mem ? [mem, ''] : []),
     'LIVE APP STATE',
     appSnapshotText(),
     '',
@@ -160,12 +180,12 @@ function confirmCopy(cap: Capability, args: Record<string, unknown>): { title: s
   return { title: cap.title, lines };
 }
 
-function clean(text: string): string {
+function clean(text: string, max = MAX_REPLY_CHARS): string {
   // Scrub BEFORE flattening: a model that wants a tool it was not offered answers
   // by PRINTING the call instead of making one (see ./tool-markup), and that
   // machine syntax used to fill the HUD container.
   const flat = stripToolMarkup(text).replace(/\s+/g, ' ').trim();
-  return flat.length > MAX_REPLY_CHARS ? `${flat.slice(0, MAX_REPLY_CHARS - 1)}…` : flat;
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
 /**
@@ -178,8 +198,14 @@ function clean(text: string): string {
  * Re-declaring the tools with `tool_choice: 'none'` does not stop it (verified
  * against deepseek-flash), so the scaffolding has to be removed instead.
  */
-function toolFreeTurn(messages: WireMessage[], ask: string): WireMessage[] {
-  const head = messages.filter((m) => m.role === 'system' || m.role === 'user').slice(0, 2);
+function toolFreeTurn(messages: WireMessage[], ask: string, keep = 2): WireMessage[] {
+  // `keep` is the transcript PREFIX that existed before the first model turn —
+  // the system prompt plus whatever conversation memory supplied. Everything
+  // after it is this run's own scaffolding and must not reach the model.
+  const head = messages
+    .slice(0, keep)
+    .map((m) => ({ role: m.role, content: stripToolMarkup(String(m.content ?? '')) }))
+    .filter((m) => m.content);
   const found: string[] = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
@@ -229,12 +255,27 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
   const send = opts.llm ?? llmChat;
   const maxSteps = Math.max(1, opts.maxSteps ?? aiMaxSteps());
   const model = opts.model ?? aiModel();
+  // One decision, made once, from the words themselves — a pure function of the
+  // utterance, so the prompt and the reply budget below can never disagree about
+  // which kind of turn this is.
+  const converse = isConversational(opts.utterance);
 
   aiBegin(opts.utterance, opts.focus);
 
   const batch = beginAiBatch(opts.utterance);
+  // Replay the tail of previous conversations as real turns. This is what makes
+  // "make it the second one" or "and the other list" resolvable at all: the
+  // store's `jarvisLastReply` is display-only and never reached the model, so
+  // before this the transcript was ALWAYS a single system + user pair.
+  const history: WireMessage[] = memoryMessages().map((t) => ({
+    role: t.role,
+    content: t.text,
+  }));
+  // Prefix the closing tool-free turn must preserve verbatim.
+  const keep = 1 + history.length + 1;
   const messages: WireMessage[] = [
-    { role: 'system', content: systemPrompt() },
+    { role: 'system', content: systemPrompt(converse) },
+    ...history,
     { role: 'user', content: opts.utterance },
   ];
 
@@ -244,14 +285,20 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
 
   const finishRun = (reply: string, ok = true): AiRunResult => {
     // Scrub here too, not only in clean(): THIS is the string the caller speaks,
-    // and a spoken DSML blob is the bug this guards against.
-    const spoken = clean(reply);
+    // and a spoken DSML blob is the bug this guards against. A conversational
+    // turn is allowed the longer budget — the answer IS the whole result.
+    const spoken = clean(reply, converse ? MAX_CHAT_CHARS : MAX_REPLY_CHARS);
     const changed = endAiBatch(batch);
     touched = changed;
-    // The spoken answer is the LAST link in the chain of thought, so it belongs
-    // in the timeline too — otherwise the companion panel shows what the agent
-    // did but not what it finally said. `aiStep` is a no-op on a cancelled run.
-    if (ok && spoken) aiStep('reply', spoken);
+    // The answer is NOT pushed as a step. It is printed in full under the
+    // transcript as `= …`, so a step here would put the same sentence on the
+    // glasses twice, and a `say__reply` call used to make it three times. On a
+    // conversational turn that sentence is the entire message.
+    // Persist the exchange so the NEXT turn (and the next launch) can see it.
+    // Only a run that actually answered is worth remembering: an aborted or
+    // failed one would teach the model that the wearer asked something for
+    // nothing, and it would answer the retry as if it had already replied.
+    if (ok && spoken) rememberExchange(opts.utterance, spoken);
     if (ok) aiFinish(spoken || 'Done');
     return { ok, reply: spoken, changed, unreachable: false };
   };
@@ -370,7 +417,11 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
 
       aiStep('call', cap.title);
       const result = await execute(outcome.prepared);
-      aiStep(result.ok ? 'ok' : 'fail', result.summary);
+      // EXCEPT say__reply: its entire result IS the sentence, and that sentence
+      // already gets the `= …` line below the transcript. Echoing it as a step
+      // too would double it on the HUD, which is exactly what a chat cannot
+      // afford — there it is the whole message rather than a footnote.
+      if (cap.name !== 'say.reply') aiStep(result.ok ? 'ok' : 'fail', result.summary);
 
       if (cap.name === 'nav.open_page') {
         // The routing line on the HUD.
@@ -408,6 +459,7 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
       messages: toolFreeTurn(
         messages,
         'Using ONLY the results above, reply with ONE short sentence saying what you did or found. Do not call any tools.',
+        keep,
       ),
     });
     const text = stripToolMarkup(closing.message?.content ?? '');

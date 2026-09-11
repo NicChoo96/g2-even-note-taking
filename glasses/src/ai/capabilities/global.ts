@@ -156,12 +156,23 @@ export const globalCapabilities: Capability[] = [
     page: GLOBAL_PAGE,
     title: 'Answer',
     description:
-      'Answer the user in words with no app change. Use when the request is a question or when no action ' +
-      'fits. Keep it to one short sentence.',
-    params: [{ name: 'text', type: 'string', description: 'The reply, at most ~200 characters.', required: true }],
+      'Answer the user in words with no app change. Use it for a question, for ordinary conversation, or ' +
+      'when no action fits. One short sentence normally; two or three when they are clearly just talking ' +
+      'with you.',
+    params: [
+      {
+        name: 'text',
+        type: 'string',
+        // The long form is for the conversational lane (see ../converse). The cap
+        // here has to clear it, or a chat reply arrives pre-truncated and the
+        // loop's own budget never gets a say.
+        description: 'The reply: one or two sentences (~200 characters), or up to ~450 in a conversation.',
+        required: true,
+      },
+    ],
     run: (args) => {
       const text = String(args.text ?? '').trim();
-      return { ok: true, summary: text.slice(0, 250), data: { replied: true } };
+      return { ok: true, summary: text.slice(0, 500), data: { replied: true } };
     },
   },
   {
