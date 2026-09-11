@@ -1535,5 +1535,129 @@ assert(
 );
 
 // ════════════════════════════════════════════════════════════════════════════
+// 15. AGENT BUILDER — voice can set EVERY setting, clone, and edit in place
+//
+// The builder has name, role (system prompt), trigger prompt, tools and a model
+// override. A voice-only wearer has no keyboard, so every one of them must be
+// reachable by speaking — and "clone" must copy them all. These tests drive the
+// real capabilities against the real agents store.
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Agent builder capabilities ──');
+
+const capOf = (name) => {
+  const c = capabilityByName(name);
+  assert(`capability ${name} exists`, !!c);
+  return c;
+};
+
+// A clean slate: no agents, but the seeded Tavily tool plus a fake REST tool so
+// name resolution has two kinds to choose between.
+agents.updateAgents((s) => ({
+  ...s,
+  agents: [],
+  sessions: [],
+  tools: [
+    ...s.tools.filter((t) => t.kind === 'tavily'),
+    {
+      id: 'tool-weather',
+      name: 'get_weather',
+      kind: 'http',
+      description: 'Weather lookup',
+      url: 'https://api.example.com/weather',
+      method: 'GET',
+    },
+  ],
+}));
+
+const toolCatalog = await capOf('tools.list').run({});
+assert('tools.list names the seeded search tool', JSON.stringify(toolCatalog.data).includes('tavily_search'));
+assert('tools.list names the REST tool', JSON.stringify(toolCatalog.data).includes('get_weather'));
+
+// create: set every setting at once, resolving spoken tool names.
+const created = await capOf('agents.create').run({
+  name: 'Researcher',
+  systemPrompt: 'You are terse.',
+  prompt: 'Summarise the news.',
+  tools: 'web search and get_weather',
+  model: 'vendor/model:free',
+});
+assert('create succeeds', created.ok, created.summary);
+let stored = agents.getAgents().agents;
+check('create stores one agent', stored.length, 1);
+check('create sets the role (system prompt)', stored[0].systemPrompt, 'You are terse.');
+check('create resolves "web search" to Tavily', stored[0].toolIds.includes('tool-tavily'), true);
+check('create resolves "get_weather"', stored[0].toolIds.includes('tool-weather'), true);
+check('create sets the model override', stored[0].model, 'vendor/model:free');
+assert('create stamps updatedAt for newest-first ordering', typeof stored[0].updatedAt === 'number');
+
+// create with "none" → no tools.
+await capOf('agents.create').run({ name: 'Bare', tools: 'none' });
+stored = agents.getAgents().agents;
+check('create with "none" attaches no tools', stored.find((a) => a.name === 'Bare').toolIds, []);
+
+// create without tools → web search by default (the builder's own default).
+await capOf('agents.create').run({ name: 'Defaulted' });
+stored = agents.getAgents().agents;
+check('create defaults to web search', stored.find((a) => a.name === 'Defaulted').toolIds, ['tool-tavily']);
+
+// update: in-place edits, including tool add/remove and clearing the model.
+const beforeUpdatedAt = stored.find((a) => a.name === 'Researcher').updatedAt;
+const upd = await capOf('agents.update').run({
+  agent: 'Researcher',
+  name: 'Scout',
+  systemPrompt: 'Be brief.',
+  addTools: 'get_weather',
+  removeTools: 'search',
+  model: 'none',
+});
+assert('update succeeds', upd.ok, upd.summary);
+stored = agents.getAgents().agents;
+const scout = stored.find((a) => a.name === 'Scout');
+assert('update renames in place', !!scout);
+check('update rewrites the role', scout.systemPrompt, 'Be brief.');
+check('update removes search', scout.toolIds.includes('tool-tavily'), false);
+check('update adds the REST tool', scout.toolIds.includes('tool-weather'), true);
+check('update clears the model override', scout.model, undefined);
+assert('update re-stamps updatedAt (drives list order)', scout.updatedAt >= beforeUpdatedAt);
+
+// update with tools "none" empties the set.
+await capOf('agents.update').run({ agent: 'Scout', tools: 'none' });
+stored = agents.getAgents().agents;
+check('update with "none" clears every tool', stored.find((a) => a.name === 'Scout').toolIds, []);
+
+// A replace that matches nothing must NOT wipe the tools (a misheard name).
+await capOf('agents.update').run({ agent: 'Scout', addTools: 'get_weather' });
+const guarded = await capOf('agents.update').run({ agent: 'Scout', tools: 'flibbertigibbet' });
+stored = agents.getAgents().agents;
+check('an unmatched replace keeps the tools', stored.find((a) => a.name === 'Scout').toolIds, ['tool-weather']);
+check('…and returns a correctable "nothing to change"', guarded.ok, false);
+
+// clone: copies EVERY setting under a new id + default name.
+const cloned = await capOf('agents.clone').run({ agent: 'Defaulted' });
+assert('clone succeeds', cloned.ok, cloned.summary);
+stored = agents.getAgents().agents;
+const copy = stored.find((a) => a.id === cloned.data.id);
+assert('clone names the copy "<original> copy"', copy.name === 'Defaulted copy', copy.name);
+assert('clone gets a NEW id', copy.id !== stored.find((a) => a.name === 'Defaulted').id);
+check('clone copies the tools', copy.toolIds, ['tool-tavily']);
+check(
+  'clone copies the role',
+  copy.systemPrompt,
+  stored.find((a) => a.name === 'Defaulted').systemPrompt,
+);
+
+// clone with an explicit name.
+await capOf('agents.clone').run({ agent: 'Scout', name: 'Watcher' });
+stored = agents.getAgents().agents;
+assert('clone accepts a new name', stored.some((a) => a.name === 'Watcher'));
+
+// agents.list exposes the full configuration so the model can read it back.
+const listed = await capOf('agents.list').run({});
+const row = listed.data.agents.find((a) => a.name === 'Scout');
+assert('agents.list returns toolIds', Array.isArray(row.toolIds));
+assert('agents.list returns the model field', 'model' in row);
+assert('agents.list returns the role', typeof row.systemPrompt === 'string');
+
+// ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${fail === 0 ? 'ALL PASS' : `${fail} FAILURE(S)`}`);
 process.exit(fail === 0 ? 0 : 1);

@@ -2,6 +2,24 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.19
+
+v0.3.19 - Build a whole agent by voice
+
+- Jarvis can now set every part of an agent: name, role, trigger prompt, tools and model, and edit them in place without rebuilding.
+- Ask it what tools exist, then say things like "add web search" or "remove the weather tool".
+- New: clone an agent, to copy one you like and tweak the copy.
+- A misheard tool name no longer wipes an agent's tools; it is ignored and reported.
+
+## 0.3.18
+
+v0.3.18 - Agent list, Stop AI and mic fixes
+
+- Agents now list newest first, and scrolling wraps around at the top and bottom.
+- New agents turn on web search by default, and you can add web search or a REST tool straight from the agent editor.
+- Fixed Stop AI: opening the menu while Jarvis was listening ended the conversation, so tapping Stop restarted it. It now stays put.
+- Fixed a dictation error leaving the mic held, which blocked later voice triggers.
+
 ## 0.3.16
 
 v0.3.16 - Sign in on the glasses app
