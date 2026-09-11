@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.24
+
+v0.3.24 - Jarvis stops vanishing mid-read
+
+- Fixed an answer disappearing while you were reading it, which left the menu on "Stop AI" over the plain page underneath.
+- A run owned by the phone can no longer overwrite what the glasses are showing, and a stale frame from an earlier connection is ignored.
+- The menu offers "Stop AI" only while a reply or the mic is really on screen, so the way out always works.
+
 ## 0.3.23
 
 v0.3.23 - Jarvis reads top-down, and never cuts you off

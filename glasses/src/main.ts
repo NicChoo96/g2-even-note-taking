@@ -662,12 +662,24 @@ async function main(): Promise<void> {
       // 'confirm' counts as running: the menu must keep offering a way OUT of
       // the HUD, since "Stop AI" is also how a destructive action is refused.
       aiRunning: ai.status === 'running' || ai.status === 'confirm',
-      // A conversation with NO turn in flight (the mic is open, or the last reply
-      // is still on screen). The menu then shows 'Stop AI' instead of 'Jarvis' so
-      // the exit is always one long-press away, while 'Undo AI' stays reachable
-      // between turns — that is the whole point of the flag being separate from
-      // `aiRunning`.
-      aiListening: jarvisSession && ai.status !== 'running' && ai.status !== 'confirm',
+      // A conversation with NO turn in flight (the Jarvis mic is open, or the
+      // last reply is still on screen). The menu then shows 'Stop AI' instead of
+      // 'Jarvis' so the exit is always one long-press away, while 'Undo AI' stays
+      // reachable between turns — that is the whole point of the flag being
+      // separate from `aiRunning`.
+      //
+      // Derived from what is actually ON SCREEN, not from the session flag alone.
+      // Left as `jarvisSession && !running` it advertised 'Stop AI' over a plain
+      // section page whenever the store fell to `idle` underneath a live session
+      // flag (a cross-surface frame overwriting the HUD, say): the wearer tapped
+      // Stop, nothing happened, and the only way back to the page was a
+      // double-tap. A phantom session now reads as plain 'Jarvis', and tapping
+      // that ends it through the defensive branch in the menu handler.
+      aiListening: jarvisSession && (
+        (dictationActive && dictationToAgent) ||
+        ai.status === 'done' ||
+        ai.status === 'error'
+      ),
       aiUndo: hasUndo(),
     });
   }

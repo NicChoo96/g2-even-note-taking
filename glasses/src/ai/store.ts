@@ -101,6 +101,20 @@ export interface AiControl {
   approve?: boolean;
 }
 
+/**
+ * Does a travelling frame carry a RUN? Anything else is not a run to mirror.
+ *
+ * `idle` is the dangerous one, and it is why this predicate exists: adopting it
+ * blanked the local HUD while the Jarvis session flag stayed set, so the
+ * contextual menu went on offering "Stop AI" over a page the wearer had already
+ * been dropped back to — and because the store was then `mirrored: true` with
+ * `status: 'idle'`, `mirrorExpired` could never sweep that state back out
+ * either. Only a real run may cross the wire onto another surface's canvas.
+ */
+export function mirrorableStatus(status: unknown): status is AiStatus {
+  return status === 'running' || status === 'confirm' || status === 'done' || status === 'error';
+}
+
 const LS_KEY = 'hub:ai';
 
 const DEFAULT_SETTINGS: AiSettings = { enabled: true, model: '', maxSteps: 6 };
@@ -405,6 +419,10 @@ export function applyRemoteAi(snapshot: AiSnapshot | null): void {
     });
     return;
   }
+  // A one-way state, refused at the door: `mirrorExpired` only fires for a
+  // NON-idle mirror, so a `mirrored && idle` store could never be swept out
+  // again. Checking here keeps it unrepresentable whatever the caller did.
+  if (!mirrorableStatus(snapshot.status)) return;
   set({
     status: snapshot.status,
     focus: snapshot.focus,

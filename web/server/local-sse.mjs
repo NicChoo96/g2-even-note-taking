@@ -800,10 +800,13 @@ const MIME = {
 const channels = new Map();
 
 // Channels whose payload is a LIVE SIGNAL rather than durable state: the Jarvis
-// run mirror ('ai') and its directed control frames ('ai-ctl'). Persisting
-// either would replay a finished run — or a Stop the user pressed minutes ago —
-// to the next client that connects, so they stay in memory only. Every other
-// channel (hub, agents) is restored and mirrored to disk as before.
+// run mirror ('ai') and its directed control frames ('ai-ctl'). A frame on one of
+// these must be DELIVERED ONCE and then forgotten. A replayed frame is a finished
+// run — or a Stop the user pressed minutes ago — arriving as if it were happening
+// now, and on the glasses that means a stale overlay replacing whatever the
+// wearer was reading. So they are excluded from the disk snapshot AND from
+// `lastState`, which is what the `init` frame hands to every new client.
+// Every other channel (hub, agents) is restored and mirrored to disk as before.
 const TRANSIENT_CHANNELS = new Set(['ai', 'ai-ctl']);
 
 function getChannel(name) {
@@ -1059,8 +1062,15 @@ const server = createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'invalid JSON' }));
       return;
     }
-    channel.lastState = state;
-    void persistState(channel.name, state);
+    // Transient channels broadcast and are then DROPPED — see
+    // TRANSIENT_CHANNELS. Caching the last `ai` frame here is what made every
+    // reconnect replay it: the SSE `init` frame below hands `lastState` to a new
+    // client, so a stale run (or a peer's idle frame) was re-delivered minutes
+    // later and overwrote the HUD of a wearer who was in the middle of reading.
+    if (!TRANSIENT_CHANNELS.has(channel.name)) {
+      channel.lastState = state;
+      void persistState(channel.name, state);
+    }
     const frame = { type: 'state', state };
     for (const client of [...channel.clients]) send(client, frame, channel.name);
     res.writeHead(200, { 'Content-Type': 'application/json' });

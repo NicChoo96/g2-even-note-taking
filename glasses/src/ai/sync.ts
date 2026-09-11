@@ -15,7 +15,12 @@
 //      cannot bounce the same run between them forever;
 //   2. an instance drops any snapshot stamped with its OWN owner id;
 //   3. a mirror expires if the owner stops speaking, so a surface that missed the
-//      terminal frame can never show a permanently stuck "working" overlay.
+//      terminal frame can never show a permanently stuck "working" overlay;
+//   4. a mirror never takes the canvas from THIS instance's own state, and a
+//      frame that carries no run on it (`idle`, or anything unrecognised) — or
+//      that is too old to be from this session — is refused outright. A
+//      replayed or empty frame must never be able to blank a reply the wearer is
+//      in the middle of reading.
 //
 // The owner only re-announces a run that is still IN FLIGHT (`running` /
 // `confirm`). A terminal frame (`done` / `error`) is published exactly once, so
@@ -32,6 +37,7 @@ import {
   applyRemoteAi,
   getAi,
   isAiMirrored,
+  mirrorableStatus,
   subscribeAi,
   type AiControl,
   type AiSnapshot,
@@ -47,6 +53,15 @@ export const AI_INSTANCE_ID = `ai-${Math.random().toString(36).slice(2, 10)}`;
 export const HEARTBEAT_MS = 2000;
 /** A mirror with no owner heartbeat for this long is presumed dead. */
 export const MIRROR_TTL_MS = 8000;
+/**
+ * Oldest frame still worth adopting — see rule 4. Deliberately loose: it only has
+ * to separate "a frame from this session" from "a frame the relay kept from an
+ * earlier one", without depending on the two surfaces' clocks agreeing (a tight
+ * bound would silently stop mirroring across even a small clock skew). A live
+ * frame is re-announced every `HEARTBEAT_MS` and swept after `MIRROR_TTL_MS`, so
+ * nothing real is ever close to this old.
+ */
+export const MIRROR_MAX_AGE_MS = 3_600_000;
 /** A control frame older than this is a reconnect replay, not a live intent. */
 export const CONTROL_TTL_MS = 15000;
 /** Cap on mirrored steps — the HUD draws a handful, and frames repeat often. */
@@ -61,10 +76,35 @@ const MAX_MIRROR_STEPS = 14;
 export function acceptRemote(
   remote: AiSnapshot | null | undefined,
   selfId: string = AI_INSTANCE_ID,
+  now: number = Date.now(),
 ): boolean {
   if (!remote || typeof remote !== 'object') return false;
   if (typeof remote.owner !== 'string' || !remote.owner) return false;
-  return remote.owner !== selfId;
+  if (remote.owner === selfId) return false; // rule 2 — our own echo
+  if (!mirrorableStatus(remote.status)) return false;
+  // Rule 4b — the frame must be from THIS session. This is a REPLAY guard, not a
+  // liveness check (that is `mirrorExpired`'s job, on our own clock), so the
+  // bound is deliberately loose: `at` is the SENDER's clock, and a tighter bound
+  // would silently stop mirroring between two surfaces whose clocks disagree by
+  // more than a few seconds. An hour is beyond any skew that would not break
+  // everything else, while still being far past the lifetime of a real frame —
+  // an owner re-announces every HEARTBEAT_MS and a mirror is swept after
+  // MIRROR_TTL_MS, so nothing live is ever anywhere near this old. Without it, a
+  // frame the relay kept from an earlier connection would arrive as live intent.
+  if (typeof remote.at !== 'number' || now - remote.at > MIRROR_MAX_AGE_MS) return false;
+  return true;
+}
+
+/**
+ * Rule 4a — may a peer's run take the canvas right now?
+ *
+ * Only when this instance has nothing of its own on it. A mirrored run is worth
+ * showing over an empty HUD; it must never displace a reply being held, a run
+ * this instance owns, or a confirmation it is waiting on. (`mirrored` is let
+ * through so a live mirror can keep updating itself.)
+ */
+export function mayMirror(local: { status: string; mirrored: boolean } = getAi()): boolean {
+  return local.status === 'idle' || local.mirrored;
 }
 
 /** Should this instance act on the given control frame? */
@@ -215,7 +255,23 @@ export function startAiMirror(): () => void {
 
   const offMirror = connectAiStream<AiSnapshot>({
     onState: (remote) => {
-      if (!acceptRemote(remote)) return; // rule 2 — ignore our own echo
+      if (!acceptRemote(remote)) {
+        // Expected traffic (our own echo) is not worth a line, but a dropped
+        // FOREIGN frame is exactly what a "Jarvis killed itself" report needs:
+        // it says which surface sent it and how late it arrived.
+        if (remote && typeof remote === 'object' && remote.owner && remote.owner !== AI_INSTANCE_ID) {
+          console.log('[hub] mirror frame refused', {
+            owner: remote.owner,
+            status: remote.status,
+            ageMs: Date.now() - Number(remote.at ?? 0),
+          });
+        }
+        return;
+      }
+      if (!mayMirror()) {
+        console.log('[hub] mirror refused — this surface owns the HUD', { status: getAi().status });
+        return;
+      }
       mirrorOwner = remote.owner;
       lastFrameAt = Date.now();
       applyRemoteAi(remote);

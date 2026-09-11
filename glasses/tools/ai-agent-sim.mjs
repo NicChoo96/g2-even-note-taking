@@ -1065,19 +1065,31 @@ console.log('\n── Mirror: ownership rules ──');
 
 const SELF = 'ai-self';
 const PEER = 'ai-peer';
+const NOW = 1_700_000_000_000;
 
-// Rule 2 — never render your own broadcast back at yourself.
-const frameFrom = (owner) => ({ ...localSnapshot(), owner });
-check('acceptRemote renders a peer run', acceptRemote(frameFrom(PEER), SELF), true);
-check('acceptRemote drops our own echo', acceptRemote(frameFrom(SELF), SELF), false);
-check('acceptRemote drops a frame with no owner', acceptRemote({ ...frameFrom(PEER), owner: '' }, SELF), false);
-check('acceptRemote drops a non-string owner', acceptRemote({ ...frameFrom(PEER), owner: 7 }, SELF), false);
-check('acceptRemote drops null', acceptRemote(null, SELF), false);
-check('acceptRemote drops a non-object', acceptRemote('nope', SELF), false);
+// Rule 2 — never render your own broadcast back at yourself. Frames are built
+// the way an owner publishes them: only a real run crosses the wire, and only a
+// frame from this session (rule 4), so both fields are part of the rule.
+const frameFrom = (owner, at = NOW) => ({ ...localSnapshot(at), owner, status: 'running' });
+check('acceptRemote renders a peer run', acceptRemote(frameFrom(PEER), SELF, NOW), true);
+check('acceptRemote drops our own echo', acceptRemote(frameFrom(SELF), SELF, NOW), false);
+check('acceptRemote drops a frame with no owner', acceptRemote({ ...frameFrom(PEER), owner: '' }, SELF, NOW), false);
+check('acceptRemote drops a non-string owner', acceptRemote({ ...frameFrom(PEER), owner: 7 }, SELF, NOW), false);
+check(
+  'acceptRemote drops an IDLE frame — there is no run on it',
+  acceptRemote({ ...frameFrom(PEER), status: 'idle' }, SELF, NOW),
+  false,
+);
+check(
+  'acceptRemote drops a replay from an earlier connection',
+  acceptRemote(frameFrom(PEER, NOW - 3_600_001), SELF, NOW),
+  false,
+);
+check('acceptRemote drops null', acceptRemote(null, SELF, NOW), false);
+check('acceptRemote drops a non-object', acceptRemote('nope', SELF, NOW), false);
 
 // Directed control frames — only the addressed instance may act, and only on a
 // fresh instruction (a reconnect replay would otherwise cancel a NEW run).
-const NOW = 1_700_000_000_000;
 const stopFor = (target, at = NOW) => ({ target, at, action: 'stop' });
 check('acceptControl takes a fresh frame addressed to us', acceptControl(stopFor(SELF), SELF, NOW), true);
 check('acceptControl drops a frame addressed elsewhere', acceptControl(stopFor(PEER), SELF, NOW), false);
@@ -1205,11 +1217,11 @@ assert(
 );
 assert(
   'a snapshot round-trips as a valid remote frame for a peer',
-  acceptRemote(snap, PEER) === true,
+  acceptRemote(snap, PEER, NOW) === true,
 );
 assert(
   'a snapshot is rejected by its own sender',
-  acceptRemote(snap, mod.AI_INSTANCE_ID) === false,
+  acceptRemote(snap, mod.AI_INSTANCE_ID, NOW) === false,
 );
 
 // Rule 1 — the one that cannot be shown by a single frame, and the one that
