@@ -7,6 +7,7 @@
 import { getAgents } from '../agents-store';
 import { getState } from '../store';
 import { activeDoc, type DocEntry, type TodoItem } from '../types';
+import { getMonitorView } from './monitor';
 import { pageTitle } from './registry';
 import { getAiFocus } from './store';
 
@@ -51,6 +52,20 @@ export function appSnapshotText(): string {
     if (running) lines.push(`Running agents: ${running}`);
   } else {
     lines.push('Agents: none configured');
+  }
+  // The runs Jarvis itself started, still being watched. Without this the model
+  // would only learn a run had finished if the wearer asked — and "is it done?"
+  // is exactly the question voice is best at.
+  const q = getMonitorView();
+  if (q.rows.length) {
+    const rows = q.rows
+      .slice(0, 3)
+      .map((r) => `${r.label} ${r.status}${r.unread ? ' [NEW]' : ''}`)
+      .join(', ');
+    lines.push(
+      `Jarvis agent queue (${q.rows.length} watched, ${q.unread} new): ${rows}` +
+        (q.rows.length > 3 ? ` (+${q.rows.length - 3} more)` : ''),
+    );
   }
   return lines.join('\n');
 }

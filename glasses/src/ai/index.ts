@@ -46,4 +46,27 @@ export {
   type AiStepKind,
 } from './store';
 export { requestRemoteConfirm, requestRemoteStop } from './sync';
+/**
+ * The watched-run queue is part of the public surface because the HUD (sections)
+ * and the platform layer (main) both draw and drive it — but the AGENT LOOP is
+ * not its owner and must not read it: a run the loop started is watched by
+ * whoever asked for it, and the prompt gets its view through ./context.
+ */
+export {
+  ackMonitor,
+  enqueueMonitoredRun,
+  getMonitored,
+  getMonitorView,
+  ingestMonitoredRuns,
+  monitorAge,
+  moveMonitorCursor,
+  removeMonitoredRun,
+  resetMonitor,
+  subscribeMonitor,
+  type MonitoredRun,
+  type MonitorRow,
+  type MonitorStatus,
+  type MonitorView,
+  type WatchedRun,
+} from './monitor';
 export { GLOBAL_PAGE, type Capability, type PageId } from './types';

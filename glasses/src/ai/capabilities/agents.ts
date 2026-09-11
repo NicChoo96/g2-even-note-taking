@@ -6,8 +6,10 @@
 // from one started by hand: it survives backgrounding and both the glasses
 // detail pane and the web panel watch the same transcript.
 import { getAgents, updateAgents } from '../../agents-store';
+import { getRuns } from '../../agent-runs';
 import { fetchRuns, startRun, stopRun } from '../../stream';
-import { tavilyTool, uid, type AgentDef, type ToolDef } from '../../types';
+import { tavilyTool, uid, type AgentDef, type AgentMessage, type ToolDef } from '../../types';
+import { enqueueMonitoredRun, monitorAge, type MonitorStatus } from '../monitor';
 import type { Capability, CapabilityResult } from '../types';
 import { resolveAgent, short } from './shared';
 
@@ -101,6 +103,142 @@ function toolSummary(ids: string[]): string {
   return ids.map(nameOf).join(', ');
 }
 
+// ── Session reading ─────────────────────────────────────────────────────────
+// "What did my agents do?" is the question the agents surface exists to answer,
+// and until now only a human could answer it by paging the detail pane. The
+// history lives in TWO places and neither alone is complete:
+//   • the relay's run store (`fetchRuns`) — the ONLY place a run that is still
+//     IN PROGRESS exists, because a run becomes a stored session only once it
+//     has finished;
+//   • AgentsState.sessions — the durable, synced history (the last 5), which
+//     survives the relay forgetting a run.
+// So the reader merges both and de-duplicates on the id, which is the run id for
+// a run that was ever observed (see main.ts `settleRun`).
+
+/** One row of the merged history, before it is flattened for the model. */
+interface SessionRow {
+  id: string;
+  agentId: string;
+  agentName: string;
+  title: string;
+  status: MonitorStatus;
+  turns: number;
+  latest: string;
+  at: number;
+  messages: AgentMessage[];
+}
+
+function flatten(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/** Newest thing an assistant SAID, skipping empty tool-calling scaffolding. */
+function lastSaid(messages: readonly { role: string; content: string; tool?: string }[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'assistant') continue;
+    if (m.tool && !m.content.trim()) continue;
+    const text = flatten(m.content, 90);
+    if (text) return text;
+  }
+  return '';
+}
+
+/**
+ * The whole history, newest FIRST.
+ *
+ * Descending order is not cosmetic: the model reads this list top-down and has
+ * one shot at picking the right row, so the most recent work has to be the
+ * first thing it sees — and `n` (1 = newest) is the handle it passes back to
+ * read one in full.
+ */
+async function sessionRows(): Promise<SessionRow[]> {
+  const runs = new Map<string, SessionRow>();
+  // The client mirror renders instantly but can go stale while the WebView is
+  // backgrounded, so the relay's answer WINS on any id both know about.
+  for (const r of getRuns()) {
+    runs.set(r.id, {
+      id: r.id,
+      agentId: r.agentId,
+      agentName: r.agentName,
+      title: r.title || flatten(r.prompt, 60),
+      status: r.status,
+      turns: r.messages.length,
+      latest: lastSaid(r.messages),
+      at: r.updatedAt || r.startedAt,
+      messages: r.messages.map((m) => ({ role: m.role, content: m.content, tool: m.tool, args: m.args, at: m.at })),
+    });
+  }
+  for (const r of await fetchRuns()) {
+    runs.set(r.id, {
+      id: r.id,
+      agentId: r.agentId,
+      agentName: r.agentName,
+      title: r.title || flatten(r.prompt, 60),
+      status: r.status,
+      turns: r.messages.length,
+      latest: lastSaid(r.messages),
+      at: r.updatedAt || r.startedAt,
+      messages: r.messages.map((m) => ({ role: m.role, content: m.content, tool: m.tool, args: m.args, at: m.at })),
+    });
+  }
+  const st = getAgents();
+  for (const s of st.sessions) {
+    if (runs.has(s.id)) continue; // a live run row is strictly newer
+    runs.set(s.id, {
+      id: s.id,
+      agentId: s.agentId,
+      agentName: st.agents.find((a) => a.id === s.agentId)?.name ?? 'agent',
+      title: s.title,
+      status: s.status,
+      turns: s.messages.length,
+      latest: lastSaid(s.messages),
+      at: s.updatedAt || s.createdAt,
+      messages: s.messages,
+    });
+  }
+  return [...runs.values()].sort((a, b) => b.at - a.at);
+}
+
+/** Resolve a spoken/derived session handle: "1" (newest), an id, or a prefix. */
+function findSession(rows: SessionRow[], raw: string): { row: SessionRow; n: number } | null {
+  const want = raw.trim();
+  if (!want) return null;
+  if (/^\d+$/.test(want)) {
+    const n = Number(want);
+    return n >= 1 && n <= rows.length ? { row: rows[n - 1], n } : null;
+  }
+  const lower = want.toLowerCase();
+  const i = rows.findIndex(
+    (r) => r.id.toLowerCase() === lower || r.id.toLowerCase().startsWith(lower),
+  );
+  if (i === -1) {
+    // Fall back to the newest session of a named agent, so "read the News run"
+    // works without the model having to copy an id off the list first.
+    const j = rows.findIndex((r) => r.agentName.toLowerCase().includes(lower));
+    return j === -1 ? null : { row: rows[j], n: j + 1 };
+  }
+  return { row: rows[i], n: i + 1 };
+}
+
+/** A compact, label-prefixed transcript — the thing the model actually reads. */
+function transcriptText(row: SessionRow, maxChars = 900): string {
+  // Chronological (oldest first) even though the LIST is newest-first: a story
+  // read backwards is useless. The tail is kept when it has to be trimmed,
+  // because the answer is at the end.
+  const lines = row.messages
+    .map((m) => {
+      const label = m.role === 'user' ? 'You' : m.role === 'tool' ? `[${m.tool ?? 'tool'}]` : 'Agent';
+      const body = flatten(m.content, 220);
+      return body ? `${label}: ${body}` : '';
+    })
+    .filter(Boolean);
+  let text = lines.join('\n');
+  if (text.length > maxChars) text = `…\n${text.slice(text.length - maxChars)}`;
+  return text;
+}
+
 export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.list',
@@ -132,6 +270,122 @@ export const agentsCapabilities: Capability[] = [
     },
   },
   {
+    name: 'agents.sessions',
+    page: 'agents',
+    title: 'Read agent sessions',
+    description:
+      'Read what the agents have DONE — their sessions, NEWEST FIRST, including runs that are ' +
+      'still in progress. Pass "session" to read one session in full (its transcript).',
+    params: [
+      {
+        name: 'agent',
+        type: 'string',
+        description: 'Only this agent\'s sessions: agent name or number. Omit or "all" for every agent.',
+        fallback: 'all',
+      },
+      {
+        name: 'session',
+        type: 'string',
+        description:
+          'Read ONE session in full: its number from the list ("1" = newest) or its id. Omit to just list them.',
+        fallback: '',
+      },
+      {
+        name: 'limit',
+        type: 'number',
+        description: 'How many recent sessions to list (1-10, default 5).',
+        fallback: 5,
+      },
+    ],
+    available: () => agents().length > 0,
+    run: async (args): Promise<CapabilityResult> => {
+      const all = await sessionRows();
+      if (!all.length) {
+        return { ok: true, summary: 'No agent sessions yet', data: { sessions: [] } };
+      }
+
+      const want = String(args.agent ?? '').trim();
+      const rows = /^(all|any|every|everything|\*|)$/i.test(want)
+        ? all
+        : (() => {
+            const agent = resolveAgent(want, agents());
+            const lower = want.toLowerCase();
+            return all.filter(
+              (r) =>
+                (agent && r.agentId === agent.id) ||
+                r.agentName.toLowerCase().includes(lower),
+            );
+          })();
+
+      if (!rows.length) {
+        return {
+          ok: false,
+          summary: `No sessions for "${short(want, 20)}"`,
+          hint: `agents: ${agentNames()}`,
+        };
+      }
+
+      // ── Detail: one session's transcript ──────────────────────────────────
+      const wantSession = String(args.session ?? '').trim();
+      if (wantSession) {
+        const found = findSession(rows, wantSession);
+        if (!found) {
+          return {
+            ok: false,
+            summary: `No session matches "${short(wantSession, 20)}"`,
+            hint: `${rows.length} session${rows.length === 1 ? '' : 's'}, newest is 1`,
+          };
+        }
+        const { row, n } = found;
+        return {
+          ok: true,
+          summary: `${short(row.agentName, 16)} · ${row.status} · ${n} of ${rows.length}`,
+          data: {
+            session: {
+              n,
+              id: row.id,
+              agent: row.agentName,
+              title: flatten(row.title, 80),
+              status: row.status,
+              turns: row.turns,
+              ago: monitorAge(row.at),
+            },
+            // A pre-rendered string, not a message array: the loop clips tool
+            // results at 1500 chars, and a clipped JSON array is unreadable.
+            transcript: transcriptText(row),
+          },
+        };
+      }
+
+      // ── List: newest first, compact enough to survive the result clip ─────
+      const limit = Math.min(10, Math.max(1, Number(args.limit) || 5));
+      const shown = rows.slice(0, limit);
+      const running = rows.filter((r) => r.status === 'running').length;
+      const newest = shown[0];
+      return {
+        ok: true,
+        summary:
+          `${rows.length} session${rows.length === 1 ? '' : 's'}` +
+          (running ? ` · ${running} running` : '') +
+          ` · newest: ${short(newest.agentName, 18)} ${newest.status}`,
+        data: {
+          count: rows.length,
+          sessions: shown.map((r, i) => ({
+            n: i + 1,
+            id: r.id,
+            agent: r.agentName,
+            title: flatten(r.title, 70),
+            status: r.status,
+            turns: r.turns,
+            ago: monitorAge(r.at),
+            latest: r.latest,
+          })),
+        },
+        hint: 'pass "session" with an "n" value (1 = newest) to read one in full',
+      };
+    },
+  },
+  {
     name: 'agents.trigger',
     page: 'agents',
     title: 'Run an agent',
@@ -157,7 +411,22 @@ export const agentsCapabilities: Capability[] = [
         model: agent.model || st.llm.model,
       });
       if (!started.runId) return { ok: false, summary: `Could not start ${short(agent.name, 20)}`, hint: started.error };
-      return { ok: true, summary: `Started ${short(agent.name, 20)}`, data: { runId: started.runId, prompt } };
+      // Watch it. A run finishes long after this spoken turn has ended, so the
+      // queue is how the wearer (and the model, on the next turn) finds out.
+      // Enqueuing is what makes the HUD's session strip appear and what raises
+      // the "1 new" badge when the run lands.
+      enqueueMonitoredRun({
+        runId: started.runId,
+        agentId: agent.id,
+        agentName: agent.name,
+        title: prompt,
+      });
+      return {
+        ok: true,
+        summary: `Started ${short(agent.name, 20)}`,
+        data: { runId: started.runId, prompt, watching: true },
+        hint: 'it now runs in the background — the wearer can watch it in the Jarvis session queue',
+      };
     },
   },
   {

@@ -58,6 +58,7 @@ import { fileURLToPath } from 'node:url';
 // date/time a run started and resolves relative phrases in the user prompt
 // BEFORE the first tool call (see datetime.mjs).
 import { preprocessText, withDateTime, withDateTimeMessages } from './datetime.mjs';
+import { looksLikeToolMarkup, stripToolMarkup } from './tool-markup.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -594,6 +595,48 @@ async function runToolOnce(tool, rawArgs, signal) {
 }
 
 /**
+ * A tool-free view of a run's transcript: the original system + user turn, plus
+ * whatever the tools actually returned, as plain text.
+ *
+ * Handing a model a history full of `tool_calls` and `role: 'tool'` messages
+ * while declaring NO tools makes it answer by PRINTING the tool call it wanted
+ * to make — DeepSeek emits its native DSML markup (U+FF5C bars around `DSML`)
+ * as text, and that markup was landing in `run.messages` as the agent's final
+ * answer on the glasses. Re-declaring the tools with `tool_choice: 'none'` does
+ * NOT stop it (verified against deepseek-flash), so the scaffolding is removed.
+ */
+function toolFreeWire(wire, ask) {
+  const head = wire.filter((m) => m.role === 'system' || m.role === 'user').slice(0, 2);
+  const found = [];
+  for (let i = 0; i < wire.length; i++) {
+    const m = wire[i];
+    if (m.role !== 'tool') continue;
+    const name = wire[i - 1]?.tool_calls?.[0]?.function?.name ?? 'result';
+    const body = stripToolMarkup(String(m.content ?? ''));
+    if (body) found.push(`${name}: ${body}`);
+  }
+  return [
+    ...head,
+    ...(found.length
+      ? [{ role: 'user', content: `[tool results]\n${clipText(found.join('\n'), 12000)}\n[end tool results]` }]
+      : []),
+    { role: 'user', content: ask },
+  ];
+}
+
+/**
+ * The text that becomes an agent's final answer. Never machine syntax: a reply
+ * that was nothing but a pseudo tool call has to be replaced, not shown.
+ */
+function answerText(raw) {
+  const text = stripToolMarkup(raw);
+  if (text) return text;
+  return looksLikeToolMarkup(raw)
+    ? 'I could not summarise this run. Try a simpler prompt, or add a search tool.'
+    : '';
+}
+
+/**
  * Run the agent loop and stream every turn to both clients. Never throws: the
  * failure is recorded on the run so the glasses and the browser both show it.
  */
@@ -633,9 +676,14 @@ async function executeRun(run) {
       const { content, toolCalls } = await llmOnce(run.model, wire, schemas, ac.signal);
 
       if (!toolCalls.length) {
+        const answer = answerText(content);
+        // A reply of nothing but machine syntax means the model wanted a tool it
+        // was not offered. Do not end the run on it — fall through to the
+        // summariser, which re-asks without any tool scaffolding.
+        if (!answer && content.trim()) break;
         run.messages.push({
           role: 'assistant',
-          content: content.trim() || '(no answer)',
+          content: answer || '(no answer)',
           at: Date.now(),
         });
         run.status = 'done';
@@ -665,17 +713,29 @@ async function executeRun(run) {
       }
     }
     // The model kept calling tools instead of answering. Rather than failing the
-    // run, ask once more with NO tools available so it is forced to summarise
-    // what it already gathered. (Small free models loop on tool calls; erroring
-    // out here looked to the user like "the relay refused the run".)
+    // run, ask once more for a summary of what it already gathered. (Small free
+    // models loop on tool calls; erroring out here looked to the user like "the
+    // relay refused the run".)
+    //
+    // The ask uses `toolFreeWire`, NOT the live `wire`: a transcript carrying
+    // `tool_calls` with no tools declared is exactly what makes DeepSeek answer
+    // by printing its DSML tool-call syntax as text, which then became the
+    // agent's visible final answer.
     run.statusText = 'Summarising…';
     broadcastRun(run);
-    const { content } = await llmOnce(run.model, wire, [], ac.signal);
+    const { content } = await llmOnce(
+      run.model,
+      toolFreeWire(
+        wire,
+        'Using ONLY the tool results above, reply with a short plain-text summary for the user (2-3 sentences). '
+          + 'Do not call any tools and do not output JSON or any markup.',
+      ),
+      [],
+      ac.signal,
+    );
     run.messages.push({
       role: 'assistant',
-      content:
-        content.trim() ||
-        'I gathered results but could not finish the summary. Try a simpler prompt.',
+      content: answerText(content) || 'I gathered results but could not finish the summary. Try a simpler prompt.',
       at: Date.now(),
     });
     run.status = 'done';
@@ -1572,7 +1632,12 @@ const server = createServer(async (req, res) => {
         model: j?.model || payload.model,
         message: {
           role: 'assistant',
-          content: String(choice.content ?? ''),
+          // Scrub machine syntax at the one funnel every model turn passes
+          // through. A model that wanted a tool it was not offered answers by
+          // PRINTING the call (DeepSeek's DSML markup); nothing downstream
+          // filtered it, so it reached the glasses as the agent's answer.
+          // See tool-markup.mjs.
+          content: stripToolMarkup(String(choice.content ?? '')),
           ...(reasoning ? { reasoning_content: String(reasoning) } : {}),
           ...(Array.isArray(choice.tool_calls) ? { tool_calls: choice.tool_calls } : {}),
         },

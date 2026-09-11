@@ -72,17 +72,23 @@ import {
 } from './dictate';
 import {
   GLOBAL_PAGE,
+  ackMonitor,
   aiAnswerConfirm,
   aiBegin,
   aiCancel,
   aiFlash,
+  aiStep,
   getAi,
+  getMonitorView,
   hasUndo,
+  ingestMonitoredRuns,
   isAiMirrored,
+  moveMonitorCursor,
   requestWebTab,
   runAiAgent,
   setAppBridge,
   subscribeAi,
+  subscribeMonitor,
   undoLastAiBatch,
 } from './ai';
 import { isLiveStatus, requestRemoteConfirm, requestRemoteStop, startAiMirror } from './ai/sync';
@@ -678,6 +684,15 @@ async function main(): Promise<void> {
       if ((!interim || interim.length <= 60) && jarvisLastReply) {
         lines.push('', clipBytes(`Was: ${jarvisLastReply}`, 150));
       }
+      // NOTIFIED, not buried. A watched run that lands while the mic is open is
+      // announced here, which is the screen the wearer is already looking at —
+      // and because the queue is in the next turn's context, one sentence about
+      // it gets the full answer without them having to go looking.
+      const q = getMonitorView();
+      if (q.rows.length) {
+        const row = q.rows[Math.min(q.cursor, Math.max(0, q.rows.length - 1))];
+        lines.push('', clipBytes(`${q.unread ? '! ' : ''}${row.label} ${row.status}`, 46));
+      }
       lines.push('', 'tap R1 = send · Stop AI = end');
       return {
         text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
@@ -1002,7 +1017,7 @@ async function main(): Promise<void> {
           : foreignActive
             ? dictationForeignView()
             : aiActive
-              ? aiView(ai, { conversing: jarvisSession })
+              ? aiView(ai, { conversing: jarvisSession, queue: getMonitorView() })
               : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
@@ -1325,7 +1340,20 @@ async function main(): Promise<void> {
     // the screen — an agent turn must not be able to scroll the page underneath
     // it (the user would lose their place with no visual feedback).
     if (dictationActive || dictationDiagText || dictationSnapshot().active) return;
-    if (getAi().status !== 'idle') return;
+    if (getAi().status !== 'idle') {
+      // …but the HUD is not opaque to the ring: the watched-session strip at the
+      // bottom of it belongs to the wearer, and checking on a background run
+      // mid-conversation must not cost them the conversation. A confirm prompt
+      // is the one exception — that screen has a job and no spare attention.
+      if (getAi().status !== 'confirm' && moveMonitorCursor(dir)) {
+        // Looking at a finished row IS the acknowledgement: there is no room on
+        // a 10-line canvas for a separate dismiss, and a badge nobody can clear
+        // is a badge that gets ignored.
+        ackMonitor();
+        void renderGlasses();
+      }
+      return;
+    }
     if (pickerActive) {
       onPickerSwipe(dir);
       return;
@@ -1522,6 +1550,26 @@ async function main(): Promise<void> {
       agentStatus = active.statusText || 'Thinking…';
     }
     for (const run of getRuns()) settleRun(run);
+    // The runs Jarvis itself asked for are being WATCHED: keep their HUD rows
+    // current, and when one lands, tell the model. This handler is the only
+    // place a run's terminal frame reaches the queue, so it is also the only
+    // place the wearer can be told — and the notification is a line in the next
+    // turn's context, not a tool call, because there is nothing to decide.
+    for (const done of ingestMonitoredRuns(getRuns())) {
+      const line = `${done.agentName} ${done.status}`;
+      // Mid-turn: drop it into the step list so the HUD (and the model's own
+      // memory of what happened) carries it. Idle: nothing is drawn, so the
+      // queue flag alone is the channel — the next sentence will say it.
+      if (getAi().status !== 'idle') aiStep('note', line);
+      console.log('[hub] watched run settled', { run: done.runId, line });
+    }
+    void renderGlasses();
+  });
+
+  // The queue repaints the HUD on its own: a run can be enqueued or settle while
+  // no run frame and no AI step is in flight (an agent started from the phone
+  // panel, say), and a badge the wearer cannot see is not a notification.
+  subscribeMonitor(() => {
     void renderGlasses();
   });
 

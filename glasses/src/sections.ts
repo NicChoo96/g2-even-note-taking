@@ -10,6 +10,8 @@
 // the simulator; oversized content makes the whole page get REJECTED).
 import { MenuContainerProperty, MenuItemProperty, utf8ByteLength } from '@evenrealities/even_hub_sdk';
 import { measureTextWrap } from '@evenrealities/pretext';
+import { monitorAge } from './ai/monitor';
+import type { MonitorView } from './ai/monitor';
 import { pageTitle } from './ai/registry';
 import type { AiState } from './ai/store';
 import type { PageId } from './ai/types';
@@ -447,6 +449,13 @@ export interface AiViewOptions {
    * footer changes; the conversation itself is owned by the platform layer.
    */
   conversing?: boolean;
+  /**
+   * The runs Jarvis started and is watching (see ./ai/monitor). Drawn as a
+   * strip at the BOTTOM of the HUD: the ring scrolls it, so the wearer can
+   * check on a background run without leaving the conversation. Omitted when
+   * nothing is being watched, in which case the HUD is exactly as it was.
+   */
+  queue?: MonitorView;
 }
 
 export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
@@ -467,9 +476,15 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
           ? 'JARVIS · failed'
           : `JARVIS · working ${Math.max(1, ai.turn)}/${Math.max(1, ai.maxSteps)}`;
   const body: string[] = [];
+  // A queue with nothing in it must not change the HUD at all — the strip is
+  // additive, never a permanently empty section.
+  const queue = opts.queue && opts.queue.rows.length ? opts.queue : null;
+  const scrollable = !!queue && queue.rows.length > 1;
   // `2x = end` is not decoration: it is the only exit that does not cost a
   // menu trip, and the menu's own exit is the first item ("Stop AI").
-  const dismissHint = conversing ? 'tap R1 = speak again · 2x = end' : 'tap R1 = dismiss';
+  const dismissHint =
+    (conversing ? 'tap R1 = speak again · 2x = end' : 'tap R1 = dismiss') +
+    (scrollable ? ' · scroll = sessions' : '');
 
   if (ai.status === 'confirm' && ai.pending) {
     body.push(...wrapToWidth(stripUnsupported(ai.pending.title).trim(), INNER_W).slice(0, 2));
@@ -502,13 +517,40 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
       .filter(
         (s) => s.kind === 'think' || s.kind === 'ok' || s.kind === 'fail' || s.kind === 'note',
       )
-      .slice(-3);
+      // The queue strip costs lines, and the canvas holds ~10. Give it its own
+      // room rather than letting a chatty run push it off the bottom.
+      .slice(queue ? -2 : -3);
     for (const s of shown) {
       const mark = s.kind === 'ok' ? '·' : s.kind === 'fail' ? '!' : s.kind === 'think' ? '>' : '-';
       body.push(truncate(`${mark} ${stripUnsupported(s.text).replace(/\s+/g, ' ').trim()}`, 44));
     }
     if (!shown.length) body.push('··· thinking');
     body.push('', remote ? 'from phone · tap = stop' : 'tap R1 = stop action');
+  }
+
+  // The watched-session strip. `confirm` is excluded on purpose: a destructive
+  // prompt is the one screen where nothing else may compete for attention.
+  // The cursor row is the one the ring points at, and its `latest` is the whole
+  // reason to scroll — "done" alone never told anyone anything.
+  if (queue && ai.status !== 'confirm') {
+    const rows = queue.rows;
+    const at = Math.min(rows.length - 1, Math.max(0, queue.cursor));
+    const row = rows[at];
+    body.push(
+      scrollable
+        ? `sessions ${at + 1}/${rows.length}${queue.unread ? ` · ${queue.unread} new` : ''}`
+        : `session${queue.unread ? ' · new' : ''}`,
+    );
+    // Only the row the ring points at is drawn, and `>` is how every other list
+    // in this app marks its selection — including the doc picker. The position
+    // line above (`sessions 2/3`) is what says which one that is.
+    body.push(
+      truncate(
+        `> ${row.label} · ${row.status} · ${monitorAge(row.updatedAt)}${row.unread ? ' · NEW' : ''}`,
+        44,
+      ),
+    );
+    if (row.latest) body.push(truncate(`  ${row.latest}`, 44));
   }
 
   return {

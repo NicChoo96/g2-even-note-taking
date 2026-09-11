@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.20
+
+v0.3.20 - Jarvis reads and watches agent runs
+
+- Jarvis can read your agent sessions, newest first, including runs still in progress, and read any one of them in full.
+- Runs it starts are queued and watched. When one finishes it says so, and the session shows at the bottom of the Jarvis screen; scroll with the ring to move through them.
+- Fixed raw model tool-call tags (DSML) leaking into replies as text.
+
 ## 0.3.19
 
 v0.3.19 - Build a whole agent by voice

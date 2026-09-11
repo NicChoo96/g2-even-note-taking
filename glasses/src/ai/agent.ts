@@ -33,6 +33,7 @@ import {
   isAiAborted,
 } from './store';
 import { beginAiBatch, endAiBatch } from './undo';
+import { stripToolMarkup } from './tool-markup';
 
 /** DeepSeek tolerates more, but a tight tool set measurably improves selection. */
 const MAX_TOOLS = 12;
@@ -116,6 +117,9 @@ function systemPrompt(): string {
     '- If nothing fits, call say__reply with one honest short sentence. Never narrate.',
     '- Destructive actions pause for a tap-to-confirm on their own. Call them directly; do not ask in words.',
     '- Write data the way the user will want to read it: keep their wording, no emoji, keep it short.',
+    '- The Jarvis agent queue lists background runs YOU started. If one is finished AND marked [NEW],',
+    '  say so in your one short sentence — the wearer cannot otherwise tell that it landed.',
+    '- Read a finished run with agents__sessions (newest first, so a fresh run is session "1").',
     '',
     'LIVE APP STATE',
     appSnapshotText(),
@@ -157,8 +161,38 @@ function confirmCopy(cap: Capability, args: Record<string, unknown>): { title: s
 }
 
 function clean(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
+  // Scrub BEFORE flattening: a model that wants a tool it was not offered answers
+  // by PRINTING the call instead of making one (see ./tool-markup), and that
+  // machine syntax used to fill the HUD container.
+  const flat = stripToolMarkup(text).replace(/\s+/g, ' ').trim();
   return flat.length > MAX_REPLY_CHARS ? `${flat.slice(0, MAX_REPLY_CHARS - 1)}…` : flat;
+}
+
+/**
+ * A tool-free view of the transcript: the original system + user turn, plus
+ * whatever the tools actually returned, as plain text.
+ *
+ * Handing a model a history full of `tool_calls` while declaring NO tools makes
+ * it answer by PRINTING the tool call it wanted to make — DeepSeek emits its
+ * native DSML markup as text, and that became the final answer on the glasses.
+ * Re-declaring the tools with `tool_choice: 'none'` does not stop it (verified
+ * against deepseek-flash), so the scaffolding has to be removed instead.
+ */
+function toolFreeTurn(messages: WireMessage[], ask: string): WireMessage[] {
+  const head = messages.filter((m) => m.role === 'system' || m.role === 'user').slice(0, 2);
+  const found: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role !== 'tool') continue;
+    const name = messages[i - 1]?.tool_calls?.[0]?.function?.name ?? 'result';
+    const body = stripToolMarkup(String(m.content ?? ''));
+    if (body) found.push(`${name}: ${body}`);
+  }
+  return [
+    ...head,
+    ...(found.length ? [{ role: 'user' as const, content: `[tool results]\n${found.join('\n')}\n[end tool results]` }] : []),
+    { role: 'user', content: ask },
+  ];
 }
 
 export interface AiRunOptions {
@@ -209,14 +243,17 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
   let touched = false;
 
   const finishRun = (reply: string, ok = true): AiRunResult => {
+    // Scrub here too, not only in clean(): THIS is the string the caller speaks,
+    // and a spoken DSML blob is the bug this guards against.
+    const spoken = clean(reply);
     const changed = endAiBatch(batch);
     touched = changed;
     // The spoken answer is the LAST link in the chain of thought, so it belongs
     // in the timeline too — otherwise the companion panel shows what the agent
     // did but not what it finally said. `aiStep` is a no-op on a cancelled run.
-    if (ok && reply) aiStep('reply', clean(reply));
-    if (ok) aiFinish(reply || 'Done');
-    return { ok, reply, changed, unreachable: false };
+    if (ok && spoken) aiStep('reply', spoken);
+    if (ok) aiFinish(spoken || 'Done');
+    return { ok, reply: spoken, changed, unreachable: false };
   };
 
   for (let step = 0; step < maxSteps; step++) {
@@ -262,9 +299,12 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
     if (reasoning) aiStep('think', clean(reasoning));
     else if (content && calls.length) aiStep('think', clean(content));
 
-    // No tool call → the model has answered.
+    // No tool call → the model has answered. A reply that is nothing BUT machine
+    // syntax means it wanted a tool it was not offered; ignoring it lets the
+    // closing turn produce a real sentence instead of echoing markup.
     if (!calls.length) {
-      if (content) return finishRun(content);
+      const text = stripToolMarkup(content);
+      if (text) return finishRun(text);
       break;
     }
 
@@ -358,18 +398,19 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
   if (isAiAborted()) return finishRun('', false);
 
   // One final, tool-free turn for a sentence — cheap and keeps the HUD honest.
+  //
+  // `toolFreeTurn` drops the `tool_calls` / `role: 'tool'` scaffolding first,
+  // because a transcript that references tools the request does not declare is
+  // exactly what makes the model print DSML markup instead of words.
   try {
     const closing = await send({
       model,
-      messages: [
-        ...messages,
-        {
-          role: 'user',
-          content: 'Reply with ONE short sentence telling me what you did or found. No tool calls.',
-        },
-      ],
+      messages: toolFreeTurn(
+        messages,
+        'Using ONLY the results above, reply with ONE short sentence saying what you did or found. Do not call any tools.',
+      ),
     });
-    const text = (closing.message?.content ?? '').trim();
+    const text = stripToolMarkup(closing.message?.content ?? '');
     if (text) return finishRun(text);
   } catch {
     /* fall through */
