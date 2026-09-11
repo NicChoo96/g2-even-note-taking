@@ -163,16 +163,19 @@ export const globalCapabilities: Capability[] = [
       {
         name: 'text',
         type: 'string',
-        // The long form is for the conversational lane (see ../converse). The cap
-        // here has to clear it, or a chat reply arrives pre-truncated and the
-        // loop's own budget never gets a say.
-        description: 'The reply: one or two sentences (~200 characters), or up to ~450 in a conversation.',
+        // The long form is for the conversational lane (see ../converse). This is
+        // a BACKSTOP, not a budget: it has to sit well clear of the loop's own
+        // cap (MAX_CHAT_CHARS) or a long chat reply arrives pre-clipped and never
+        // even reaches `clean`, which is the only place a cut is decided and
+        // marked with an ellipsis.
+        description:
+          'The reply: one or two sentences (~200 characters), or up to ~450 in a conversation. Never more than 700.',
         required: true,
       },
     ],
     run: (args) => {
       const text = String(args.text ?? '').trim();
-      return { ok: true, summary: text.slice(0, 500), data: { replied: true } };
+      return { ok: true, summary: text.slice(0, 1200), data: { replied: true } };
     },
   },
   {

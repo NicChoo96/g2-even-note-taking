@@ -235,7 +235,7 @@ const CHAT_REPLY = [
 ].join(' ');
 assert(
   'the probe reply is longer than the command cap and shorter than the chat cap',
-  CHAT_REPLY.length > 240 && CHAT_REPLY.length <= 480,
+  CHAT_REPLY.length > 240 && CHAT_REPLY.length <= 720,
   `${CHAT_REPLY.length} chars`,
 );
 
@@ -294,10 +294,35 @@ is('a command reply is still cut to the short cap', longCmd.res.reply.length, 24
 assert('and it is marked as cut', longCmd.res.reply.endsWith('…'), longCmd.res.reply.slice(-8));
 assert('the chat reply is longer than the command reply', chat.res.reply.length > longCmd.res.reply.length);
 
+// The bug this guards: the chat cap used to be 480 while the capability told the
+// model it may write ~450, so a merely VERBOSE answer came back from the loop
+// already chopped and the wearer saw an ellipsis where the rest of the reply
+// should have been. It pages on the glasses now, so the canvas is no longer the
+// limit and the only job left is to leave the model headroom.
+const VERBOSE = `${CHAT_REPLY} ${CHAT_REPLY}`;
+assert('the probe reply is genuinely longer than the old cap', VERBOSE.length > 480 && VERBOSE.length <= 720, `${VERBOSE.length} chars`);
+const verbose = await runTurn('tell me everything about my day', () => ({
+  ok: true,
+  message: { role: 'assistant', content: VERBOSE },
+}));
+assert('a verbose chat reply is NOT cut', verbose.res.reply === VERBOSE, `${verbose.res.reply.length} chars`);
+assert('a verbose chat reply carries no ellipsis', !verbose.res.reply.endsWith('…'), verbose.res.reply.slice(-8));
+// The cap is still a cap: an essay is cut, and the cut is visible.
+const ESSAY = 'z'.repeat(1200);
+const essay = await runTurn('write me a long essay about tea', () => ({
+  ok: true,
+  message: { role: 'assistant', content: ESSAY },
+}));
+is('an essay is still cut to the chat cap', essay.res.reply.length, 720);
+assert('and the essay is marked as cut', essay.res.reply.endsWith('…'), essay.res.reply.slice(-8));
+
 // The say__reply capability clips its own argument before the loop ever sees it,
-// so a slice left at 250 would pre-truncate every conversational answer.
+// so a slice left at the cap would pre-truncate every conversational answer and
+// the loop would never get a say. It has to sit clear ABOVE the loop's cap.
 const spoken = await callAction('say.reply', { text: 'x'.repeat(600) }, 'todo');
-is('say__reply passes a conversational answer through', spoken.summary.length, 500);
+is('say__reply passes a conversational answer through', spoken.summary.length, 600);
+const oversize = await callAction('say.reply', { text: 'x'.repeat(5000) }, 'todo');
+is('say__reply still backstops a runaway reply', oversize.summary.length, 1200);
 
 // …and end to end, through the tool the model actually calls.
 const viaTool = await runTurn('tell me a joke', () => ({

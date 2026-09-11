@@ -54,10 +54,17 @@ const MAX_REPLY_CHARS = 240;
 /**
  * How long a CONVERSATIONAL answer may be (see ./converse). A command earns one
  * short sentence because the wearer is waiting on an action; a chat needs the
- * shape of a reply, so it gets two or three. Still a cap rather than a target —
- * the HUD pages now, but nobody wants to read an essay on a 576x288 screen.
+ * shape of a reply, so it gets two or three.
+ *
+ * This used to be 480 — barely above the ~450 the model is told it may write, so
+ * a merely verbose reply came back from the loop already clipped, and the wearer
+ * saw an ellipsis where the second half of the answer should have been. The cap
+ * existed because the HUD could only show one screenful; it PAGES now and the
+ * listening screen shows that same feed, so the canvas is no longer the binding
+ * limit. 720 leaves real headroom over the model's own instruction while still
+ * stopping an essay, and a cut is still marked with an ellipsis.
  */
-const MAX_CHAT_CHARS = 480;
+const MAX_CHAT_CHARS = 720;
 
 /**
  * Tool budget, highest value first. Page actions sit above the introspection

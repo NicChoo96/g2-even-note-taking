@@ -134,7 +134,7 @@ await build({
       "export * from './ai/index.ts';",
       "export * from './ai/registry.ts';",
       "export { runAiAgent } from './ai/agent.ts';",
-      "export { aiView } from './sections.ts';",
+      "export { aiView, listenView } from './sections.ts';",
       "export * as agentsStore from './agents-store.ts';",
       "export * as runsStore from './agent-runs.ts';",
     ].join('\n'),
@@ -166,6 +166,7 @@ const {
   resetMonitor,
   runAiAgent,
   aiView,
+  listenView,
 } = M;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -531,13 +532,51 @@ ingestMonitoredRuns([
 const opts = (scroll) => ({ conversing: false, queue: getMonitorView(), scroll });
 
 const view = aiView(fakeAi(), opts(0));
-has('the first page keeps the question', view.text, '"run the news agent"');
-has('the first page keeps the chain of thought', view.text, '· Started News');
-has('the first page counts its pages', view.text, 'scroll = steps 1/');
+has('the newest page keeps the question', view.text, '"run the news agent"');
+has('the newest page keeps the chain of thought', view.text, '· Started News');
+// The turn reads newest-first: the ANSWER sits at the top of the pane and the
+// question it answered is the last thing on it, so the first screenful is the
+// part the wearer actually asked for. This used to be the other way round.
+has('the answer leads the newest page', view.text, '= Started News');
+assert(
+  'the answer sits above the question on the page',
+  view.text.indexOf('= Started News') < view.text.indexOf('"run the news agent"'),
+  'answer must precede the question',
+);
+has('the page states its position once', view.text, 'scroll = 1/');
+lacks('the position is not restated in the header', view.text, 'JARVIS · done · scroll');
 is('the hud can page now', view.canNext, true);
 is('the first page cannot go back', view.canPrev, false);
 assert('hud under the byte cap', Buffer.byteLength(view.text, 'utf8') <= 999, `${Buffer.byteLength(view.text, 'utf8')} bytes`);
+assert(
+  'hud under the line cap',
+  view.text.split('\n').length <= 10,
+  `${view.text.split('\n').length} lines`,
+);
 check('hud has no unsupported glyphs', unsafeChars(view.text), []);
+// The section boundary used to be 18 ASCII hyphens: a fifth of the pane wide,
+// and invisible as a border. It is now a labelled rule of wide box-drawing
+// glyphs that names the region it opens.
+//
+// This measurement is REAL. `sections.ts` measures with `@evenrealities/pretext`
+// — the pixel-accurate LVGL matcher — and only the SDK import is stubbed here, so
+// the rule below is drawn at the true render width. The builder appends glyphs
+// until one would wrap, so the exact count depends on how wide the LABEL is: an
+// all-dash rule stops at 29, and a labelled one squeezes in a few more because
+// 'reply ' is narrower than a box glyph.
+has('the page opens with a labelled rule', view.text, '── reply ');
+const ruleWidth = [...view.text.split('\n')[1]].length;
+assert(
+  'the rule covers the pane without wrapping',
+  ruleWidth >= 29 && ruleWidth <= 36,
+  `${ruleWidth} glyphs: ${JSON.stringify(view.text.split('\n')[1])}`,
+);
+lacks('the old hyphen rule is gone', view.text, '------------------');
+assert(
+  'the controls are pinned to the bottom line',
+  /^(tap R1|2x =|Stop AI)/.test(view.text.split('\n')[9] || ''),
+  JSON.stringify(view.text.split('\n')[9]),
+);
 
 // The transcript region ends where the session rows begin — that boundary is
 // how the caller knows a swipe has moved onto a background run (and should ack
@@ -549,21 +588,28 @@ assert('the page before the sessions is still transcript', nearEnd.todoCursor < 
 is('the last transcript page can go forward', nearEnd.canNext, true);
 
 const s1 = aiView(fakeAi(), opts(start));
-has('strip shows the position', s1.text, 'sessions 1/2');
+has('strip shows the position', s1.text, 'runs 1/2');
 has('strip marks the newest row', s1.text, '> Mail');
 has('strip shows status and age', s1.text, 'Mail · running · 0s');
 has('strip shows the latest line', s1.text, 'Reading the inbox');
-has('strip teaches the remaining scroll', s1.text, 'scroll = sessions');
+has('the rule names the run region', s1.text, '── runs 1/2 ');
 lacks('the transcript is not repeated above the strip', s1.text, '= Started News');
 is('the last unit cannot go forward', s1.canNext, true);
 
 const s2 = aiView(fakeAi(), opts(start + 1));
-has('scrolling moves the position', s2.text, 'sessions 2/2');
+has('scrolling moves the position', s2.text, 'runs 2/2');
 has('scrolling moves to the older row', s2.text, '> News');
 has('scrolling reaches the badge', s2.text, 'NEW');
 lacks('the other row is not repeated', s2.text, '> Mail');
 is('the end of the queue', s2.canNext, false);
 assert('the strip page fits too', Buffer.byteLength(s2.text, 'utf8') <= 999, `${Buffer.byteLength(s2.text, 'utf8')} bytes`);
+// A run unit is its OWN screen: the labelled rule names the region and the row
+// block is the only thing under it. Mixing a page of transcript above a run is
+// what made the old strip unreadable — there was no telling which half of the
+// pane the ring was on.
+has('the run unit is named by its rule', s2.text, '── runs 2/2 ');
+lacks('a run unit repeats no transcript', s2.text, '── reply ');
+lacks('a run unit repeats no answer', s2.text, '= Started News');
 
 // Clamping lives in the view, not the caller, so a stale index left over from a
 // longer transcript can never strand the ring on a screen that no longer exists.
@@ -612,9 +658,21 @@ has('paging reaches a failure line', all, '! tavily key missing, fell back');
 has('paging reaches the answer', all, 'The port strike is about pay.');
 check('every page fits the container', walked.filter((t) => Buffer.byteLength(t, 'utf8') > 999), []);
 check('every page is glyph-safe', walked.flatMap((t) => unsafeChars(t)), []);
-// The answer is the LAST thing in the transcript, so it must be on a page the
-// wearer can actually get to — not clipped off the end of a fixed slice.
-has('the final page carries the answer', walked[walked.length - 1], '= The port strike is about pay.');
+// The line cap is the guardrail that actually keeps the ring working: an
+// overflowing container makes the firmware scroll it and swallow the swipe, so
+// a page that is over budget is a page the wearer cannot leave. Bytes alone do
+// not catch that — ten wide glyphs of rule are cheap but still ten lines.
+check('every page fits the screen', walked.filter((t) => t.split('\n').length > 10), []);
+// Newest-first means the answer is the FIRST thing the ring shows, and the
+// question it answered is on the LAST page — the reverse of the old order.
+has('the newest page carries the answer', walked[0], '= The port strike is about pay.');
+has('the oldest page carries the question', walked[walked.length - 1], 'research the port strike');
+lacks('the answer is not repeated on the oldest page', walked[walked.length - 1], '= The port strike is about pay.');
+assert(
+  'every page after the first is labelled as older',
+  walked.slice(1).every((t) => t.includes('── older ')),
+  walked.slice(1).map((t) => t.split('\n')[1]).join(' | '),
+);
 
 const emptyQueue = aiView(fakeAi(), { conversing: false });
 lacks('no queue, no strip', emptyQueue.text, 'session');
@@ -628,8 +686,9 @@ const single = aiView(fakeAi(), {
   queue: { rows: getMonitorView().rows.slice(0, 1), unread: 1, running: 0 },
   scroll: 2,
 });
-has('single row reads as a session', single.text, 'session · new');
-lacks('single row does not advertise position', single.text, 'sessions 1/1');
+has('single row reads as a run', single.text, '── run ');
+has('single row still reports its state', single.text, '· running ·');
+lacks('single row does not advertise position', single.text, 'runs 1/1');
 is('a single session unit still pages the transcript first', single.canPrev, true);
 
 const confirming = aiView(
@@ -638,6 +697,137 @@ const confirming = aiView(
 );
 lacks('a confirm prompt hides the strip', confirming.text, 'sessions');
 is('a confirm prompt is a single screen', confirming.canNext, false);
+
+// ── 4b. The LISTENING screen ────────────────────────────────────────────────
+// The mic and the feed on ONE canvas. Two things have to hold at once: the words
+// being heard are visible while the wearer talks, and the ring still reaches the
+// turn underneath. It used to be impossible — the mic screen REPLACED the HUD and
+// refused the swipe, so a tap to speak destroyed the reply being read.
+//
+// The stub's `measureTextWrap` reports one line for everything, but the LISTEN
+// layout is measured for real: `sections.ts` wraps with `@evenrealities/pretext`
+// directly, so both the live region and the feed below it lay out at the true
+// render width here.
+console.log('\n── listening screen ──');
+
+const LIVE = 'remind me what the port strike was about';
+const listenOpts = (scroll = 0) => ({
+  head: '>> Jarvis — listening',
+  live: LIVE,
+  status: 'Listening…',
+  ai: LONG,
+  queue: getMonitorView(),
+  scroll,
+  footer: 'tap R1 = send · Stop AI = end',
+});
+const listening = listenView(listenOpts());
+
+has('the listening head names Jarvis', listening.text, '>> Jarvis — listening');
+has('the listening screen labels the live region', listening.text, '── speech ');
+has('the live words are on screen', listening.text, LIVE);
+has('the listening screen labels the feed below', listening.text, '── reply ');
+has('the listening screen keeps the answer readable', listening.text, '= The port strike is about pay.');
+has('the listening footer names the send gesture', listening.text, 'tap R1 = send');
+has('the listening footer names the exit', listening.text, 'Stop AI = end');
+is('the mic screen is scrollable now', listening.canNext, true);
+is('the first listen screen cannot go back', listening.canPrev, false);
+lacks('the listening screen never offers to dismiss', listening.text, 'tap R1 = dismiss');
+assert(
+  'the listening screen fits the canvas',
+  listening.text.split('\n').length <= 10,
+  `${listening.text.split('\n').length} lines`,
+);
+assert(
+  'the listening footer is the bottom line',
+  listening.text.split('\n')[9].startsWith('tap R1 = send'),
+  JSON.stringify(listening.text.split('\n')[9]),
+);
+assert(
+  'the listening screen is under the byte cap',
+  Buffer.byteLength(listening.text, 'utf8') <= 999,
+  `${Buffer.byteLength(listening.text, 'utf8')} bytes`,
+);
+check('the listening screen is glyph-safe', unsafeChars(listening.text), []);
+
+// The live region takes the TRAILING words when the sentence outgrows the three
+// lines it is given: what was just heard is what the wearer is checking, not the
+// opening clause. Speech runs through the same wrap the renderer uses, so this is
+// a real layout assertion — the utterance below needs five wrapped lines to fit.
+const LONG_SPEECH =
+  'ok so first please check the news agent and then remind me what the port strike was about and finally mark the mail item done and also tell me whether the tomato plants need water today because the forecast said rain and I do not want to overwater them again this week';
+const speaking = listenView({ ...listenOpts(), live: LONG_SPEECH });
+has('a long utterance keeps its newest words', speaking.text, 'overwater them again');
+is('the live region ends on the newest word', speaking.text.split('\n')[4], 'this week');
+lacks('a long utterance drops its opening clause', speaking.text, 'ok so first please');
+
+// Scrolling the feed must reach every unit, including the watched runs — the
+// wearer composes the follow-up WHILE the transcript is in front of them.
+const listenWalk = [];
+for (let i = 0; i < 40; i += 1) {
+  const v = listenView(listenOpts(i));
+  if (v.todoCursor !== i) break;
+  listenWalk.push(v.text);
+}
+assert('the listen feed pages', listenWalk.length > 1, `${listenWalk.length} unit(s)`);
+has('the listen feed reaches the oldest thought', listenWalk.join('\n'), 'I should search the web before answering anything.');
+has('the listen feed reaches the runs', listenWalk.join('\n'), '> Mail · running · 0s');
+// The transcript region ENDS where the watched runs begin — same boundary as the
+// HUD, so a swipe behaves identically on both screens. `sessionStart` is what
+// `scrollJarvis` reads to know when a swipe has landed on a run and should ack it.
+const lastListen = listenWalk[listenWalk.length - 1];
+has('the listen feed ends on the run region', lastListen, '── runs ');
+has('the listen feed shows the run row', lastListen, '> ');
+check('every listen page fits the screen', listenWalk.filter((t) => t.split('\n').length > 10), []);
+check('every listen page fits the container', listenWalk.filter((t) => Buffer.byteLength(t, 'utf8') > 999), []);
+assert(
+  'the listen screen announces the run region',
+  listening.sessionStart > 0,
+  `sessionStart=${listening.sessionStart}`,
+);
+
+// The live region costs the feed three lines, so the SAME turn pages in shorter
+// chunks here than it does on the HUD. That is the whole reason the ring has to
+// be resolved against the view actually on screen: move one HUD unit while
+// listening and the wearer would be thrown pages past where they were.
+const walkUnits = (build) => {
+  let n = 0;
+  for (let i = 0; i < 40; i += 1) {
+    if (build(i).todoCursor !== i) break;
+    n += 1;
+  }
+  return n;
+};
+const hudUnits = walkUnits((s) => aiView(LONG, opts(s)));
+const listenUnits = walkUnits((s) => listenView(listenOpts(s)));
+assert(
+  'the listen screen pages its feed in shorter chunks',
+  listenUnits > hudUnits,
+  `listen=${listenUnits} hud=${hudUnits}`,
+);
+is('an over-scrolled listen screen clamps', listenView(listenOpts(999)).todoCursor, listenUnits - 1);
+is('the listen screen ends', listenView(listenOpts(999)).canNext, false);
+
+// Plain dictation has no turn behind it, so the whole pane goes to the live
+// region — same borders, same footer slot, no feed and nothing to scroll.
+const dictating = listenView({
+  head: '>> Dictate',
+  live: '',
+  status: 'Starting mic…',
+  ai: null,
+  scroll: 0,
+  footer: '● tap R1 = stop',
+});
+has('plain dictation falls back to the mic status', dictating.text, 'Starting mic…');
+has('plain dictation labels the live region', dictating.text, '── speech ');
+lacks('plain dictation has no feed to page', dictating.text, '── reply ');
+is('plain dictation has nothing to scroll', dictating.canNext, false);
+is('plain dictation has no run region', dictating.sessionStart, -1);
+assert(
+  'plain dictation fits the screen',
+  dictating.text.split('\n').length <= 10,
+  `${dictating.text.split('\n').length} lines`,
+);
+has('plain dictation keeps its stop gesture', dictating.text, '● tap R1 = stop');
 
 // ── 5. The HELD answer ──────────────────────────────────────────────────────
 // The resting state of a Jarvis conversation: the finished turn stays on screen,

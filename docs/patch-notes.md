@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.23
+
+v0.3.23 - Jarvis reads top-down, and never cuts you off
+
+- Newest reply is at the top; older thinking is grouped under labelled sections so you can see where one ends and the next begins.
+- Long answers are no longer clipped mid-sentence.
+- Talking and reading are one screen: your words stream at the top while the ring still pages the reply underneath.
+
 ## 0.3.22
 
 v0.3.22 - Jarvis stops cutting off its own answers

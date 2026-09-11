@@ -11,7 +11,7 @@
 import { MenuContainerProperty, MenuItemProperty, utf8ByteLength } from '@evenrealities/even_hub_sdk';
 import { measureTextWrap } from '@evenrealities/pretext';
 import { monitorAge } from './ai/monitor';
-import type { MonitorView } from './ai/monitor';
+import type { MonitorRow, MonitorView } from './ai/monitor';
 import { pageTitle } from './ai/registry';
 import type { AiState } from './ai/store';
 import type { PageId } from './ai/types';
@@ -210,12 +210,32 @@ const INNER_W = 568; // 576 - 2 * paddingLength(4)
 const PAGE_BODY_LINES = 9; // body lines per page; compact 1-line header above
 const PAGE_BYTES = 900; // body byte budget per page (≤ 999 - header)
 // Jarvis HUD. The canvas shows ~10 rendered lines; the HUD spends 3 of them on
-// chrome (header, divider, controls) and up to 3 more on the pinned session
-// strip, so a transcript page gets what is left. Staying UNDER the screen is
-// what makes the ring scroll work: one line over and the firmware scrolls the
-// container instead, swallowing the swipe.
+// chrome (header, rule, controls) and up to 3 more on the watched-run block, so
+// a transcript page gets what is left. Staying UNDER the screen is what makes
+// the ring scroll work: one line over and the firmware scrolls the container
+// instead, swallowing the swipe.
 const AI_SCREEN_LINES = 10;
-const AI_PAGE_BYTES = 880; // under the header + divider + controls bytes
+/**
+ * Floor for one page's byte budget. The real budget is DERIVED per render from
+ * the chrome that is actually on screen (see `aiFeed`) — this only stops a
+ * pathological head + two rules + a run block + a footer from squeezing the body
+ * down to nothing.
+ */
+const AI_MIN_PAGE_BYTES = 240;
+
+// Listen screen. The live speech region and the feed underneath are two
+// independent line/byte budgets on ONE container, so the reserves below are
+// subtracted from the feed's page budget rather than guessed at.
+/** Rendered lines of live speech while a feed is also on screen. */
+const LISTEN_LIVE_LINES = 3;
+/** Rendered lines of live speech when there is no feed to share the pane with. */
+const LISTEN_LIVE_ALONE_LINES = 6;
+/** Rendered lines of the feed the listen screen shows at once. */
+const LISTEN_FEED_LINES = 3;
+/** Bytes reserved for the live region when sizing a feed page. */
+const LISTEN_LIVE_BYTES = 200;
+/** Hard byte cap on the live region before it is wrapped down to its last lines. */
+const LISTEN_LIVE_CAP = 400;
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
@@ -332,6 +352,51 @@ function pageText(text: string): string[] {
     lines: PAGE_BODY_LINES,
     bytes: PAGE_BYTES,
   });
+}
+
+// ── HUD chrome ──────────────────────────────────────────────────────────────
+/**
+ * The HUD's rule glyph. `─` is a WIDE glyph in the firmware font: measured with
+ * @evenrealities/pretext at the HUD's inner width only 29 fit one rendered line,
+ * against roughly 90 ASCII hyphens. That is why the old `'------------------'`
+ * — eighteen ASCII hyphens — read as a line that had been CUT OFF rather than a
+ * border: it covers about a fifth of the pane.
+ */
+const RULE_CHAR = '─';
+/**
+ * Ceiling on rule glyphs per line.
+ *
+ * This is a BOUND, not the target: the loop in `rule` stops at the first glyph
+ * that would wrap, so a real build draws the widest rule that fits. The ceiling
+ * exists only because the sim harness stubs the measurer as "everything is one
+ * line", which would otherwise let that loop run away.
+ */
+const RULE_MAX_GLYPHS = 29;
+
+const ruleCache = new Map<string, string>();
+
+/**
+ * A full-width horizontal rule with an optional label: `── reply ──────────────`.
+ *
+ * This is the HUD's only border and it does two jobs at once — it separates the
+ * header from the body AND names the section under it. That is deliberate. A
+ * bare line told the wearer nothing, and a separate section heading would cost a
+ * line of content on every page of a 10-line canvas. Naming the section here is
+ * what finally makes the boundaries between the reply, the older pages of a run
+ * and the watched background runs visible at a glance.
+ */
+function rule(label = ''): string {
+  const hit = ruleCache.get(label);
+  if (hit !== undefined) return hit;
+  const head = label ? `── ${label} ` : '';
+  // If even the label alone overflows, hard-split it first so the dashes below
+  // are appended to a fragment that fits instead of to an overflowing string.
+  let s = lineFits(head, INNER_W) ? head : splitAtWidth(head, INNER_W)[0];
+  for (let i = 0; i < RULE_MAX_GLYPHS && lineFits(`${s}${RULE_CHAR}`, INNER_W); i += 1) {
+    s += RULE_CHAR;
+  }
+  ruleCache.set(label, s);
+  return s;
 }
 
 /** Join parts with " · " while the result stays within `max` characters. */
@@ -494,7 +559,75 @@ export interface AiViewOptions {
   scroll?: number;
 }
 
-export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
+interface AiFeedOpts {
+  /** True inside a Jarvis conversation — the mic is the other half of the UI. */
+  conversing?: boolean;
+  /** True while a finished turn is HELD: the mic is closed and nothing is timed. */
+  holding?: boolean;
+  /** Watched background runs, already filtered to "there is something to show". */
+  queue?: MonitorView | null;
+  /** Rendered body lines one page may use. */
+  bodyLines: number;
+  /**
+   * Bytes the CALLER also needs on this container — the live speech region on
+   * the listen screen, plus its rule. Subtracted from the page budget so the two
+   * halves can never together exceed the 999-byte cap.
+   */
+  reserveBytes?: number;
+}
+
+interface AiFeed {
+  /** First line of the screen: what the glasses are doing, right now. */
+  head: string;
+  /** Transcript pages, NEWEST FIRST — `pages[0]` opens with the answer. */
+  pages: string[];
+  /** One already-wrapped block per watched run; each block is one scroll unit. */
+  rows: string[][];
+  /** Rule label per scroll unit, indexed exactly like `pages` ++ `rows`. */
+  labels: string[];
+  /** Scroll units: transcript pages first, then one per watched run. */
+  units: number;
+  /** Footer naming the gesture that works on THIS screen. */
+  footer: string;
+}
+
+/** Section name for the rule above scroll unit 0 — what the newest page IS. */
+function feedLabel(ai: AiState, engaged: boolean): string {
+  if (ai.status === 'confirm') return 'confirm';
+  if (ai.status === 'error') return 'failed';
+  if (ai.status === 'done') return engaged ? 'reply' : 'said';
+  return 'working';
+}
+
+/**
+ * One watched background run as a wrapped block: who it is, how it is doing and
+ * the row's own `latest` line — which is the whole reason to scroll, because
+ * "done" alone told nobody anything.
+ */
+function monitorBlock(row: MonitorRow): string[] {
+  const head = `> ${row.label} · ${row.status} · ${monitorAge(row.updatedAt)}${row.unread ? ' · NEW' : ''}`;
+  const body = row.latest ? `  ${row.latest}` : '';
+  return [...wrapToWidth(head, INNER_W), ...(body ? wrapToWidth(body, INNER_W) : [])];
+}
+
+/**
+ * Build the scrollable content of the Jarvis HUD: the run's transcript as pages,
+ * plus one block per watched background run.
+ *
+ * The transcript is assembled as BLOCKS in the order they happened and then
+ * reversed, so the feed reads NEWEST FIRST — page 0 opens on the answer, and the
+ * ring walks backwards through the run from there. Reversing whole blocks rather
+ * than individual lines is the part that matters: a long reply is one block, so
+ * it still reads top-to-bottom inside its own paragraph, while a step that just
+ * arrived appears ABOVE the older ones without pushing the answer off screen.
+ *
+ * That ordering is the fix for "I can't see the agent's reply anywhere". The
+ * answer used to be the LAST thing in the transcript, so on any run with more
+ * than a page of reasoning it landed on the last page and the wearer had to page
+ * through the model's whole chain of thought to reach the one line they asked
+ * for.
+ */
+function aiFeed(ai: AiState, opts: AiFeedOpts): AiFeed {
   // A mirrored run is being driven from the phone panel. The controls have to
   // say so: offering "tap R1 = run" on a run this device cannot execute reads as
   // a dead button, and a confirmation answered in the wrong place is worse than
@@ -523,12 +656,11 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
             ? 'JARVIS · done'
             : 'JARVIS · said'
           : `JARVIS · working ${Math.max(1, ai.turn)}/${Math.max(1, ai.maxSteps)}`;
-  // A queue with nothing in it must not change the HUD at all — the strip is
-  // additive, never a permanently empty section. `confirm` is excluded too: a
-  // destructive prompt is the one screen where nothing else may compete for
-  // attention, and its tap means something else entirely.
-  const queue = ai.status !== 'confirm' && opts.queue && opts.queue.rows.length ? opts.queue : null;
-  const rows = queue ? queue.rows : [];
+  // The caller has already decided whether there is anything to watch — an empty
+  // queue must not change the HUD at all, and a `confirm` prompt is the one
+  // screen where nothing else may compete for attention, because its tap means
+  // something else entirely.
+  const rows = opts.queue ? opts.queue.rows : [];
   // The footer names the exit that actually EXISTS on the screen the wearer is
   // looking at — the ring is the only input, so a hint that describes the wrong
   // gesture is worse than no hint.
@@ -544,18 +676,22 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
     : 'tap R1 = dismiss';
 
   // ── The transcript ─────────────────────────────────────────────────────────
-  // EVERY line of it, at full length. The previous view kept only the last two
-  // or three steps and clipped each one to 44 characters, which is why a run's
-  // own reasoning was unreadable on the glasses. Length is now handled by
-  // PAGING (below) instead of by throwing text away.
-  const timeline: string[] = [];
+  // EVERY line of it, at full length, as one block per event. The previous view
+  // kept only the last two or three steps and clipped each one to 44 characters,
+  // which is why a run's own reasoning was unreadable on the glasses. Length is
+  // handled by PAGING below and by the ring, instead of by throwing text away.
+  //
+  // Blocks go in CHRONOLOGICALLY here and are reversed further down.
+  const blocks: string[][] = [];
   let footer: string;
   let sawStep = false;
 
   if (ai.status === 'confirm' && ai.pending) {
     footer = remote ? 'from phone · tap = cancel' : 'tap R1 = run · Stop = cancel';
-    timeline.push(stripUnsupported(ai.pending.title).trim());
-    for (const line of ai.pending.lines.slice(0, 2)) timeline.push(stripUnsupported(line).trim());
+    const block = [ai.pending.title, ...ai.pending.lines.slice(0, 2)]
+      .map((line) => stripUnsupported(line).trim())
+      .filter(Boolean);
+    if (block.length) blocks.push(block);
   } else {
     // Working, done and error share ONE record: what was asked, which page it
     // ran against, and the chain of thought the loop produced. The old view
@@ -563,7 +699,7 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
     // of reply, so "what did it actually do?" was unanswerable after the fact —
     // which is the truncation the wearer kept hitting.
     const said = stripUnsupported(ai.utterance).replace(/\s+/g, ' ').trim();
-    if (said) timeline.push(`"${said}"`);
+    if (said) blocks.push([`"${said}"`]);
     // Layer 1, always on screen. The seed step carries the raw page id (it is
     // written by aiBegin), later ones a title — resolve both through the
     // registry so the line reads the same way the companion panel prints it.
@@ -571,7 +707,7 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
     const current = focuses[focuses.length - 1];
     if (current) {
       const label = stripUnsupported(pageTitle(current.text as PageId)).trim() || current.text;
-      timeline.push(`→ ${label}`);
+      blocks.push([`→ ${label}`]);
     }
     // Chain of thought + results, in the order the model produced them. `think`
     // is the model's own reasoning, the rest are our loop's labels for what it
@@ -581,78 +717,225 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
       const mark = s.kind === 'ok' ? '·' : s.kind === 'fail' ? '!' : s.kind === 'think' ? '>' : '-';
       const text = stripUnsupported(s.text).replace(/\s+/g, ' ').trim();
       if (!text) continue;
-      timeline.push(`${mark} ${text}`);
+      blocks.push([`${mark} ${text}`]);
       sawStep = true;
     }
     if (ai.status === 'done') {
       footer = remote ? 'from phone · tap = dismiss' : dismissHint;
       const answer = stripUnsupported(ai.result || 'Done').trim();
-      if (answer) timeline.push('', `= ${answer}`);
+      if (answer) blocks.push([`= ${answer}`]);
     } else if (ai.status === 'error') {
       footer = remote ? 'from phone · tap = dismiss' : dismissHint;
       const problem = stripUnsupported(ai.error || 'Something went wrong').trim();
-      if (problem) timeline.push('', `! ${problem}`);
+      if (problem) blocks.push([`! ${problem}`]);
     } else {
       footer = remote ? 'from phone · tap = stop' : 'tap R1 = stop action';
-      if (!sawStep) timeline.push('··· thinking');
+      if (!sawStep) blocks.push(['··· thinking']);
     }
   }
 
-  // Word-wrap FIRST so paging only has to pack whole rendered lines (it hard
-  // splits otherwise, which mid-cuts a word and reads as a typo).
-  const wrapped: string[] = [];
-  for (const line of timeline) wrapped.push(...wrapToWidth(line, INNER_W));
-
-  // Line budget: the canvas shows AI_SCREEN_LINES, the header + divider take 2,
-  // the controls take 1, and the pinned session strip takes up to 3. An OS
-  // scroll would swallow the ring's swipe, so every page is sized to stay under
-  // it rather than relying on the firmware to clip.
-  const bodyLines = Math.max(2, AI_SCREEN_LINES - 3 - (rows.length ? 3 : 1));
-  const pages =
-    ai.status === 'confirm'
-      ? [wrapped.slice(0, bodyLines).join('\n')]
-      : paginateLines(wrapped, { width: INNER_W, lines: bodyLines, bytes: AI_PAGE_BYTES });
-
-  // Ring position. Units are TRANSCRIPT PAGES first, then one unit per watched
-  // session — so ▼ walks the run's own history and then hands over to the
-  // background runs, without a mode switch.
-  const units = pages.length + rows.length;
-  const scroll = Math.min(units - 1, Math.max(0, opts.scroll ?? 0));
-  const onSessions = scroll >= pages.length;
-
-  const at = Math.min(Math.max(0, scroll - pages.length), Math.max(0, rows.length - 1));
-  const strip: string[] = [];
-  if (rows.length) {
-    const row = rows[at];
-    strip.push(
-      rows.length > 1
-        ? `sessions ${at + 1}/${rows.length}${queue!.unread ? ` · ${queue!.unread} new` : ''}`
-        : `session${queue!.unread ? ' · new' : ''}`,
-    );
-    // The row's own `latest` is the whole reason to scroll — "done" alone told
-    // nobody anything. It WRAPS now instead of being clipped at 44 characters.
-    const label = `> ${row.label} · ${row.status} · ${monitorAge(row.updatedAt)}${row.unread ? ' · NEW' : ''}`;
-    strip.push(...wrapToWidth(label, INNER_W));
-    if (row.latest) strip.push(...wrapToWidth(`  ${row.latest}`, INNER_W));
+  // ── Newest first ───────────────────────────────────────────────────────────
+  // The blocks were built in the order they happened; the feed is the reverse of
+  // that. Word-wrap each one FIRST so paging only has to pack whole rendered
+  // lines (it hard-splits otherwise, which mid-cuts a word and reads as a typo).
+  const ordered: string[] = [];
+  for (const block of blocks.slice().reverse()) {
+    for (const line of block) ordered.push(...wrapToWidth(line, INNER_W));
   }
 
-  const scrollHint =
-    units > 1 ? (onSessions ? 'scroll = sessions' : `scroll = steps ${scroll + 1}/${pages.length}`) : '';
-  const controls = scrollHint ? `${footer} · ${scrollHint}` : footer;
+  const rowBlocks = rows.map(monitorBlock);
 
-  const lines = [head, '------------------'];
-  // In the session region the pinned strip IS the body, so the transcript page
-  // is not repeated above it.
-  if (!onSessions) lines.push(...pages[scroll].split('\n'));
-  if (!rows.length) lines.push('');
-  lines.push(...strip, controls);
+  // ── The byte budget is DERIVED, not tuned ──────────────────────────────────
+  // The 999-byte cap is per CONTAINER, so the head, the rules, the watched-run
+  // block, the footer and every newline come out of the same 999 as the body. A
+  // hand-tuned constant drifts the moment the chrome changes and the failure is
+  // SILENT: `clipBytes` trims the END of the string, so the wearer would lose
+  // the controls line while the body above it still looked perfectly fine.
+  const chromeBytes =
+    utf8ByteLength(head) +
+    utf8ByteLength(rule(feedLabel(ai, engaged))) +
+    utf8ByteLength(footer) +
+    (rowBlocks.length
+      ? utf8ByteLength(rule('runs')) + rowBlocks[0].reduce((n, l) => n + utf8ByteLength(l), 0)
+      : 0) +
+    // One newline per rendered line, plus the blanks the caller pads with to pin
+    // the controls to the bottom. Over-counting a few bytes is safe; the
+    // under-count is what eats the footer.
+    AI_SCREEN_LINES;
+  const pageBytes = Math.max(
+    AI_MIN_PAGE_BYTES,
+    MAX_CONTENT_BYTES - chromeBytes - (opts.reserveBytes ?? 0),
+  );
+
+  // A confirmation is one prompt, never a paged document: its title, its details
+  // and the question have to stay together, because the tap answers the thing
+  // that is on screen.
+  const pages =
+    ai.status === 'confirm'
+      ? [ordered.slice(0, opts.bodyLines).join('\n')]
+      : paginateLines(ordered, { width: INNER_W, lines: opts.bodyLines, bytes: pageBytes });
+
+  const labels: string[] = pages.map((_, i) => (i === 0 ? feedLabel(ai, engaged) : 'older'));
+  // One unit per watched run, appended AFTER the transcript, so the ring walks
+  // the run's own history first and then hands over to the background runs
+  // without a mode switch.
+  for (let i = 0; i < rowBlocks.length; i += 1) {
+    labels.push(rowBlocks.length > 1 ? `runs ${i + 1}/${rowBlocks.length}` : 'run');
+  }
+
+  return {
+    head,
+    pages,
+    rows: rowBlocks,
+    labels,
+    units: pages.length + rowBlocks.length,
+    footer,
+  };
+}
+
+/**
+ * The Jarvis HUD.
+ *
+ * NEWEST FIRST: scroll unit 0 opens on the answer, and the ring walks BACKWARDS
+ * through the run from there. The answer used to be the last thing in the
+ * transcript, so on any run with more than a page of reasoning the wearer had to
+ * page through the model's entire chain of thought to reach the one line they
+ * asked for — which is why a conversational reply looked like it had gone
+ * missing.
+ */
+export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
+  // A queue with nothing in it must not change the HUD at all, and a `confirm`
+  // prompt is the one screen where nothing may compete for attention because its
+  // tap means something else entirely.
+  const queue = ai.status !== 'confirm' && opts.queue && opts.queue.rows.length ? opts.queue : null;
+  const watching = queue ? queue.rows.length : 0;
+  // Line budget: header + rule (2), the body, the watched-run preview (its own
+  // rule, a label line and a `latest` line) and the controls (1). An OS scroll
+  // would swallow the ring's swipe, so every page is sized to stay UNDER the
+  // screen rather than relying on the firmware to clip it.
+  const bodyLines = Math.max(2, AI_SCREEN_LINES - 3 - (watching ? 3 : 0));
+  const feed = aiFeed(ai, {
+    conversing: !!opts.conversing,
+    holding: !!opts.holding,
+    queue,
+    bodyLines,
+  });
+
+  const scroll = Math.min(feed.units - 1, Math.max(0, opts.scroll ?? 0));
+  const onRuns = scroll >= feed.pages.length;
+  const rowAt = onRuns ? (feed.rows[scroll - feed.pages.length] ?? []) : [];
+
+  // The controls carry the POSITION, the rule carries the SECTION. Stating each
+  // fact exactly once is what keeps a ten-line screen readable.
+  const controls =
+    feed.units > 1 ? `${feed.footer} · scroll = ${scroll + 1}/${feed.units}` : feed.footer;
+
+  const lines = [feed.head, rule(feed.labels[scroll])];
+  if (onRuns) {
+    // The run's own block IS the body here, so no transcript page is repeated
+    // above it.
+    lines.push(...rowAt);
+  } else {
+    lines.push(...feed.pages[scroll].split('\n'));
+    if (watching) {
+      // The boundary that was invisible before: the newest background run is
+      // previewed under its OWN labelled rule, so "the reply ends here and the
+      // watched runs begin here" is legible without leaving the transcript.
+      lines.push(rule('runs'), ...(feed.rows[0] ?? []).slice(0, 2));
+    }
+  }
+  // Pin the controls to the last line so the HUD reads as a bordered panel —
+  // content at the top, controls at the bottom — instead of text that stopped
+  // half way down the screen.
+  while (lines.length < AI_SCREEN_LINES - 1) lines.push('');
+  lines.push(controls);
+
+  return {
+    text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
+    todoCursor: scroll,
+    canPrev: scroll > 0,
+    canNext: scroll < feed.units - 1,
+    sessionStart: watching ? feed.pages.length : -1,
+  };
+}
+
+export interface ListenViewOptions {
+  /** Header line, e.g. `>> Jarvis — listening`. */
+  head: string;
+  /** Live speech-to-text as the engine reports it. '' while nothing is heard. */
+  live: string;
+  /** Shown in place of `live` — the mic status, or the reason it stopped. */
+  status: string;
+  /** The turn behind the mic. Its feed is what the ring scrolls. */
+  ai?: AiState | null;
+  /** Watched background runs, already filtered. */
+  queue?: MonitorView | null;
+  /** Ring scroll over the feed. Clamped here and echoed in `todoCursor`. */
+  scroll?: number;
+  /** Footer naming the stop/send gesture. */
+  footer: string;
+}
+
+/**
+ * The LISTENING screen: live speech pinned at the top, the previous turn's feed
+ * scrollable underneath, under one set of borders.
+ *
+ * These used to be two screens taking turns. `dictationView` REPLACED the HUD for
+ * as long as the mic was open, so the moment the wearer tapped to speak the reply
+ * they were reading was gone — and the ring did nothing at all, because a
+ * non-scrollable overlay swallows the swipe. Now the mic and the feed share the
+ * canvas: speech streams at the top, the answer stays where it was underneath,
+ * and the ring pages the feed exactly as it does on the HUD. Same cursor, same
+ * scroll unit, so scrolling here scrolls there.
+ *
+ * Two labelled rules do the separating — one above the speech, one above the
+ * feed — which is what makes it obvious that the bottom half is history rather
+ * than something still being dictated into.
+ */
+export function listenView(opts: ListenViewOptions): SectionView {
+  const ai = opts.ai ?? null;
+  const hasFeed = !!ai && ai.status !== 'idle';
+  // The live region takes the whole pane when there is nothing underneath to
+  // read; otherwise the two share it, because both are true at once.
+  const liveLines = hasFeed ? LISTEN_LIVE_LINES : LISTEN_LIVE_ALONE_LINES;
+
+  // Take the TRAILING words: while speaking, what was just heard is what the
+  // wearer is checking, not the beginning of the sentence.
+  const spoken = stripUnsupported(opts.live).replace(/\s+/g, ' ').trim();
+  const wrapped = spoken ? wrapToWidth(clipBytes(spoken, LISTEN_LIVE_CAP), INNER_W) : [];
+  const liveBlock = wrapped.length > liveLines ? wrapped.slice(-liveLines) : wrapped;
+
+  const feed = hasFeed
+    ? aiFeed(ai, {
+        conversing: true,
+        queue: opts.queue,
+        bodyLines: LISTEN_FEED_LINES,
+        reserveBytes: LISTEN_LIVE_BYTES + utf8ByteLength(rule('speech')),
+      })
+    : null;
+  const units = feed ? feed.units : 0;
+  const scroll = units ? Math.min(units - 1, Math.max(0, opts.scroll ?? 0)) : 0;
+
+  const lines = [opts.head, rule('speech')];
+  if (liveBlock.length) lines.push(...liveBlock);
+  else lines.push(stripUnsupported(opts.status).replace(/\s+/g, ' ').trim() || 'Listening…');
+  if (feed && units) {
+    lines.push(rule(feed.labels[scroll]));
+    // A watched run is the unit under the ring: show its block instead of a
+    // transcript page, exactly as the HUD does, so the two screens agree.
+    const row = scroll >= feed.pages.length ? feed.rows[scroll - feed.pages.length] : null;
+    if (row && row.length) lines.push(...row);
+    else lines.push(...feed.pages[scroll].split('\n'));
+  }
+  while (lines.length < AI_SCREEN_LINES - 1) lines.push('');
+  lines.push(units > 1 ? `${opts.footer} · scroll = ${scroll + 1}/${units}` : opts.footer);
 
   return {
     text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
     todoCursor: scroll,
     canPrev: scroll > 0,
     canNext: scroll < units - 1,
-    sessionStart: rows.length ? pages.length : -1,
+    sessionStart: feed && units ? feed.pages.length : -1,
   };
 }
 

@@ -18,6 +18,7 @@ import {
   aiView,
   clipBytes,
   docPickerView,
+  listenView,
   MAX_CONTENT_BYTES,
   MENU,
   sectionByMenuId,
@@ -340,8 +341,6 @@ async function main(): Promise<void> {
    * only a double-tap leaves the session.
    */
   let jarvisHolding = false;
-  /** The previous turn's spoken answer, re-shown while listening for the next one. */
-  let jarvisLastReply = '';
   /** Consecutive turns that heard nothing, so a dead mic cannot loop forever. */
   let jarvisSilentTurns = 0;
   /** Give up re-arming after this many empty turns and explain why instead. */
@@ -360,9 +359,11 @@ async function main(): Promise<void> {
   /**
    * Re-open the mic for the next sentence of the conversation.
    *
-   * The mic screen REPLACES the HUD, so the held answer leaves the screen here —
-   * `jarvisHolding` is the flag that says which of the two the wearer is looking
-   * at, and it must never say "answer" while the mic is open.
+   * `jarvisHolding` is the flag that says whether the turn is parked (mic closed,
+   * transcript up) or live; the listen screen plays the previous turn's feed in
+   * both cases now, so clearing it here is what lets the live speech region take
+   * the room it needs at the top instead of leaving half the pane to a reading
+   * view nobody asked for.
    */
   function listenAgain(): void {
     if (!jarvisSession || isDictating()) return;
@@ -414,7 +415,6 @@ async function main(): Promise<void> {
   function dismissAi(): void {
     jarvisSession = false;
     jarvisHolding = false;
-    jarvisLastReply = '';
     jarvisSilentTurns = 0;
     // The next run opens on its own newest page, not wherever this one was left.
     aiFollow = true;
@@ -443,8 +443,6 @@ async function main(): Promise<void> {
   function stopTurnKeepTalking(): void {
     clearAiTimer();
     if (isAiMirrored() && isLiveStatus(getAi().status)) requestRemoteStop();
-    const reply = getAi().result;
-    if (reply) jarvisLastReply = reply;
     aiCancel();
     void renderGlasses();
     listenAgain();
@@ -496,9 +494,6 @@ async function main(): Promise<void> {
 
     const status = getAi().status;
     if (status === 'done') {
-      // Remember the answer so the listening screen can show it as context for
-      // the follow-up question ("what about the other one?").
-      jarvisLastReply = res.reply || getAi().result;
       jarvisSilentTurns = 0;
       if (jarvisSession) {
         // HOLD the finished turn — see `jarvisHolding`. Nothing moves on its own
@@ -718,53 +713,50 @@ async function main(): Promise<void> {
     return res;
   }
 
-  // R1-ring dictation: a compact full-screen overlay (status + running text).
-  // Jarvis reuses this exact screen — same trigger, same speech engine, same
-  // stop gesture — and only the header/footer change, so the user is never
-  // asked to learn a second voice flow.
+  // R1-ring dictation: live speech pinned at the TOP of the canvas with the turn
+  // behind it still readable underneath. Jarvis reuses this exact screen — same
+  // trigger, same speech engine, same stop gesture — and only the head, the feed
+  // and the footer change, so the user is never asked to learn a second voice
+  // flow.
+  //
+  // The two halves used to be separate screens taking turns: opening the mic
+  // REPLACED the HUD, which deleted the reply the wearer was still reading and
+  // left the ring doing nothing at all, because a non-scrollable overlay
+  // swallows the swipe. `listenView` puts both on one canvas under one cursor.
   function dictationView(): SectionView {
-    const status = dictationStatus || 'Starting mic…';
-    const interim = dictationInterim.trim();
-    if (dictationToAgent) {
-      // Jarvis CONVERSATION screen. Two things have to fit in ~10 lines: what the
-      // user is saying now, and — while they are still deciding — what the agent
-      // just answered. Follow-up commands are full of pronouns ("mark the other
-      // one done"), so the referent has to be readable at the moment they speak.
-      // The transcript wins as soon as it needs the room; until then the reply is
-      // shown as context. Both clips are hard byte caps, so the container can
-      // never be pushed past the 999-byte content limit.
-      const lines = ['>> Jarvis — listening', interim ? clipBytes(interim, 200) : status];
-      if ((!interim || interim.length <= 60) && jarvisLastReply) {
-        lines.push('', clipBytes(`Was: ${jarvisLastReply}`, 150));
-      }
-      // NOTIFIED, not buried. A watched run that lands while the mic is open is
-      // announced here, which is the screen the wearer is already looking at —
-      // and because the queue is in the next turn's context, one sentence about
-      // it gets the full answer without them having to go looking.
-      const q = getMonitorView();
-      if (q.rows.length) {
-        // The run worth naming here is the one that just FINISHED — that is what
-        // "notified, not buried" means. Falling back to the newest row keeps the
-        // line useful while a run is still going.
-        const row = q.rows.find((r) => r.unread) ?? q.rows[0];
-        lines.push('', clipBytes(`${q.unread ? '! ' : ''}${row.label} ${row.status}`, 46));
-      }
-      lines.push('', 'tap R1 = send · Stop AI = end');
-      return {
-        text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
-        todoCursor: 0,
-        canPrev: false,
-        canNext: false,
-      };
-    }
-    const body = interim ? `${status}\n\n${clipBytes(interim, 380)}` : status;
-    // Footer hint is always present so the stop gesture stays visible.
-    return {
-      text: `>> Dictate\n${body}\n\n● Tap R1 = stop`,
-      todoCursor: 0,
-      canPrev: false,
-      canNext: false,
-    };
+    if (dictationToAgent) return jarvisListenView();
+    // Plain dictation has no feed, so it gets the same borders with the whole
+    // pane given to the live transcript.
+    return listenView({
+      head: '>> Dictate',
+      live: dictationInterim,
+      status: dictationStatus || 'Starting mic…',
+      ai: null,
+      scroll: 0,
+      footer: '● tap R1 = stop',
+    });
+  }
+
+  /**
+   * The Jarvis conversation screen. `scroll` overrides the ring position; left
+   * undefined it resolves `aiFollow` the way every other render does.
+   *
+   * `dictationStatus` carries the mic instruction ("…· tap R1 to stop") because
+   * it also feeds the plain-dictation screen. The footer here owns that
+   * instruction, so the suffix is stripped rather than printed twice inside one
+   * ten-line pane.
+   */
+  function jarvisListenView(scroll?: number): SectionView {
+    return listenView({
+      head: '>> Jarvis — listening',
+      live: dictationInterim,
+      status: dictationStatus.replace(/\s*·?\s*tap R1 to stop\s*$/i, '').trim() || 'Listening…',
+      ai: getAi(),
+      queue: getMonitorView(),
+      // `aiFollow` means "track the newest", and the newest page is now unit 0.
+      scroll: scroll ?? (aiFollow ? 0 : aiScroll),
+      footer: 'tap R1 = send · Stop AI = end',
+    });
   }
 
   /** Mirror a dictation started elsewhere (web/phone MicButton) on the glasses
@@ -1084,7 +1076,9 @@ async function main(): Promise<void> {
                   conversing: jarvisSession,
                   holding: jarvisHolding,
                   queue: getMonitorView(),
-                  scroll: aiFollow ? Number.MAX_SAFE_INTEGER : aiScroll,
+                  // `aiFollow` means "track the newest" — and the newest page is
+                  // unit 0 now that the feed reads newest-first.
+                  scroll: aiFollow ? 0 : aiScroll,
                 })
               : sectionView(getState(), todoCursor, docPage);
     lastView = view;
@@ -1407,49 +1401,66 @@ async function main(): Promise<void> {
     update((s) => ({ ...s, activeSection: 'docs', activeDocId: target.id }));
   }
 
+  /**
+   * Move the ring one scroll unit through the Jarvis feed, on whichever of the
+   * two screens is currently showing it.
+   *
+   * The listen screen has a SHORTER body than the HUD (its top three lines are
+   * live speech), so its pages are its own: the ring has to be resolved against
+   * the view that is actually on screen, or one swipe in the HUD's units would
+   * skip pages on the listen screen and land the wearer somewhere they did not
+   * ask to be. Both views share `aiScroll`, so the position survives the switch
+   * between them — and to a `confirm` prompt, which is the one screen with a job
+   * and no spare attention.
+   */
+  function scrollJarvis(dir: -1 | 1): void {
+    const ai = getAi();
+    if (ai.status === 'idle' || ai.status === 'confirm') return;
+    const q = getMonitorView();
+    const listening = dictationActive && dictationToAgent;
+    const build = (scroll: number): SectionView =>
+      listening
+        ? jarvisListenView(scroll)
+        : aiView(ai, { conversing: jarvisSession, holding: jarvisHolding, queue: q, scroll });
+    // Resolve where the ring ACTUALLY is first — while following the newest page
+    // the stored index is stale by design — then move one unit from there. Asking
+    // the VIEW rather than clamping here is what keeps this honest: only it knows
+    // how many pages its own body produced, and a swipe at either end must be a
+    // no-op instead of a redraw (a redraw costs a flicker).
+    const here = build(aiFollow ? 0 : aiScroll);
+    const view = build(here.todoCursor + dir);
+    if (view.todoCursor === here.todoCursor) return;
+    aiFollow = false;
+    aiScroll = view.todoCursor;
+    // Landing on a finished run IS the acknowledgement: there is no room on a
+    // 10-line canvas for a separate dismiss, and a badge nobody can clear is a
+    // badge that gets ignored.
+    const start = view.sessionStart ?? -1;
+    if (start >= 0 && aiScroll >= start) {
+      const row = q.rows[aiScroll - start];
+      if (row) ackMonitor(row.runId);
+    }
+    void renderGlasses();
+  }
+
   function onSwipe(dir: -1 | 1): void {
-    // Swipes are ignored while dictating / diag, and while the Jarvis HUD owns
-    // the screen — an agent turn must not be able to scroll the page underneath
-    // it (the user would lose their place with no visual feedback).
-    if (dictationActive || dictationDiagText || dictationSnapshot().active) return;
+    // The Jarvis listen screen IS scrollable. The mic owns the top of the canvas
+    // but the reply underneath is still the wearer's to read while they compose
+    // the next sentence, and refusing the swipe there was what made the two
+    // halves feel like unrelated screens. Plain dictation has no feed behind it,
+    // so its swipe is still swallowed — letting it through would scroll the page
+    // under a screen the wearer is not looking at. The sticky diagnostic and the
+    // phone-started mirror are non-scrollable by construction.
+    if (dictationActive) {
+      if (dictationToAgent) scrollJarvis(dir);
+      return;
+    }
+    if (dictationDiagText || dictationSnapshot().active) return;
     if (getAi().status !== 'idle') {
       // …but the HUD is not opaque to the ring: its transcript is PAGED, and the
-      // watched-session rows at the bottom of it belong to the wearer, so
-      // checking on a background run mid-conversation must not cost them the
-      // conversation. A confirm prompt is the one exception — that screen has a
-      // job and no spare attention.
-      const ai = getAi();
-      if (ai.status === 'confirm') return;
-      const q = getMonitorView();
-      // Resolve where the ring ACTUALLY is first — while following the tail the
-      // stored index is stale by design — then move one unit from there. Asking
-      // the view rather than clamping here is what keeps this honest: only it
-      // knows how many pages the transcript produced, and a swipe at either end
-      // must be a no-op instead of a redraw (a redraw costs a flicker).
-      const here = aiView(ai, {
-        conversing: jarvisSession,
-        holding: jarvisHolding,
-        queue: q,
-        scroll: aiFollow ? Number.MAX_SAFE_INTEGER : aiScroll,
-      });
-      const view = aiView(ai, {
-        conversing: jarvisSession,
-        holding: jarvisHolding,
-        queue: q,
-        scroll: here.todoCursor + dir,
-      });
-      if (view.todoCursor === here.todoCursor) return;
-      aiFollow = false;
-      aiScroll = view.todoCursor;
-      // Landing on a finished session IS the acknowledgement: there is no room
-      // on a 10-line canvas for a separate dismiss, and a badge nobody can clear
-      // is a badge that gets ignored.
-      const start = view.sessionStart ?? -1;
-      if (start >= 0 && aiScroll >= start) {
-        const row = q.rows[aiScroll - start];
-        if (row) ackMonitor(row.runId);
-      }
-      void renderGlasses();
+      // watched-run rows at the bottom of it belong to the wearer, so checking on
+      // a background run mid-conversation must not cost them the conversation.
+      scrollJarvis(dir);
       return;
     }
     if (pickerActive) {
@@ -1706,7 +1717,6 @@ async function main(): Promise<void> {
         }
         jarvisSession = true;
         jarvisHolding = false;
-        jarvisLastReply = '';
         jarvisSilentTurns = 0;
         startGlassesDictation(true);
         return;
