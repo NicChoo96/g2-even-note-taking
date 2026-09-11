@@ -6,9 +6,9 @@ Store-submission notes. Each entry must stay under 500 characters.
 
 v0.3.21 - Jarvis talks, and remembers you
 
-- Jarvis just talks when you are not asking for anything: a sentence that names no page and gives no order gets a real reply, not a status report. Every action stays available.
-- It remembers earlier conversations, and folds the oldest into a 400-word summary once the log passes 100k words, so the next session carries on.
-- The Jarvis screen now scrolls with the ring, and an answer is no longer printed twice.
+- Jarvis answers like a person when you are only talking. Every action still works.
+- It remembers past conversations and summarises old ones past 100k words.
+- The Jarvis screen scrolls with the ring, and answers no longer print twice.
 
 ## 0.3.20
 
