@@ -470,6 +470,16 @@ export interface AiViewOptions {
    */
   conversing?: boolean;
   /**
+   * True while the finished turn is HELD on screen: the reply and its whole
+   * transcript are up, the mic is CLOSED, and the ring belongs to the wearer.
+   *
+   * The footer has to name both exits, because neither is discoverable from the
+   * screen alone — a tap opens the mic again, a double-tap drops to the page
+   * underneath. Without this the HUD would keep advertising "speak again · end"
+   * on a screen where speaking is not what the next tap does.
+   */
+  holding?: boolean;
+  /**
    * The runs Jarvis started and is watching (see ./ai/monitor). Drawn as a
    * strip at the BOTTOM of the HUD: the ring scrolls it, so the wearer can
    * check on a background run without leaving the conversation. Omitted when
@@ -493,6 +503,9 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
   // A conversation only exists on the surface that owns the loop — a mirror has
   // no mic to re-arm, so it keeps the plain dismiss hint.
   const conversing = !!opts.conversing && !remote;
+  // Only meaningful inside a conversation: holding is what the mic-closed rest
+  // state looks like, and a mirrored run has no mic to close.
+  const holding = conversing && !!opts.holding;
   // Did this run actually touch the app? A run that never called anything was a
   // CONVERSATION — the wearer asked for nothing to change and the model simply
   // answered (see ai/converse). "done" claims work happened, so say what really
@@ -516,9 +529,19 @@ export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
   // attention, and its tap means something else entirely.
   const queue = ai.status !== 'confirm' && opts.queue && opts.queue.rows.length ? opts.queue : null;
   const rows = queue ? queue.rows : [];
-  // `2x = end` is not decoration: it is the only exit that does not cost a
-  // menu trip, and the menu's own exit is the first item ("Stop AI").
-  const dismissHint = conversing ? 'tap R1 = speak again · 2x = end' : 'tap R1 = dismiss';
+  // The footer names the exit that actually EXISTS on the screen the wearer is
+  // looking at — the ring is the only input, so a hint that describes the wrong
+  // gesture is worse than no hint.
+  //   • holding  — a tap toggles back to the mic; `2x` is the way out to the page.
+  //   • talking  — a tap sends this sentence; `2x` ends the conversation.
+  //   • plain    — a one-shot run has nowhere to go, so a tap just dismisses it.
+  // `2x = read` is the wording for the hold because the double-tap lands on the
+  // page read view, which is exactly what the wearer is trying to get back to.
+  const dismissHint = conversing
+    ? holding
+      ? 'tap R1 = speak · 2x = read'
+      : 'tap R1 = speak again · 2x = end'
+    : 'tap R1 = dismiss';
 
   // ── The transcript ─────────────────────────────────────────────────────────
   // EVERY line of it, at full length. The previous view kept only the last two

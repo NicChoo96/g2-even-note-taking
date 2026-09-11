@@ -34,6 +34,7 @@
  * Run: node tools/jarvis-monitor-sim.mjs        (SIM_QUIET=1 for the tally only)
  */
 import { build } from 'esbuild';
+import { measureTextWrap } from '@evenrealities/pretext';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -637,6 +638,66 @@ const confirming = aiView(
 );
 lacks('a confirm prompt hides the strip', confirming.text, 'sessions');
 is('a confirm prompt is a single screen', confirming.canNext, false);
+
+// ── 5. The HELD answer ──────────────────────────────────────────────────────
+// The resting state of a Jarvis conversation: the finished turn stays on screen,
+// the mic is CLOSED and no timer is running, so the ring is the wearer's. WHEN it
+// holds is owned by the platform layer (main.ts) and is out of reach here — what
+// this can prove is that the screen it holds on is the one the footer promises,
+// that holding does not take the ring away, and that the promise is LEGIBLE.
+console.log('\n── held answer ──');
+
+const held = aiView(LONG, { conversing: true, holding: true, queue: getMonitorView(), scroll: 0 });
+has('the held footer offers the mic', held.text, 'tap R1 = speak');
+has('the held footer offers the way out', held.text, '2x = read');
+lacks('the held footer does not say "end"', held.text, '2x = end');
+is('holding does not take the ring away', held.canNext, true);
+// The whole point of the hold: the answer is still reachable after the run ends.
+const heldAll = [];
+for (let i = 0; i < 40; i += 1) {
+  const v = aiView(LONG, { conversing: true, holding: true, queue: getMonitorView(), scroll: i });
+  if (v.todoCursor !== i) break;
+  if (v.sessionStart >= 0 && i >= v.sessionStart) break;
+  heldAll.push(v.text);
+}
+has('a held run still pages to its answer', heldAll.join('\n'), '= The port strike is about pay.');
+has('a held run still pages to its first thought', heldAll.join('\n'), 'I should search the web before answering anything.');
+
+const talking = aiView(LONG, { conversing: true, holding: false, queue: getMonitorView(), scroll: 0 });
+has('the talking footer still sends', talking.text, 'tap R1 = speak again');
+has('the talking footer still ends', talking.text, '2x = end');
+lacks('talking is not described as reading', talking.text, '2x = read');
+
+// A mirrored run has no mic to close, so the hold must not leak onto it — the
+// phone panel would otherwise advertise a tap that does nothing on that surface.
+const mirroredHold = aiView(fakeAi({ mirrored: true }), {
+  conversing: true,
+  holding: true,
+  queue: getMonitorView(),
+});
+has('a mirrored run keeps its dismiss hint', mirroredHold.text, 'tap = dismiss');
+lacks('a mirrored run never offers the mic', mirroredHold.text, 'speak');
+lacks('a mirrored run never offers the read exit', mirroredHold.text, '2x = read');
+
+// The controls line sits BELOW a full body of transcript, so one extra rendered
+// line pushes the container past the canvas — and the firmware then scrolls it,
+// swallowing the ring swipe. That is the exact failure this screen exists to
+// avoid, so every footer variant is measured at the real render width rather
+// than eyeballed, including the widest page counter the ring can produce.
+const INNER_W = 568; // 576 - 2 * paddingLength(4); see sections.ts
+const controlsLine = (v) => v.text.split('\n').pop();
+const tooWide = (s) => measureTextWrap(s, INNER_W).lineCount > 1;
+check(
+  'every footer renders on ONE line at 568px',
+  [
+    controlsLine(held),
+    controlsLine(talking),
+    // The widest counter: the last page of a long transcript against a 2-row strip.
+    controlsLine(aiView(LONG, { conversing: true, holding: true, queue: getMonitorView(), scroll: 99 })),
+    controlsLine(aiView(LONG, { conversing: false, queue: getMonitorView(), scroll: 99 })),
+  ].filter(tooWide),
+  [],
+);
 
 // ── verdict ─────────────────────────────────────────────────────────────────
 console.log(`\n${fail === 0 ? 'ALL CHECKS PASSED' : `${fail} CHECK(S) FAILED`} — ${pass} passed, ${fail} failed\n`);

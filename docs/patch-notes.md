@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.22
+
+v0.3.22 - Jarvis stops cutting off its own answers
+
+- A finished turn stays on screen until you leave it, instead of closing the mic after a couple of seconds.
+- The ring pages the whole transcript, answer included.
+- On a held answer: tap = talk again, double-tap = back to reading.
+
 ## 0.3.21
 
 v0.3.21 - Jarvis talks, and remembers you

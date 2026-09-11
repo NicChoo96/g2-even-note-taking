@@ -315,23 +315,35 @@ async function main(): Promise<void> {
   // walk back to the contextual menu between every sentence, which is exactly
   // the friction that makes voice on glasses useless.
   //
-  // So a Jarvis session stays OPEN. When a turn finishes, the reply stays on
-  // screen for a beat and then the mic is re-armed automatically; the same tap
-  // that sent the previous sentence sends the next one.
+  // So a Jarvis session stays OPEN. When a turn finishes the reply is HELD on
+  // screen — the whole transcript, paged by the ring — and the mic is closed
+  // until the wearer asks for it. Nothing is ever taken away mid-read.
   //
-  // The exits are deliberate and few, so an open mic can never become a trap:
+  // The exits are deliberate and few, so a session can never become a trap:
   //   • `Stop AI` (menu item #1, always present while a session is open) — ends
   //     the conversation AND cancels whatever the turn is doing.
-  //   • double-tap — same, without a menu trip.
-  // A tap NEVER ends it: while listening it sends, while thinking it stops that
-  // one action, and on a finished reply it skips the wait to re-arm the mic.
+  //   • double-tap — same, without a menu trip. It lands on the page underneath,
+  //     which is what "go back to reading" means.
+  // A single tap NEVER ends it — it TOGGLES: on a held answer it opens the mic,
+  // while listening it sends, and a listening screen that heard nothing falls
+  // back to the answer instead of re-opening the mic into silence.
   let jarvisSession = false;
+  /**
+   * True while a finished turn is HELD on screen: the reply and its whole
+   * transcript are up, the mic is CLOSED, and no timer is running.
+   *
+   * This is what replaced the 2.4s auto re-arm. That pause was long enough to
+   * glance at an answer and nowhere near long enough to read a run's transcript,
+   * and because the listening screen replaces the HUD outright, the reply and
+   * every step behind it were destroyed while the wearer was still reading.
+   * Holding also makes the gestures unambiguous: tap toggles answer <-> mic, and
+   * only a double-tap leaves the session.
+   */
+  let jarvisHolding = false;
   /** The previous turn's spoken answer, re-shown while listening for the next one. */
   let jarvisLastReply = '';
   /** Consecutive turns that heard nothing, so a dead mic cannot loop forever. */
   let jarvisSilentTurns = 0;
-  /** How long the reply stays up before the mic re-arms. */
-  const JARVIS_LISTEN_DELAY_MS = 2400;
   /** Give up re-arming after this many empty turns and explain why instead. */
   const JARVIS_MAX_SILENT = 2;
 
@@ -345,10 +357,32 @@ async function main(): Promise<void> {
     else commitSpeechToSection(text);
   }
 
-  /** Re-open the mic for the next sentence of the conversation. */
+  /**
+   * Re-open the mic for the next sentence of the conversation.
+   *
+   * The mic screen REPLACES the HUD, so the held answer leaves the screen here —
+   * `jarvisHolding` is the flag that says which of the two the wearer is looking
+   * at, and it must never say "answer" while the mic is open.
+   */
   function listenAgain(): void {
     if (!jarvisSession || isDictating()) return;
+    jarvisHolding = false;
     startGlassesDictation(true);
+  }
+
+  /**
+   * Put the finished turn back on screen with the mic CLOSED and no timer set.
+   *
+   * This is the resting state of a Jarvis conversation, and the reason a long
+   * run is finally readable: the transcript stays up, the ring pages it, and
+   * nothing happens until the wearer acts. It is also where a tap that heard
+   * NOTHING lands (see the dictation idle handler), so a silent tap can never
+   * turn the mic into a loop that talks to itself.
+   */
+  function holdReply(): void {
+    clearAiTimer();
+    jarvisHolding = true;
+    void renderGlasses();
   }
 
   /** Stop the auto-hide timer for a terminal HUD state. */
@@ -379,6 +413,7 @@ async function main(): Promise<void> {
    */
   function dismissAi(): void {
     jarvisSession = false;
+    jarvisHolding = false;
     jarvisLastReply = '';
     jarvisSilentTurns = 0;
     // The next run opens on its own newest page, not wherever this one was left.
@@ -466,14 +501,10 @@ async function main(): Promise<void> {
       jarvisLastReply = res.reply || getAi().result;
       jarvisSilentTurns = 0;
       if (jarvisSession) {
-        // Conversation: keep the reply on screen for a beat, then come back and
-        // listen. The mic is what makes the next sentence possible, so the pause
-        // is short enough to feel like the agent is waiting, long enough to read.
-        aiDismissTimer = window.setTimeout(() => {
-          aiDismissTimer = null;
-          if (!jarvisSession) return;
-          listenAgain();
-        }, JARVIS_LISTEN_DELAY_MS);
+        // HOLD the finished turn — see `jarvisHolding`. Nothing moves on its own
+        // from here: the transcript stays up and the ring pages it. Re-arming the
+        // mic on a timer is what used to wipe the reply mid-read.
+        holdReply();
       } else {
         aiDismissTimer = window.setTimeout(() => {
           aiDismissTimer = null;
@@ -481,13 +512,17 @@ async function main(): Promise<void> {
         }, 6000);
       }
     } else if (status === 'error') {
-      // A failed turn is worth showing, but the conversation is over: retrying
-      // into a misconfigured relay would just re-arm the mic into another error.
-      jarvisSession = false;
-      aiDismissTimer = window.setTimeout(() => {
-        aiDismissTimer = null;
-        dismissAi();
-      }, 6000);
+      // A failed turn is HELD for the same reason a good one is — the wearer has
+      // to be able to read WHY — and holding is what makes retrying safe: the mic
+      // no longer re-arms by itself into a relay that is still broken.
+      if (jarvisSession) {
+        holdReply();
+      } else {
+        aiDismissTimer = window.setTimeout(() => {
+          aiDismissTimer = null;
+          dismissAi();
+        }, 6000);
+      }
     }
     // A pending confirmation waits for the user indefinitely — tap to run the
     // action, or long-press → "Stop AI" to refuse it.
@@ -892,10 +927,17 @@ async function main(): Promise<void> {
             // never-heard watchdog), repeatedly, gives up.
             jarvisSilentTurns += 1;
             const deadMic = /never-heard/.test(lastDictationReason());
+            const prev = getAi().status;
             if (deadMic && jarvisSilentTurns > JARVIS_MAX_SILENT) {
               jarvisSession = false;
               dictationToAgent = false;
               flashAi('Jarvis off · no audio');
+            } else if (prev === 'done' || prev === 'error') {
+              // The tap heard nothing, and the previous turn is still in the
+              // store: land back on it instead of re-opening the mic into
+              // silence. An empty tap means "never mind", and the answer they
+              // were reading is a better place to be than a live mic.
+              holdReply();
             } else {
               listenAgain();
             }
@@ -1040,6 +1082,7 @@ async function main(): Promise<void> {
             : aiActive
               ? aiView(ai, {
                   conversing: jarvisSession,
+                  holding: jarvisHolding,
                   queue: getMonitorView(),
                   scroll: aiFollow ? Number.MAX_SAFE_INTEGER : aiScroll,
                 })
@@ -1385,10 +1428,16 @@ async function main(): Promise<void> {
       // must be a no-op instead of a redraw (a redraw costs a flicker).
       const here = aiView(ai, {
         conversing: jarvisSession,
+        holding: jarvisHolding,
         queue: q,
         scroll: aiFollow ? Number.MAX_SAFE_INTEGER : aiScroll,
       });
-      const view = aiView(ai, { conversing: jarvisSession, queue: q, scroll: here.todoCursor + dir });
+      const view = aiView(ai, {
+        conversing: jarvisSession,
+        holding: jarvisHolding,
+        queue: q,
+        scroll: here.todoCursor + dir,
+      });
       if (view.todoCursor === here.todoCursor) return;
       aiFollow = false;
       aiScroll = view.todoCursor;
@@ -1534,9 +1583,13 @@ async function main(): Promise<void> {
       return;
     }
     if (ai.status === 'done' || ai.status === 'error') {
-      // On a finished reply in a conversation, a tap means "go on, I'm ready to
-      // answer" — it skips the pause instead of throwing the conversation away.
-      if (jarvisSession && ai.status === 'done') listenAgain();
+      // A tap on a HELD answer opens the mic again. It is the exact pair to the
+      // tap that sent the sentence, so a conversation toggles between "read
+      // this" and "say the next thing" with no menu trip — and leaving is the
+      // double-tap (or Stop AI), never the same gesture as speaking. `error` is
+      // included so a failed turn can be retried by hand rather than stranding
+      // the wearer on a dead HUD.
+      if (jarvisSession) listenAgain();
       else dismissAi();
       return;
     }
@@ -1652,6 +1705,7 @@ async function main(): Promise<void> {
           return;
         }
         jarvisSession = true;
+        jarvisHolding = false;
         jarvisLastReply = '';
         jarvisSilentTurns = 0;
         startGlassesDictation(true);
@@ -1732,11 +1786,12 @@ async function main(): Promise<void> {
       // that is driving the action loop, leaving the model's work half applied
       // with no HUD to explain it.
       //
-      // This is also one of only TWO ways a Jarvis CONVERSATION ends, so it has
-      // to cover the listening phase too. `dictationActive` counts: during the
-      // conversation the store is `idle` (the previous turn already finished)
-      // and the mic, not the HUD, is what is holding the user — without this the
-      // double-tap would shut the whole app down mid-sentence.
+      // From a HELD answer this is the "back to reading" gesture the HUD footer
+      // promises (`2x = read`): the session closes and the page underneath comes
+      // straight back. It has to cover the listening phase too — `dictationActive`
+      // is false while holding, and during the toggling the store may still be
+      // `done` from the previous turn, so neither flag alone is enough; a
+      // double-tap would otherwise shut the whole app down mid-conversation.
       if (getAi().status !== 'idle' || jarvisSession) {
         dismissAi();
         return;
@@ -1768,7 +1823,10 @@ async function main(): Promise<void> {
       // first item back to 'Jarvis' so the Stop tap restarted it. Keep the
       // session; if the mic did die with the page, re-arm it instead.
       if (jarvisSession) {
-        if (!dictationActive && !dictationSnapshot().active) listenAgain();
+        // A HELD answer survives the round trip: opening the contextual menu is
+        // a look, not a "carry on", and re-arming the mic would replace the
+        // transcript the wearer came back to read with a listening screen.
+        if (!jarvisHolding && !dictationActive && !dictationSnapshot().active) listenAgain();
       } else if (getAi().status === 'running') {
         aiCancel();
       }
