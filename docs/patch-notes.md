@@ -6,9 +6,9 @@ Store-submission notes. Each entry must stay under 500 characters.
 
 v0.3.20 - Jarvis reads and watches agent runs
 
-- Jarvis can read your agent sessions, newest first, including runs still in progress, and read any one of them in full.
-- Runs it starts are queued and watched. When one finishes it says so, and the session shows at the bottom of the Jarvis screen; scroll with the ring to move through them.
-- Fixed raw model tool-call tags (DSML) leaking into replies as text.
+- Jarvis can read your agent sessions, newest first, including runs still going, and read any one in full.
+- Runs it starts are watched. When one finishes it tells you, and you can scroll them at the bottom of the Jarvis screen.
+- Fixed model tool-call tags leaking into replies.
 
 ## 0.3.19
 
