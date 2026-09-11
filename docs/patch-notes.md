@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.16
+
+v0.3.16 - Sign in on the glasses app
+
+- The glasses phone app no longer blocks you with a pairing code. It shows the same sign in as any browser, so it works on its own.
+- Pairing is now optional and lives in Settings, for a device that cannot sign in.
+- Devices you paired before keep working, and you can still list or revoke them.
+- The glasses now ask you to sign in when nothing is connected.
+
 ## 0.3.15
 
 v0.3.15 - Jarvis AI agent

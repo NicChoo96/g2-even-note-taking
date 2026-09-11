@@ -1,14 +1,17 @@
 // Authentication for the G2 Even Reality Hub.
 //
-// Browser: Google Sign-In. The ID token is verified server-side against the
-// ALLOWED_EMAILS whitelist, and the relay issues a per-session token that the
-// browser uses for the live stream.
+// ONE credential model for every client: Google Sign-In. The ID token is
+// verified server-side against the ALLOWED_EMAILS whitelist and the relay
+// issues a per-session token that the browser — and the Even App WebView —
+// uses for the live stream, agent runs and settings.
 //
-// Even App WebView (glasses device): there is no OAuth here. The device
-// generates an unguessable per-device ID, shows a short pairing code, and the
-// owner approves it from a logged-in browser. Once approved, the device ID
-// itself is the stream credential. Every glasses device is individually
-// approved — there is no shared device login.
+// The Even App WebView used to be gated behind a blocking "Pair this device"
+// screen, which made the app unusable on the phone that is already talking to
+// the glasses over the SDK bridge. It now signs in like any other client. The
+// per-device approval flow still exists, unchanged on the wire (self-register →
+// code → owner approves → device ID is the credential), but it is OPT-IN: the
+// owner turns it on from Settings for a secondary device that cannot do Google
+// sign-in, or from the login screen as a fallback.
 import {
   createContext,
   useCallback,
@@ -20,7 +23,15 @@ import {
 } from 'react';
 import { API_BASE } from '../stream';
 import { onAuthRejected, setStreamToken } from '../auth-token';
-import { clearDeviceSession, loadDeviceSession, saveDeviceSession } from '../durable-docs';
+import {
+  clearDeviceSession,
+  clearOwnerSession,
+  getDurableBridge,
+  loadDeviceSession,
+  loadOwnerSession,
+  saveDeviceSession,
+  saveOwnerSession,
+} from '../durable-docs';
 
 const AUTH_KEY = 'hub:auth'; // owner email (sessionStorage)
 const SESSION_KEY = 'hub:session'; // owner session token (sessionStorage)
@@ -34,19 +45,23 @@ export interface PairedDevice {
 interface AuthCtx {
   loading: boolean;
   inEvenApp: boolean;
-  // Browser (Google SSO)
+  // Owner (Google SSO) — the primary credential on EVERY surface
   authed: boolean;
   email: string | null;
   error: string | null;
-  // Even App device pairing
+  // Opt-in device pairing (secondary device with no Google sign-in)
+  pairing: boolean;
   paired: boolean;
   pairCode: string | null;
   pairStatus: 'pending' | 'approved' | null;
   pairError: string | null;
+  thisDeviceId: string | null;
   devices: PairedDevice[] | null;
   signOut: () => void;
   setAuthed: (email: string, sessionToken: string) => void;
   setError: (e: string | null) => void;
+  setPairing: (on: boolean) => void;
+  unpair: () => void;
   pairDevice: (code: string) => Promise<{ ok: boolean; error?: string }>;
   revokeDevice: (deviceId: string) => Promise<void>;
   refreshDevices: () => Promise<void>;
@@ -58,14 +73,18 @@ const Ctx = createContext<AuthCtx>({
   authed: false,
   email: null,
   error: null,
+  pairing: false,
   paired: false,
   pairCode: null,
   pairStatus: null,
   pairError: null,
+  thisDeviceId: null,
   devices: null,
   signOut: () => {},
   setAuthed: () => {},
   setError: () => {},
+  setPairing: () => {},
+  unpair: () => {},
   pairDevice: async () => ({ ok: false }),
   revokeDevice: async () => {},
   refreshDevices: async () => {},
@@ -218,109 +237,84 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const inEvenApp = useMemo(detectEvenApp, []);
 
-  // Browser (Google SSO)
+  // Owner (Google SSO) — the primary credential on EVERY surface.
   const [authed, setAuthedState] = useState<boolean>(() => !!sessionStorage.getItem(AUTH_KEY));
   const [email, setEmail] = useState<string | null>(() => sessionStorage.getItem(AUTH_KEY));
   const [error, setError] = useState<string | null>(null);
 
-  // Even App device pairing
-  const [paired, setPairedState] = useState<boolean>(false);
+  // Opt-in device pairing (a secondary device that cannot do Google sign-in).
+  const [pairing, setPairingState] = useState(false);
+  const [paired, setPairedState] = useState(false);
   const [pairCode, setPairCode] = useState<string | null>(null);
   const [pairStatus, setPairStatus] = useState<'pending' | 'approved' | null>(null);
   const [pairError, setPairError] = useState<string | null>(null);
+  const [thisDeviceId, setThisDeviceId] = useState<string | null>(null);
   const [devices, setDevices] = useState<PairedDevice[] | null>(null);
 
-  // Boot: restore an existing credential, or start the device pairing flow.
-  // The device ID lives in the host's reliable storage (bridge.setLocalStorage)
-  // so it survives Even App restarts — no re-pairing every launch.
+  // Boot: restore the owner session — but ASK THE RELAY whether the stored token
+  // is still valid first. If the auth store was reset (e.g. a Railway redeploy
+  // without a persistent volume) the old token 401s everywhere and we'd
+  // otherwise sit "signed in" showing a misleading Offline state.
   useEffect(() => {
-    if (inEvenApp) {
-      let cancelled = false;
-      let timer: number | undefined;
-      let approvedOnce = false;
+    let cancelled = false;
+    (async () => {
+      let tok = sessionStorage.getItem(SESSION_KEY);
+      let em = sessionStorage.getItem(AUTH_KEY);
 
-      const tick = async () => {
-        if (cancelled) return;
-        try {
-          let deviceId = await loadDeviceSession();
-          if (!deviceId) {
-            deviceId = makeDeviceId();
-            await saveDeviceSession(deviceId);
+      // Even App WebView: its browser storage does not survive a restart, so
+      // fall back to the host store. main.ts mounts this UI BEFORE the SDK
+      // bridge resolves (waitForEvenAppBridge, up to ~4s) — wait for it rather
+      // than racing it and wrongly concluding "signed out" on every launch.
+      if (!tok && inEvenApp) {
+        for (let i = 0; i < 8 && !cancelled; i++) {
+          const saved = await loadOwnerSession();
+          if (saved) {
+            tok = saved.token;
+            em = saved.email;
+            sessionStorage.setItem(SESSION_KEY, saved.token);
+            if (saved.email) sessionStorage.setItem(AUTH_KEY, saved.email);
+            break;
           }
+          // No bridge yet => the host store was not readable. Once the bridge is
+          // up an empty answer is definitive, so stop waiting.
+          if (getDurableBridge()) break;
+          await new Promise((r) => window.setTimeout(r, 500));
+        }
+      }
 
-          if (approvedOnce) {
-            // Already approved — watchdog for owner-initiated revoke.
-            const r = await checkPairStatus(deviceId);
-            if (cancelled) return;
-            if (r.status === 'approved') {
-              setPairedState(true);
-              setPairStatus('approved');
-              setStreamToken(deviceId);
-            } else {
-              // Revoked / reset — drop the stale credential, go back to pairing.
-              console.log('[auth] device no longer approved — clearing session');
-              await clearDeviceSession();
-              setStreamToken(null);
-              approvedOnce = false;
-              setPairedState(false);
-              setPairStatus('pending');
-              setPairCode(null);
-            }
-            if (!cancelled) timer = window.setTimeout(tick, 15000);
-            return;
-          }
-
-          // Not approved yet — register (creates/refreshes the pair code).
-          const r = await pairRequest(deviceId);
+      if (!tok) {
+        // No owner session. An approved device credential from a previous launch
+        // still counts, so an already-paired device keeps syncing exactly as it
+        // did before — no re-pair, no code screen. Keep the pairing poll alive
+        // afterwards so an owner-initiated revoke still drops the credential.
+        const devId = await loadDeviceSession();
+        if (devId) {
+          setThisDeviceId(devId);
+          const st = await checkPairStatus(devId);
           if (cancelled) return;
-          if (r.status === 'approved') {
-            approvedOnce = true;
+          if (st.status === 'approved') {
             setPairedState(true);
             setPairStatus('approved');
-            setPairCode(null);
-            setStreamToken(deviceId);
-          } else {
-            setPairedState(false);
-            setPairStatus('pending');
-            setPairCode(r.pairCode ?? null);
+            setPairingState(true);
+          } else if (st.ok) {
+            // Relay answered and it is NOT approved (revoked / store reset).
+            // A network failure must NOT wipe a still-valid credential.
+            await clearDeviceSession();
           }
-          if (!cancelled) timer = window.setTimeout(tick, 3000);
-        } catch {
-          // Transient — retry.
-          if (!cancelled) timer = window.setTimeout(tick, 3000);
         }
-      };
-
-      void tick();
-      setLoading(false);
-      return () => {
-        cancelled = true;
-        if (timer) window.clearTimeout(timer);
-      };
-    }
-
-    // Browser: restore the owner session — but ASK THE RELAY whether the stored
-    // token is still valid first. If the auth store was reset (e.g. a Railway
-    // redeploy without a persistent volume) the old token 401s everywhere and
-    // we'd otherwise sit "signed in" showing a misleading Offline state.
-    let cancelled = false;
-    const tok = sessionStorage.getItem(SESSION_KEY);
-    const em = sessionStorage.getItem(AUTH_KEY);
-    (async () => {
-      if (!tok) {
         if (!cancelled) setLoading(false);
         return;
       }
+
       const m = await me(tok);
       if (cancelled) return;
       if (m.ok) {
         setAuthedState(true);
         setEmail(em || m.email || null);
-        setStreamToken(tok);
       } else {
         sessionStorage.removeItem(AUTH_KEY);
         sessionStorage.removeItem(SESSION_KEY);
-        setStreamToken(null);
+        void clearOwnerSession();
         setAuthedState(false);
         setEmail(null);
       }
@@ -331,22 +325,98 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [inEvenApp]);
 
+  // Opt-in device pairing. Unchanged on the wire: self-register a per-device ID,
+  // show the code, poll until an owner approves it, then keep polling so a
+  // revoked device drops its credential instead of streaming forever.
+  useEffect(() => {
+    if (!pairing) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    let approvedOnce = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        let id = await loadDeviceSession();
+        if (!id) {
+          id = makeDeviceId();
+          await saveDeviceSession(id);
+        }
+        setThisDeviceId(id);
+
+        if (approvedOnce) {
+          // Already approved — watchdog for an owner-initiated revoke.
+          const r = await checkPairStatus(id);
+          if (cancelled) return;
+          if (r.status === 'approved') {
+            setPairedState(true);
+            setPairStatus('approved');
+          } else {
+            // Revoked / reset — drop the stale credential, back to the code.
+            console.log('[auth] device no longer approved — clearing session');
+            await clearDeviceSession();
+            approvedOnce = false;
+            setPairedState(false);
+            setPairStatus('pending');
+            setPairCode(null);
+          }
+          if (!cancelled) timer = window.setTimeout(tick, 15000);
+          return;
+        }
+
+        // Not approved yet — register (creates/refreshes the pair code).
+        const r = await pairRequest(id);
+        if (cancelled) return;
+        if (r.status === 'approved') {
+          approvedOnce = true;
+          setPairedState(true);
+          setPairStatus('approved');
+          setPairCode(null);
+        } else {
+          setPairedState(false);
+          setPairStatus('pending');
+          setPairCode(r.pairCode ?? null);
+        }
+        if (!cancelled) timer = window.setTimeout(tick, 3000);
+      } catch {
+        // Transient — retry.
+        if (!cancelled) timer = window.setTimeout(tick, 3000);
+      }
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [pairing]);
+
+  // ONE place decides the stream credential. An owner session always wins — it
+  // is strictly stronger (it can also write settings) — and an approved device
+  // ID is the fallback for a paired secondary device.
+  useEffect(() => {
+    if (loading) return;
+    const owner = authed ? sessionStorage.getItem(SESSION_KEY) : null;
+    setStreamToken(owner ?? (paired ? thisDeviceId : null));
+  }, [loading, authed, paired, thisDeviceId]);
+
   // Any owner call (stream publish, dictation, SSE reconnect) that comes back
   // 401 means this session died server-side → drop it and show the login screen.
-  // The Even App device path is excluded: it self-heals via the pairing watchdog.
+  // An approved DEVICE token is not an owner session, so those 401s are left to
+  // the pairing watchdog above (revoked → back to the code screen).
   useEffect(() => {
-    if (inEvenApp) return;
+    if (!authed) return;
     return onAuthRejected(() => {
       const tok = sessionStorage.getItem(SESSION_KEY);
       if (tok) void logout(tok);
       sessionStorage.removeItem(AUTH_KEY);
       sessionStorage.removeItem(SESSION_KEY);
+      void clearOwnerSession();
       setAuthedState(false);
       setEmail(null);
-      setStreamToken(null);
       window.google?.accounts?.id?.disableAutoSelect?.();
     });
-  }, [inEvenApp]);
+  }, [authed]);
 
   const setAuthed = useCallback((em: string, sessionToken: string) => {
     sessionStorage.setItem(AUTH_KEY, em);
@@ -354,7 +424,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthedState(true);
     setEmail(em);
     setError(null);
-    setStreamToken(sessionToken);
+    // An owner session supersedes the device flow — stop the pairing poll.
+    setPairingState(false);
+    setPairCode(null);
+    setPairError(null);
+    // The Even App WebView wipes browser storage on restart, so mirror the
+    // session into the host store there (a plain browser keeps sessionStorage).
+    if (detectEvenApp()) void saveOwnerSession({ token: sessionToken, email: em });
   }, []);
 
   const signOut = useCallback(() => {
@@ -362,10 +438,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (tok) void logout(tok);
     sessionStorage.removeItem(AUTH_KEY);
     sessionStorage.removeItem(SESSION_KEY);
+    void clearOwnerSession();
     setAuthedState(false);
     setEmail(null);
-    setStreamToken(null);
+    setPairingState(false);
     window.google?.accounts?.id?.disableAutoSelect?.();
+  }, []);
+
+  const setPairing = useCallback((on: boolean) => {
+    setPairError(null);
+    setPairingState(on);
+    if (!on) {
+      setPairCode(null);
+      setPairStatus(null);
+    }
+  }, []);
+
+  /** Forget THIS device's pairing credential (the owner side is "revoke"). */
+  const unpair = useCallback(() => {
+    void clearDeviceSession();
+    setPairingState(false);
+    setPairedState(false);
+    setPairCode(null);
+    setPairStatus(null);
+    setThisDeviceId(null);
   }, []);
 
   const refreshDevices = useCallback(async () => {
@@ -413,14 +509,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         authed,
         email,
         error,
+        pairing,
         paired,
         pairCode,
         pairStatus,
         pairError,
+        thisDeviceId,
         devices,
         signOut,
         setAuthed,
         setError,
+        setPairing,
+        unpair,
         pairDevice,
         revokeDevice,
         refreshDevices,
@@ -435,9 +535,9 @@ export function useAuth(): AuthCtx {
   return useContext(Ctx);
 }
 
-/** The browser login screen (shown until the whitelisted Google account signs in). */
+/** The sign-in screen. Every client uses it, including the Even App WebView. */
 export function LoginScreen() {
-  const { error, setError, setAuthed } = useAuth();
+  const { error, setError, setAuthed, inEvenApp, setPairing } = useAuth();
   const [clientId, setClientId] = useState<string | null>(null);
   const [cfgError, setCfgError] = useState<string | null>(null);
   const btnRef = useRef<HTMLDivElement>(null);
@@ -504,23 +604,34 @@ export function LoginScreen() {
         {cfgError && <p style={{ color: 'var(--danger)', fontSize: 13 }}>{cfgError}</p>}
         {error && <p style={{ color: 'var(--danger)', fontSize: 13 }}>{error}</p>}
         <p style={{ color: 'var(--muted)', fontSize: 12, marginTop: 14 }}>
-          Only whitelisted accounts can access the web control app. New glasses
-          devices must be approved from here.
+          Only whitelisted accounts can access the web control app. Extra glasses
+          devices are paired from Settings after you sign in.
         </p>
+        {inEvenApp || cfgError ? (
+          <p style={{ marginTop: 14 }}>
+            <button className="link-btn" onClick={() => setPairing(true)}>
+              Can't sign in here? Pair this device instead
+            </button>
+          </p>
+        ) : null}
       </div>
     </div>
   );
 }
 
-/** Shown inside the Even App until this glasses device has been approved. */
+/**
+ * OPTIONAL per-device approval. No longer a gate for the Even App — it is only
+ * reached from Settings, or from the login screen's fallback link when a device
+ * cannot complete Google sign-in. The wire protocol is unchanged.
+ */
 export function PairScreen() {
-  const { pairCode, pairStatus, pairError } = useAuth();
+  const { pairCode, pairStatus, pairError, paired, setPairing } = useAuth();
   return (
     <div className="app" style={{ alignItems: 'center', textAlign: 'center', paddingTop: 60 }}>
       <div>
         <h1>🥽 Pair this device</h1>
         <p className="tagline">
-          This glasses device needs your approval before it can see the live stream.
+          A device code is an alternative to signing in on this device.
         </p>
       </div>
       <div className="card" style={{ minWidth: 300 }}>
@@ -532,13 +643,20 @@ export function PairScreen() {
             <div className="pair-code">{pairCode}</div>
             <p style={{ color: 'var(--muted)', fontSize: 12, marginTop: 12 }}>
               Open the hub URL in a browser, sign in with the owner Google account,
-              and approve this device. Waiting…
+              then approve this code in Settings → Devices. Waiting…
             </p>
           </>
         ) : (
           <p style={{ color: 'var(--muted)', fontSize: 13 }}>Contacting the hub…</p>
         )}
         {pairError && <p style={{ color: 'var(--danger)', fontSize: 13 }}>{pairError}</p>}
+        {!paired && (
+          <p style={{ marginTop: 14 }}>
+            <button className="link-btn" onClick={() => setPairing(false)}>
+              ← Back to sign in
+            </button>
+          </p>
+        )}
       </div>
     </div>
   );

@@ -3,9 +3,14 @@
 // while the SDK draws to the glasses when loaded inside the Even App.
 //
 // Security model:
-//  - Browser: gated behind Google Sign-In (owner session token).
-//  - Even App WebView: gated behind device pairing — the device shows a code
-//    the owner approves from a logged-in browser. No anonymous access either way.
+//  - EVERY client signs in with the owner's Google account — a plain browser
+//    and the Even App WebView alike. The phone that already drives the glasses
+//    over the SDK bridge is not a separate, untrusted device, so it must never
+//    sit behind a blocking device-approval screen.
+//  - Per-device pairing still exists (same wire protocol) for a device that
+//    cannot sign in. It is OPT-IN, lives in Settings → Devices, and the login
+//    screen offers it as a fallback inside the Even App only.
+//  - No anonymous access either way.
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
@@ -13,16 +18,18 @@ import { AuthProvider, LoginScreen, PairScreen, useAuth } from './auth';
 import './styles.css';
 
 function Gate() {
-  const { loading, inEvenApp, authed, paired } = useAuth();
-  if (inEvenApp) {
-    // Even App WebView — the glasses device must be approved before anything
-    // appears on the stream (and on the glasses).
-    if (paired) return <App />;
-    return <PairScreen />;
+  const { loading, authed, paired, pairing } = useAuth();
+  if (loading) {
+    return (
+      <div className="app" style={{ textAlign: 'center', padding: 60 }}>
+        Loading…
+      </div>
+    );
   }
-  if (loading) return <div className="app" style={{ textAlign: 'center', padding: 60 }}>Loading…</div>;
-  if (!authed) return <LoginScreen />;
-  return <App />;
+  // An owner session, or the approved device it was paired as, opens the app.
+  if (authed || paired) return <App />;
+  // Pairing is only ever shown because the user asked for it.
+  return pairing ? <PairScreen /> : <LoginScreen />;
 }
 
 export function mountUi(): void {

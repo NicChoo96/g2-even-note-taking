@@ -446,6 +446,30 @@ li.empty {
   font-variant-numeric: tabular-nums;
 }
 
+/* Same code, but inside the Settings card where a 40px block is too loud. */
+.pair-code.inline {
+  font-size: 22px;
+  letter-spacing: 6px;
+  padding: 4px 0 2px;
+  text-align: left;
+}
+
+/* A button that should read as a link (login-screen fallbacks). */
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.link-btn:hover {
+  opacity: 0.8;
+}
+
 .pair-row {
   display: flex;
   gap: 10px;

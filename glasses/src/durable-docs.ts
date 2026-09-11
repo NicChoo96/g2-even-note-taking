@@ -1,4 +1,4 @@
-// Durable persistence (docs library + the Even App device session).
+// Durable persistence (docs library + the Even App session credentials).
 //
 // The Even App WebView is a Flutter WebView — browser localStorage/IndexedDB
 // do NOT reliably survive app restarts there (see the device-features G2 skill:
@@ -10,6 +10,7 @@ import type { DocEntry } from './types';
 
 const DOCS_KEY = 'hub:docs';
 const DEVICE_KEY = 'hub:deviceId';
+const OWNER_KEY = 'hub:owner';
 
 let bridge: EvenAppBridge | null = null;
 
@@ -130,4 +131,38 @@ export async function saveDeviceSession(deviceId: string): Promise<void> {
 /** Clear the stored device session (e.g. the owner revoked this device). */
 export async function clearDeviceSession(): Promise<void> {
   await durableRemove(DEVICE_KEY);
+}
+
+/**
+ * Owner session — the Google sign-in credential. Every client signs in now,
+ * including the Even App WebView, so the token has to outlive the WebView's own
+ * (wiped) browser storage or the user re-authenticates on every launch.
+ * Only the Even App mirror is stored here; a plain browser keeps its token in
+ * sessionStorage exactly as before.
+ */
+export interface OwnerSession {
+  token: string;
+  email: string | null;
+}
+
+export async function loadOwnerSession(): Promise<OwnerSession | null> {
+  const raw = await durableGet(OWNER_KEY);
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw) as Partial<OwnerSession>;
+    if (o && typeof o.token === 'string' && o.token) {
+      return { token: o.token, email: typeof o.email === 'string' ? o.email : null };
+    }
+  } catch {
+    /* corrupt — treat as signed out */
+  }
+  return null;
+}
+
+export async function saveOwnerSession(s: OwnerSession): Promise<void> {
+  await durableSet(OWNER_KEY, JSON.stringify(s));
+}
+
+export async function clearOwnerSession(): Promise<void> {
+  await durableRemove(OWNER_KEY);
 }

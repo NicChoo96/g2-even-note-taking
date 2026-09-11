@@ -94,9 +94,12 @@ import { mountUi } from './web/ui';
 const CONTAINER_ID = 1;
 const CONTAINER_NAME = 'main';
 
-// Shown on the glasses before the device has been paired/approved.
-const PAIRING_TEXT =
-  'Pair this device\n\nOpen the hub URL in\na browser, sign in, and\napprove this device.\n\nPaste & edit on the\nweb app, control with\nyour R1 ring.';
+// Shown on the glasses while no credential is active — nobody has signed in and
+// this device holds no pairing token. Signing in is the normal path on EVERY
+// surface (including the Even App WebView); pairing is the opt-in fallback for a
+// device that cannot sign in.
+const SIGNIN_TEXT =
+  'Sign in to start\n\nOpen the hub and sign in\nwith your Google account.\nOne account, every device.\n\nPairing is only for a device\nthat cannot sign in.\n\nControl with your R1 ring.';
 
 /** Diagnostic logging only — the phone screen stays clean (just the web UI). */
 function setStatus(line: string): void {
@@ -916,15 +919,16 @@ async function main(): Promise<void> {
   }
 
   async function doRender(): Promise<void> {
-    // Before the device is paired (no credential), the glasses show onboarding.
+    // Before anyone signs in (and with no pairing token), the glasses show
+    // onboarding instead of an empty pasteboard.
     if (!getStreamToken()) {
-      const text = PAIRING_TEXT;
+      const text = SIGNIN_TEXT;
       if (!started) {
         const res = await createPage(text);
         started = res === StartUpPageCreateResult.success;
         if (started) setStartupReady();
         renderedText = text;
-        if (!started) console.log('[hub] WARNING: startup page rejected (pairing)');
+        if (!started) console.log('[hub] WARNING: startup page rejected (sign-in)');
         return;
       }
       if (text !== renderedText) {

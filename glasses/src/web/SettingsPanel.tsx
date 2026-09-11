@@ -15,6 +15,7 @@ import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
 import { FREE_TOOL_MODELS, DEEPSEEK_MODELS } from '../models';
 import { DEFAULT_MODEL } from '../types';
 import { fetchAgentStatus, saveSettings, type AgentStatus, type ValueSource } from './agents-client';
+import { DevicesPanel } from './DevicesPanel';
 
 /** A small pill that says where a value comes from. */
 function SourceBadge({ source }: { source?: ValueSource }) {
@@ -247,6 +248,8 @@ export function SettingsPanel() {
         the glasses bundle). Set <code>OPENROUTER_API_KEY</code> / <code>TAVILY_API_KEY</code> in
         <code> web/.env.local</code> (or your host's env vars) to override — environment values win.
       </p>
+
+      <DevicesPanel />
     </div>
   );
 }
