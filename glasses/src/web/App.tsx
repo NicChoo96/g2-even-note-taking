@@ -3,7 +3,9 @@ import { categorize } from './categorize';
 import { useAuth } from './auth';
 import { MicButton } from './Dictate';
 import { AgentsPanel } from './AgentsPanel';
+import { AiPanel } from './AiPanel';
 import { SettingsPanel } from './SettingsPanel';
+import { consumeWebTab, getAi, subscribeAi } from '../ai';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
 import type { ConnStatus } from '../store';
 import type { HubState, SectionId, TodoItem } from '../types';
@@ -17,12 +19,16 @@ const SECTION_LABELS: Record<SectionId, string> = {
 };
 
 /** Local tabs — Settings is browser-only and never becomes the glasses section. */
-type Tab = SectionId | 'settings';
+type Tab = SectionId | 'settings' | 'jarvis';
 
-const TAB_ORDER: Tab[] = ['todo', 'docs', 'notes', 'agents', 'settings'];
+// Jarvis sits just before Settings: it is an AI surface over the whole app
+// rather than a fifth glasses page, so it groups with the "meta" tab.
+const TAB_ORDER: Tab[] = ['todo', 'docs', 'notes', 'agents', 'jarvis', 'settings'];
 
 function tabLabel(id: Tab): string {
-  return id === 'settings' ? 'Settings' : SECTION_LABELS[id];
+  if (id === 'settings') return 'Settings';
+  if (id === 'jarvis') return 'Jarvis';
+  return SECTION_LABELS[id];
 }
 
 function useHubState(): HubState {
@@ -110,6 +116,23 @@ export default function App() {
   /** Local tab override — lets Settings show without changing the glasses section. */
   const [tab, setTab] = useState<Tab | null>(null);
   const activeTab: Tab = tab ?? state.activeSection;
+
+  // A live dot on the Jarvis tab, so an agent run started from the glasses or
+  // from a confirmation prompt is visible without hunting for it.
+  const ai = useSyncExternalStore(subscribeAi, getAi);
+  const aiLive = ai.status === 'running' || ai.status === 'confirm';
+
+  // The agent can ask the browser to show something (`nav.open_page`,
+  // `settings.open`). Those come through as a one-shot request rather than a
+  // subscription, so consume it and clear it — otherwise the user could never
+  // navigate away from a page the AI opened.
+  const requested = ai.webTab;
+  useEffect(() => {
+    if (!requested) return;
+    consumeWebTab();
+    // Guard the cast: a typo'd page name must not blank the content area.
+    if (TAB_ORDER.includes(requested as Tab)) setTab(requested as Tab);
+  }, [requested]);
 
   const handleCategorize = () => {
     if (!paste.trim()) return;
@@ -304,10 +327,10 @@ export default function App() {
           : { cls: '', label: 'Ready' };
 
   return (
-    // `app-wide` widens the shell for the Agents tab only: its two-pane editor
-    // needs ~1040px, and the 760px reading width that suits notes/docs/docs
-    // would otherwise squeeze the master list and the form fields.
-    <div className={`app${activeTab === 'agents' ? ' app-wide' : ''}`}>
+    // `app-wide` widens the shell for the two-pane tabs: Agents (master list +
+    // editor) and Jarvis (live timeline + action catalog). The 760px reading
+    // width that suits notes/docs would squeeze both.
+    <div className={`app${activeTab === 'agents' || activeTab === 'jarvis' ? ' app-wide' : ''}`}>
       <header className="app-header">
         <div>
           <h1>🥽 G2 Even Reality Hub</h1>
@@ -359,9 +382,14 @@ export default function App() {
             role="tab"
             aria-selected={activeTab === id}
             className={activeTab === id ? 'tab active' : 'tab'}
-            onClick={() => (id === 'settings' ? setTab('settings') : switchSection(id))}
+            onClick={() =>
+              // Settings and Jarvis are companion-only tabs: they never change
+              // the glasses section, because neither is a G2 page.
+              id === 'settings' || id === 'jarvis' ? setTab(id) : switchSection(id)
+            }
           >
             {tabLabel(id)}
+            {id === 'jarvis' && aiLive && <span className="count">●</span>}
             {id === 'todo' && state.sections.todo.length > 0 && (
               <span className="count">
                 {pending}/{state.sections.todo.length}
@@ -373,6 +401,8 @@ export default function App() {
 
       <main className="content card">
         {activeTab === 'settings' && <SettingsPanel />}
+
+        {activeTab === 'jarvis' && <AiPanel />}
 
         {activeTab === 'agents' && <AgentsPanel />}
 

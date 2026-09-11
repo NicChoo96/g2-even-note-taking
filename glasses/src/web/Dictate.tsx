@@ -29,6 +29,13 @@ export interface MicButtonProps {
   title?: string;
   /** Hide the helper/interim text (use in tight rows, e.g. the todo adder). */
   compact?: boolean;
+  /**
+   * 'text' (default) writes the transcript into a field; 'ai' hands it to the
+   * Jarvis agent. The capture flow is IDENTICAL — only the wording changes — so
+   * an AI command never needs a different mic gesture or a second permission
+   * prompt. Every existing MicButton keeps the default and is unaffected.
+   */
+  mode?: 'text' | 'ai';
 }
 
 export function useDictation(onText: (text: string) => void) {
@@ -110,16 +117,25 @@ export function useDictation(onText: (text: string) => void) {
   return { state, detail, interim, toggle };
 }
 
-export function MicButton({ onText, hint, title, compact = false }: MicButtonProps) {
+export function MicButton({ onText, hint, title, compact = false, mode = 'text' }: MicButtonProps) {
   const { state, detail, interim, toggle } = useDictation(onText);
   const listening = state === 'listening';
   const busy = state === 'transcribing';
   const bad = state === 'error' || state === 'unsupported';
+  const ai = mode === 'ai';
 
-  const label = listening ? 'Stop dictation' : busy ? 'Transcribing…' : 'Dictate with voice';
+  const label = listening
+    ? ai
+      ? 'Stop and run the agent'
+      : 'Stop dictation'
+    : busy
+      ? 'Transcribing…'
+      : ai
+        ? 'Speak a command for Jarvis'
+        : 'Dictate with voice';
   return (
     <span
-      className={`dictate ${compact ? 'dictate-compact' : ''}`}
+      className={`dictate ${compact ? 'dictate-compact' : ''} ${ai ? 'dictate-ai' : ''}`}
       title={title || hint}
     >
       <button
@@ -129,14 +145,18 @@ export function MicButton({ onText, hint, title, compact = false }: MicButtonPro
         aria-label={label}
         aria-pressed={listening}
       >
-        {busy ? '…' : listening ? '◼' : '🎙'}
+        {busy ? '…' : listening ? '◼' : ai ? '✦' : '🎙'}
       </button>
       {!compact && (
         <span className={`dictate-state ${bad ? 'err' : ''}`}>
           {bad
             ? detail || 'Voice unavailable'
             : interim ||
-              (listening ? 'Listening… tap the mic to stop' : hint || 'Tap to dictate (mic permission will be requested)')}
+              (listening
+                ? ai
+                  ? 'Listening… stop to run the agent'
+                  : 'Listening… tap the mic to stop'
+                : hint || 'Tap to dictate (mic permission will be requested)')}
         </span>
       )}
     </span>

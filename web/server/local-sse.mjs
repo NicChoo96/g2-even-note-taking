@@ -3,6 +3,13 @@
 // devices at the same time" backend for Railway/Fly/Render.
 //
 //   GET  /api/stream?channel=hub  -> SSE stream (the app + glasses connect here)
+//   GET  /api/stream?channels=a,b -> the SAME stream, several channels on ONE
+//                                     socket (frames tagged with `channel`).
+//                                     Preferred: a browser only allows ~6 live
+//                                     HTTP/1.1 sockets per origin and an SSE
+//                                     response holds its socket forever, so one
+//                                     EventSource per channel starves every
+//                                     other request — including POST /api/llm.
 //   POST /api/stream              -> publish HubState + broadcast to SSE clients
 //   GET  /                        -> serves the unified app (glasses-dist): the
 //                                     companion web UI in any browser, AND the
@@ -470,7 +477,7 @@ function runSnapshot() {
 function broadcastRun(run) {
   run.updatedAt = Date.now();
   const frame = { type: 'run', run };
-  for (const client of [...getChannel('agents').clients]) send(client, frame);
+  for (const client of [...getChannel('agents').clients]) send(client, frame, 'agents');
 }
 
 /** OpenAI-style tool schema — mirrors glasses/src/agents.ts toolSchema(). */
@@ -732,6 +739,13 @@ const MIME = {
 // channel -> { name, clients: Set<res>, lastState: object | null }
 const channels = new Map();
 
+// Channels whose payload is a LIVE SIGNAL rather than durable state: the Jarvis
+// run mirror ('ai') and its directed control frames ('ai-ctl'). Persisting
+// either would replay a finished run — or a Stop the user pressed minutes ago —
+// to the next client that connects, so they stay in memory only. Every other
+// channel (hub, agents) is restored and mirrored to disk as before.
+const TRANSIENT_CHANNELS = new Set(['ai', 'ai-ctl']);
+
 function getChannel(name) {
   if (!channels.has(name)) channels.set(name, { name, clients: new Set(), lastState: null });
   return channels.get(name);
@@ -743,7 +757,7 @@ async function loadPersistedState() {
     const raw = await readFile(STATE_FILE, 'utf8');
     const data = JSON.parse(raw);
     for (const [name, lastState] of Object.entries(data ?? {})) {
-      if (lastState) getChannel(name).lastState = lastState;
+      if (lastState && !TRANSIENT_CHANNELS.has(name)) getChannel(name).lastState = lastState;
     }
     console.log(`[g2-hub] restored ${Object.keys(data ?? {}).length} channel(s) from ${STATE_FILE}`);
   } catch {
@@ -755,7 +769,10 @@ async function loadPersistedState() {
 async function persistState(name, lastState) {
   try {
     const data = {};
-    for (const [ch, info] of channels) data[ch] = info.lastState ?? null;
+    for (const [ch, info] of channels) {
+      if (TRANSIENT_CHANNELS.has(ch)) continue;
+      data[ch] = info.lastState ?? null;
+    }
     await writeFile(STATE_FILE, JSON.stringify(data, null, 2));
   } catch {
     /* disk may be read-only on some hosts — in-memory broadcast still works */
@@ -776,9 +793,35 @@ function setCors(res) {
   res.setHeader('Access-Control-Max-Age', '600');
 }
 
-function send(client, frame) {
+/**
+ * Responses that asked for SEVERAL channels at once (`?channels=a,b,c`).
+ *
+ * WHY THIS EXISTS — browsers keep at most SIX HTTP/1.1 connections per origin,
+ * and an SSE response never releases its socket. The app used to open one
+ * EventSource per channel (hub, agents, ai, ai-ctl), so a single tab pinned
+ * 4 of the 6 sockets forever and a SECOND tab pinned 8 — more than the cap.
+ * Every remaining request (notably POST /api/llm) then queued indefinitely:
+ * a Jarvis run would sit on its first model turn with the HUD showing no
+ * overlay, which looked like a hung provider but was pure socket starvation.
+ *
+ * Multiplexing fixes that at the root: one socket carries every channel. It
+ * also means a NEW channel costs zero extra sockets, so the tool-call /
+ * capability layer stays free to grow.
+ *
+ * A multiplexed client is registered in EVERY channel's `clients` set, so
+ * publishing is unchanged; only the frame is tagged with its origin channel
+ * (a legacy single-channel subscriber gets the untagged frame it always got).
+ */
+const MULTIPLEXED = new WeakSet();
+
+function send(client, frame, channelName) {
+  // Tag only when the client multiplexes AND the frame does not already name
+  // its channel — a single-channel subscriber must keep receiving exactly the
+  // frames it received before this change.
+  const tag = channelName ?? frame.channel;
+  const out = tag && MULTIPLEXED.has(client) ? { ...frame, channel: tag } : frame;
   try {
-    client.write(`data: ${JSON.stringify(frame)}\n\n`);
+    client.write(`data: ${JSON.stringify(out)}\n\n`);
   } catch {
     /* client gone */
   }
@@ -959,7 +1002,7 @@ const server = createServer(async (req, res) => {
     channel.lastState = state;
     void persistState(channel.name, state);
     const frame = { type: 'state', state };
-    for (const client of [...channel.clients]) send(client, frame);
+    for (const client of [...channel.clients]) send(client, frame, channel.name);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, clients: channel.clients.size }));
     return;
@@ -979,19 +1022,38 @@ const server = createServer(async (req, res) => {
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
     });
-    channel.clients.add(res);
-    // ALWAYS send an init frame — `state: null` means "the server has nothing
-    // yet, seed me". Without this a client cannot tell an empty relay from an
-    // unreachable one, and its fallback seeding would overwrite a newer snapshot
-    // that another device already published.
-    send(res, { type: 'init', state: channel.lastState ?? null });
+
+    // MULTIPLEXED SUBSCRIPTION — `?channels=hub,agents,ai,ai-ctl` rides ONE
+    // socket. See MULTIPLEXED above for why: 4 sockets per tab exhausts the
+    // browser's per-origin connection pool and starves every other request.
+    // A legacy `?channel=X` request keeps the original untagged frame shape.
+    const wanted = (url.searchParams.get('channels') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const names = wanted.length ? [...new Set(wanted)] : [channel.name];
+    const multi = wanted.length > 0;
+    if (multi) MULTIPLEXED.add(res);
+
+    const subs = names.map((n) => getChannel(n));
+    for (const sub of subs) sub.clients.add(res);
+
+    // ALWAYS send an init frame per channel — `state: null` means "the server
+    // has nothing yet, seed me". Without this a client cannot tell an empty
+    // relay from an unreachable one, and its fallback seeding would overwrite a
+    // newer snapshot that another device already published.
+    for (const sub of subs) send(res, { type: 'init', state: sub.lastState ?? null }, sub.name);
+
     // Agents channel also replays in-flight/recent runs so a client that just
     // came back from the background can rebuild the live transcript.
-    if (channel.name === 'agents') {
+    if (subs.some((s) => s.name === 'agents')) {
       const live = runSnapshot().filter((r) => r.status === 'running');
-      if (live.length) send(res, { type: 'runInit', runs: live });
+      if (live.length) send(res, { type: 'runInit', runs: live }, 'agents');
     }
-    req.on('close', () => channel.clients.delete(res));
+
+    req.on('close', () => {
+      for (const sub of subs) sub.clients.delete(res);
+    });
     return;
   }
 
@@ -1500,12 +1562,18 @@ const server = createServer(async (req, res) => {
         return;
       }
       const choice = j?.choices?.[0]?.message ?? {};
+      // Reasoning ("chain of thought") is a separate field, and providers name
+      // it differently: DeepSeek uses `reasoning_content`, OpenRouter `reasoning`.
+      // It used to be dropped here, which is why the agent HUD could only ever
+      // show its own step labels and never what the model actually thought.
+      const reasoning = choice.reasoning_content ?? choice.reasoning;
       json(res, 200, {
         ok: true,
         model: j?.model || payload.model,
         message: {
           role: 'assistant',
           content: String(choice.content ?? ''),
+          ...(reasoning ? { reasoning_content: String(reasoning) } : {}),
           ...(Array.isArray(choice.tool_calls) ? { tool_calls: choice.tool_calls } : {}),
         },
         usage: j?.usage ?? null,

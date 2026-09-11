@@ -10,6 +10,9 @@
 // the simulator; oversized content makes the whole page get REJECTED).
 import { MenuContainerProperty, MenuItemProperty, utf8ByteLength } from '@evenrealities/even_hub_sdk';
 import { measureTextWrap } from '@evenrealities/pretext';
+import { pageTitle } from './ai/registry';
+import type { AiState } from './ai/store';
+import type { PageId } from './ai/types';
 import {
   activeDoc,
   type AgentDef,
@@ -51,14 +54,31 @@ export const MENU = {
   /** R1 → long-press menu → Dictate: start glasses-mic speech-to-text. */
   DICTATE: 20,
   /** Return to the last non-special tab (switchers are hidden there). */
-  BACK: 21,
-  // Agents-tab actions. Select / New / Delete live in the WEB app now, so the
+  BACK: 21,  // Agents-tab actions. Select / New / Delete live in the WEB app now, so the
   // glasses menu only carries the run controls; ids 30–33 stay reserved so an
   // installed page with the previous menu still maps to something sensible.
   /** Run the selected agent's SAVED prompt (no dictation needed). */
   AGENT_TRIGGER: 34,
   /** Cancel the in-flight run. */
   AGENT_STOP: 35,
+  /**
+   * Jarvis: speak ONE sentence and let the AI agent work out which page and
+   * which actions it needs. It is the FIRST item in every menu — same trigger,
+   * same speech engine and same listen-then-act flow as Dictate (which is now
+   * always LAST), so the difference the user feels is only in what happens
+   * after they stop talking. Starting it also opens a CONVERSATION: when a turn
+   * finishes the mic is re-armed so the next sentence needs no menu trip.
+   */
+  JARVIS: 30,
+  /**
+   * Stop the AI turn / end the Jarvis conversation; also declines a pending
+   * destructive action. Shown as long as the agent is running, waiting on a
+   * confirmation, or listening between turns — one of the two deliberate exits
+   * from a conversation (the other is a double-tap).
+   */
+  JARVIS_STOP: 31,
+  /** Revert the whole previous AI batch. Only shown while one exists. */
+  UNDO_AI: 32,
 } as const;
 
 /**
@@ -74,21 +94,38 @@ export interface MenuState {
   hasAgents?: boolean;
   /** True while a server-side agent run is in flight → show Stop instead. */
   agentRunning?: boolean;
+  /** True while the Jarvis agent is running or waiting on a confirmation. */
+  aiRunning?: boolean;
+  /**
+   * True while a Jarvis CONVERSATION is open but no turn is in flight — i.e.
+   * the mic is re-armed, or the last reply is still on screen waiting to be
+   * superseded. Distinguishing this from `aiRunning` is what lets "Undo AI"
+   * stay reachable between turns (it would fight a live run for the same hand,
+   * but merely talking to the agent is exactly when a revert is wanted).
+   */
+  aiListening?: boolean;
+  /** True once an AI batch can be reverted → show "Undo AI". */
+  aiUndo?: boolean;
 }
 
 /**
  * Build the OS contextual menu for the current state — reusable and
- * state-aware:
+ * state-aware. The order is fixed and deliberate:
  *
- *   • **Dictate is always the FIRST item** so a long-press reaches it instantly.
- *   • **Docs tab** → Dictate · Back · New Docs · Select Docs · Delete Docs.
- *   • **Agents tab** → Dictate · Back · Trigger (becomes Stop while a run is in
- *     flight). Trigger runs the highlighted agent's SAVED prompt — no dictation
- *     needed on this tab. Select / New / Delete were removed: agent CRUD lives
- *     in the web app, and the ring already moves between the master list and
- *     the detail pane without a menu item (tap into the detail, double-tap
- *     back). Back is KEPT — it is the only way off this tab.
- *   • **Any other tab** → Dictate · To-Do · Docs · Notes · Agents.
+ *   1. **Jarvis** (→ "Stop AI" while a run is live or a conversation is open)
+ *      — the flagship action, so a long-press reaches it first.
+ *   2. **Undo AI** — only while a revertible batch exists and nothing is
+ *      running; the recovery for a wrong AI action, kept next to the way in.
+ *   3. **Back** — wherever it applies (docs, agents). The escape hatch sits
+ *      above the page's own actions so it is never the item you scroll past.
+ *   4. **The page's own actions**, in this tab's order:
+ *      • Docs → New Docs · Select Docs · Delete Docs
+ *      • Agents → Trigger (becomes Stop while a run is in flight)
+ *      • Any other tab → the To-Do · Docs · Notes · Agents switchers
+ *   5. **Dictate** — always LAST. Same trigger, same speech engine as Jarvis;
+ *      the difference is that the sentence is typed into the page instead of
+ *      being routed through the agent. Keeping it last means the raw,
+ *      no-undo path is the one you must reach for deliberately.
  *
  * The menu is applied on the startup page and REPLACED wholesale on every
  * `rebuildPageContainer`, so call this with the current state whenever the
@@ -98,11 +135,24 @@ export interface MenuState {
  */
 export function sectionMenu(state: MenuState): MenuContainerProperty {
   const items: MenuItemProperty[] = [
-    // Global action, always first so a long-press reaches it immediately.
-    new MenuItemProperty({ itemName: 'Dictate', itemID: MENU.DICTATE }),
+    // 1. Jarvis: same trigger, same speech flow — the only difference is that
+    // the sentence is routed through the agent. While a run is live OR a
+    // conversation is open the item flips to Stop so there is always a way out
+    // of the HUD. (There is no "cancel the confirm" gesture on the glasses, so
+    // this item is also what declines a pending destructive action, and it is
+    // the deliberate way to end a Jarvis conversation.)
+    state.aiRunning || state.aiListening
+      ? new MenuItemProperty({ itemName: 'Stop AI', itemID: MENU.JARVIS_STOP })
+      : new MenuItemProperty({ itemName: 'Jarvis', itemID: MENU.JARVIS }),
   ];
+  // 2. Undo is offered only when there is actually something to revert, so the
+  // destructive path always has a visible way back without cluttering the menu.
+  if (state.aiUndo && !state.aiRunning) {
+    items.push(new MenuItemProperty({ itemName: 'Undo AI', itemID: MENU.UNDO_AI }));
+  }
   if (state.section === 'docs') {
-    // Docs-scoped actions only — Back returns to the last non-special tab.
+    // 3. Escape hatch first, then this tab's actions — Back returns to the last
+    // non-special tab.
     items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
     items.push(new MenuItemProperty({ itemName: 'New Docs', itemID: MENU.DOC_NEW }));
     if (state.hasDocs) {
@@ -111,11 +161,12 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
     }
   } else if (state.section === 'agents') {
     // Back is the ONLY way off this tab (the switchers are hidden here), so it
-    // stays. Then the run control: Trigger fires the highlighted agent's SAVED
-    // prompt server-side (so it keeps running if the glasses page is
-    // backgrounded) and streams the transcript back into the detail panel.
+    // stays — and per the fixed menu order it sits directly after the AI group,
+    // above the run control. Then the run control: Trigger fires the highlighted
+    // agent's SAVED prompt server-side (so it keeps running if the glasses page
+    // is backgrounded) and streams the transcript back into the detail panel.
     // The master↔detail move is a gesture now (tap in, double-tap back), so
-    // Select/New/Delete Agents are gone and the menu stays three items long.
+    // Select/New/Delete Agents are gone and the menu stays short.
     items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
     if (state.hasAgents) {
       items.push(
@@ -125,11 +176,15 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
       );
     }
   } else {
-    // Section switchers (Dictate is already first, so it is not repeated).
+    // Section switchers — the page core for the plain tabs, after Back (there
+    // is nothing to go back to from here, so Back is absent by design).
     for (const s of SECTIONS) {
       items.push(new MenuItemProperty({ itemName: s.title, itemID: s.menuId }));
     }
   }
+  // 5. Dictate LAST, and unconditional: it is the one entry that must never be
+  // trimmed, because it is the raw (agent-free) path into the page.
+  items.push(new MenuItemProperty({ itemName: 'Dictate', itemID: MENU.DICTATE }));
   return new MenuContainerProperty({ menuItems: items });
 }
 
@@ -362,6 +417,105 @@ export function sectionView(state: HubState, todoCursor: number, docPage: number
   if (section === 'todo') return todoView(state.sections.todo, todoCursor);
   if (section === 'docs') return docView(state, docPage);
   return bodyView(sectionTitle('notes'), state.sections.notes, docPage);
+}
+
+/**
+ * Jarvis HUD — the full-screen overlay shown while the AI agent is working.
+ *
+ * Design notes (576×288, 4-bit greyscale, ~10 lines, 999-byte cap):
+ *   • The FIRST line always says what the glasses are doing (working / confirm /
+ *     done / failed) so the mode is never ambiguous when a page is redrawn.
+ *   • The routing line (`→ <Page>`) is the visible proof of tool-call LAYER 1:
+ *     the user watches the agent navigate, which is what makes multi-page
+ *     requests understandable instead of "it did something somewhere". It shows
+ *     the CURRENT page from the first turn on — a run that never navigates is
+ *     still acting on a page, and that is exactly the fact the user needs.
+ *   • The reasoning lines (`> …`) are the chain of thought: what the model said
+ *     to itself before choosing an action. They are the model's own words, not
+ *     our loop's labels, and they are interleaved with results in the order they
+ *     happened so the HUD reads as a transcript.
+ *   • Action results use ASCII marks ONLY. `▸`, `✓` and `⚠` are NOT in the
+ *     firmware font (see SAFE_NON_ASCII) and would render as tofu boxes.
+ *   • Destructive actions put their target on screen before the tap: a
+ *     confirmation the user cannot read is not a confirmation.
+ */
+export interface AiViewOptions {
+  /**
+   * True while a Jarvis CONVERSATION is open — the mic is re-armed after this
+   * turn, so the footer offers "speak again" instead of "dismiss". Only the
+   * footer changes; the conversation itself is owned by the platform layer.
+   */
+  conversing?: boolean;
+}
+
+export function aiView(ai: AiState, opts: AiViewOptions = {}): SectionView {
+  // A mirrored run is being driven from the phone panel. The controls have to
+  // say so: offering "tap R1 = run" on a run this device cannot execute reads as
+  // a dead button, and a confirmation answered in the wrong place is worse than
+  // one never shown.
+  const remote = ai.mirrored;
+  // A conversation only exists on the surface that owns the loop — a mirror has
+  // no mic to re-arm, so it keeps the plain dismiss hint.
+  const conversing = !!opts.conversing && !remote;
+  const head =
+    ai.status === 'confirm'
+      ? 'JARVIS · CONFIRM'
+      : ai.status === 'done'
+        ? 'JARVIS · done'
+        : ai.status === 'error'
+          ? 'JARVIS · failed'
+          : `JARVIS · working ${Math.max(1, ai.turn)}/${Math.max(1, ai.maxSteps)}`;
+  const body: string[] = [];
+  // `2x = end` is not decoration: it is the only exit that does not cost a
+  // menu trip, and the menu's own exit is the first item ("Stop AI").
+  const dismissHint = conversing ? 'tap R1 = speak again · 2x = end' : 'tap R1 = dismiss';
+
+  if (ai.status === 'confirm' && ai.pending) {
+    body.push(...wrapToWidth(stripUnsupported(ai.pending.title).trim(), INNER_W).slice(0, 2));
+    for (const line of ai.pending.lines.slice(0, 2)) {
+      body.push(...wrapToWidth(stripUnsupported(line).trim(), INNER_W).slice(0, 1));
+    }
+    body.push('', remote ? 'from phone · tap = cancel' : 'tap R1 = run · Stop = cancel');
+  } else if (ai.status === 'done') {
+    body.push(...wrapToWidth(stripUnsupported(ai.result || 'Done').trim(), INNER_W).slice(0, 3));
+    body.push('', remote ? 'from phone · tap = dismiss' : dismissHint);
+  } else if (ai.status === 'error') {
+    body.push(...wrapToWidth(stripUnsupported(ai.error || 'Something went wrong').trim(), INNER_W).slice(0, 3));
+    body.push('', remote ? 'from phone · tap = dismiss' : dismissHint);
+  } else {
+    const said = stripUnsupported(ai.utterance).replace(/\s+/g, ' ').trim();
+    if (said) body.push(truncate(`"${said}"`, 42));
+    // Layer 1, always on screen. The seed step carries the raw page id (it is
+    // written by aiBegin), later ones a title — resolve both through the
+    // registry so the line reads the same way the companion panel prints it.
+    const focuses = ai.steps.filter((s) => s.kind === 'focus');
+    const current = focuses[focuses.length - 1];
+    if (current) {
+      const label = stripUnsupported(pageTitle(current.text as PageId)).trim() || current.text;
+      body.push(`→ ${label}`);
+    }
+    // Chain of thought + results, newest last, interleaved in the order the
+    // model produced them. `think` is the model's own reasoning, the rest are
+    // our loop's labels for what it did.
+    const shown = ai.steps
+      .filter(
+        (s) => s.kind === 'think' || s.kind === 'ok' || s.kind === 'fail' || s.kind === 'note',
+      )
+      .slice(-3);
+    for (const s of shown) {
+      const mark = s.kind === 'ok' ? '·' : s.kind === 'fail' ? '!' : s.kind === 'think' ? '>' : '-';
+      body.push(truncate(`${mark} ${stripUnsupported(s.text).replace(/\s+/g, ' ').trim()}`, 44));
+    }
+    if (!shown.length) body.push('··· thinking');
+    body.push('', remote ? 'from phone · tap = stop' : 'tap R1 = stop action');
+  }
+
+  return {
+    text: clipBytes(`${head}\n------------------\n${body.join('\n')}`, MAX_CONTENT_BYTES),
+    todoCursor: 0,
+    canPrev: false,
+    canNext: false,
+  };
 }
 
 /** In-app doc picker list (long-press → Select/Delete Doc). Ring navigates. */

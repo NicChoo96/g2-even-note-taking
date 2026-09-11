@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.15
+
+v0.3.15 - Jarvis AI agent
+
+- New Jarvis item at the top of the glasses menu. Ask in your own words and it does the job: to-dos, docs, notes.
+- Its thinking shows on the lens while it works, then it speaks the result.
+- Keep talking: speak again after each reply. Stop AI or double-tap ends it.
+- Undo AI reverses its changes. Destructive actions ask first.
+- The web app has a matching Jarvis panel, live timeline and Undo.
+- Menu now runs Jarvis, Back, page actions, then Dictate last.
+
 ## 0.3.13
 
 v0.3.13 - Dictation no longer stops itself

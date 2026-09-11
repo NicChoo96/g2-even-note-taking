@@ -321,8 +321,24 @@ console.log('\n── 6. consumers commit from idle only (source) ──');
   }
   const main = readFileSync('src/main.ts', 'utf8');
   assert(
-    'main.ts writes the section only from the idle branch',
-    /s === 'idle'[\s\S]{0,900}?commitSpeechToSection\(draft\)/.test(main),
+    'main.ts commits from the idle branch only',
+    /s === 'idle'[\s\S]{0,900}?deliverTranscript\(draft\)/.test(main),
+  );
+  // Jarvis reuses the SAME dictation session, so `deliverTranscript` is the one
+  // seam where a finished sentence picks its destination (section write vs AI
+  // run). A second direct call would let some hook bypass that gate — and a
+  // bypass during a Jarvis session would write the user's command into the page
+  // as if it were text.
+  assert(
+    'the idle branch fans out through deliverTranscript',
+    /function deliverTranscript[\s\S]{0,160}?if \(dictationToAgent\) void startAiRun\(text\);\s*else commitSpeechToSection\(text\);/.test(
+      main,
+    ),
+  );
+  assert(
+    'nothing else writes the section directly',
+    (main.match(/commitSpeechToSection\(/g) ?? []).length === 2,
+    `${(main.match(/commitSpeechToSection\(/g) ?? []).length} reference(s): the definition + the fan-out`,
   );
   const tsx = readFileSync('src/web/Dictate.tsx', 'utf8');
   assert(
@@ -341,8 +357,8 @@ console.log('\n── 7. the overlay actually reaches the screen (source) ──
     /activeSection === 'agents' && !overlayActive/.test(main),
   );
   assert(
-    'overlayActive covers picker + dictation + diagnostics + foreign mirror',
-    /const overlayActive = pickerActive \|\| dictationActive \|\| !!dictationDiagText \|\| foreignActive;/.test(
+    'overlayActive covers picker + dictation + diagnostics + foreign mirror + AI',
+    /const overlayActive =[\s\S]{0,200}?pickerActive\s*\|\|\s*dictationActive\s*\|\|\s*!!dictationDiagText\s*\|\|\s*foreignActive\s*\|\|\s*aiActive;/.test(
       main,
     ),
   );

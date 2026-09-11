@@ -56,6 +56,13 @@ export interface WireMessage {
   tool_calls?: WireToolCall[];
   tool_call_id?: string;
   name?: string;
+  /**
+   * The model's "chain of thought" for this assistant turn. The relay
+   * normalises DeepSeek's `reasoning_content` and OpenRouter's `reasoning` into
+   * this one field, so the agent loop can show what the model reasoned before
+   * it acted instead of only the actions it took.
+   */
+  reasoning_content?: string;
 }
 
 export interface LlmReply {

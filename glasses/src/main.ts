@@ -15,6 +15,7 @@ import {
   AGENT_LAYOUT,
   agentsMasterDetailView,
   agentsStatusLine,
+  aiView,
   clipBytes,
   docPickerView,
   MAX_CONTENT_BYTES,
@@ -57,6 +58,7 @@ import {
   type TodoItem,
 } from './types';
 import {
+  cancelDictation,
   dictationSnapshot,
   dictationText,
   isDictating,
@@ -66,6 +68,22 @@ import {
   startDictation,
   stopDictation,
 } from './dictate';
+import {
+  GLOBAL_PAGE,
+  aiAnswerConfirm,
+  aiBegin,
+  aiCancel,
+  aiFlash,
+  getAi,
+  hasUndo,
+  isAiMirrored,
+  requestWebTab,
+  runAiAgent,
+  setAppBridge,
+  subscribeAi,
+  undoLastAiBatch,
+} from './ai';
+import { isLiveStatus, requestRemoteConfirm, requestRemoteStop, startAiMirror } from './ai/sync';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -98,6 +116,7 @@ async function main(): Promise<void> {
   mountUi();
   let closeStream: (() => void) | null = null;
   let closeAgentsStream: (() => void) | null = null;
+  let closeAiMirror: (() => void) | null = null;
   let lastStreamToken: string | null = null;
   onStreamToken((token) => {
     if (token === lastStreamToken) return; // idempotent
@@ -106,6 +125,8 @@ async function main(): Promise<void> {
     closeStream = null;
     closeAgentsStream?.();
     closeAgentsStream = null;
+    closeAiMirror?.();
+    closeAiMirror = null;
     if (!token) return; // kicked / not authenticated — no stream
     closeStream = connectStream({
       onState: (next) => applyRemote(next),
@@ -124,6 +145,11 @@ async function main(): Promise<void> {
       onStatus: (s) => setAgentsConn(s),
       onHandshake: (hasSnapshot) => noteAgentsHandshake(hasSnapshot),
     });
+    // Jarvis runs mirror across surfaces on their own channel PAIR: the run
+    // snapshot out, directed Stop/confirm frames back. Started before the bridge
+    // check on purpose — the browser panel needs to mirror a glasses-driven run
+    // just as much as the glasses need to mirror a phone-driven one.
+    closeAiMirror = startAiMirror();
     // Live agent runs are TRANSIENT frames on the same channel: a run executes
     // in the relay, so the detail pane streams even if this page was
     // backgrounded mid-run. `subscribeRuns` (below) owns that connection.
@@ -244,6 +270,219 @@ async function main(): Promise<void> {
   // menu closes — without a grace period that press instantly stops the mic.
   let dictationStopAfter = 0;
 
+  // ── Jarvis (AI dictation-agent mode) ──────────────────────────────────────
+  // Same trigger, same speech engine, same listen-then-act flow as Dictate —
+  // the ONLY difference is where the finished sentence goes. A plain Dictate
+  // writes the words into the active section; Jarvis hands them to the model,
+  // which then drives the app through the capability registry instead.
+  //
+  // Because both modes share one dictation session, the destination is a flag
+  // captured when the session STARTS, not when it ends: the user can trigger
+  // Stop AI mid-sentence and the utterance must not silently become a to-do.
+  let dictationToAgent = false;
+  /** Auto-hide timer for the terminal HUD states (done / error / undo flash). */
+  let aiDismissTimer: number | null = null;
+
+  // ── The Jarvis conversation (back-and-forth with the agent) ────────────────
+  //
+  // Talking to an assistant is a LOOP, not a transaction: ask, watch it think
+  // and act, hear the answer, ask the follow-up. Without this the user has to
+  // walk back to the contextual menu between every sentence, which is exactly
+  // the friction that makes voice on glasses useless.
+  //
+  // So a Jarvis session stays OPEN. When a turn finishes, the reply stays on
+  // screen for a beat and then the mic is re-armed automatically; the same tap
+  // that sent the previous sentence sends the next one.
+  //
+  // The exits are deliberate and few, so an open mic can never become a trap:
+  //   • `Stop AI` (menu item #1, always present while a session is open) — ends
+  //     the conversation AND cancels whatever the turn is doing.
+  //   • double-tap — same, without a menu trip.
+  // A tap NEVER ends it: while listening it sends, while thinking it stops that
+  // one action, and on a finished reply it skips the wait to re-arm the mic.
+  let jarvisSession = false;
+  /** The previous turn's spoken answer, re-shown while listening for the next one. */
+  let jarvisLastReply = '';
+  /** Consecutive turns that heard nothing, so a dead mic cannot loop forever. */
+  let jarvisSilentTurns = 0;
+  /** How long the reply stays up before the mic re-arms. */
+  const JARVIS_LISTEN_DELAY_MS = 2400;
+  /** Give up re-arming after this many empty turns and explain why instead. */
+  const JARVIS_MAX_SILENT = 2;
+
+  /**
+   * Hand the finished utterance to whichever mode started the session.
+   * This is the single seam between "speech" and "what the words mean", and it
+   * is deliberately the ONLY place the two modes diverge.
+   */
+  function deliverTranscript(text: string): void {
+    if (dictationToAgent) void startAiRun(text);
+    else commitSpeechToSection(text);
+  }
+
+  /** Re-open the mic for the next sentence of the conversation. */
+  function listenAgain(): void {
+    if (!jarvisSession || isDictating()) return;
+    startGlassesDictation(true);
+  }
+
+  /** Stop the auto-hide timer for a terminal HUD state. */
+  function clearAiTimer(): void {
+    if (aiDismissTimer !== null) {
+      window.clearTimeout(aiDismissTimer);
+      aiDismissTimer = null;
+    }
+  }
+
+  /**
+   * Hide the Jarvis HUD and stop repainting it, whatever phase it is in.
+   *
+   * A run owned by the phone panel has to be stopped THERE: clearing only the
+   * local mirror would blank the HUD while the loop on the other surface went on
+   * executing tool calls the user thought they had just cancelled.
+   *
+   * Only a LIVE run needs telling, though. A finished mirror is dismissed
+   * locally, because that is what its HUD footer promises ('tap = dismiss' — a
+   * local act) and because cancelling on the owner would wipe a transcript and
+   * reply the person holding the other surface may still be reading. A terminal
+   * mirror evaporates on its own within MIRROR_TTL_MS anyway, so nothing is left
+   * hanging by not reaching across.
+   *
+   * This is also one of the TWO ways a Jarvis conversation ends (the other is a
+   * double-tap), so it always closes the session — a dismissal that left the
+   * session open would re-arm the mic behind a HUD the user just dismissed.
+   */
+  function dismissAi(): void {
+    jarvisSession = false;
+    jarvisLastReply = '';
+    jarvisSilentTurns = 0;
+    clearAiTimer();
+    // A conversation can be ended mid-sentence (Stop AI on the listening
+    // screen). The mic must go with it — leaving it open would let the next
+    // stray phrase start a fresh turn after the user thought they were done.
+    // `dictationTapStop` marks this as a deliberate stop so the idle handler
+    // does not follow up with the "heard nothing" diagnostics screen.
+    if (dictationActive && dictationToAgent) {
+      dictationTapStop = true;
+      cancelDictation();
+    }
+    if (isAiMirrored() && isLiveStatus(getAi().status)) requestRemoteStop();
+    aiCancel();
+    void renderGlasses();
+  }
+
+  /**
+   * Abandon the turn in flight but KEEP the conversation open (a tap on the
+   * 'working' HUD). The user is stopping one action, not leaving — so the mic
+   * comes straight back. The in-flight /api/llm request cannot be aborted, so
+   * its later writes are dropped by aiCancel instead.
+   */
+  function stopTurnKeepTalking(): void {
+    clearAiTimer();
+    if (isAiMirrored() && isLiveStatus(getAi().status)) requestRemoteStop();
+    const reply = getAi().result;
+    if (reply) jarvisLastReply = reply;
+    aiCancel();
+    void renderGlasses();
+    listenAgain();
+  }
+
+  /** Put a one-off line on the HUD (undo confirmation) and fade it out. */
+  function flashAi(text: string): void {
+    aiFlash(text);
+    clearAiTimer();
+    aiDismissTimer = window.setTimeout(() => {
+      aiDismissTimer = null;
+      dismissAi();
+    }, 5000);
+    void renderGlasses();
+  }
+
+  /**
+   * Run one Jarvis turn: focus follows the visible page, the agent loop drives
+   * the registry, and the HUD mirrors every step.
+   *
+   * `unreachable: true` means the very first model call failed and NOTHING was
+   * touched — the model may simply be misconfigured or offline. In that case we
+   * fall back to plain dictation so the utterance still lands in the section
+   * instead of vanishing: voice must never dead-end because the AI was down.
+   */
+  async function startAiRun(utterance: string): Promise<void> {
+    clearAiTimer();
+    pickerActive = false;
+    const focus = getState().activeSection;
+    aiBegin(utterance, focus);
+    void renderGlasses();
+    const res = await runAiAgent({ utterance, focus });
+    // A dismissed/cancelled run must not repaint the HUD.
+    if (getAi().status === 'idle') return;
+
+    if (!res.ok && res.unreachable) {
+      // Nothing at all happened and the model never answered (relay down, no
+      // key, no network). The user already spoke a full sentence, so fall back
+      // to plain dictation rather than throwing their words away — and clear
+      // the agent flag so those words still travel the ONE write path.
+      aiCancel();
+      dictationToAgent = false;
+      jarvisSession = false;
+      deliverTranscript(utterance);
+      void renderGlasses();
+      return;
+    }
+
+    const status = getAi().status;
+    if (status === 'done') {
+      // Remember the answer so the listening screen can show it as context for
+      // the follow-up question ("what about the other one?").
+      jarvisLastReply = res.reply || getAi().result;
+      jarvisSilentTurns = 0;
+      if (jarvisSession) {
+        // Conversation: keep the reply on screen for a beat, then come back and
+        // listen. The mic is what makes the next sentence possible, so the pause
+        // is short enough to feel like the agent is waiting, long enough to read.
+        aiDismissTimer = window.setTimeout(() => {
+          aiDismissTimer = null;
+          if (!jarvisSession) return;
+          listenAgain();
+        }, JARVIS_LISTEN_DELAY_MS);
+      } else {
+        aiDismissTimer = window.setTimeout(() => {
+          aiDismissTimer = null;
+          dismissAi();
+        }, 6000);
+      }
+    } else if (status === 'error') {
+      // A failed turn is worth showing, but the conversation is over: retrying
+      // into a misconfigured relay would just re-arm the mic into another error.
+      jarvisSession = false;
+      aiDismissTimer = window.setTimeout(() => {
+        aiDismissTimer = null;
+        dismissAi();
+      }, 6000);
+    }
+    // A pending confirmation waits for the user indefinitely — tap to run the
+    // action, or long-press → "Stop AI" to refuse it.
+    void renderGlasses();
+  }
+
+  // The capability registry talks to the app through this bridge only, so it
+  // never reaches into renderer internals (and the web panel can inject its own
+  // bridge when there is no glasses bridge at all).
+  setAppBridge({
+    openPage: (page) => {
+      if (page === GLOBAL_PAGE) return;
+      if (page === 'settings') {
+        // Settings is companion-UI only: API keys must never be reachable by
+        // voice. Ask the web panel to surface it and leave the page alone.
+        requestWebTab('settings');
+        return;
+      }
+      requestWebTab(page);
+      switchSection(page);
+    },
+    goBack: () => goBack(),
+  });
+
   // Durable docs writes are debounced (bridge.setLocalStorage shares the BLE hop).
   let saveDocsTimer: number | null = null;
 
@@ -352,11 +591,22 @@ async function main(): Promise<void> {
   /** Contextual menu for the current state (docs/agents actions in their tabs). */
   function currentSectionMenu(): MenuContainerProperty {
     const st = getState();
+    const ai = getAi();
     return sectionMenu({
       section: st.activeSection,
       hasDocs: st.sections.docs.length > 0,
       hasAgents: getAgents().agents.length > 0,
       agentRunning: getRuns().some((r) => r.status === 'running'),
+      // 'confirm' counts as running: the menu must keep offering a way OUT of
+      // the HUD, since "Stop AI" is also how a destructive action is refused.
+      aiRunning: ai.status === 'running' || ai.status === 'confirm',
+      // A conversation with NO turn in flight (the mic is open, or the last reply
+      // is still on screen). The menu then shows 'Stop AI' instead of 'Jarvis' so
+      // the exit is always one long-press away, while 'Undo AI' stays reachable
+      // between turns — that is the whole point of the flag being separate from
+      // `aiRunning`.
+      aiListening: jarvisSession && ai.status !== 'running' && ai.status !== 'confirm',
+      aiUndo: hasUndo(),
     });
   }
 
@@ -402,9 +652,32 @@ async function main(): Promise<void> {
   }
 
   // R1-ring dictation: a compact full-screen overlay (status + running text).
+  // Jarvis reuses this exact screen — same trigger, same speech engine, same
+  // stop gesture — and only the header/footer change, so the user is never
+  // asked to learn a second voice flow.
   function dictationView(): SectionView {
     const status = dictationStatus || 'Starting mic…';
     const interim = dictationInterim.trim();
+    if (dictationToAgent) {
+      // Jarvis CONVERSATION screen. Two things have to fit in ~10 lines: what the
+      // user is saying now, and — while they are still deciding — what the agent
+      // just answered. Follow-up commands are full of pronouns ("mark the other
+      // one done"), so the referent has to be readable at the moment they speak.
+      // The transcript wins as soon as it needs the room; until then the reply is
+      // shown as context. Both clips are hard byte caps, so the container can
+      // never be pushed past the 999-byte content limit.
+      const lines = ['>> Jarvis — listening', interim ? clipBytes(interim, 200) : status];
+      if ((!interim || interim.length <= 60) && jarvisLastReply) {
+        lines.push('', clipBytes(`Was: ${jarvisLastReply}`, 150));
+      }
+      lines.push('', 'tap R1 = send · Stop AI = end');
+      return {
+        text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
+        todoCursor: 0,
+        canPrev: false,
+        canNext: false,
+      };
+    }
     const body = interim ? `${status}\n\n${clipBytes(interim, 380)}` : status;
     // Footer hint is always present so the stop gesture stays visible.
     return {
@@ -443,7 +716,7 @@ async function main(): Promise<void> {
     const draft = dictationText().trim();
     dictationInterim = '';
     dictationActive = false;
-    if (draft) commitSpeechToSection(draft);
+    if (draft) deliverTranscript(draft);
     void renderGlasses();
   }
 
@@ -490,12 +763,17 @@ async function main(): Promise<void> {
     void renderGlasses();
   }
 
-  /** Contextual menu → Dictate: turn on the glasses/phone mic and show live text. */
-  function startGlassesDictation(): void {
+  /**
+   * Contextual menu → Dictate / Jarvis: turn on the glasses/phone mic and show
+   * live text. `toAgent` decides where the finished sentence goes — this is the
+   * only behavioural difference between the two menu items.
+   */
+  function startGlassesDictation(toAgent = false): void {
     if (isDictating()) return; // already capturing
     pickerActive = false;
     pickerCursor = 0;
     dictationActive = true;
+    dictationToAgent = toAgent;
     dictationStatus = 'Starting mic…';
     dictationInterim = '';
     dictationStartedAt = Date.now();
@@ -524,7 +802,7 @@ async function main(): Promise<void> {
           // (The engine only publishes the transcript at the end; read the
           // snapshot so a partial utterance is not lost.)
           const had = dictationText().trim();
-          if (had) commitSpeechToSection(had);
+          if (had) deliverTranscript(had);
           dictationStatus = detail || 'Voice unavailable';
           dictationStopAfter = 0;
           // Persist the reason + session log on the glasses until the user taps.
@@ -543,7 +821,22 @@ async function main(): Promise<void> {
           }
           if (draft) {
             dictationGotFinal = true;
-            commitSpeechToSection(draft);
+            deliverTranscript(draft);
+          } else if (jarvisSession && dictationToAgent) {
+            // The user tapped "send" (or the cap fired) but the engine heard
+            // nothing. In a conversation that tap still means "I'm done, carry
+            // on", so re-arm rather than dead-end on a diagnostics screen — but
+            // COUNT it, because a mic that hears nothing forever is worse than
+            // ending. Two empty turns in a row is a broken/blocked microphone,
+            // not a pause.
+            jarvisSilentTurns += 1;
+            if (jarvisSilentTurns > JARVIS_MAX_SILENT) {
+              jarvisSession = false;
+              dictationToAgent = false;
+              flashAi('Jarvis off · no audio');
+            } else {
+              listenAgain();
+            }
           } else if (!dictationTapStop) {
             // Ended without hearing anything — surface why.
             showDictationDiag();
@@ -663,11 +956,16 @@ async function main(): Promise<void> {
 
     // In-app doc picker, the R1-ring dictation overlay, a sticky diagnostics
     // screen, a mirror of a dictation started elsewhere (web/phone MicButton),
-    // or the normal renderer.
+    // the Jarvis agent HUD, or the normal renderer.
     const foreignActive = !dictationActive && !dictationDiagText && dictationSnapshot().active;
+    const ai = getAi();
+    const aiActive = ai.status !== 'idle';
     // Any of these takes over the WHOLE screen, so it must bypass the Agents
     // dual-pane renderer below (which otherwise wins and hides the overlay).
-    const overlayActive = pickerActive || dictationActive || !!dictationDiagText || foreignActive;
+    // Priority matters: listening to the user outranks showing them the agent,
+    // and a sticky diagnostic outranks everything.
+    const overlayActive =
+      pickerActive || dictationActive || !!dictationDiagText || foreignActive || aiActive;
     const view = pickerActive
       ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
       : dictationActive
@@ -676,7 +974,9 @@ async function main(): Promise<void> {
           ? dictationDiagView()
           : foreignActive
             ? dictationForeignView()
-            : sectionView(getState(), todoCursor, docPage);
+            : aiActive
+              ? aiView(ai, { conversing: jarvisSession })
+              : sectionView(getState(), todoCursor, docPage);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
     else if (!overlayActive) todoCursor = view.todoCursor;
@@ -992,7 +1292,11 @@ async function main(): Promise<void> {
   }
 
   function onSwipe(dir: -1 | 1): void {
-    if (dictationActive || dictationDiagText || dictationSnapshot().active) return; // ignore swipes while dictating / diag
+    // Swipes are ignored while dictating / diag, and while the Jarvis HUD owns
+    // the screen — an agent turn must not be able to scroll the page underneath
+    // it (the user would lose their place with no visual feedback).
+    if (dictationActive || dictationDiagText || dictationSnapshot().active) return;
+    if (getAi().status !== 'idle') return;
     if (pickerActive) {
       onPickerSwipe(dir);
       return;
@@ -1059,12 +1363,45 @@ async function main(): Promise<void> {
   }
 
   function onTap(): void {
-    // A tap dismisses the sticky dictation diagnostics screen.
-    if (dictationDiagText) {
-      dictationDiagText = '';
+    // The Jarvis HUD owns the screen while a run is live, so it gets first
+    // refusal on the tap. Three distinct meanings, all discoverable from the
+    // footer the HUD prints:
+    //   confirm → run the destructive action (the HUD shows the target first)
+    //   running → stop; the in-flight request can't be aborted, so its later
+    //             writes are dropped instead (see aiCancel)
+    //   done/error → dismiss
+    //
+    // A MIRRORED run (started on another surface) answers through the relay in
+    // every one of those cases — this device has no loop to run or cancel, so a
+    // local answer would either do nothing or blank a run that is still going.
+    //
+    // A mirrored CONFIRM cancels (approve === false), it does NOT approve. Two
+    // reasons: the owner is holding a screen that shows explicit Approve/Decline
+    // buttons, so consent for a destructive action belongs there; and a tap is
+    // the easiest gesture to trigger by accident, which must never be what
+    // deletes data. This is exactly what the HUD footer promises the wearer:
+    // `from phone · tap = cancel`. Approving here would silently do the
+    // opposite of the instruction printed on the lens.
+    const ai = getAi();
+    if (ai.status === 'confirm') {
+      if (ai.mirrored) requestRemoteConfirm(false);
+      else aiAnswerConfirm(true);
       void renderGlasses();
       return;
     }
+    if (ai.status === 'running') {
+      // In a conversation, stopping the ACTION is not leaving the conversation:
+      // the mic comes straight back so the user can rephrase. Only Stop AI and
+      // a double-tap end the session.
+      if (jarvisSession) stopTurnKeepTalking();
+      else dismissAi();
+      return;
+    }
+    // Dictation owns the tap whenever the mic is open — INCLUDING the Jarvis
+    // conversation's listening phase, where the store still holds the previous
+    // turn's terminal status. Checking `done`/`error` first would turn the
+    // "send this sentence" tap into "dismiss the HUD" and silently drop the
+    // command the user just spoke.
     if (dictationActive) {
       // A tap while dictating = stop + commit what was heard. But ignore taps
       // inside the grace window — the press that confirmed the 'Dictate' menu
@@ -1076,10 +1413,23 @@ async function main(): Promise<void> {
       void stopDictation();
       return;
     }
+    // A tap dismisses the sticky dictation diagnostics screen.
+    if (dictationDiagText) {
+      dictationDiagText = '';
+      void renderGlasses();
+      return;
+    }
     // A dictation started elsewhere (web/phone MicButton) is active — the R1
     // ring tap stops it.
     if (!dictationActive && !dictationDiagText && dictationSnapshot().active) {
       void stopDictation();
+      return;
+    }
+    if (ai.status === 'done' || ai.status === 'error') {
+      // On a finished reply in a conversation, a tap means "go on, I'm ready to
+      // answer" — it skips the pause instead of throwing the conversation away.
+      if (jarvisSession && ai.status === 'done') listenAgain();
+      else dismissAi();
       return;
     }
     if (pickerActive) {
@@ -1125,6 +1475,13 @@ async function main(): Promise<void> {
     void renderGlasses();
   });
 
+  // Every Jarvis step (routing, action, result, confirm prompt) repaints the
+  // HUD. Renders are coalesced serially in renderGlasses(), so a burst of
+  // steps can never overlap a create/rebuild.
+  subscribeAi(() => {
+    void renderGlasses();
+  });
+
   // Live run frames (server-side execution) re-render the detail pane so each
   // turn appears as it is produced, and settle the run into a session once.
   subscribeRuns(() => {
@@ -1148,6 +1505,34 @@ async function main(): Promise<void> {
       console.log('[hub] menu item', itemID);
       if (itemID === MENU.DICTATE) {
         startGlassesDictation();
+        return;
+      }
+      // Jarvis — same mic, same stop gesture, different destination. Kept as a
+      // SEPARATE menu item so plain Dictate can never change behaviour under a
+      // user who only ever wanted their words typed into the section.
+      //
+      // Choosing Jarvis opens a CONVERSATION rather than a one-shot command: the
+      // session flag is what makes startAiRun re-arm the mic after each reply, so
+      // the follow-up question needs no menu trip. Only this entry point sets it
+      // — a Jarvis run started from the phone panel stays a single turn here.
+      if (itemID === MENU.JARVIS) {
+        jarvisSession = true;
+        jarvisLastReply = '';
+        jarvisSilentTurns = 0;
+        startGlassesDictation(true);
+        return;
+      }
+      if (itemID === MENU.JARVIS_STOP) {
+        // Also serves as the "no" answer to a pending destructive action, which
+        // is why it is offered during the confirm phase too. And because it
+        // clears the conversation flag it is the menu exit from a live Jarvis
+        // conversation — the HUD footer also offers it as `Stop = cancel`.
+        dismissAi();
+        return;
+      }
+      if (itemID === MENU.UNDO_AI) {
+        const label = undoLastAiBatch();
+        flashAi(label ? `Undid: ${label}` : 'Nothing to undo');
         return;
       }
       if (itemID === MENU.DOC_NEW) {
@@ -1207,6 +1592,20 @@ async function main(): Promise<void> {
       return;
     }
     if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+      // While the Jarvis HUD is up, double-tap means "get me out of here" —
+      // NOT shut the page down. Exiting mid-run would tear down the JS context
+      // that is driving the action loop, leaving the model's work half applied
+      // with no HUD to explain it.
+      //
+      // This is also one of only TWO ways a Jarvis CONVERSATION ends, so it has
+      // to cover the listening phase too. `dictationActive` counts: during the
+      // conversation the store is `idle` (the previous turn already finished)
+      // and the mic, not the HUD, is what is holding the user — without this the
+      // double-tap would shut the whole app down mid-sentence.
+      if (getAi().status !== 'idle' || jarvisSession) {
+        dismissAi();
+        return;
+      }
       // Double-tap is a BACK gesture first: while the Agents detail pane holds
       // the ring, return to the master list so the agent selection is
       // reachable again. Only when there is nowhere to go back to (master pane,
@@ -1222,6 +1621,18 @@ async function main(): Promise<void> {
     if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
       pickerActive = false;
       pickerCursor = 0;
+      // A run that was mid-flight when the app went to the background cannot be
+      // trusted to still be alive (the WebView may have been torn down), and a
+      // HUD frozen on "working 2/6" forever is worse than losing the turn. The
+      // capability writes it already made are durable and revertible via
+      // "Undo AI", so nothing is silently lost.
+      //
+      // A Jarvis CONVERSATION cannot survive the round trip either: the mic was
+      // torn down along with the page, so an open session would strand the menu
+      // on 'Stop AI' with nothing listening. Close it and let the next Jarvis
+      // open a fresh one.
+      if (jarvisSession) dismissAi();
+      else if (getAi().status === 'running') aiCancel();
       void renderGlasses();
       return;
     }

@@ -23,6 +23,19 @@ export const AGENTS_STREAM_URL: string =
   (import.meta.env.VITE_HUB_AGENTS_URL as string | undefined) ??
   `${API_BASE}/api/stream?channel=agents`;
 
+// The Jarvis run gets its own pair of channels, for the same reason agents did:
+// the mirror is a HIGH-FREQUENCY transient signal (a frame per model step), and
+// it must never bloat — or be resurrected from — the persisted hub snapshot.
+//
+//   ai      → the owner's run snapshot, broadcast to every surface
+//   ai-ctl  → rare DIRECTED frames (Stop / confirm answer) sent back to the
+//             owner, so the surface the user is NOT holding can still answer
+//             a run. Both are transient on the relay.
+export const AI_STREAM_URL: string =
+  (import.meta.env.VITE_HUB_AI_URL as string | undefined) ?? `${API_BASE}/api/stream?channel=ai`;
+
+export const AI_CTL_STREAM_URL: string = `${API_BASE}/api/stream?channel=ai-ctl`;
+
 /** The SSE/state URL with the current stream credential appended. */
 export function streamUrl(): string {
   return withToken(STREAM_URL);
@@ -30,6 +43,14 @@ export function streamUrl(): string {
 
 export function agentsStreamUrl(): string {
   return withToken(AGENTS_STREAM_URL);
+}
+
+export function aiStreamUrl(): string {
+  return withToken(AI_STREAM_URL);
+}
+
+export function aiCtlStreamUrl(): string {
+  return withToken(AI_CTL_STREAM_URL);
 }
 
 function withToken(url: string): string {
@@ -60,6 +81,16 @@ export async function publishState(state: HubState): Promise<boolean> {
 /** Publish the agents snapshot (configs + the last 5 sessions) to the relay. */
 export async function publishAgents(state: AgentsState): Promise<boolean> {
   return postJson(AGENTS_STREAM_URL, state);
+}
+
+/** Broadcast a Jarvis run snapshot (the cross-surface HUD mirror). */
+export async function publishAi(snapshot: unknown): Promise<boolean> {
+  return postJson(AI_STREAM_URL, snapshot);
+}
+
+/** Send a directed control frame (Stop / confirm answer) to the run's owner. */
+export async function publishAiControl(msg: unknown): Promise<boolean> {
+  return postJson(AI_CTL_STREAM_URL, msg);
 }
 
 async function postJson(url: string, body: unknown): Promise<boolean> {
@@ -112,34 +143,262 @@ async function credentialStillValid(): Promise<boolean> {
  * but we manage re-creation to surface status changes).
  */
 export function connectStream(handlers: StreamHandlers): () => void {
-  return connectSse<HubState>(
-    streamUrl,
-    (frame) => (frame.state ? (frame.state as HubState) : undefined),
-    handlers,
-  );
+  return subscribe(CHANNEL_HUB, (frame) => (frame.state ? (frame.state as HubState) : undefined), handlers);
 }
 
 /** Same SSE client, pointed at the separate 'agents' channel. */
 export function connectAgentsStream(handlers: AgentsStreamHandlers): () => void {
-  return connectSse<AgentsState>(
-    agentsStreamUrl,
+  return subscribe(
+    CHANNEL_AGENTS,
     (frame) => (frame.state ? (frame.state as AgentsState) : undefined),
     handlers,
   );
 }
 
 /**
- * Shared SSE client. `pick` turns a raw frame into the value to deliver, or
- * `undefined` to ignore it (the agents channel carries BOTH state snapshots and
- * transient run frames, so the picker decides which one this subscriber wants).
+ * Subscribe to mirrored Jarvis runs. Only `state` frames are delivered — the
+ * control channel is a separate subscription so a control frame can never be
+ * mistaken for a run to render.
+ */
+export function connectAiStream<T>(handlers: {
+  onState(state: T): void;
+  onStatus?(status: 'connecting' | 'open' | 'error'): void;
+}): () => void {
+  return subscribe(
+    CHANNEL_AI,
+    (frame) => (frame.type === 'state' && frame.state ? (frame.state as T) : undefined),
+    handlers,
+  );
+}
+
+/**
+ * Subscribe to directed control frames. The relay's `init` frame carries the
+ * channel's last state, so a reconnect can replay an old instruction — the
+ * consumer must freshness-check it (see the CONTROL_TTL_MS guard in ai/sync.ts).
+ */
+export function connectAiControlStream<T>(handlers: {
+  onState(state: T): void;
+  onStatus?(status: 'connecting' | 'open' | 'error'): void;
+}): () => void {
+  return subscribe(CHANNEL_AI_CTL, (frame) => (frame.state ? (frame.state as T) : undefined), handlers);
+}
+
+// ── One socket for every channel ─────────────────────────────────────────────
+//
+// WHY: a browser keeps at most SIX HTTP/1.1 connections per origin, and an SSE
+// response never gives its socket back. Opening one EventSource per channel
+// pinned 4 of them per tab (hub, agents, ai, ai-ctl), so the second open tab
+// already exceeded the cap and EVERY other request — most importantly the
+// POST /api/llm that drives a Jarvis run — queued behind them indefinitely.
+// The symptom was a run frozen on its first model turn, with no HUD overlay
+// and no error: it looked like a hung provider, but nothing was ever sent.
+//
+// So all channels ride ONE multiplexed EventSource (`?channels=hub,agents,...`)
+// and each frame is routed by its `channel` tag. Adding a channel is now free —
+// the connection count stays at one, however many channels the app grows — and
+// a relay that still answers with untagged frames keeps working unchanged.
+
+/** The relay's channel names, taken from the (env-overridable) channel URLs. */
+const CHANNEL_HUB = channelNameOf(STREAM_URL, 'hub');
+const CHANNEL_AGENTS = channelNameOf(AGENTS_STREAM_URL, 'agents');
+const CHANNEL_AI = channelNameOf(AI_STREAM_URL, 'ai');
+const CHANNEL_AI_CTL = channelNameOf(AI_CTL_STREAM_URL, 'ai-ctl');
+
+/**
+ * Where each channel lives, so channels pointed at DIFFERENT relays still get
+ * their own socket and never receive another relay's frames. Normally all four
+ * agree — the deployed app is served by the relay — so they share one socket.
+ * The base keeps any mount prefix (e.g. `/glasses`) instead of assuming the
+ * stream sits at the very root.
+ */
+const BASES: Record<string, string> = {
+  [CHANNEL_HUB]: baseOf(STREAM_URL),
+  [CHANNEL_AGENTS]: baseOf(AGENTS_STREAM_URL),
+  [CHANNEL_AI]: baseOf(AI_STREAM_URL),
+  [CHANNEL_AI_CTL]: baseOf(AI_CTL_STREAM_URL),
+};
+
+function channelNameOf(url: string, fallback: string): string {
+  const m = /[?&]channel=([^&]+)/.exec(url);
+  return m ? decodeURIComponent(m[1]) : fallback;
+}
+
+/** Everything before `/api/` — 'http://host:5198', '/glasses', or '' same-origin. */
+function baseOf(url: string): string {
+  const i = url.indexOf('/api/');
+  return i >= 0 ? url.slice(0, i) : '';
+}
+
+interface Subscriber {
+  channel: string;
+  pick: (frame: Record<string, unknown>) => unknown | undefined;
+  onState(state: unknown): void;
+  onStatus?(status: 'connecting' | 'open' | 'error'): void;
+  onHandshake?(hasSnapshot: boolean): void;
+  handshakeSeen: boolean;
+}
+
+interface Hub {
+  /** Socket this group of channels arrived on. */
+  base: string;
+  subs: Set<Subscriber>;
+  es: EventSource | null;
+  retry: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  /** The exact URL the live socket is subscribed to (null when disconnected). */
+  live: string | null;
+}
+
+const hubs = new Map<string, Hub>();
+
+/** One EventSource per relay base, lazily created and torn down with its last sub. */
+function hub(base: string): Hub {
+  let h = hubs.get(base);
+  if (!h) {
+    h = { base, subs: new Set(), es: null, retry: 0, timer: null, live: null };
+    hubs.set(base, h);
+  }
+  return h;
+}
+
+/**
+ * The multiplexed stream URL for `h`: every channel this base serves, with the
+ * current credential. Kept as a string so a channel-set change is a plain
+ * comparison (and therefore a reconnect we can detect and coalesce).
  *
- * `onHandshake` fires for the relay's very first `init` frame and reports
+ * Names are de-duplicated: two features may legitimately subscribe to the same
+ * channel (the agents panel and the live-run transcript both want 'agents'), and
+ * that must not change the URL — a URL change is what triggers a reconnect.
+ */
+function hubUrl(h: Hub): string {
+  const names = [...new Set([...h.subs].map((s) => s.channel))];
+  names.sort();
+  return withToken(`${h.base}/api/stream?channels=${names.join(',')}`);
+}
+
+/**
+ * Connect (or reconnect) `h` if the channel set changed. Deferred by a tick so
+ * the four subscriptions made back-to-back during app start coalesce into ONE
+ * socket instead of four sequential connects.
+ */
+function schedule(h: Hub): void {
+  if (h.timer) return;
+  h.timer = setTimeout(() => {
+    h.timer = null;
+    flush(h);
+  }, 0);
+}
+
+function flush(h: Hub): void {
+  if (h.subs.size === 0) {
+    teardown(h);
+    return;
+  }
+  const url = hubUrl(h);
+  if (h.es && h.live === url) return; // already on the right channel set
+  const wasOpen = h.live !== null;
+  teardown(h, { keepStatus: wasOpen });
+  connect(h, url);
+}
+
+function teardown(h: Hub, opts: { keepStatus?: boolean } = {}): void {
+  if (h.timer) {
+    clearTimeout(h.timer);
+    h.timer = null;
+  }
+  h.es?.close();
+  h.es = null;
+  h.live = null;
+  if (!opts.keepStatus) h.retry = 0;
+}
+
+function connect(h: Hub, url: string): void {
+  if (h.subs.size === 0) return;
+  for (const s of h.subs) s.onStatus?.('connecting');
+  const es = new EventSource(url);
+  h.es = es;
+  h.live = url;
+
+  es.onopen = () => {
+    h.retry = 0;
+    for (const s of h.subs) s.onStatus?.('open');
+  };
+
+  es.onerror = () => {
+    for (const s of h.subs) s.onStatus?.('error');
+    es.close();
+    if (h.es !== es) return; // superseded by a reconnect of our own
+    h.es = null;
+    h.live = null;
+    const delay = Math.min(1000 * 2 ** h.retry, 15000);
+    h.retry += 1;
+    // After a few failed reconnects, confirm the credential is still valid;
+    // a 401 (reset auth store) otherwise shows as a misleading "Offline".
+    // Only meaningful when we actually HAVE a credential — a reconnect that
+    // raced ahead of session restore must not be read as "signed out".
+    if (h.retry === 3 && getStreamToken()) {
+      void credentialStillValid().then((ok) => {
+        if (!ok) notifyAuthRejected();
+      });
+    }
+    if (h.timer) clearTimeout(h.timer);
+    h.timer = setTimeout(() => {
+      h.timer = null;
+      // Recompute rather than reusing `url`: a subscription made BEFORE sign-in
+      // was refused a token by withToken(), so replaying that exact URL would
+      // retry unauthenticated forever — the credential that later arrived would
+      // never reach the wire.
+      connect(h, hubUrl(h));
+    }, delay);
+  };
+
+  es.onmessage = (e) => {
+    try {
+      const frame = JSON.parse(e.data as string) as Record<string, unknown>;
+      route(h, frame);
+    } catch {
+      // ignore malformed frames
+    }
+  };
+}
+
+/**
+ * Deliver one frame to the subscribers it belongs to.
+ *
+ * A multiplexed relay tags every frame with its origin channel, so routing is
+ * exact — essential because e.g. both the hub and the agents channel broadcast
+ * `{type:'state', state}`, and only the tag tells them apart. Against a relay
+ * that predates multiplexing there is no tag; those sockets carry exactly one
+ * channel, so a single subscriber may claim it, and anything ambiguous is
+ * dropped rather than mis-delivered.
+ */
+function route(h: Hub, frame: Record<string, unknown>): void {
+  const tag = typeof frame.channel === 'string' ? frame.channel : null;
+  if (!tag && h.subs.size !== 1) return;
+  for (const s of h.subs) {
+    if (tag && tag !== s.channel) continue;
+    if (!s.handshakeSeen && frame.type === 'init') {
+      s.handshakeSeen = true;
+      s.onHandshake?.(frame.state != null);
+    }
+    const value = s.pick(frame);
+    if (value !== undefined) s.onState(value);
+  }
+}
+
+/**
+ * Shared SSE subscription. `pick` turns a raw frame into the value to deliver,
+ * or `undefined` to ignore it (the agents channel carries BOTH state snapshots
+ * and transient run frames, so the picker decides which one this subscriber
+ * wants).
+ *
+ * `onHandshake` fires for the channel's very first `init` frame and reports
  * whether it carried a snapshot. `hasSnapshot === false` means "the server has
  * nothing, you may seed it"; no frame at all means the relay never spoke, so
  * seeding must stay off.
  */
-function connectSse<T>(
-  urlFn: () => string,
+function subscribe<T>(
+  channel: string,
   pick: (frame: Record<string, unknown>) => T | undefined,
   handlers: {
     onState(state: T): void;
@@ -147,61 +406,22 @@ function connectSse<T>(
     onHandshake?(hasSnapshot: boolean): void;
   },
 ): () => void {
-  let es: EventSource | null = null;
-  let closed = false;
-  let retry = 0;
-  let handshakeSeen = false;
-
-  const connect = () => {
-    if (closed) return;
-    handlers.onStatus?.('connecting');
-    es = new EventSource(urlFn());
-
-    es.onopen = () => {
-      retry = 0;
-      handlers.onStatus?.('open');
-    };
-
-    es.onerror = () => {
-      handlers.onStatus?.('error');
-      es?.close();
-      if (!closed) {
-        const delay = Math.min(1000 * 2 ** retry, 15000);
-        retry += 1;
-        // After a few failed reconnects, confirm the credential is still valid;
-        // a 401 (reset auth store) otherwise shows as a misleading "Offline".
-        // Only meaningful when we actually HAVE a credential — a reconnect that
-        // raced ahead of session restore must not be read as "signed out".
-        if (retry === 3 && getStreamToken()) {
-          void credentialStillValid().then((ok) => {
-            if (!ok) notifyAuthRejected();
-          });
-        }
-        setTimeout(connect, delay);
-      }
-    };
-
-    es.onmessage = (e) => {
-      try {
-        const frame = JSON.parse(e.data as string) as Record<string, unknown>;
-        if (!handshakeSeen && frame.type === 'init') {
-          handshakeSeen = true;
-          handlers.onHandshake?.(frame.state != null);
-        }
-        const value = pick(frame);
-        if (value !== undefined) handlers.onState(value);
-      } catch {
-        // ignore malformed frames
-      }
-    };
+  const h = hub(BASES[channel] ?? '');
+  const sub: Subscriber = {
+    channel,
+    pick: pick as (frame: Record<string, unknown>) => unknown | undefined,
+    onState: handlers.onState as (state: unknown) => void,
+    onStatus: handlers.onStatus,
+    onHandshake: handlers.onHandshake,
+    handshakeSeen: false,
   };
-
-  connect();
+  h.subs.add(sub);
+  schedule(h);
 
   return () => {
-    closed = true;
-    es?.close();
-    es = null;
+    h.subs.delete(sub);
+    if (h.subs.size === 0) teardown(h);
+    else schedule(h);
   };
 }
 
@@ -328,10 +548,14 @@ export function connectRuns(handlers: {
   onRun?(run: AgentRun): void;
   onInit?(runs: AgentRun[]): void;
 }): () => void {
-  return connectSse<RunFrame>(agentsStreamUrl, (frame) => frame as unknown as RunFrame, {
-    onState: (frame) => {
-      if (frame.type === 'run' && frame.run) handlers.onRun?.(frame.run);
-      else if (frame.type === 'runInit') handlers.onInit?.(frame.runs ?? []);
+  return subscribe(
+    CHANNEL_AGENTS,
+    (frame) => frame as unknown as RunFrame,
+    {
+      onState: (frame: RunFrame) => {
+        if (frame.type === 'run' && frame.run) handlers.onRun?.(frame.run);
+        else if (frame.type === 'runInit') handlers.onInit?.(frame.runs ?? []);
+      },
     },
-  });
+  );
 }

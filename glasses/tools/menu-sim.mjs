@@ -50,26 +50,35 @@ const assert = (label, cond, detail = '') => {
 };
 
 // ── Docs tab ────────────────────────────────────────────────────────────────
+// FIXED ORDER, every section: Jarvis → Undo AI (when offered) → Back → that
+// page's own actions → Dictate LAST.
+//   • The agent sits at the top because it is the entry point that can reach
+//     everything else; a menu is read top-down, so the most powerful item first.
+//   • Voice entry for raw dictation sits at the bottom: it is the most familiar
+//     gesture, so it is the easiest to find by thumb without reading.
 const docs = sectionMenu({ section: 'docs', hasDocs: true });
 check('docs (has docs)', names(docs), [
-  'Dictate',
+  'Jarvis',
   'Back',
   'New Docs',
   'Select Docs',
   'Delete Docs',
+  'Dictate',
 ]);
 check('docs ids', ids(docs), [
-  MENU.DICTATE,
+  MENU.JARVIS,
   MENU.BACK,
   MENU.DOC_NEW,
   MENU.DOC_SELECT,
   MENU.DOC_DELETE,
+  MENU.DICTATE,
 ]);
 
 check('docs (empty)', names(sectionMenu({ section: 'docs', hasDocs: false })), [
-  'Dictate',
+  'Jarvis',
   'Back',
   'New Docs',
+  'Dictate',
 ]);
 
 // ── Agents tab ──────────────────────────────────────────────────────────────
@@ -77,16 +86,17 @@ check('docs (empty)', names(sectionMenu({ section: 'docs', hasDocs: false })), [
 // app and the master↔detail move is a gesture (tap in, double-tap back). Back
 // stays because it is the only way off this tab.
 const agents = sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true });
-check('agents (has agents)', names(agents), ['Dictate', 'Back', 'Trigger']);
-check('agents ids', ids(agents), [MENU.DICTATE, MENU.BACK, MENU.AGENT_TRIGGER]);
+check('agents (has agents)', names(agents), ['Jarvis', 'Back', 'Trigger', 'Dictate']);
+check('agents ids', ids(agents), [MENU.JARVIS, MENU.BACK, MENU.AGENT_TRIGGER, MENU.DICTATE]);
 check(
   'agents (running) shows Stop',
   names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true, agentRunning: true })),
-  ['Dictate', 'Back', 'Stop'],
+  ['Jarvis', 'Back', 'Stop', 'Dictate'],
 );
 check('agents (empty)', names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: false })), [
-  'Dictate',
+  'Jarvis',
   'Back',
+  'Dictate',
 ]);
 assert(
   'agents menu keeps Back (only way off the tab)',
@@ -100,9 +110,61 @@ assert(
 );
 
 // ── Plain tabs ──────────────────────────────────────────────────────────────
-const switchers = ['Dictate', 'To-Do', 'Docs', 'Notes', 'Agents'];
+const switchers = ['Jarvis', 'To-Do', 'Docs', 'Notes', 'Agents', 'Dictate'];
 check('todo', names(sectionMenu({ section: 'todo', hasDocs: true })), switchers);
 check('notes', names(sectionMenu({ section: 'notes', hasDocs: true })), switchers);
+
+// ── The voice entries must bracket the page's own actions ──────────────────
+for (const s of ['todo', 'docs', 'notes', 'agents']) {
+  const list = names(sectionMenu({ section: s, hasDocs: true, hasAgents: true }));
+  check(`${s}: Dictate is LAST`, list[list.length - 1], 'Dictate');
+  check(`${s}: Jarvis is FIRST`, list[0], 'Jarvis');
+  check(`${s}: Jarvis appears exactly once`, list.filter((n) => n === 'Jarvis').length, 1);
+  check(`${s}: Dictate appears exactly once`, list.filter((n) => n === 'Dictate').length, 1);
+}
+// Undo AI sits directly under Jarvis — the two agent controls stay adjacent, and
+// the page's own actions keep their relative order below the Back item.
+const withUndo = names(sectionMenu({ section: 'todo', hasDocs: true, aiUndo: true }));
+check('todo gains Undo AI when a batch exists', withUndo[1], 'Undo AI');
+check('Undo AI sits directly under Jarvis', withUndo[0], 'Jarvis');
+check(
+  '…and loses it while the agent is running',
+  names(sectionMenu({ section: 'todo', hasDocs: true, aiUndo: true, aiRunning: true })).includes(
+    'Undo AI',
+  ),
+  false,
+);
+check(
+  '…while a running agent still offers Stop',
+  names(sectionMenu({ section: 'todo', hasDocs: true, aiRunning: true }))[0],
+  'Stop AI',
+);
+
+// ── An OPEN Jarvis conversation (mic armed, no turn in flight) ─────────────
+// The menu must keep offering the way OUT of the conversation — 'Stop AI' —
+// while leaving 'Undo AI' reachable, because between turns the user is still
+// reading the transcript and may want to revert the previous action.
+const listening = names(
+  sectionMenu({ section: 'todo', hasDocs: true, aiUndo: true, aiListening: true }),
+);
+check('listening: Stop AI replaces Jarvis', listening[0], 'Stop AI');
+check('listening: Undo AI still reachable', listening[1], 'Undo AI');
+check('listening: Dictate still LAST', listening[listening.length - 1], 'Dictate');
+check(
+  'listening: no bare Jarvis item to re-open a live session',
+  listening.includes('Jarvis'),
+  false,
+);
+check(
+  'a turn in flight outranks the listening hint',
+  names(sectionMenu({ section: 'todo', hasDocs: true, aiRunning: true, aiListening: true }))[0],
+  'Stop AI',
+);
+check(
+  'no undo batch → no Undo AI even while listening',
+  names(sectionMenu({ section: 'todo', hasDocs: true, aiListening: true })).includes('Undo AI'),
+  false,
+);
 
 // ── Global invariants ───────────────────────────────────────────────────────
 const allSections = ['todo', 'docs', 'notes', 'agents'];
@@ -110,7 +172,8 @@ for (const s of allSections) {
   for (const hasAgents of [false, true]) {
     const list = ids(sectionMenu({ section: s, hasDocs: true, hasAgents }));
     const label = `${s}/hasAgents=${hasAgents}`;
-    check(`${label}: Dictate first`, list[0], MENU.DICTATE);
+    check(`${label}: Dictate last`, list[list.length - 1], MENU.DICTATE);
+    check(`${label}: Jarvis first`, list[0], MENU.JARVIS);
     check(`${label}: unique ids`, new Set(list).size, list.length);
     assert(`${label}: <= 10 items`, list.length <= 10, `(${list.length})`);
   }

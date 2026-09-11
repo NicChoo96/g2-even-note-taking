@@ -1065,3 +1065,417 @@ li.empty {
   padding: 1px 4px;
   color: var(--accent);
 }
+
+/* ── Jarvis (AI agent) panel ──────────────────────────────────────────────── */
+.ap-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.ap-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.ap-lede {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 62ch;
+}
+
+/* Status pill — one class per ai.status value. */
+.ap-status {
+  flex: none;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.ap-status-running,
+.ap-status-confirm {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.ap-status-confirm {
+  animation: ap-blink 1.2s ease-in-out infinite;
+}
+
+.ap-status-done {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.ap-status-error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+@keyframes ap-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* The mic reads as the primary affordance on this tab. */
+.dictate-ai .mic-btn {
+  width: 38px;
+  height: 38px;
+  font-size: 17px;
+}
+
+.ap-ask {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.ap-ask input {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.ap-off {
+  padding: 9px 12px;
+  border: 1px dashed var(--accent-dim);
+  border-radius: 8px;
+  background: rgba(61, 220, 132, 0.06);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* A run that started on the glasses. Tinted like `.ap-off` (a state notice,
+   not an error) but with a solid rule so it reads as "live", not "disabled". */
+.ap-mirror {
+  padding: 9px 12px;
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(61, 220, 132, 0.08);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ap-heard {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ap-heard-label {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Step timeline */
+.ap-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.ap-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  min-width: 0;
+}
+
+.ap-step-mark {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.ap-step-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ap-step-focus {
+  color: var(--muted);
+}
+
+.ap-step-focus .ap-step-mark,
+.ap-step-ok .ap-step-mark {
+  color: var(--accent);
+}
+
+.ap-step-fail,
+.ap-step-fail .ap-step-mark {
+  color: var(--danger);
+}
+
+.ap-step-call {
+  color: var(--text);
+}
+
+/* The model's own reasoning — quoted back as context, so it is set apart from
+   the app's factual steps (seen / done / failed) rather than competing with
+   them. Italic reads as "reported speech" next to the plain action lines. */
+.ap-step-think {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.ap-step-think .ap-step-mark {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.ap-step-reply {
+  color: var(--accent);
+}
+
+.ap-step-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Destructive-action confirmation */
+.ap-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background: rgba(229, 83, 75, 0.08);
+}
+
+.ap-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.ap-confirm-body em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.ap-confirm-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+.ap-result {
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.ap-result.ok {
+  border: 1px solid var(--accent-dim);
+  background: rgba(61, 220, 132, 0.07);
+  color: var(--text);
+}
+
+.ap-result.bad {
+  border: 1px solid var(--danger);
+  background: rgba(229, 83, 75, 0.08);
+  color: var(--danger);
+}
+
+.ap-undo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ap-undo-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Action catalog — generated from the capability registry */
+.ap-catalog {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.ap-page-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.ap-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ap-chip:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.ap-chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* The page the agent is currently focused on. */
+.ap-chip.here::after {
+  content: '●';
+  font-size: 9px;
+  color: var(--accent);
+}
+
+.ap-chip .count {
+  color: var(--muted);
+}
+
+.ap-actions {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ap-actions li {
+  display: grid;
+  gap: 2px 10px;
+  grid-template-columns: max-content 1fr;
+  align-items: baseline;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.ap-actions code {
+  grid-row: 1;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.ap-action-title {
+  grid-row: 1;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.ap-needs-confirm {
+  color: var(--danger);
+  font-style: normal;
+  font-size: 12px;
+}
+
+/* The verbatim description the model itself is given — so this list is a
+   faithful preview of what the agent can be asked to do. */
+.ap-action-desc {
+  grid-column: 2;
+  grid-row: 2;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ap-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.ap-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.ap-toggle input {
+  margin-top: 2px;
+  flex: none;
+}
+
+.ap-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.ap-field > span {
+  color: var(--muted);
+  min-width: 130px;
+}
+
+.ap-field em {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}
+
+.ap-field input[type='number'] {
+  width: 84px;
+}
+

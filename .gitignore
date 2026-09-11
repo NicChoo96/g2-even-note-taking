@@ -46,3 +46,5 @@ __pycache__/
 *.pyc
 probe-result.txt
 tavily-probe.txt
+
+.tmp-e2e/
