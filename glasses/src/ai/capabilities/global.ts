@@ -157,25 +157,26 @@ export const globalCapabilities: Capability[] = [
     title: 'Answer',
     description:
       'Answer the user in words with no app change. Use it for a question, for ordinary conversation, or ' +
-      'when no action fits. One short sentence normally; two or three when they are clearly just talking ' +
-      'with you.',
+      'when no action fits. Say the WHOLE answer; keep it tight, but never shorten it to fit.',
     params: [
       {
         name: 'text',
         type: 'string',
-        // The long form is for the conversational lane (see ../converse). This is
-        // a BACKSTOP, not a budget: it has to sit well clear of the loop's own
-        // cap (MAX_CHAT_CHARS) or a long chat reply arrives pre-clipped and never
-        // even reaches `clean`, which is the only place a cut is decided and
-        // marked with an ellipsis.
+        // No length budget here, on purpose. A slice used to sit at 1200 while
+        // the loop capped the reply at 240/720 — so a long answer arrived at the
+        // loop PRE-CLIPPED, silently, and `clean` in ../agent (the only place a
+        // cut is decided and marked with an ellipsis) never even got to see the
+        // text it was meant to be guarding. The glasses page the answer now, so
+        // this hands the sentence over whole and lets the ONE marked cut decide.
         description:
-          'The reply: one or two sentences (~200 characters), or up to ~450 in a conversation. Never more than 700.',
+          'The reply, in full: as many sentences as the answer genuinely needs. There is no length ' +
+          'limit — the glasses paginate a long answer. Keep it tight, but never truncate.',
         required: true,
       },
     ],
     run: (args) => {
       const text = String(args.text ?? '').trim();
-      return { ok: true, summary: text.slice(0, 1200), data: { replied: true } };
+      return { ok: true, summary: text, data: { replied: true } };
     },
   },
   {

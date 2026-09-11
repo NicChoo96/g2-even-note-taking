@@ -284,45 +284,68 @@ lacks('the command prompt has no conversation clause', cmd.box.system, 'CONVERSA
 has('the command prompt still names the pages', cmd.box.system, 'PAGES (route here');
 assert('the command run reports success', cmd.res.ok, cmd.res.error);
 
-// ── 4. The reply budget ─────────────────────────────────────────────────────
-console.log('\n── the reply budget follows the lane ──');
+// ── 4. The answer is not cut to fit a lane ──────────────────────────────────
+// The bug this guards, in full: the loop picked a reply budget from `converse`
+// (240 for a command, 720 for a chat) and the model was TOLD to write to roughly
+// the same size. So "the whole answer" was whatever survived the smaller of two
+// guesses — and because the lane is inferred from the sentence, "what did the
+// agent say?" named the app, counted as a command, and lost its answer at 240
+// characters behind an ellipsis. The glasses PAGE the feed now (see sections.ts),
+// so length is the HUD's problem and the loop has no business shortening a reply.
+console.log('\n── the answer is not cut to fit a lane ──');
+
 const longCmd = await runTurn('open the docs page', () => ({
   ok: true,
   message: { role: 'assistant', content: CHAT_REPLY },
 }));
-is('a command reply is still cut to the short cap', longCmd.res.reply.length, 240);
-assert('and it is marked as cut', longCmd.res.reply.endsWith('…'), longCmd.res.reply.slice(-8));
-assert('the chat reply is longer than the command reply', chat.res.reply.length > longCmd.res.reply.length);
+assert('a long answer on the COMMAND lane is not cut', longCmd.res.reply === CHAT_REPLY, `${longCmd.res.reply.length} chars`);
+assert('and it carries no ellipsis', !longCmd.res.reply.endsWith('…'), longCmd.res.reply.slice(-8));
 
-// The bug this guards: the chat cap used to be 480 while the capability told the
-// model it may write ~450, so a merely VERBOSE answer came back from the loop
-// already chopped and the wearer saw an ellipsis where the rest of the reply
-// should have been. It pages on the glasses now, so the canvas is no longer the
-// limit and the only job left is to leave the model headroom.
-const VERBOSE = `${CHAT_REPLY} ${CHAT_REPLY}`;
-assert('the probe reply is genuinely longer than the old cap', VERBOSE.length > 480 && VERBOSE.length <= 720, `${VERBOSE.length} chars`);
+const VERBOSE = Array(4).fill(CHAT_REPLY).join(' ');
+assert('the probe is longer than the old chat cap', VERBOSE.length > 720, `${VERBOSE.length} chars`);
 const verbose = await runTurn('tell me everything about my day', () => ({
   ok: true,
   message: { role: 'assistant', content: VERBOSE },
 }));
-assert('a verbose chat reply is NOT cut', verbose.res.reply === VERBOSE, `${verbose.res.reply.length} chars`);
-assert('a verbose chat reply carries no ellipsis', !verbose.res.reply.endsWith('…'), verbose.res.reply.slice(-8));
-// The cap is still a cap: an essay is cut, and the cut is visible.
-const ESSAY = 'z'.repeat(1200);
+assert('a verbose answer is not cut either', verbose.res.reply === VERBOSE, `${verbose.res.reply.length} chars`);
+assert('and it is not marked as cut', !verbose.res.reply.endsWith('…'), verbose.res.reply.slice(-8));
+
+// A REAL answer, not a doubled probe: the whole point of the fix is that the
+// wearer can ask for something long and get ALL of it. This is ~10 HUD pages,
+// which the ring walks — the number that matters is that the string arrives
+// EXACTLY as the model wrote it, ellipsis-free.
+const ESSAY = Array.from(
+  { length: 60 },
+  (_, i) => `Point ${i + 1} about tea: the water matters more than the leaf, and the leaf matters more than the pot.`,
+).join(' ');
+assert('the essay probe runs to several HUD pages', ESSAY.length > 5000, `${ESSAY.length} chars`);
 const essay = await runTurn('write me a long essay about tea', () => ({
   ok: true,
   message: { role: 'assistant', content: ESSAY },
 }));
-is('an essay is still cut to the chat cap', essay.res.reply.length, 720);
-assert('and the essay is marked as cut', essay.res.reply.endsWith('…'), essay.res.reply.slice(-8));
+assert('a real long answer arrives whole', essay.res.reply === ESSAY, `${essay.res.reply.length} of ${ESSAY.length} chars`);
+assert('and it is NOT marked as cut', !essay.res.reply.endsWith('…'), essay.res.reply.slice(-8));
 
-// The say__reply capability clips its own argument before the loop ever sees it,
-// so a slice left at the cap would pre-truncate every conversational answer and
-// the loop would never get a say. It has to sit clear ABOVE the loop's cap.
+// The cap is still a cap — a runaway reply is stopped, and the cut is VISIBLE.
+// Above the backstop sits only nonsense, so nothing a person asked for is ever
+// lost here; and it has to stay far enough above a real answer that raising it
+// is never the fix for "my reply got cut".
+const RUNAWAY = 'z'.repeat(9000);
+const runaway = await runTurn('keep going forever', () => ({
+  ok: true,
+  message: { role: 'assistant', content: RUNAWAY },
+}));
+is('a runaway answer is stopped at the backstop', runaway.res.reply.length, 8000);
+assert('and the cut is marked', runaway.res.reply.endsWith('…'), runaway.res.reply.slice(-8));
+assert('the backstop sits clear of a real answer', 8000 >= Math.round(ESSAY.length * 1.25), `${ESSAY.length} vs 8000`);
+
+// say__reply must not clip its own argument either. It used to slice at 1200, so
+// a long answer reached the loop PRE-CLIPPED — silently, with no ellipsis at all
+// — and `clean` never got the chance to be the one place a cut is decided.
 const spoken = await callAction('say.reply', { text: 'x'.repeat(600) }, 'todo');
 is('say__reply passes a conversational answer through', spoken.summary.length, 600);
-const oversize = await callAction('say.reply', { text: 'x'.repeat(5000) }, 'todo');
-is('say__reply still backstops a runaway reply', oversize.summary.length, 1200);
+const oversize = await callAction('say.reply', { text: 'x'.repeat(9000) }, 'todo');
+is('say__reply does not pre-clip the loop', oversize.summary.length, 9000);
 
 // …and end to end, through the tool the model actually calls.
 const viaTool = await runTurn('tell me a joke', () => ({
@@ -335,6 +358,21 @@ const viaTool = await runTurn('tell me a joke', () => ({
 }));
 const viaToolView = aiView(getAi(), { conversing: true });
 assert('a say__reply answer survives the loop whole', viaTool.res.reply === CHAT_REPLY, `${viaTool.res.reply.length} chars`);
+
+// The same, for a LONG answer through the tool a real conversational reply takes.
+const longTool = await runTurn('explain the port strike to me', () => ({
+  ok: true,
+  message: {
+    role: 'assistant',
+    content: '',
+    tool_calls: [{ id: 'c1', type: 'function', function: { name: 'say__reply', arguments: JSON.stringify({ text: ESSAY }) } }],
+  },
+}));
+assert(
+  'a long say__reply answer survives the loop whole',
+  longTool.res.reply === ESSAY,
+  `${longTool.res.reply.length} of ${ESSAY.length} chars`,
+);
 
 // ── 5. The HUD: no duplicate answer, and an honest header ───────────────────
 console.log('\n── the hud says what happened, once ──');

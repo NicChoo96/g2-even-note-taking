@@ -171,16 +171,23 @@ export function isConversational(utterance: string): boolean {
 /**
  * The prompt clause spliced in when `isConversational` said yes.
  *
- * It is placed AFTER the RULES block so it wins over "answer in ONE short
- * sentence", and its last line deliberately hands the turn back: a heuristic
- * that guesses wrong must be overrulable BY THE MODEL, or a false positive
- * really would swallow a command.
+ * It is placed AFTER the RULES block so it wins over the "act, never narrate"
+ * default, and its last line deliberately hands the turn back: a heuristic that
+ * guesses wrong must be overrulable BY THE MODEL, or a false positive really
+ * would swallow a command.
+ *
+ * It does NOT shorten the answer any more. It used to ask for "two or three
+ * sentences", which made the PROMPT the thing that cut the reply — the loop's
+ * cap was only ever chasing it. The glasses page a long answer, so the only
+ * length instruction left is "do not pad".
  */
 export function conversePromptText(): string {
   return [
     'CONVERSATION — this sentence names nothing in the app',
     'The wearer is probably just talking to you, not asking for anything to change. Answer them.',
-    '- Reply in your OWN words: two or three sentences, the way a helpful person would talk.',
+    '- Reply in your OWN words, the way a helpful person would talk, and take as much room as the',
+    '  answer needs: there is no length limit and the glasses page a long reply. Do not pad, and do',
+    '  not cut yourself short either.',
     '  This is the one turn where "never narrate" does not apply to the ANSWER itself.',
     '- It is fine to ask a short question back.',
     '- Still change NOTHING: do not open a page, do not call an action, do not invent one.',

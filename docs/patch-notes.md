@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.25
+
+v0.3.25 - Jarvis answers in full, however long that takes
+
+- The reply is no longer trimmed to fit an estimated chat length; the app asked for two or three sentences and then cut whatever came back.
+- The prompt and the say__reply tool now ask for the whole answer, and only a runaway reply is ever stopped.
+- A long answer is paged by the ring, so every sentence is reachable.
+
 ## 0.3.24
 
 v0.3.24 - Jarvis stops vanishing mid-read

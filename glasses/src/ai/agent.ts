@@ -50,21 +50,33 @@ function wireName(name: string): string {
 }
 /** Tool results are fed back verbatim; keep the context bounded. */
 const MAX_RESULT_CHARS = 1500;
-const MAX_REPLY_CHARS = 240;
 /**
- * How long a CONVERSATIONAL answer may be (see ./converse). A command earns one
- * short sentence because the wearer is waiting on an action; a chat needs the
- * shape of a reply, so it gets two or three.
- *
- * This used to be 480 — barely above the ~450 the model is told it may write, so
- * a merely verbose reply came back from the loop already clipped, and the wearer
- * saw an ellipsis where the second half of the answer should have been. The cap
- * existed because the HUD could only show one screenful; it PAGES now and the
- * listening screen shows that same feed, so the canvas is no longer the binding
- * limit. 720 leaves real headroom over the model's own instruction while still
- * stopping an essay, and a cut is still marked with an ellipsis.
+ * Step text: the model's chain of thought, and this loop's label for what it
+ * did. ONE line on the HUD, deliberately short — a 400-character reasoning
+ * paragraph would push the answer off the page it exists to introduce.
  */
-const MAX_CHAT_CHARS = 720;
+const MAX_STEP_CHARS = 240;
+/**
+ * How long an ANSWER may be. This is a runaway guard, NOT a writing budget, and
+ * the distinction is the whole point.
+ *
+ * It used to be a budget, picked per lane (240 for a command, then 480, then 720
+ * for a conversation), and every raise was chasing the model: the prompt said
+ * "one short sentence", the capability said "~450 in a conversation", and the
+ * loop cut at 480 — so a merely verbose reply came back ALREADY clipped and the
+ * wearer saw an ellipsis where the rest of the answer should have been. Worse,
+ * the lane was GUESSED from the sentence, so "what did the agent say?" named the
+ * app, counted as a command, and had its answer cut at 240.
+ *
+ * The HUD pages now and the listening screen pages the same feed, so length
+ * costs the wearer ring swipes rather than words. Nothing here shortens a reply
+ * to fit a screen, or a guess about what kind of turn it was. The only cut left
+ * is against an answer so long that something has clearly gone wrong, and it is
+ * set above DeepSeek's own ceiling for a spoken turn — so in practice it is
+ * never reached, and if it ever is, the cut is marked with an ellipsis and every
+ * page before it is intact.
+ */
+const MAX_ANSWER_CHARS = 8000;
 
 /**
  * Tool budget, highest value first. Page actions sit above the introspection
@@ -133,7 +145,11 @@ function systemPrompt(converse = false): string {
     '- Resolve "it", "the second one", "my shopping list" from the live state below BEFORE acting.',
     '- Never invent ids, titles or positions. Read first (app__status, a *__list or *__read action) if unsure.',
     '- Prefer one action over many, and matching an existing item over creating a duplicate.',
-    '- If the user asked a QUESTION, call say__reply and change nothing. Answer in ONE short sentence.',
+    // The answer is not length-limited by the HUD any more — it pages — so the
+    // prompt must not be the thing that shortens it. "Short" survives only as a
+    // style note: padding is bad, but brevity that loses the answer is worse.
+    '- If the user asked a QUESTION, call say__reply and change nothing. Answer it in full, in as',
+    '  many sentences as it genuinely needs.',
     '- If nothing fits, call say__reply with one honest short sentence. Never narrate.',
     '- Destructive actions pause for a tap-to-confirm on their own. Call them directly; do not ask in words.',
     '- Write data the way the user will want to read it: keep their wording, no emoji, keep it short.',
@@ -143,7 +159,7 @@ function systemPrompt(converse = false): string {
     '- "Earlier I said", "what did I tell you", "you remember…" refer to the MEMORY block below. Answer',
     '  from it in one sentence; never read the whole block back.',
     '',
-    // Placed AFTER the rules so it wins over "answer in ONE short sentence",
+    // Placed AFTER the rules so it wins over the "act, never narrate" default,
     // and only ever for a turn that named nothing in the app (see ./converse for
     // why a wrong guess here is guaranteed to be cheap).
     ...(converse ? [conversePromptText(), ''] : []),
@@ -187,7 +203,7 @@ function confirmCopy(cap: Capability, args: Record<string, unknown>): { title: s
   return { title: cap.title, lines };
 }
 
-function clean(text: string, max = MAX_REPLY_CHARS): string {
+function clean(text: string, max = MAX_STEP_CHARS): string {
   // Scrub BEFORE flattening: a model that wants a tool it was not offered answers
   // by PRINTING the call instead of making one (see ./tool-markup), and that
   // machine syntax used to fill the HUD container.
@@ -292,9 +308,13 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
 
   const finishRun = (reply: string, ok = true): AiRunResult => {
     // Scrub here too, not only in clean(): THIS is the string the caller speaks,
-    // and a spoken DSML blob is the bug this guards against. A conversational
-    // turn is allowed the longer budget — the answer IS the whole result.
-    const spoken = clean(reply, converse ? MAX_CHAT_CHARS : MAX_REPLY_CHARS);
+    // and a spoken DSML blob is the bug this guards against.
+    //
+    // One budget for both lanes, and it is a backstop rather than a size the
+    // reply is written to fit. It used to be picked from `converse`, which meant
+    // a question that happened to name the app had its answer chopped short for
+    // no reason the wearer could see. Length is the HUD's problem — it pages.
+    const spoken = clean(reply, MAX_ANSWER_CHARS);
     const changed = endAiBatch(batch);
     touched = changed;
     // The answer is NOT pushed as a step. It is printed in full under the

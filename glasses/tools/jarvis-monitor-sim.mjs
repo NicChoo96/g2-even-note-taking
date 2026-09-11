@@ -889,6 +889,85 @@ check(
   [],
 );
 
+// ── 6. A long ANSWER, all the way to its last page ──────────────────────────
+// 0.3.25 stopped the loop shortening a reply to fit a lane, so a real answer now
+// reaches this pager at full length. That only helps if the pager can show all
+// of it — a long answer is acceptable exactly when every character is reachable
+// by ring swipe. A long answer is ONE block, so its pages are pure slices of a
+// single paragraph, which is the one shape where a dropped or clipped line would
+// be invisible from the first page. Hence the reconstruction below.
+console.log('\n── a long answer, all the way to its last page ──');
+
+const ANSWER = Array.from(
+  { length: 60 },
+  (_, i) => `Line ${i + 1}: the port strike is about pay, and the pay offer is what the union is voting on.`,
+).join(' ');
+assert('the probe answer runs to several pages', ANSWER.length > 5000, `${ANSWER.length} chars`);
+const CHATTY = fakeAi({
+  status: 'done',
+  focus: 'agents',
+  utterance: 'what is going on with the port strike',
+  steps: [
+    { kind: 'focus', text: 'agents', at: Date.now() },
+    { kind: 'call', text: 'agents.sessions · port strike', at: Date.now() },
+    { kind: 'ok', text: 'two sessions', at: Date.now() },
+  ],
+  result: ANSWER,
+});
+
+// Peel the fixed chrome off a transcript page: the controls (always pinned to
+// the last line), the header, the labelled rule, and the blank padding between
+// the body and the controls. What is left is that page's slice of the feed.
+function pageBody(text) {
+  const lines = text.split('\n');
+  lines.pop();
+  lines.splice(0, 2);
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n');
+}
+
+// No queue, so the body of a page is transcript and nothing else, and no
+// sessionStart to stop the walk at.
+const chatOpts = (scroll) => ({ conversing: true, holding: true, scroll });
+const answerWalk = [];
+for (let i = 0; i < 80; i += 1) {
+  const v = aiView(CHATTY, chatOpts(i));
+  if (v.todoCursor !== i) break; // the feed clamped: we are past the end
+  answerWalk.push(v.text);
+  if (!v.canNext) break; // and this was the last page
+}
+assert('a long answer needs many pages', answerWalk.length > 5, `${answerWalk.length} page(s)`);
+
+// Strip the chrome from every page and concatenate them in scroll order. The
+// answer is ONE block, and the feed reverses whole blocks while keeping the
+// lines inside a block in reading order — so for a single long answer the pages
+// run start-to-finish, and joining them must reproduce it character for
+// character. Comparing whitespace-insensitively keeps this independent of where
+// the pager happened to break a line, which is what makes it a proof rather than
+// a lucky phrase match.
+const rebuilt = answerWalk.map(pageBody).join('').replace(/\s+/g, '');
+assert(
+  'every character of a long answer reaches a page',
+  rebuilt.includes(ANSWER.replace(/\s+/g, '')),
+  `${rebuilt.length} of ${ANSWER.replace(/\s+/g, '').length} chars rebuilt`,
+);
+
+check('every answer page fits the container', answerWalk.filter((t) => Buffer.byteLength(t, 'utf8') > 999), []);
+check('every answer page fits the canvas', answerWalk.filter((t) => t.split('\n').length > 10), []);
+check('every answer page is glyph-safe', answerWalk.flatMap((t) => unsafeChars(t)), []);
+// A long answer is what makes the page counter reach two digits, and the counter
+// rides on the controls line — which must still render on ONE line, or a full
+// body plus the footer pushes the container past the canvas and the firmware
+// scrolls it, swallowing the ring.
+check(
+  'a long answer never pushes the footer to a second line',
+  [
+    controlsLine(aiView(CHATTY, chatOpts(answerWalk.length - 1))),
+    controlsLine(aiView(CHATTY, { conversing: true, holding: false, scroll: answerWalk.length - 1 })),
+  ].filter(tooWide),
+  [],
+);
+
 // ── verdict ─────────────────────────────────────────────────────────────────
 console.log(`\n${fail === 0 ? 'ALL CHECKS PASSED' : `${fail} CHECK(S) FAILED`} — ${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
