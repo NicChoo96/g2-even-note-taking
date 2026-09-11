@@ -50,6 +50,7 @@ import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } f
 import {
   activeDoc,
   emptyDoc,
+  orderedAgents,
   uid,
   upsertDoc,
   type AgentDef,
@@ -65,6 +66,7 @@ import {
   lastDictationLog,
   lastDictationReason,
   onDictationSnapshot,
+  releaseDictationMic,
   startDictation,
   stopDictation,
 } from './dictate';
@@ -541,16 +543,19 @@ async function main(): Promise<void> {
    */
   function agentContainers(): TextContainerProperty[] {
     const a = getAgents();
+    // Newest-updated agent first; the cursor indexes THIS order, so the render,
+    // agentSelected() and the web panel always agree on who is highlighted.
+    const list = orderedAgents(a.agents);
     const view = agentsMasterDetailView(
       {
-        agents: a.agents,
+        agents: list,
         sessions: a.sessions,
         cursor: agentCursor,
         focus: agentFocus,
         sessionCursor: agentSessionCursor,
         detailPage: agentDetailPage,
         status: agentStatus || agentsStatusLine(agentRunning, agentError),
-        run: liveRunFor(a.agents[agentCursor]?.id),
+        run: liveRunFor(list[agentCursor]?.id),
       },
       (id) => a.tools.find((t) => t.id === id)?.name ?? id,
     );
@@ -806,8 +811,20 @@ async function main(): Promise<void> {
           // snapshot so a partial utterance is not lost.)
           const had = dictationText().trim();
           if (had) deliverTranscript(had);
-          dictationStatus = detail || 'Voice unavailable';
+          // A failed session must LET GO of the mic. Leaving the capture (or
+          // `dictationActive`) alive here held the host mic open and blocked
+          // every later trigger. Reset the overlay, close any session and
+          // force the SDK mic off before showing the reason.
+          dictationActive = false;
+          dictationToAgent = false;
+          jarvisSession = false;
           dictationStopAfter = 0;
+          if (dictationTimer !== null) {
+            window.clearInterval(dictationTimer);
+            dictationTimer = null;
+          }
+          releaseDictationMic();
+          dictationStatus = detail || 'Voice unavailable';
           // Persist the reason + session log on the glasses until the user taps.
           showDictationDiag(detail);
         } else if (s === 'idle') {
@@ -828,12 +845,18 @@ async function main(): Promise<void> {
           } else if (jarvisSession && dictationToAgent) {
             // The user tapped "send" (or the cap fired) but the engine heard
             // nothing. In a conversation that tap still means "I'm done, carry
-            // on", so re-arm rather than dead-end on a diagnostics screen — but
-            // COUNT it, because a mic that hears nothing forever is worse than
-            // ending. Two empty turns in a row is a broken/blocked microphone,
-            // not a pause.
+            // on", so re-arm rather than dead-end on a diagnostics screen.
+            //
+            // A silent tap must NOT end the conversation: opening the
+            // contextual menu can re-deliver presses as taps, and counting
+            // those used to trip the "no audio" cut-off while the menu was
+            // open — which flipped the menu item from 'Stop AI' back to
+            // 'Jarvis', so the user's Stop tap restarted Jarvis instead. Only a
+            // mic that has genuinely never heard anything (the engine's 90s
+            // never-heard watchdog), repeatedly, gives up.
             jarvisSilentTurns += 1;
-            if (jarvisSilentTurns > JARVIS_MAX_SILENT) {
+            const deadMic = /never-heard/.test(lastDictationReason());
+            if (deadMic && jarvisSilentTurns > JARVIS_MAX_SILENT) {
               jarvisSession = false;
               dictationToAgent = false;
               flashAi('Jarvis off · no audio');
@@ -1108,9 +1131,11 @@ async function main(): Promise<void> {
   // ── Agents actions ─────────────────────────────────────────────────────────
   /** The agent currently under the master-panel cursor. */
   function agentSelected(): AgentDef | null {
-    const a = getAgents();
-    if (!a.agents.length) return null;
-    return a.agents[Math.min(a.agents.length - 1, Math.max(0, agentCursor))];
+    // Same ordered list the master pane renders — the cursor is an index into
+    // it, not into the raw store array.
+    const list = orderedAgents(getAgents().agents);
+    if (!list.length) return null;
+    return list[Math.min(list.length - 1, Math.max(0, agentCursor))];
   }
 
   /**
@@ -1320,7 +1345,9 @@ async function main(): Promise<void> {
       if (agentFocus === 'master') {
         const n = getAgents().agents.length;
         if (!n) return;
-        const next = Math.min(n - 1, Math.max(0, agentCursor + dir));
+        // Wrap around: ▲ at the top cycles to the bottom and ▼ at the bottom
+        // cycles to the top, so the list never dead-ends at an edge.
+        const next = (agentCursor + dir + n) % n;
         if (next !== agentCursor) {
           agentCursor = next;
           agentSessionCursor = 0;
@@ -1520,6 +1547,13 @@ async function main(): Promise<void> {
       // the follow-up question needs no menu trip. Only this entry point sets it
       // — a Jarvis run started from the phone panel stays a single turn here.
       if (itemID === MENU.JARVIS) {
+        // Defensive: if a session or run is somehow still live (the OS may
+        // re-render the menu), treat this as Stop rather than stacking a second
+        // Jarvis on top of the one the user was trying to end.
+        if (jarvisSession || getAi().status !== 'idle') {
+          dismissAi();
+          return;
+        }
         jarvisSession = true;
         jarvisLastReply = '';
         jarvisSilentTurns = 0;
@@ -1631,12 +1665,16 @@ async function main(): Promise<void> {
       // capability writes it already made are durable and revertible via
       // "Undo AI", so nothing is silently lost.
       //
-      // A Jarvis CONVERSATION cannot survive the round trip either: the mic was
-      // torn down along with the page, so an open session would strand the menu
-      // on 'Stop AI' with nothing listening. Close it and let the next Jarvis
-      // open a fresh one.
-      if (jarvisSession) dismissAi();
-      else if (getAi().status === 'running') aiCancel();
+      // A Jarvis CONVERSATION must SURVIVE a brief round trip: opening the
+      // contextual menu can re-deliver a foreground-enter, and dismissing here
+      // was what ended Jarvis "by itself" while the menu was open — flipping the
+      // first item back to 'Jarvis' so the Stop tap restarted it. Keep the
+      // session; if the mic did die with the page, re-arm it instead.
+      if (jarvisSession) {
+        if (!dictationActive && !dictationSnapshot().active) listenAgain();
+      } else if (getAi().status === 'running') {
+        aiCancel();
+      }
       void renderGlasses();
       return;
     }

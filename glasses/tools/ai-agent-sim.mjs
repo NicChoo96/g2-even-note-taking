@@ -1508,7 +1508,17 @@ src('double-tap covers the LISTENING phase too', /getAi\(\)\.status !== 'idle' \
 src('the conversation survives a turn being stopped', /function stopTurnKeepTalking\(\)/);
 src('a run that never reached the model ends the conversation', /jarvisSession = false;\s*\n\s*dictationToAgent = false;\s*\n\s*flashAi\('Jarvis off/);
 src('a silent mic cannot loop forever', /JARVIS_MAX_SILENT/);
-src('the background round trip closes it', /if \(jarvisSession\) dismissAi\(\);/);
+// The conversation now SURVIVES a foreground round trip: opening the contextual
+// menu can re-deliver foreground-enter, and ending the session there flipped the
+// menu's first item back to 'Jarvis', so a Stop tap restarted Jarvis instead.
+// A dead mic is re-armed; only a deliberate Stop / double-tap ends it.
+src('a foreground round trip keeps the conversation (re-arms a dead mic)', /if \(jarvisSession\) \{[\s\S]{0,160}listenAgain\(\)/);
+assert('…and foreground-enter no longer dismisses the session', !/if \(jarvisSession\) dismissAi\(\);/.test(mainSrc));
+
+// This batch's other fixes, locked as source invariants.
+src('the agent list wraps around at both edges', /const next = \(agentCursor \+ dir \+ n\) % n;/);
+src('a silent tap no longer ends the Jarvis conversation', /const deadMic = \/never-heard\/\.test\(lastDictationReason\(\)\)/);
+src('a dictation error releases the mic', /releaseDictationMic\(\);/);
 src('the listening screen carries the previous answer', /Was: \$\{jarvisLastReply\}/);
 src('raw Dictate is untouched (still the default)', /function startGlassesDictation\(toAgent = false\)/);
 

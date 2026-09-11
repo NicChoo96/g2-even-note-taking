@@ -18,6 +18,7 @@ import { FREE_TOOL_MODELS } from '../models';
 import {
   emptyAgent,
   emptyLlmSettings,
+  orderedAgents,
   tavilyTool,
   uid,
   type AgentDef,
@@ -70,7 +71,9 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   const patch = (p: Partial<AgentDef>) =>
     updateAgents((s) => ({
       ...s,
-      agents: s.agents.map((a) => (a.id === agent.id ? { ...a, ...p } : a)),
+      agents: s.agents.map((a) =>
+        a.id === agent.id ? { ...a, ...p, updatedAt: Date.now() } : a,
+      ),
     }));
 
   const toggleTool = (id: string) =>
@@ -79,6 +82,47 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         ? agent.toolIds.filter((t) => t !== id)
         : [...agent.toolIds, id],
     });
+
+  /** Enable the seeded Tavily tool (creating it if it was removed) and attach it. */
+  const addTavilyToAgent = () =>
+    updateAgents((s) => {
+      const has = s.tools.some((t) => t.id === 'tool-tavily');
+      return {
+        ...s,
+        tools: has ? s.tools : [...s.tools, tavilyTool()],
+        agents: s.agents.map((a) =>
+          a.id === agent.id
+            ? {
+                ...a,
+                toolIds: [...new Set([...a.toolIds, 'tool-tavily'])],
+                updatedAt: Date.now(),
+              }
+            : a,
+        ),
+      };
+    });
+
+  /** Create a new REST tool and attach it to this agent in one step. */
+  const addRestToolToAgent = () => {
+    const id = uid();
+    updateAgents((s) => ({
+      ...s,
+      tools: [
+        ...s.tools,
+        {
+          id,
+          name: `tool_${s.tools.length + 1}`,
+          kind: 'http',
+          description: '',
+          url: '',
+          method: 'POST',
+        },
+      ],
+      agents: s.agents.map((a) =>
+        a.id === agent.id ? { ...a, toolIds: [...a.toolIds, id], updatedAt: Date.now() } : a,
+      ),
+    }));
+  };
 
   return (
     <div className="agent-editor">
@@ -130,6 +174,10 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
             {t.name}
           </button>
         ))}
+      </div>
+      <div className="docs-actions">
+        <button onClick={addTavilyToAgent}>+ Tavily search</button>
+        <button onClick={addRestToolToAgent}>+ REST tool</button>
       </div>
 
       <label className="field-label">Model override (blank = global)</label>
@@ -381,7 +429,7 @@ export function AgentsPanel() {
           <div className="panel-label">Agents</div>
           <ul className="agent-list">
             {state.agents.length === 0 && <li className="empty">No agents yet.</li>}
-            {state.agents.map((a) => (
+            {orderedAgents(state.agents).map((a) => (
               <li key={a.id} className={a.id === agent?.id ? 'agent-row active' : 'agent-row'}>
                 <button className="agent-pick" onClick={() => setSelected(a.id)}>
                   <span className="agent-name">{a.name || '(unnamed)'}</span>

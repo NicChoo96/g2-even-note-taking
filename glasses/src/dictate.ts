@@ -456,6 +456,28 @@ export function cancelDictation(): void {
   session?.abort();
 }
 
+/**
+ * Hard release: abort any session AND force the host mic off.
+ *
+ * Used when a session ends in an ERROR state — the engine can fail before its
+ * own teardown ran, and a mic left open blocks every later trigger (the host
+ * thinks the capture is still owned). Safe to call when nothing is active.
+ */
+export function releaseDictationMic(): void {
+  try {
+    session?.abort();
+  } catch {
+    /* already torn down */
+  }
+  session = null;
+  snap.active = false;
+  snap.state = 'idle';
+  snap.interim = '';
+  snapCb?.();
+  const bridge = getDurableBridge();
+  if (bridge) void bridge.audioControl(false).catch(() => undefined);
+}
+
 // ── Engine 1: browser Web Speech API ─────────────────────────────────────────
 function startWebSpeech(hooks: DictHooks): boolean {
   const w = window as unknown as Record<string, never>;

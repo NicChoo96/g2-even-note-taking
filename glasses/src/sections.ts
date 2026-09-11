@@ -15,6 +15,7 @@ import type { AiState } from './ai/store';
 import type { PageId } from './ai/types';
 import {
   activeDoc,
+  orderedAgents,
   type AgentDef,
   type AgentSession,
   type DocEntry,
@@ -842,7 +843,11 @@ export function agentsMasterDetailView(
   input: AgentsViewInput,
   nameOf: (id: string) => string = (id) => id,
 ): AgentsView {
-  const { agents, sessions, focus } = input;
+  const { sessions, focus } = input;
+  // The list is ALWAYS shown newest-updated-first. The master cursor indexes
+  // THIS order, so main.ts selects from the same ordered list (see
+  // agentSelected / agentContainers).
+  const agents = orderedAgents(input.agents);
   const clamped = agents.length ? Math.min(agents.length - 1, Math.max(0, input.cursor)) : 0;
   const agent = agents[clamped] ?? null;
   const toolNames = agent ? agent.toolIds.map(nameOf).filter(Boolean) : [];

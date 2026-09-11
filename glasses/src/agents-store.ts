@@ -88,7 +88,13 @@ function emit(): void {
  * glasses menu calls `.trim()` on it, so backfill it on every ingress path.
  */
 function normalizeAgent(a: AgentDef): AgentDef {
-  return { ...a, prompt: typeof a.prompt === 'string' ? a.prompt : '' };
+  return {
+    ...a,
+    prompt: typeof a.prompt === 'string' ? a.prompt : '',
+    // Legacy agents predate `updatedAt`; fall back to their creation stamp so
+    // the newest-first ordering still has a key to sort on.
+    updatedAt: typeof a.updatedAt === 'number' ? a.updatedAt : a.createdAt,
+  };
 }
 
 function schedulePublish(): void {

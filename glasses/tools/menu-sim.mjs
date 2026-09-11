@@ -224,6 +224,20 @@ assert('detail shows the newest answer', view.detail.includes('Newest answer'), 
 assert('detail shows the tool name', view.detail.includes('tavily_search'));
 assert('cursor clamped', view.cursor === 0 && view.canPrev === false && view.canNext === true);
 
+// The master list is ordered newest-updated first, on every surface.
+const ordered = agentsMasterDetailView({
+  agents: [
+    { id: 'old', name: 'Older', systemPrompt: '', toolIds: [], createdAt: 1, updatedAt: 1 },
+    { id: 'new', name: 'Newer', systemPrompt: '', toolIds: [], createdAt: 2, updatedAt: 99 },
+  ],
+  sessions: [],
+  cursor: 0,
+  focus: 'master',
+  status: '',
+});
+assert('the newest-updated agent is listed first', /▶1\.Newer/.test(ordered.master), ordered.master);
+assert('the older agent follows it', /2\.Older/.test(ordered.master), ordered.master);
+
 const browsed = agentsMasterDetailView({
   agents: [mkAgent('a1', 'Alpha')],
   sessions: [mkSession('s1', 'a1', 'Newest answer'), mkSession('s2', 'a1', 'Older answer')],

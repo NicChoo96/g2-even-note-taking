@@ -111,8 +111,10 @@ export const agentsCapabilities: Capability[] = [
         name,
         systemPrompt: String(args.systemPrompt ?? '').trim(),
         prompt: String(args.prompt ?? '').trim(),
-        toolIds: [],
+        // Web search on by default, matching the builder's new-agent default.
+        toolIds: ['tool-tavily'],
         createdAt: Date.now(),
+        updatedAt: Date.now(),
       };
       updateAgents((s) => ({ ...s, agents: [...s.agents, agent] }));
       return { ok: true, summary: `Created agent "${short(name, 20)}"`, data: { id: agent.id } };

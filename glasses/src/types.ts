@@ -130,6 +130,8 @@ export interface AgentDef {
   /** Optional per-agent model override (falls back to LlmSettings.model). */
   model?: string;
   createdAt: number;
+  /** Last time the agent was created or edited — drives the list order. */
+  updatedAt?: number;
 }
 
 export type AgentRole = 'user' | 'assistant' | 'tool';
@@ -207,9 +209,21 @@ export function emptyAgent(name = 'New Agent'): AgentDef {
       'You are a concise research assistant. Use the available tools when you need ' +
       'current information, then answer briefly in plain text.',
     prompt: 'What is new in AI this week?',
-    toolIds: [],
+    // Web search is ON by default for every agent (the seeded Tavily tool).
+    toolIds: ['tool-tavily'],
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   };
+}
+
+/** Sort key: the last edit time, falling back to creation for legacy agents. */
+export function agentUpdatedAt(a: AgentDef): number {
+  return a.updatedAt ?? a.createdAt ?? 0;
+}
+
+/** Agents in the order every surface shows them: most recently updated first. */
+export function orderedAgents(agents: readonly AgentDef[]): AgentDef[] {
+  return [...agents].sort((a, b) => agentUpdatedAt(b) - agentUpdatedAt(a));
 }
 
 export function agentById(s: AgentsState, id: string | null | undefined): AgentDef | null {
