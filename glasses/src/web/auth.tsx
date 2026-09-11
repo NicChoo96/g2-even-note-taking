@@ -559,38 +559,67 @@ export function LoginScreen() {
 
   useEffect(() => {
     if (!clientId || !btnRef.current) return;
-    const g = window.google?.accounts?.id;
-    if (!g) {
-      setCfgError('Google Sign-In failed to load — check your connection.');
-      return;
+    let cancelled = false;
+
+    const renderButton = (g: NonNullable<Window['google']>['accounts']['id']) => {
+      if (cancelled || !btnRef.current) return;
+      g.initialize({
+        client_id: clientId,
+        ux_mode: 'popup',
+        callback: async (resp: { credential?: string }) => {
+          if (!resp?.credential) {
+            setError('Sign-in was cancelled.');
+            return;
+          }
+          const v = await verify(resp.credential);
+          if (v.ok && v.email && v.sessionToken) {
+            setAuthed(v.email, v.sessionToken);
+          } else {
+            setError(
+              v.error === 'not whitelisted'
+                ? 'This Google account is not whitelisted. Only the owner can use this app.'
+                : 'Sign-in failed. Please try again.',
+            );
+          }
+        },
+      });
+      g.renderButton(btnRef.current, {
+        theme: 'filled_black',
+        size: 'large',
+        shape: 'pill',
+        text: 'signin_with',
+      });
+      setCfgError(null);
+    };
+
+    // The GSI script (accounts.google.com/gsi/client) is loaded async/defer, so
+    // it can still be in flight when the client ID arrives first (the config is
+    // a network fetch). Wait for it instead of hard-failing on first sight: poll
+    // briefly and only show the "failed to load" error after a real timeout.
+    const existing = window.google?.accounts?.id;
+    if (existing) {
+      renderButton(existing);
+      return () => {
+        cancelled = true;
+      };
     }
-    g.initialize({
-      client_id: clientId,
-      ux_mode: 'popup',
-      callback: async (resp: { credential?: string }) => {
-        if (!resp?.credential) {
-          setError('Sign-in was cancelled.');
-          return;
-        }
-        const v = await verify(resp.credential);
-        if (v.ok && v.email && v.sessionToken) {
-          setAuthed(v.email, v.sessionToken);
-        } else {
-          setError(
-            v.error === 'not whitelisted'
-              ? 'This Google account is not whitelisted. Only the owner can use this app.'
-              : 'Sign-in failed. Please try again.',
-          );
-        }
-      },
-    });
-    g.renderButton(btnRef.current, {
-      theme: 'filled_black',
-      size: 'large',
-      shape: 'pill',
-      text: 'signin_with',
-    });
-    setCfgError(null);
+
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      const g = window.google?.accounts?.id;
+      if (g) {
+        window.clearInterval(timer);
+        renderButton(g);
+      } else if (Date.now() - startedAt > 15000) {
+        window.clearInterval(timer);
+        if (!cancelled) setCfgError('Google Sign-In failed to load — check your connection.');
+      }
+    }, 200);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [clientId, setError, setAuthed]);
 
   return (
