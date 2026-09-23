@@ -649,6 +649,7 @@ export const agentsCapabilities: Capability[] = [
             description: t.description,
             ...(t.kind === 'http' ? { url: t.url ?? '', method: t.method ?? 'POST' } : {}),
             ...(t.kind === 'tavily' ? { searchDepth: t.searchDepth ?? 'basic' } : {}),
+            ...(t.kind === 'jev' ? { note: 'typed decision tool — no configuration' } : {}),
           })),
         },
         hint: 'pass these names to agents.create "tools" or agents.update "tools"/"addTools"/"removeTools"',

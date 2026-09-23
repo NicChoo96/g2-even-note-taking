@@ -59,6 +59,9 @@ import { fileURLToPath } from 'node:url';
 // BEFORE the first tool call (see datetime.mjs).
 import { preprocessText, withDateTime, withDateTimeMessages } from './datetime.mjs';
 import { looksLikeToolMarkup, stripToolMarkup } from './tool-markup.mjs';
+// Jev — the typed-decision model. Builds/validates the question spec and reads
+// the answers back. Ships twice (relay + WebView); see the header of jev-spec.mjs.
+import { buildRequest, describeAnswers, normalizeAnswers, specFromToolArgs } from './jev-spec.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -307,6 +310,17 @@ const TAVILY_URL = 'https://api.tavily.com/search';
 const LLM_MAX_BYTES = 512 * 1024;
 const TOOL_MAX_BYTES = 32 * 1024;
 
+// ── Jev (typed decisions) ────────────────────────────────────────────────────
+// Jev is NOT the chat model. It is a separate endpoint that answers narrow,
+// typed questions and returns calibrated probabilities, so it has its OWN
+// config on purpose: `LLM_PROVIDER` may point the chat proxy at DeepSeek while
+// jev still needs the OpenRouter key. Reading llmConfig() here would have sent
+// jev's requests to DeepSeek's URL with a DeepSeek key and failed obscurely.
+const JEV_URL = 'https://openrouter.ai/api/alpha/decisions';
+/** Pinned, not user-facing: `~typesafe/jev-latest` is the typed-decision model. */
+const JEV_DEFAULT_MODEL = '~typesafe/jev-latest';
+const JEV_MAX_BYTES = 64 * 1024;
+
 /** Persisted overrides (model/referer/title/depth + keys) — see loadSecrets(). */
 const secrets = { openrouterKey: '', deepseekKey: '', tavilyKey: '', model: '', referer: '', title: '', depth: '' };
 
@@ -391,6 +405,73 @@ function llmConfig() {
   };
 }
 
+/**
+ * Jev config — the OpenRouter key, independent of `LLM_PROVIDER`.
+ * Env wins over the persisted settings file, exactly like llmConfig().
+ */
+function jevConfig() {
+  const envKey = process.env.OPENROUTER_API_KEY || '';
+  const fileKey = secrets.openrouterKey || '';
+  return {
+    key: envKey || fileKey || '',
+    model: process.env.JEV_MODEL || JEV_DEFAULT_MODEL,
+    referer: process.env.OPENROUTER_REFERER || secrets.referer || '',
+    title: process.env.OPENROUTER_TITLE || secrets.title || 'G2 Even Reality Hub',
+    source: envKey ? 'env' : fileKey ? 'settings' : 'none',
+  };
+}
+
+/** OpenRouter attribution headers, always required for jev's model routing. */
+function jevHeaders(cfg) {
+  const h = {
+    Authorization: `Bearer ${cfg.key}`,
+    'Content-Type': 'application/json',
+  };
+  if (cfg.referer) h['HTTP-Referer'] = cfg.referer;
+  if (cfg.title) h['X-OpenRouter-Title'] = cfg.title;
+  return h;
+}
+
+/** Find the answers map in a response whose envelope we do not control. */
+function pickAnswers(payload, questions) {
+  if (payload?.answers && typeof payload.answers === 'object') return payload.answers;
+  const nested = payload?.data?.answers;
+  if (nested && typeof nested === 'object') return nested;
+  // Some shapes return the name → answer map at the top level.
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const names = Object.keys(questions ?? {});
+    if (names.length && names.every((n) => n in payload)) return payload;
+  }
+  return {};
+}
+
+/**
+ * One Decisions call. `request` must already be validated by buildRequest().
+ * Throws on transport/HTTP failure; the CALLER decides how to report it.
+ */
+async function jevDecide(request) {
+  const cfg = jevConfig();
+  if (!cfg.key) throw new Error('Jev not configured — set OPENROUTER_API_KEY');
+  const r = await fetch(JEV_URL, {
+    method: 'POST',
+    headers: jevHeaders(cfg),
+    body: JSON.stringify({
+      model: request.model || cfg.model,
+      state: request.state,
+      questions: request.questions,
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new Error(j?.error?.message || j?.error || `jev ${r.status}`);
+  }
+  return {
+    answers: normalizeAnswers(request.questions, pickAnswers(j, request.questions)),
+    model: j?.model || request.model || cfg.model,
+    usage: j?.usage ?? null,
+  };
+}
+
 function tavilyConfig() {
   const envKey = process.env.TAVILY_API_KEY || '';
   const fileKey = secrets.tavilyKey || '';
@@ -413,14 +494,19 @@ function tavilyConfig() {
 function agentStatusPayload() {
   const llm = llmConfig();
   const tv = tavilyConfig();
+  const jev = jevConfig();
   return {
     ok: true,
     provider: llm.provider,
     llm: Boolean(llm.key),
     tavily: Boolean(tv.key),
+    // Jev is gated on the OPENROUTER key, NOT the chat provider — an app running
+    // on DeepSeek chat can still have jev available. Clients use this to hide or
+    // disable jev affordances rather than offering a tool that will fail.
+    jev: Boolean(jev.key),
     model: llm.model,
     depth: tv.depth,
-    source: { llm: llm.source, tavily: tv.source },
+    source: { llm: llm.source, tavily: tv.source, jev: jev.source },
   };
 }
 
@@ -497,6 +583,45 @@ function toolSchemaFor(t) {
       },
     };
   }
+  // jev — a typed decision. The model supplies a question and an option list,
+  // and the STRICT spec is built here from that flat shape: a tool-calling model
+  // writes prose well and JSON poorly, so it is never asked to author criteria.
+  if (t?.kind === 'jev') {
+    return {
+      type: 'function',
+      function: {
+        name: t.name || 'jev_decide',
+        description:
+          t.description ||
+          'Ask a narrow decision question about a piece of text and get a typed answer back instead of prose. Use for routing, ranking and verification. Returns a probability, a chosen option, or a position on a rubric.',
+        parameters: {
+          type: 'object',
+          properties: {
+            state: {
+              type: 'string',
+              description: 'The text or JSON to judge — paste the material, do not summarise it.',
+            },
+            question: {
+              type: 'string',
+              description: 'The one decision to make, phrased in plain words.',
+            },
+            kind: {
+              type: 'string',
+              enum: ['noul', 'choice', 'score'],
+              description:
+                'noul = yes/no as a probability; choice = pick exactly one option; score = position on an ordered rubric.',
+            },
+            options: {
+              type: 'string',
+              description:
+                'Required for choice and score: the options, or the rubric steps ordered low → high, separated by | or commas.',
+            },
+          },
+          required: ['state', 'question', 'kind'],
+        },
+      },
+    };
+  }
   return {
     type: 'function',
     function: {
@@ -545,6 +670,26 @@ async function runToolOnce(tool, rawArgs, signal) {
     /* keep empty */
   }
   if (!tool) return `Unknown tool.`;
+  if (tool.kind === 'jev') {
+    const jev = jevConfig();
+    if (!jev.key) return 'tool error: Jev not configured (no OpenRouter key)';
+    const built = specFromToolArgs({
+      kind: args.kind,
+      question: args.question ?? args.instructions,
+      options: args.options,
+    });
+    if (!built.ok) return `tool error: ${built.error}`;
+    const state = String(args.state ?? args.text ?? '').trim();
+    if (!state) return 'tool error: state is required — paste the text to judge';
+    const req = buildRequest({ state, questions: built.value });
+    if (!req.ok) return `tool error: ${req.error}`;
+    try {
+      const { answers } = await jevDecide(req.value);
+      return clipText(describeAnswers(answers) || 'tool error: empty decision', 4000);
+    } catch (err) {
+      return `tool error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
   if (tool.kind === 'tavily') {
     const tv = tavilyConfig();
     if (!tv.key) return 'tool error: Tavily not configured';
@@ -1755,6 +1900,46 @@ const server = createServer(async (req, res) => {
       const r = await fetch(finalUrl, init);
       const text = await r.text();
       json(res, 200, { ok: r.ok, result: clipText(text, 4000) });
+    } catch (err) {
+      json(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+    return;
+  }
+
+  // Jev decisions — a typed-decision proxy. The model is NOT a chat model and
+  // the OpenRouter key never leaves this process, so callers send only the
+  // state and the question spec and receive typed answers back.
+  if (req.method === 'POST' && url.pathname === '/api/decisions') {
+    const principal = principalFromToken(readToken(req, url));
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, JEV_MAX_BYTES);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid or oversized JSON' });
+      return;
+    }
+    // Validate BEFORE spending an upstream call — a malformed spec is a 400 that
+    // names the field, not an opaque provider error.
+    const built = buildRequest(body);
+    if (!built.ok) {
+      json(res, 400, { ok: false, error: built.error, field: built.field });
+      return;
+    }
+    const cfg = jevConfig();
+    if (!cfg.key) {
+      json(res, 501, {
+        ok: false,
+        error: 'Jev not configured — set OPENROUTER_API_KEY or save it in Settings',
+      });
+      return;
+    }
+    try {
+      const out = await jevDecide(built.value);
+      json(res, 200, { ok: true, ...out });
     } catch (err) {
       json(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
     }

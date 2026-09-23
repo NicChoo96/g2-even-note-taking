@@ -205,6 +205,14 @@ export function SettingsPanel() {
           {info?.tavily ? '✓ Tavily key set' : '✕ no Tavily key'}
           <SourceBadge source={src?.tavily?.key} />
         </span>
+        {/* Same credential as the OpenRouter chat backend, but its own check:
+            the provider can be DeepSeek, so "API key set" above may be reporting
+            a DeepSeek key and says nothing about jev. jev always reads the
+            OpenRouter key, which is why it gets its own pill. */}
+        <span className={info?.jev ? 'pill ok' : 'pill bad'}>
+          {info?.jev ? '✓ Jev ready' : '✕ Jev needs OpenRouter key'}
+          <SourceBadge source={src?.jev?.key} />
+        </span>
         <span className="pill">
           model: {info?.model ?? model}
           <SourceBadge source={src?.llm?.model} />

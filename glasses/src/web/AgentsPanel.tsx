@@ -18,6 +18,7 @@ import { FREE_TOOL_MODELS } from '../models';
 import {
   emptyAgent,
   emptyLlmSettings,
+  jevTool,
   orderedAgents,
   tavilyTool,
   uid,
@@ -102,6 +103,29 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
       };
     });
 
+  /**
+   * Enable the typed-decision tool (creating it if it was removed) and attach it.
+   * It needs no configuration of its own — it uses the relay's OpenRouter key,
+   * so there is nothing to save here.
+   */
+  const addJevToAgent = () =>
+    updateAgents((s) => {
+      const has = s.tools.some((t) => t.id === 'tool-jev');
+      return {
+        ...s,
+        tools: has ? s.tools : [...s.tools, jevTool()],
+        agents: s.agents.map((a) =>
+          a.id === agent.id
+            ? {
+                ...a,
+                toolIds: [...new Set([...a.toolIds, 'tool-jev'])],
+                updatedAt: Date.now(),
+              }
+            : a,
+        ),
+      };
+    });
+
   /** Create a new REST tool and attach it to this agent in one step. */
   const addRestToolToAgent = () => {
     const id = uid();
@@ -177,6 +201,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
       </div>
       <div className="docs-actions">
         <button onClick={addTavilyToAgent}>+ Tavily search</button>
+        <button onClick={addJevToAgent}>+ Jev decision</button>
         <button onClick={addRestToolToAgent}>+ REST tool</button>
       </div>
 
@@ -191,7 +216,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   );
 }
 
-function ToolEditor({ tool }: { tool: ToolDef }) {
+function ToolEditor({ tool, jevReady }: { tool: ToolDef; jevReady: boolean }) {
   const [token, setToken] = useState('');
   const patch = (p: Partial<ToolDef>) =>
     updateAgents((s) => ({
@@ -217,6 +242,7 @@ function ToolEditor({ tool }: { tool: ToolDef }) {
         />
         <select value={tool.kind} onChange={(e) => patch({ kind: e.target.value as ToolDef['kind'] })}>
           <option value="tavily">Tavily search</option>
+          <option value="jev">Jev decision</option>
           <option value="http">REST API</option>
         </select>
         <button
@@ -243,7 +269,7 @@ function ToolEditor({ tool }: { tool: ToolDef }) {
         placeholder="What this tool does (the model reads this to decide when to call it)"
       />
 
-      {tool.kind === 'tavily' ? (
+      {tool.kind === 'tavily' && (
         <label className="inline-field">
           Search depth
           <select
@@ -254,7 +280,17 @@ function ToolEditor({ tool }: { tool: ToolDef }) {
             <option value="advanced">advanced (deeper)</option>
           </select>
         </label>
-      ) : (
+      )}
+
+      {tool.kind === 'jev' && (
+        <p className="empty">
+          {jevReady
+            ? 'Ready — uses the OpenRouter key held server-side, so there is nothing to configure here.'
+            : 'No OpenRouter key on the server yet. Add one in Settings; until then this tool reports that it was skipped rather than guessing.'}
+        </p>
+      )}
+
+      {tool.kind === 'http' && (
         <>
           <input
             value={tool.url ?? ''}
@@ -451,7 +487,7 @@ export function AgentsPanel() {
             Tools
           </div>
           {state.tools.map((t) => (
-            <ToolEditor key={t.id} tool={t} />
+            <ToolEditor key={t.id} tool={t} jevReady={statusInfo?.jev === true} />
           ))}
           <div className="docs-actions">
             <button onClick={addTool}>+ Custom REST tool</button>

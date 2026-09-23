@@ -9,6 +9,7 @@ import { registerCapabilities, registerPage } from './registry';
 import { agentsCapabilities } from './capabilities/agents';
 import { docsCapabilities } from './capabilities/docs';
 import { globalCapabilities } from './capabilities/global';
+import { jevCapabilities } from './capabilities/jev';
 import { notesCapabilities } from './capabilities/notes';
 import { settingsCapabilities } from './capabilities/settings';
 import { todoCapabilities } from './capabilities/todo';
@@ -16,6 +17,7 @@ import type { Capability } from './types';
 
 const CAPABILITIES: Capability[] = [
   ...globalCapabilities,
+  ...jevCapabilities,
   ...todoCapabilities,
   ...docsCapabilities,
   ...notesCapabilities,

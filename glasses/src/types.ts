@@ -84,8 +84,13 @@ export function upsertDoc(
 // public. Agents therefore live in their own SSE channel ('agents') and their own
 // durable keys, and only compact summaries are rendered on the glasses.
 
-/** Tool transports. Tavily is the seeded web-search tool; http is any REST API. */
-export type ToolKind = 'tavily' | 'http';
+/**
+ * Tool transports. Tavily is the seeded web-search tool, http is any REST API,
+ * and jev is a typed-decision tool: instead of returning prose it answers a
+ * yes/no, pick-one or rubric question and returns a calibrated probability.
+ * jev has no per-tool config — it uses the relay's OpenRouter key.
+ */
+export type ToolKind = 'tavily' | 'http' | 'jev';
 export type TavilyDepth = 'basic' | 'advanced';
 
 export interface ToolDef {
@@ -187,6 +192,24 @@ export function tavilyTool(): ToolDef {
     description:
       'Search the web for current information. Use for facts, news, prices, or anything not in the prompt.',
     searchDepth: 'basic',
+    hasToken: false,
+  };
+}
+
+/**
+ * A tool that decides rather than describes. The agent supplies the text to
+ * judge plus one typed question, and gets back a probability or a label — not a
+ * paragraph it would have to interpret. Needs no token of its own.
+ */
+export function jevTool(): ToolDef {
+  return {
+    id: 'tool-jev',
+    name: 'jev_decide',
+    kind: 'jev',
+    description:
+      'Ask a typed question about a piece of text and get a calibrated answer back: a yes/no ' +
+      'probability, a pick from options you define, or a position on an ordered scale. Use for ' +
+      'routing, ranking and verification instead of asking for prose.',
     hasToken: false,
   };
 }

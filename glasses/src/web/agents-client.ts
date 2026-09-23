@@ -16,6 +16,12 @@ export interface AgentStatus {
   provider?: string;
   llm: boolean;
   tavily: boolean;
+  /**
+   * True when the relay holds an OpenRouter key, which is what jev needs.
+   * Deliberately NOT the same as `llm`: the chat provider can be DeepSeek while
+   * jev is always OpenRouter, so the two can disagree in either direction.
+   */
+  jev?: boolean;
   model: string;
   depth: string;
   /** Provenance per field, so the UI can lock env-managed inputs. */
@@ -29,6 +35,7 @@ export interface AgentStatus {
       deepseekKey?: ValueSource;
     };
     tavily?: { key?: ValueSource; depth?: ValueSource };
+    jev?: { key?: ValueSource };
   };
 }
 
