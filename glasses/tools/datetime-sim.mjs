@@ -141,12 +141,29 @@ assert('a non-array message list is safe', Array.isArray(withDateTimeMessages(nu
 
 console.log('\n── 7. the relay actually uses it (source) ──');
 const relay = readFileSync(resolve('..', 'web/server/local-sse.mjs'), 'utf8');
+// The run's message assembly moved into `wire.mjs` so it can be tested directly
+// (`local-sse.mjs` starts a server on import, so nothing it builds was
+// reachable). The stamping assertion therefore follows the code — and it is
+// paired with a check that the relay still DELEGATES, because a source scan of
+// the wrong file would otherwise pass while the real path went unstamped.
+const wire = readFileSync(resolve('..', 'web/server/wire.mjs'), 'utf8');
 assert('relay imports the clock module', /from '\.\/datetime\.mjs'/.test(relay));
-assert('every run stamps the system prompt', /withDateTime\(run\.systemPrompt/.test(relay));
+assert('the run assembly lives in a testable module', /from '\.\/wire\.mjs'/.test(relay));
+assert('…and the relay actually calls it', /assembleWire\(run, resolved\.text, now\)/.test(relay));
+assert('the assembly module stamps the system prompt', /withDateTime\(run\?\.systemPrompt/.test(wire));
+assert('every run stamps the system prompt', /withDateTime\(run\?\.systemPrompt/.test(wire));
 assert('the run preprocesses the user prompt', /preprocessText\(run\.prompt/.test(relay));
 assert('the run clock is pinned at trigger time', /new Date\(run\.startedAt\)/.test(relay));
 assert('/api/llm stamps the message list', /withDateTimeMessages\(body\.messages/.test(relay));
-assert('the Tavily query is preprocessed', /preprocessText\(String\(args\.query/.test(relay));
+assert('the web-search query is preprocessed (both providers)', /preprocessText\(String\(args\.query/.test(relay));
+// The relay has TWO search call sites (the run executor and the /api/tool
+// proxy). Pairing the LAST of each keeps the comparison inside the proxy path;
+// pairing the first would compare the proxy's preprocess against the executor's
+// call and be false for the wrong reason. Presence is already asserted above.
+assert(
+  '…and it is preprocessed BEFORE the provider is chosen',
+  relay.lastIndexOf('preprocessText(String(args.query') < relay.lastIndexOf('await searchWeb({'),
+);
 assert('custom REST tool args are preprocessed', /resolvedArgs/.test(relay));
 assert('the resolutions are surfaced in the transcript', /\[time\] \$\{resolved\.notes/.test(relay));
 assert('no emoji reaches the G2 transcript (font has no glyphs)', !/🕒/.test(relay));

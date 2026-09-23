@@ -27,6 +27,7 @@ export const docsCapabilities: Capability[] = [
   {
     name: 'docs.new',
     page: 'docs',
+    effect: 'write',
     title: 'Create document',
     description: 'Create a new empty document and open it. Use for "start a new note/doc called X".',
     params: [
@@ -70,6 +71,7 @@ export const docsCapabilities: Capability[] = [
   {
     name: 'docs.append',
     page: 'docs',
+    effect: 'write',
     title: 'Append to document',
     description:
       'Add text to the END of a document, keeping what is already there. Use this for "add this to my X ' +
@@ -101,6 +103,7 @@ export const docsCapabilities: Capability[] = [
   {
     name: 'docs.set_content',
     page: 'docs',
+    effect: 'irreversible',
     title: 'Replace document text',
     description:
       'REPLACE a document\'s entire contents. Destructive — only when the user asks to rewrite or ' +
@@ -122,6 +125,7 @@ export const docsCapabilities: Capability[] = [
   {
     name: 'docs.rename',
     page: 'docs',
+    effect: 'write',
     title: 'Rename document',
     description: 'Change the title of a document.',
     params: [
@@ -142,6 +146,7 @@ export const docsCapabilities: Capability[] = [
   {
     name: 'docs.delete',
     page: 'docs',
+    effect: 'irreversible',
     title: 'Delete document',
     description: 'Delete a document and its contents permanently.',
     params: [

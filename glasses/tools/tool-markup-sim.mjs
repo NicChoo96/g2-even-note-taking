@@ -5,7 +5,7 @@
 //   Agents whose runs used all of their steps ended with machine syntax as their
 //   FINAL ANSWER on the glasses:
 //
-//     <|DSML|tool_calls> <|DSML|invoke name="tavily_search">
+//     <|DSML|tool_calls> <|DSML|invoke name="web_search">
 //     <|DSML|parameter name="query" string="true">top headlines</|DSML|parameter>
 //
 //   DeepSeek emits its native tool-call grammar as PLAIN TEXT when the model
@@ -59,9 +59,9 @@ const PCLOSE = DC('parameter'); // the value ends with `</|DSML| parameter>`
 /** Fixture: a full DSML call block, exactly as deepseek-flash printed it. */
 const DSML_BLOCK = [
   D('tool_calls'),
-  D('invoke name="tavily_search"'),
+  D('invoke name="web_search"'),
   D('parameter name="query" string="true"') + 'top headlines today' + PCLOSE,
-  D('invoke name="tavily_search"'),
+  D('invoke name="web_search"'),
   D('parameter name="query" string="true"') + 'latest breaking news' + PCLOSE,
   DC('invoke'),
   DC('tool_calls'),
@@ -82,7 +82,7 @@ const FIXTURES = [
   },
   {
     name: 'streamed/truncated DSML (no closing token)',
-    input: 'Searching now.\n' + D('tool_calls') + '\n' + D('invoke name="tavily_search"'),
+    input: 'Searching now.\n' + D('tool_calls') + '\n' + D('invoke name="web_search"'),
     want: 'Searching now.',
     markup: true,
   },
@@ -95,26 +95,26 @@ const FIXTURES = [
   {
     name: 'legacy ASCII <tool_call> block',
     input:
-      'I\'ll search for the latest headlines right now.\n\n<tool_call>\n{"name": "tavily_search", "arguments": {"query": "top news headlines today"}}\n</tool_call>',
+      'I\'ll search for the latest headlines right now.\n\n<tool_call>\n{"name": "web_search", "arguments": {"query": "top news headlines today"}}\n</tool_call>',
     want: "I'll search for the latest headlines right now.",
     markup: true,
   },
   {
     name: 'legacy ASCII-pipe DSML (<|tool▁calls▁begin|>)',
     input:
-      'Let me look that up.\n<|tool\u2581calls\u2581begin|>\n<|invoke name="tavily_search"|>\n<|parameter name="query"|>news<|parameter|>\n<|invoke|>\n<|tool\u2581calls\u2581end|>',
+      'Let me look that up.\n<|tool\u2581calls\u2581begin|>\n<|invoke name="web_search"|>\n<|parameter name="query"|>news<|parameter|>\n<|invoke|>\n<|tool\u2581calls\u2581end|>',
     want: 'Let me look that up.',
     markup: true,
   },
   {
     name: 'ASCII pipe wrapping the DSML word (<|DSML| tool_calls|>)',
-    input: 'One moment.\n<|DSML| tool_calls|>\n<|DSML| invoke name="tavily_search"|>',
+    input: 'One moment.\n<|DSML| tool_calls|>\n<|DSML| invoke name="web_search"|>',
     want: 'One moment.',
     markup: true,
   },
   {
     name: 'a bare call body whose tags were lost',
-    input: '{"name":"tavily_search","arguments":{"query":"news"}}',
+    input: '{"name":"web_search","arguments":{"query":"news"}}',
     want: '',
     markup: true,
   },

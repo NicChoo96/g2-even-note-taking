@@ -35,7 +35,7 @@ qr-prototype.png
 # Relay auth store (session tokens + approved devices) — NEVER commit
 .g2-hub-auth.json
 
-# Relay secret store (OpenRouter + Tavily keys) — NEVER commit
+# Relay secret store (LLM + web-search keys) — NEVER commit
 .g2-hub-secrets.json
 
 # Watchdog-sim test artifacts (generated/downloaded wav)
@@ -45,6 +45,9 @@ glasses/tools/*.wav
 __pycache__/
 *.pyc
 probe-result.txt
-tavily-probe.txt
+search-probe.txt
+
+# Sweep scratch (sim-all.mjs / harness redirect targets)
+.tmp-*
 
 .tmp-e2e/

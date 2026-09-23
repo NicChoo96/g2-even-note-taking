@@ -130,6 +130,10 @@ export interface MenuState {
  *      being routed through the agent. Keeping it last means the raw,
  *      no-undo path is the one you must reach for deliberately.
  *
+ * ONE EXCEPTION to 3 and 4: while a Jarvis conversation is open (a turn is in
+ * flight or the mic is armed between turns) the menu is the AI group ALONE —
+ * Stop AI · Undo AI? · Back? · Dictate. See `inConversation` below for why.
+ *
  * The menu is applied on the startup page and REPLACED wholesale on every
  * `rebuildPageContainer`, so call this with the current state whenever the
  * active section (or collection count) changes. Items sit between the system
@@ -153,7 +157,35 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
   if (state.aiUndo && !state.aiRunning) {
     items.push(new MenuItemProperty({ itemName: 'Undo AI', itemID: MENU.UNDO_AI }));
   }
-  if (state.section === 'docs') {
+  /**
+   * While a conversation is open the menu is the AI group ALONE.
+   *
+   * A conversation is modal by design: the HUD owns the tap and the mic re-arms
+   * without a menu trip. Listing the page's own actions next to a live
+   * transcript made the long-press two menus in one — "Delete Docs" sitting
+   * under a half-finished sentence is genuinely ambiguous about whether the
+   * wearer is talking to Jarvis or commanding the page. Removing them makes the
+   * long-press answer one question.
+   *
+   * This trims only things that are reachable another way, which is the rule
+   * that matters here (0.3.10: never trim a menu item that is the ONLY escape
+   * from a tab):
+   *   • Stop AI  → ends the conversation, and is always item 1.
+   *   • Back     → KEPT for the tabs that need it; on docs/agents the switchers
+   *                are hidden anyway, so this is still the way off.
+   *   • Double-tap → ends the conversation without opening the menu at all.
+   *   • Dictate  → never trimmed, so the raw page path stays one press away.
+   * What goes away is only this tab's own actions (New Docs, Trigger, the
+   * switchers), and those come straight back the moment the conversation ends.
+   */
+  const inConversation = Boolean(state.aiRunning || state.aiListening);
+  if (inConversation) {
+    // Back is the escape hatch from docs/agents, and the ONLY one on agents
+    // (its switchers are hidden), so it survives the trim on exactly those tabs.
+    if (state.section === 'docs' || state.section === 'agents') {
+      items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
+    }
+  } else if (state.section === 'docs') {
     // 3. Escape hatch first, then this tab's actions — Back returns to the last
     // non-special tab.
     items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));

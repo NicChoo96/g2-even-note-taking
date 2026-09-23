@@ -10,6 +10,7 @@
 // catalog entries and (via ai/undo) undo support. No other file changes.
 import {
   GLOBAL_PAGE,
+  effectOf,
   type Capability,
   type CapabilityResult,
   type PageDef,
@@ -17,6 +18,26 @@ import {
   type ParamSpec,
   type ToolSchema,
 } from './types';
+import { needsGate } from './ledger';
+
+/**
+ * The ONE place that decides whether an action pauses for a tap.
+ *
+ * Both the confirm gate and the model-visible tool description read it, because
+ * they must never disagree: a description that promises a confirmation the loop
+ * does not ask for (or vice versa) is how a model learns to attempt destructive
+ * things casually.
+ *
+ * The `||` is a safety net, not a behaviour change. `effectOf` derives
+ * `irreversible` from `confirm` when no `effect` is declared, so for every
+ * capability that existed before effect classes this is exactly
+ * `Boolean(cap.confirm)`. What it adds is that a capability declaring
+ * `effect: 'irreversible'` can no longer FORGET to set `confirm: true` — the
+ * gate follows from the classification instead of from remembering a flag.
+ */
+export function asksToConfirm(cap: Capability): boolean {
+  return Boolean(cap.confirm) || needsGate(effectOf(cap));
+}
 
 const pages = new Map<PageId, PageDef>();
 const caps = new Map<string, Capability>();
@@ -132,7 +153,7 @@ export function toToolSchema(cap: Capability): ToolSchema {
     function: {
       // Wire form: providers reject a dot in a function name.
       name: toWireName(cap.name),
-      description: cap.confirm ? `${cap.description} (asks the user to confirm)` : cap.description,
+      description: asksToConfirm(cap) ? `${cap.description} (asks the user to confirm)` : cap.description,
       parameters: { type: 'object', properties, required },
     },
   };
@@ -262,7 +283,7 @@ export function prepare(name: string, rawArgs: unknown, focused: PageId): Prepar
   if (!validated.ok) {
     return { kind: 'error', error: `invalid arguments for ${wire}: ${validated.error}` };
   }
-  return { kind: 'ready', prepared: { cap, args: validated.args }, needsConfirm: Boolean(cap.confirm) };
+  return { kind: 'ready', prepared: { cap, args: validated.args }, needsConfirm: asksToConfirm(cap) };
 }
 
 /** Run a prepared capability. Errors are returned, never thrown. */

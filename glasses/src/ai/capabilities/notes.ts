@@ -18,6 +18,7 @@ export const notesCapabilities: Capability[] = [
   {
     name: 'notes.append',
     page: 'notes',
+    effect: 'write',
     title: 'Add to notes',
     description:
       'Add a line to the end of the notes scratchpad, keeping existing notes. This is the right target for ' +
@@ -34,6 +35,7 @@ export const notesCapabilities: Capability[] = [
   {
     name: 'notes.set',
     page: 'notes',
+    effect: 'irreversible',
     title: 'Replace notes',
     description: 'REPLACE the entire notes scratchpad. Destructive — only when the user asks to rewrite them.',
     params: [{ name: 'text', type: 'string', description: 'The new full notes text.', required: true }],
@@ -47,6 +49,7 @@ export const notesCapabilities: Capability[] = [
   {
     name: 'notes.clear',
     page: 'notes',
+    effect: 'irreversible',
     title: 'Clear notes',
     description: 'Delete all notes.',
     params: [],

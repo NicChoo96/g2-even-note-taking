@@ -4,7 +4,7 @@ Usage: python tools/seed-agents-state.py [relay_url] [owner_token]
 
 Writes two channel snapshots (hub + agents) with:
   * To-Do active with 2 tasks (so the switcher menu shows the section list)
-  * 2 agents -- ag1 "Researcher" (tavily tool), ag2 "Summarizer" (no tools)
+  * 2 agents -- ag1 "Researcher" (web search tool), ag2 "Summarizer" (no tools)
   * 2 sessions on ag1, newest first
 """
 import json
@@ -39,7 +39,7 @@ AGENTS = {
             "name": "Researcher",
             "systemPrompt": "You are a concise research assistant. Use the available tools when you need current information, then answer briefly in plain text.",
             "prompt": "What is new in AI this week?",
-            "toolIds": ["tool-tavily"],
+            "toolIds": ["tool-web"],
             "createdAt": NOW,
         },
         {
@@ -53,9 +53,12 @@ AGENTS = {
     ],
     "tools": [
         {
-            "id": "tool-tavily",
-            "name": "tavily_search",
-            "kind": "tavily",
+            # One tool, two backends: the provider is chosen in Settings, not here.
+            # The legacy id/name/kind (`tool-tavily` / `tavily_search` / `tavily`)
+            # is still accepted and migrated on load.
+            "id": "tool-web",
+            "name": "web_search",
+            "kind": "web",
             "description": "Search the web for current information.",
             "searchDepth": "basic",
             "hasToken": False,

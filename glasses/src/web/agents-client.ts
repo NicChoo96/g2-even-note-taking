@@ -1,7 +1,7 @@
 // Browser-side helpers for the Agents feature.
 //
-// Every call goes through the relay (see web/server/local-sse.mjs) so the
-// OpenRouter and Tavily keys live server-side and the WebView never has to be
+// Every call goes through the relay (see web/server/local-sse.mjs) so the LLM
+// and web-search keys live server-side and the WebView never has to be
 // whitelisted for third-party origins. Auth is the same stream credential used
 // by the SSE channel.
 import { getStreamToken } from '../auth-token';
@@ -15,7 +15,18 @@ export interface AgentStatus {
   /** Active LLM backend: 'openrouter' (default) or 'deepseek'. */
   provider?: string;
   llm: boolean;
+  /**
+   * Whether the ACTIVE search provider is configured. Deprecated alias — new
+   * code reads `search`; kept so an older bundle keeps rendering correctly.
+   */
   tavily: boolean;
+  /** The web-search setting: which provider is live, and both key states. */
+  search?: {
+    provider?: 'tavily' | 'brave' | string;
+    configured?: boolean;
+    depth?: string;
+    keys?: { tavily?: boolean; brave?: boolean };
+  };
   /**
    * True when the relay holds an OpenRouter key, which is what jev needs.
    * Deliberately NOT the same as `llm`: the chat provider can be DeepSeek while
@@ -34,15 +45,28 @@ export interface AgentStatus {
       openrouterKey?: ValueSource;
       deepseekKey?: ValueSource;
     };
+    search?: {
+      provider?: ValueSource;
+      key?: ValueSource;
+      depth?: ValueSource;
+      tavilyKey?: ValueSource;
+      braveKey?: ValueSource;
+    };
+    /** Deprecated mirror of `search`, for the older bundle. */
     tavily?: { key?: ValueSource; depth?: ValueSource };
     jev?: { key?: ValueSource };
   };
 }
 
+export type SearchProvider = 'tavily' | 'brave';
+
 export interface SettingsPatch {
   openrouterKey?: string;
   deepseekKey?: string;
   tavilyKey?: string;
+  braveKey?: string;
+  /** Which web-search backend to use. '' means auto (whichever key is set). */
+  searchProvider?: SearchProvider | '';
   model?: string;
   referer?: string;
   title?: string;
@@ -109,7 +133,10 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   }
 }
 
-/** Are the LLM/Tavily keys configured, and what is the effective model? */
+/**
+ * Are the LLM and web-search keys configured, which search provider is live, and
+ * what is the effective model?
+ */
 export async function fetchAgentStatus(): Promise<AgentStatus | null> {
   try {
     const res = await fetch(`${API_BASE}/api/agent/status`, { headers: authHeaders() });
@@ -134,8 +161,9 @@ export function llmChat(args: {
   return post<LlmReply>('/api/llm', args);
 }
 
-/** Run one tool (Tavily search, or a generic REST call) through the relay. */
+/** Run one tool (web search, or a generic REST call) through the relay. */
 export function runTool(args: {
+  /** 'web' (legacy 'tavily' also accepted) or 'http'. */
   kind: string;
   toolId: string;
   url?: string;

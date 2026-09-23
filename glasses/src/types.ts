@@ -85,13 +85,27 @@ export function upsertDoc(
 // durable keys, and only compact summaries are rendered on the glasses.
 
 /**
- * Tool transports. Tavily is the seeded web-search tool, http is any REST API,
- * and jev is a typed-decision tool: instead of returning prose it answers a
- * yes/no, pick-one or rubric question and returns a calibrated probability.
- * jev has no per-tool config — it uses the relay's OpenRouter key.
+ * Tool transports. 'web' is the seeded web-search tool — the BACKEND (Tavily or
+ * Brave Search) is a relay setting, deliberately not a property of the tool, so
+ * the same tool swaps provider without being re-created. 'http' is any REST API,
+ * and 'jev' is a typed-decision tool: instead of returning prose it answers a
+ * yes/no, pick-one or rubric question and returns a calibrated probability. jev
+ * has no per-tool config — it uses the relay's OpenRouter key.
+ *
+ * 'tavily' is the LEGACY kind for the same tool. It is accepted on every read
+ * path (see normalizeTool) because persisted agents, bridge snapshots and an
+ * older client bundle can all still carry it, but nothing writes it any more.
  */
-export type ToolKind = 'tavily' | 'http' | 'jev';
-export type TavilyDepth = 'basic' | 'advanced';
+export type ToolKind = 'web' | 'http' | 'jev';
+/** Legacy spelling, read-only — kept so normalizing old state type-checks. */
+export type LegacyToolKind = 'tavily';
+export type WebDepth = 'basic' | 'advanced';
+
+/** The seeded web-search tool's id. A legacy install has 'tool-tavily'. */
+export const SEED_TOOL_ID = 'tool-web';
+const LEGACY_SEED_TOOL_ID = 'tool-tavily';
+/** The legacy model-facing name for the same tool. */
+const LEGACY_SEED_TOOL_NAME = 'tavily_search';
 
 export interface ToolDef {
   id: string;
@@ -105,8 +119,33 @@ export interface ToolDef {
   method?: 'GET' | 'POST';
   /** Secret is stored server-side (relay env / settings store) — never here. */
   hasToken?: boolean;
-  /** Tavily only — defaults to 'basic' as the user requested. */
-  searchDepth?: TavilyDepth;
+  /** Web search only — how much to read. Defaults to 'basic'. */
+  searchDepth?: WebDepth;
+}
+
+/**
+ * Map a stored tool onto the current vocabulary.
+ *
+ * Three renames are folded in one place so every ingress path agrees: the kind
+ * `tavily` → `web`, the id `tool-tavily` → `tool-web`, and the seeded tool's
+ * model-facing name `tavily_search` → `web_search`. The NAME is only rewritten
+ * for a tool that was actually of the legacy kind AND still had the seed name —
+ * a user who deliberately named a tool `tavily_search` keeps their label.
+ *
+ * Every field is optional on the way in because this runs against localStorage,
+ * a bridge snapshot and a relay frame, none of which are ours to trust.
+ */
+export function normalizeTool(t: ToolDef): ToolDef {
+  const legacy = (t as { kind?: string }).kind === 'tavily';
+  const kind: ToolKind = legacy ? 'web' : t.kind;
+  const id = t.id === LEGACY_SEED_TOOL_ID ? SEED_TOOL_ID : t.id;
+  const name = legacy && (!t.name || t.name === LEGACY_SEED_TOOL_NAME) ? 'web_search' : t.name;
+  return { ...t, id, kind, name };
+}
+
+/** Map a stored tool id onto the current vocabulary. */
+export function normalizeToolId(id: string): string {
+  return id === LEGACY_SEED_TOOL_ID ? SEED_TOOL_ID : id;
 }
 
 export interface LlmSettings {
@@ -183,12 +222,18 @@ export function emptyLlmSettings(): LlmSettings {
   return { provider: 'openrouter', model: DEFAULT_MODEL, hasKey: false };
 }
 
-/** The web-search tool every new install starts with (searchDepth 'basic'). */
-export function tavilyTool(): ToolDef {
+/**
+ * The web-search tool every new install starts with (searchDepth 'basic').
+ *
+ * Named for what it does, not for who serves it: the provider is a relay setting
+ * (Tavily or Brave Search) so the model's tool list does not change, the agent's
+ * `toolIds` do not change, and no agent is invalidated when the backend swaps.
+ */
+export function webSearchTool(): ToolDef {
   return {
-    id: 'tool-tavily',
-    name: 'tavily_search',
-    kind: 'tavily',
+    id: SEED_TOOL_ID,
+    name: 'web_search',
+    kind: 'web',
     description:
       'Search the web for current information. Use for facts, news, prices, or anything not in the prompt.',
     searchDepth: 'basic',
@@ -217,7 +262,7 @@ export function jevTool(): ToolDef {
 export function emptyAgentsState(): AgentsState {
   return {
     agents: [],
-    tools: [tavilyTool()],
+    tools: [webSearchTool()],
     llm: emptyLlmSettings(),
     sessions: [],
     updatedAt: Date.now(),
@@ -232,8 +277,8 @@ export function emptyAgent(name = 'New Agent'): AgentDef {
       'You are a concise research assistant. Use the available tools when you need ' +
       'current information, then answer briefly in plain text.',
     prompt: 'What is new in AI this week?',
-    // Web search is ON by default for every agent (the seeded Tavily tool).
-    toolIds: ['tool-tavily'],
+    // Web search is ON by default for every agent (the seeded web-search tool).
+    toolIds: [SEED_TOOL_ID],
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };

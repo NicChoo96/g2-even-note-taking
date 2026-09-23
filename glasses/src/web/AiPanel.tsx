@@ -18,7 +18,9 @@ import {
   aiFail,
   aiMaxSteps,
   aiModel,
+  asksToConfirm,
   capabilitiesForPage,
+  effectOf,
   getAi,
   GLOBAL_PAGE,
   hasUndo,
@@ -138,7 +140,10 @@ function ActionCatalog({ focused }: { focused: string }) {
               <code>{c.name}</code>
               <span className="ap-action-title">
                 {c.title}
-                {c.confirm ? <em className="ap-needs-confirm"> · asks first</em> : null}
+                {asksToConfirm(c) ? <em className="ap-needs-confirm"> · asks first</em> : null}
+                {effectOf(c) === 'irreversible' ? (
+                  <em className="ap-needs-confirm"> · not undoable</em>
+                ) : null}
               </span>
               <span className="ap-action-desc">{c.description}</span>
             </li>

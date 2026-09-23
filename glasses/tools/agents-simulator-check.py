@@ -274,7 +274,7 @@ check(
 )
 check(
     "detail pane shows the agent, its tool and session",
-    any("tavily_search" in m and "session 1/2" in m for m in reb),
+    any("web_search" in m and "session 1/2" in m for m in reb),
     (reb[-1][-140:] if reb else ""),
 )
 

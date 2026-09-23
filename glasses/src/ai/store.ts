@@ -6,6 +6,16 @@
 // plus the durable settings. Keeping them apart means the loop can be unit
 // tested in node without a renderer.
 import type { PageId } from './types';
+import {
+  ledgerAppend,
+  ledgerBegin,
+  ledgerResolve,
+  type EntryBy,
+  type EntryKind,
+  type EntryLocus,
+  type EntryStatus,
+  type Effect,
+} from './ledger';
 
 export type AiStatus = 'idle' | 'running' | 'confirm' | 'done' | 'error';
 
@@ -38,6 +48,33 @@ export interface AiStep {
   kind: AiStepKind;
   text: string;
   at: number;
+}
+
+/**
+ * Which ledger entry an HUD step corresponds to. The HUD's vocabulary is about
+ * PRESENTATION (a "focus" line is a routing change drawn with an arrow); the
+ * ledger's is about WHAT HAPPENED. Keeping them separate means the HUD can be
+ * redesigned without invalidating the audit trail.
+ */
+const LEDGER_KIND: Record<AiStepKind, EntryKind> = {
+  focus: 'route',
+  think: 'note',
+  call: 'call',
+  ok: 'result',
+  fail: 'error',
+  reply: 'reply',
+  note: 'note',
+};
+
+/** Optional classification a caller can attach to a step it knows more about. */
+export interface AiStepMeta {
+  /** How much damage the action can do — known by the caller, not the store. */
+  effect?: Effect;
+  locus?: EntryLocus;
+  status?: EntryStatus;
+  refs?: number[];
+  by?: EntryBy;
+  payload?: unknown;
 }
 
 export interface AiSettings {
@@ -143,6 +180,10 @@ let confirmResolver: ((ok: boolean) => void) | null = null;
  * cancelled run would repaint its HUD over whatever the user moved on to.
  */
 let cancelled = false;
+/** Disambiguates run ids created in the same millisecond. */
+let ledgerCounter = 0;
+/** The `seq` of the open gate entry, so its resolution can cite it. */
+let gateSeq: number | null = null;
 
 function loadSettings(): AiSettings {
   try {
@@ -230,6 +271,12 @@ export function setAiFocus(page: PageId): void {
 export function aiBegin(utterance: string, focus: PageId): void {
   confirmResolver = null;
   cancelled = false;
+  // A run id is minted here because this is the one place that always knows a
+  // run is starting. The ledger keys on it, which is what makes "everything
+  // that happened in that run" a filter rather than an inference.
+  const runId = `r${Date.now().toString(36)}${(ledgerCounter += 1).toString(36)}`;
+  ledgerBegin(runId);
+  ledgerAppend({ kind: 'ask', by: 'wearer', text: utterance, effect: 'pure', runId });
   set({
     status: 'running',
     focus,
@@ -251,8 +298,22 @@ export function aiSetTurn(turn: number): void {
   set({ turn });
 }
 
-export function aiStep(kind: AiStepKind, text: string): void {
+export function aiStep(kind: AiStepKind, text: string, meta?: AiStepMeta): void {
   if (cancelled) return;
+  // Recorded BEFORE the guard below so a bounded HUD list never silently
+  // becomes a bounded AUDIT list. The ledger has its own ceiling (400) that is
+  // deliberately an order of magnitude larger than the 60 the HUD keeps: the
+  // screen shows the last few lines, the record keeps the run.
+  ledgerAppend({
+    kind: LEDGER_KIND[kind],
+    by: meta?.by ?? 'jarvis',
+    text,
+    effect: meta?.effect ?? 'pure',
+    ...(meta?.status ? { status: meta.status } : {}),
+    ...(meta?.locus ? { locus: meta.locus } : {}),
+    ...(meta?.refs ? { refs: meta.refs } : {}),
+    ...(meta?.payload !== undefined ? { payload: meta.payload } : {}),
+  });
   const next = [...state.steps, { kind, text, at: Date.now() }];
   set({ steps: next.length > MAX_STEPS_KEPT ? next.slice(-MAX_STEPS_KEPT) : next });
 }
@@ -273,10 +334,22 @@ export function aiAskConfirm(title: string, lines: string[]): Promise<boolean> {
   if (confirmResolver) {
     const prev = confirmResolver;
     confirmResolver = null;
+    closeGate('declined', 'Superseded by a later prompt');
     prev(false);
   }
   return new Promise<boolean>((resolve) => {
     confirmResolver = resolve;
+    // A gate is TWO entries, not one mutable one: the question and the answer.
+    // The `pending` record is what a client that was offline can still find and
+    // act on, and the resolved record is what proves the gate was answered.
+    gateSeq = ledgerAppend({
+      kind: 'gate',
+      by: 'jarvis',
+      text: title,
+      effect: 'irreversible',
+      status: 'pending',
+      payload: { lines },
+    }).seq;
     set({ status: 'confirm', pending: { title, lines } });
   });
 }
@@ -291,6 +364,10 @@ export function aiAnswerConfirm(ok: boolean): boolean {
   const resolve = confirmResolver;
   confirmResolver = null;
   if (resolve) {
+    // Close the gate in the ledger with the wearer's actual answer. A declined
+    // gate is recorded too — "the model proposed this and it was refused" is
+    // exactly the evidence you want when tuning what the model proposes.
+    closeGate(ok ? 'ok' : 'declined');
     set({ pending: null, status: 'running' });
     resolve(ok);
     return true;
@@ -303,6 +380,15 @@ export function aiAnswerConfirm(ok: boolean): boolean {
 export function aiFinish(result: string): void {
   if (cancelled) return;
   confirmResolver = null;
+  ledgerAppend({
+    kind: 'result',
+    by: 'jarvis',
+    text: result || 'Done',
+    effect: 'pure',
+    status: 'ok',
+    payload: { turns: state.turn, maxSteps: state.maxSteps },
+  });
+  ledgerBegin('');
   set({ status: 'done', result, pending: null, mirrored: false });
 }
 
@@ -321,15 +407,31 @@ export function aiFlash(text: string): void {
 export function aiFail(error: string, result = ''): void {
   if (cancelled) return;
   confirmResolver = null;
+  closeGate('declined', 'Run failed');
+  ledgerAppend({ kind: 'error', by: 'jarvis', text: error || 'Run failed', effect: 'pure', status: 'failed' });
   set({ status: 'error', error, result, pending: null, mirrored: false });
+}
+
+/**
+ * Close the open gate entry, if any. Every path that abandons a prompt MUST go
+ * through here: a gate left `pending` forever is a proposal no client can ever
+ * answer, and it would also read as "the wearer never approved this" for the
+ * rest of the run — which is worse than no record at all.
+ */
+function closeGate(status: 'ok' | 'declined' | 'skipped', text?: string): void {
+  if (gateSeq === null) return;
+  ledgerResolve(gateSeq, status, text);
+  gateSeq = null;
 }
 
 export function aiReset(): void {
   if (confirmResolver) {
     const prev = confirmResolver;
     confirmResolver = null;
+    closeGate('skipped');
     prev(false);
   }
+  ledgerBegin('');
   set({ status: 'idle', steps: [], pending: null, result: '', error: '', utterance: '', turn: 0, mirrored: false });
 }
 
@@ -343,6 +445,12 @@ export function aiCancel(): void {
   const resolve = confirmResolver;
   confirmResolver = null;
   if (resolve) resolve(false);
+  // Recorded before `ledgerBegin('')`: an abandoned run is still a run, and
+  // "the wearer stopped it here" is the most useful datum in the whole trace
+  // when a conversation keeps going wrong at the same step.
+  closeGate('skipped', 'Run stopped');
+  ledgerAppend({ kind: 'note', by: 'wearer', text: 'Run stopped', effect: 'pure', status: 'skipped' });
+  ledgerBegin('');
   set({ status: 'idle', steps: [], pending: null, result: '', error: '', utterance: '', turn: 0, mirrored: false });
 }
 

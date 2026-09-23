@@ -7,7 +7,7 @@
 // Deliberately store-aware but not store-coupled: it drives ai/store (so the HUD
 // and the web panel can render) while keeping the loop itself a plain async
 // function that a node harness can drive with a stubbed LLM.
-import { GLOBAL_PAGE, type Capability, type CapabilityResult, type PageId, type ToolSchema } from './types';
+import { GLOBAL_PAGE, effectOf, type Capability, type CapabilityResult, type PageId, type ToolSchema } from './types';
 import { llmChat, type WireMessage, type LlmReply, type WireToolCall } from '../web/agents-client';
 import { appSnapshotText } from './context';
 import {
@@ -531,7 +531,7 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
         const copy = confirmCopy(cap, args);
         const approved = await aiAskConfirm(copy.title, copy.lines);
         if (!approved) {
-          aiStep('note', `Declined: ${cap.title}`);
+          aiStep('note', `Declined: ${cap.title}`, { effect: effectOf(cap) });
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -542,13 +542,24 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
         }
       }
 
-      aiStep('call', cap.title);
+      // The effect is declared by the capability, not guessed from whether it
+      // happened to be flagged destructive. That distinction is what lets an
+      // undoable write be recorded as a write instead of being lumped in with
+      // a deletion — and it is what `ungatedIrreversible()` audits.
+      const effect = effectOf(cap);
+      aiStep('call', cap.title, { effect });
       const result = await execute(outcome.prepared);
       // EXCEPT say__reply: its entire result IS the sentence, and that sentence
       // already gets the `= …` line below the transcript. Echoing it as a step
       // too would double it on the HUD, which is exactly what a chat cannot
       // afford — there it is the whole message rather than a footnote.
-      if (cap.name !== 'say.reply') aiStep(result.ok ? 'ok' : 'fail', result.summary);
+      if (cap.name !== 'say.reply') {
+        aiStep(result.ok ? 'ok' : 'fail', result.summary, {
+          effect,
+          status: result.ok ? 'ok' : 'failed',
+          locus: 'client',
+        });
+      }
 
       if (cap.name === 'nav.open_page') {
         // The routing line on the HUD.

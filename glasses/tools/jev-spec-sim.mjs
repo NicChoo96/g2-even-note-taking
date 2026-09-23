@@ -367,6 +367,23 @@ assert(
   /required: \['state', 'question', 'kind'\]/.test(relay),
 );
 
+// jev is a reranker as well as a tool. The relay DERIVES the ranking from the
+// answer it already has rather than spending a second call, and it advertises
+// the `rank` intent so a model can say what it is doing.
+assert('the relay derives a ranking from the jev answer', /rankAnswers\(built\.value, answers\)/.test(relay));
+assert('the relay renders that ranking into the tool result', /describeRanking/.test(relay));
+assert(
+  'the jev agent schema offers the rank intent',
+  /enum: \['noul', 'choice', 'score', 'rank'\]/.test(relay),
+);
+// Adding a capability would shrink the page budget and evict a page action (the
+// bug fixed in 0.3.28), so the reserve must still hold exactly one entry.
+const agentSrc = readFileSync(resolve('src', 'ai', 'agent.ts'), 'utf8');
+assert(
+  'the always-available reserve still holds exactly one tool',
+  /const ALWAYS_AVAILABLE = \['jev\.decide'\];/.test(agentSrc),
+);
+
 // ── 10. the Agents tool side (source invariants) ────────────────────────────
 //
 // jev has to appear in two places a new capability does not: the capability
@@ -382,7 +399,8 @@ const clientSrc = readFileSync(resolve('src', 'web', 'jev-client.ts'), 'utf8');
 const storeSrc = readFileSync(resolve('src', 'agents-store.ts'), 'utf8');
 const settingsSrc = readFileSync(resolve('src', 'web', 'SettingsPanel.tsx'), 'utf8');
 
-assert('ToolKind admits the jev kind', /'tavily' \| 'http' \| 'jev'/.test(typesSrc));
+assert('ToolKind admits the jev kind alongside web', /'web' \| 'http' \| 'jev'/.test(typesSrc));
+assert('ToolKind still admits the legacy tavily kind', /'tavily'/.test(typesSrc));
 assert('types.ts exports a jev tool seeder', /export function jevTool\(\): ToolDef/.test(typesSrc));
 assert('the panel can seed jev onto an agent', /addJevToAgent/.test(panelSrc));
 assert('the panel offers jev as a tool kind', /<option value="jev">/.test(panelSrc));
@@ -452,7 +470,7 @@ await build({
 // Side effect and helper come from different modules on purpose: pages.ts is the
 // file that REGISTERS the catalog, registry.ts is where the helpers live.
 import './ai/pages.ts';
-export { capabilityByName, listPages, toToolSchema, toWireName, callAction } from './ai/registry.ts';
+export { capabilityByName, allCapabilities, capabilitiesForPage, listPages, toToolSchema, toWireName, callAction } from './ai/registry.ts';
 export { selectTools } from './ai/agent.ts';
 export { emptyAgentsState, jevTool } from './types.ts';
 export { GLOBAL_PAGE } from './ai/types.ts';
@@ -479,11 +497,20 @@ assert('the wire name is legal for tool-calling APIs', /^[a-zA-Z0-9_-]+$/.test(w
 const schema = ui.toToolSchema(cap);
 check('the tool is a function', schema.type, 'function');
 check('the dotted name is translated for the wire', schema.function.name, 'jev__decide');
-check('both arguments are required', schema.function.parameters.required, ['state', 'questions']);
+check('the two structured arguments are required', schema.function.parameters.required, ['state', 'questions']);
 check(
-  'both arguments are strings (jev needs a JSON-encoded question set)',
-  Object.values(schema.function.parameters.properties).map((p) => p.type),
+  'both structured arguments are strings (jev needs a JSON-encoded question set)',
+  ['state', 'questions'].map((n) => schema.function.parameters.properties[n].type),
   ['string', 'string'],
+);
+// `rank` was added to this schema, so the shape is asserted explicitly rather
+// than by counting properties. It must be OFFERED and never REQUIRED: a caller
+// that omits it must get the pre-reranker behaviour byte for byte.
+check('the rank intent is offered as a boolean', schema.function.parameters.properties.rank?.type, 'boolean');
+assert('the rank intent is not required', !schema.function.parameters.required.includes('rank'));
+assert(
+  'the rank intent is described well enough for the model to decide',
+  (schema.function.parameters.properties.rank?.description ?? '').length > 40,
 );
 assert(
   'every jev argument is described well enough for the model to fill it',
@@ -594,7 +621,206 @@ const hugeState = await ask(JSON.stringify(Q_VALID));
 assert('a state within limits is not rejected for size', hugeState.ok === true);
 check('local validation spends no upstream call', networkCalls, 1);
 
+// `rank: true` re-leads the result with the leader. The default path above is
+// asserted unchanged, so this is additive by construction, not by claim.
+replyWith(200, { ok: true, answers: web.normalizeAnswers(Q_VALID, REAL_ANSWERS) });
+const ranked = await ui.callAction(
+  'jev.decide',
+  { state: STATE, questions: JSON.stringify(Q_VALID), rank: true },
+  ui.GLOBAL_PAGE,
+);
+assert('asking for a ranking succeeds', ranked.ok === true, ranked.summary);
+assert('the ranked headline is the leader, not the first question', /billing/.test(ranked.summary), ranked.summary);
+assert('the ranked headline still fits the cap', ranked.summary.length <= 48, String(ranked.summary.length));
+assert('the raw answers are still there when ranking', ranked.data?.answers?.department?.choice === 'billing');
+assert('the ranking is kept for the model to branch on', ranked.data?.ranking?.department?.top === 'billing');
+assert(
+  'the hint spells out the whole order',
+  /billing 0\.88 > technical 0\.12 > sales 0/.test(ranked.hint ?? ''),
+  ranked.hint,
+);
+
+// A near-tie must not reach the glasses as a decision either.
+const TIE_Q = { pick: { type: 'choice', instructions: 'Which?', criteria: { a: 'A', b: 'B' } } };
+replyWith(200, {
+  ok: true,
+  answers: web.normalizeAnswers(TIE_Q, {
+    pick: { type: 'choice', choice: 'a', probabilities: { a: 0.52, b: 0.48 } },
+  }),
+});
+const tied = await ui.callAction(
+  'jev.decide',
+  { state: STATE, questions: JSON.stringify(TIE_Q), rank: true },
+  ui.GLOBAL_PAGE,
+);
+assert('an unresolved ranking is marked on the glasses line', /^\? /.test(tied.summary), tied.summary);
+assert('an unresolved ranking names no winner in data', tied.data?.ranking?.pick?.top === null);
+assert('an unresolved ranking says why', /within/.test(tied.hint ?? ''), tied.hint);
+
 globalThis.fetch = realFetch;
+
+// ── 13. jev as a RERANKER ──────────────────────────────────────────────────
+//
+// A `choice` answer already carries the whole distribution and a confidence, so
+// jev has always been a reranker that nobody read as one. This section pins the
+// READER: it turns a distribution into an order, and — more importantly — it
+// refuses to invent one when the evidence does not separate the candidates.
+//
+// It is the same underlying call. "Tool" and "reranker" are two ways of reading
+// one answer, not two features.
+
+console.log('\n── 13. jev as a reranker ──');
+
+const normalized = web.normalizeAnswers(Q_VALID, REAL_ANSWERS);
+const webRank = web.rankAnswers(Q_VALID, normalized);
+const serverRank = server.rankAnswers(Q_VALID, server.normalizeAnswers(Q_VALID, REAL_ANSWERS));
+
+check('both implementations rank identically', webRank, serverRank);
+check(
+  'both implementations render the ranking identically',
+  Object.values(webRank).map(web.describeRanking),
+  Object.values(serverRank).map(server.describeRanking),
+);
+
+// The REAL distribution is {technical 0.12, billing 0.88, sales 0}. The declared
+// order is billing, technical, sales — so a reader that merely echoed the spec
+// would still look right on the headline. The full order is what proves it
+// actually sorted.
+check('the REAL distribution is ordered by probability', webRank.department.ranked, [
+  { label: 'billing', p: 0.88, rank: 1 },
+  { label: 'technical', p: 0.12, rank: 2 },
+  { label: 'sales', p: 0, rank: 3 },
+]);
+check('a separated leader is named as the answer', webRank.department.top, 'billing');
+check('a separated leader is not flagged unresolved', webRank.department.unresolved, false);
+check('the margin that separated it is carried through', webRank.department.confidence, 0.81);
+check('there is nothing to explain when the order held', webRank.department.reason, null);
+check(
+  'the rubric is ranked too, with index-keyed probabilities remapped',
+  webRank.frustration.ranked,
+  [
+    { label: 'Frustrated', p: 0.95, rank: 1 },
+    { label: 'Very angry', p: 0.05, rank: 2 },
+    { label: 'Calm', p: 0, rank: 3 },
+  ],
+);
+check(
+  'a yes/no answer is not ranked: it is a value, not an order',
+  Object.keys(webRank),
+  ['department', 'frustration'],
+);
+check(
+  'the rendered ranking reads as an order, winner first',
+  web.describeRanking(webRank.department),
+  'department: billing 0.88 > technical 0.12 > sales 0',
+);
+assert(
+  'a rendered ranking is ASCII-only (glasses font is emoji-free)',
+  [...Object.values(webRank).map(web.describeRanking).join('\n')].every((c) => c.codePointAt(0) < 128),
+);
+
+// A near-tie is a coin toss. Naming a winner here would be exactly the
+// confident-but-wrong answer the whole module exists to prevent.
+const tieOf = (probabilities, choice = 'a') =>
+  web.rankAnswers(TIE_Q, { pick: { type: 'choice', choice, probabilities } }).pick;
+
+const tie = tieOf({ a: 0.52, b: 0.48 });
+check('a near-tie names no winner', tie.top, null);
+check('a near-tie is flagged unresolved', tie.unresolved, true);
+assert('a near-tie explains itself', /within/.test(tie.reason ?? ''), String(tie.reason));
+check('a near-tie still exposes the raw leader for a caller that wants it', tie.ranked[0].label, 'a');
+
+check('exactly one margin apart IS separated', tieOf({ a: 0.6, b: 0.4 }).top, 'a');
+check('exactly one margin apart is not flagged', tieOf({ a: 0.6, b: 0.4 }).unresolved, false);
+check('a dead heat keeps declaration order', tieOf({ a: 0.5, b: 0.5 }).ranked.map((r) => r.label), ['a', 'b']);
+check('a dead heat names no winner', tieOf({ a: 0.5, b: 0.5 }).top, null);
+
+// `confidence: null` means "no gate available", never "high confidence".
+check('a missing confidence is null, not a stand-in for certainty', tieOf({ a: 0.9, b: 0.1 }).confidence, null);
+check('a missing confidence does not block a clearly separated order', tieOf({ a: 0.9, b: 0.1 }).top, 'a');
+
+// No distribution at all: the model did pick, so the claim leads, but the order
+// around it is the declared order and the result says so rather than dressing it
+// up as a ranking.
+const bare = web.rankAnswers(Q_VALID, web.normalizeAnswers(Q_VALID, { department: { type: 'choice', choice: 'billing' } })).department;
+check('a pick with no distribution claims no ranking', bare.top, null);
+check('a pick with no distribution is unresolved', bare.unresolved, true);
+check('the claimed option leads the fallback order', bare.ranked.map((r) => r.label), ['billing', 'technical', 'sales']);
+check('no probability is invented to fill the gap', bare.ranked.map((r) => r.p), [null, null, null]);
+check(
+  'an unsupported order is labelled as such on the wire',
+  web.describeRanking(bare),
+  'department: billing > technical > sales (unresolved: no probabilities were returned, so the order is the declared order)',
+);
+
+// Unreadable: the producer's own order, never an invention.
+const junkRank = web.rankAnswers(Q_VALID, web.normalizeAnswers(Q_VALID, { department: 'junk' })).department;
+check('an unreadable answer ranks nothing', junkRank.top, null);
+check('an unreadable answer falls back to declaration order', junkRank.ranked.map((r) => r.label), ['billing', 'technical', 'sales']);
+assert('an unreadable answer says why', /no readable answer/.test(junkRank.reason ?? ''), String(junkRank.reason));
+
+// A distribution that does not cover a candidate cannot compare it, so a
+// missing value must never be read as "low" and lose the leader its place.
+const partial = tieOf({ a: 0.9 });
+check('a partial distribution names no winner from a missing value', partial.top, null);
+check('a partial distribution is unresolved', partial.unresolved, true);
+assert('a partial distribution explains itself', /does not cover/.test(partial.reason ?? ''), String(partial.reason));
+
+// The honesty paths are the ones most likely to drift between the two copies.
+for (const [label, q, a] of [
+  ['the REAL body', Q_VALID, normalized],
+  ['a near-tie', TIE_Q, { pick: { type: 'choice', choice: 'a', probabilities: { a: 0.52, b: 0.48 } } }],
+  ['a dead beat', TIE_Q, { pick: { type: 'choice', choice: 'a', probabilities: { a: 0.5, b: 0.5 } } }],
+  ['a bare pick', Q_VALID, web.normalizeAnswers(Q_VALID, { department: { type: 'choice', choice: 'billing' } })],
+  ['junk', Q_VALID, web.normalizeAnswers(Q_VALID, { department: 'junk' })],
+  ['a partial distribution', TIE_Q, { pick: { type: 'choice', choice: 'a', probabilities: { a: 0.9 } } }],
+]) {
+  check(`lockstep on ${label}`, web.rankAnswers(q, a), server.rankAnswers(q, a));
+}
+
+// `rank` is a shape ALIAS, not a fourth question type: it must build exactly the
+// spec `choice` builds, so a model that says "rank" and a model that says
+// "choice" ask the provider the same question.
+{
+  const mk = (kind) => ({ kind, question: 'Which result is most relevant?', options: 'hit_1|hit_2|hit_3' });
+  const asRank = web.specFromToolArgs(mk('rank'));
+  const asChoice = web.specFromToolArgs(mk('choice'));
+  check('kind "rank" is accepted', asRank.ok, true);
+  check('kind "rank" builds exactly the choice spec', asRank, asChoice);
+  check('lockstep: the server builds the same rank spec', server.specFromToolArgs(mk('rank')), asRank);
+  check(
+    'the built question is a choice over the given shortlist',
+    Object.keys(asRank.value.answer.criteria),
+    ['hit_1', 'hit_2', 'hit_3'],
+  );
+  check('kind "rank" needs options, exactly as choice does', web.specFromToolArgs({ kind: 'rank', question: 'x' }).ok, false);
+  check(
+    'an unknown kind still names every legal one',
+    web.specFromToolArgs({ kind: 'likert', question: 'x' }).error,
+    'kind must be one of: noul, choice, score, rank',
+  );
+}
+
+// The capability must expose the reader, and must NOT have grown the catalog:
+// extra global capabilities eat the per-page tool budget (see 0.3.28).
+assert('the jev capability offers an optional rank switch to Jarvis', /name: 'rank',\s*\n\s*type: 'boolean'/.test(capSrc));
+assert('the capability derives a ranking from the decision', /rankAnswers\(parsed\.value, reply\.answers\)/.test(capSrc));
+check(
+  'the reranker added no capability — the global count is unchanged',
+  ui.allCapabilities().filter((c) => c.page === ui.GLOBAL_PAGE).length,
+  8,
+);
+
+// The invariant behind the 0.3.28 bug, stated as a test rather than a comment:
+// the reserve is taken out BEFORE page actions, so every page must still be
+// handed all of its own actions, and the list must still fit MAX_TOOLS.
+for (const pid of ui.listPages().map((p) => p.id)) {
+  const handed = ui.selectTools(pid).map((s) => s.function.name);
+  const own = ui.capabilitiesForPage(pid).map((c) => ui.toWireName(c.name));
+  const missing = own.filter((n) => !handed.includes(n));
+  assert(`no page loses its own action to the reserve on '${pid}'`, missing.length === 0, missing.join(', '));
+  assert(`the tool list stays within the cap on '${pid}'`, handed.length <= 12, String(handed.length));
+}
 
 console.log(fail ? `\n${fail} FAILURE(S) of ${total}` : `\nALL PASS (${total} assertions)`);
 process.exit(fail ? 1 : 0);

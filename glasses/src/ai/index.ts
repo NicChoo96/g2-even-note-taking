@@ -10,6 +10,7 @@ export { aiModel, aiMaxSteps, updateAiSettings, type AiSettings } from './store'
 export { appSnapshotText, openDocText } from './context';
 export {
   allCapabilities,
+  asksToConfirm,
   canonicalName,
   capabilitiesForPage,
   fromWireName,
@@ -94,4 +95,41 @@ export {
   type MemoryTurn,
   type MemoryView,
 } from './memory';
-export { GLOBAL_PAGE, type Capability, type PageId } from './types';
+export { GLOBAL_PAGE, effectOf, type Capability, type PageId } from './types';
+/**
+ * The run ledger. Public for the same reason the monitor queue and memory are:
+ * it is a record the user is entitled to READ. The write side (`ledgerAppend`)
+ * is intentionally reachable too, because the agent loop records through
+ * literal imports rather than this barrel, and any future recorder needs the
+ * same door — but nothing in the UI may treat it as authoritative state.
+ */
+export {
+  atLeast,
+  deltaBlock,
+  EFFECT_ORDER,
+  isGated,
+  ledgerAppend,
+  ledgerBegin,
+  ledgerDeltas,
+  ledgerEntries,
+  ledgerLast,
+  ledgerMaterial,
+  ledgerResolve,
+  ledgerRun,
+  ledgerRunId,
+  ledgerSize,
+  ledgerSnapshot,
+  ledgerTrace,
+  needsGate,
+  pendingEntries,
+  resetLedger,
+  subscribeLedger,
+  ungatedIrreversible,
+  type Effect,
+  type Entry,
+  type EntryBy,
+  type EntryInput,
+  type EntryKind,
+  type EntryLocus,
+  type EntryStatus,
+} from './ledger';

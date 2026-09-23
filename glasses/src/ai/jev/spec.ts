@@ -47,6 +47,15 @@
 export const QUESTION_TYPES = ['noul', 'choice', 'score'] as const;
 export type JevMode = (typeof QUESTION_TYPES)[number];
 
+/**
+ * The types a TOOL CALL may name. `rank` is NOT an upstream question type — it
+ * is a `choice` the caller intends to read as an ORDER, so that a model which
+ * wants a ranking can say so instead of having to know that a full distribution
+ * is how you ask for one. It validates to the same spec as `choice`.
+ */
+export const TOOL_KINDS = [...QUESTION_TYPES, 'rank'] as const;
+export type JevToolKind = (typeof TOOL_KINDS)[number];
+
 /** Hard bounds. Everything here exists to keep one request small and honest. */
 export const LIMITS = {
   /** Serialised `state` size. Long input is the model's problem, not a feature. */
@@ -62,6 +71,16 @@ export const LIMITS = {
   /** Below two options there is no decision to make. */
   MIN_CRITERIA_COUNT: 2,
 } as const;
+
+/**
+ * How far ahead the leader must be before `top` names it.
+ *
+ * Under this gap the "winner" is a coin toss dressed up as a probability, and
+ * reporting one would be exactly the confident-but-wrong answer this module
+ * exists to prevent. A caller that genuinely wants the raw leader reads
+ * `ranked[0]` and accepts that risk knowingly.
+ */
+export const RANK_MARGIN = 0.1;
 
 /**
  * Question names become JSON keys AND are how the caller reads answers back, so
@@ -607,6 +626,179 @@ export function describeAnswers(answers: JevAnswers): string {
   return lines.join('\n');
 }
 
+// ── Ranking ─────────────────────────────────────────────────────────────────
+// jev as a RERANKER.
+//
+// A `choice` answer already carries the whole distribution and a confidence, so
+// jev has always been a reranker that nobody read as one. What was missing was
+// the reader: nothing turned a distribution into an order, or decided whether
+// the leader was separated enough to act on. Every prospective caller — routing
+// to a page, picking which agent or which context to use, trusting a search
+// result — would have re-derived that, and re-derived it differently.
+//
+// The rules below are jev's own doctrine applied to ranking: never a default,
+// never a prior. When the evidence does not separate the candidates we say so
+// and hand back the declared order rather than inventing a winner.
+//
+// Cost note that makes this cheap: for a `choice` question the CANDIDATES ARE
+// the criteria, so a rerank spends almost no `state` budget — the task goes in,
+// the shortlist goes in the criteria, and MAX_STATE_CHARS is not the constraint.
+
+/** One candidate in a ranking. */
+export interface JevRanked {
+  label: string;
+  /** null when the distribution did not cover this label. */
+  p: number | null;
+  /** 1-based, matching the declaration order when probabilities tie. */
+  rank: number;
+}
+
+/**
+ * An ordered shortlist plus the evidence for trusting it.
+ *
+ * `top` is null whenever `unresolved` is true — the field means "act on this",
+ * not "the leader". `ranked[0]` is always the raw leader, so a caller that wants
+ * it anyway can take it explicitly rather than by accident.
+ */
+export interface JevRanking {
+  name: string;
+  ranked: JevRanked[];
+  top: string | null;
+  confidence: number | null;
+  unresolved: boolean;
+  reason: string | null;
+}
+
+/** The labels a question declares, in declaration order. */
+function declaredLabels(spec: JevQuestion): string[] {
+  if (spec.type === 'score') return [...spec.criteria];
+  return Object.keys(spec.criteria as Record<string, string>);
+}
+
+/**
+ * Every label, in declaration order, with no probabilities — the honest
+ * fallback. `first` (the label the answer itself claimed, when it did) is moved
+ * to the front so `ranked[0]` is the claim, but `top` stays null and
+ * `unresolved` stays true: an order we cannot support is not a ranking, it is
+ * just the order the options happened to be written in.
+ */
+function declaredOrder(
+  name: string,
+  spec: JevQuestion,
+  reason: string,
+  confidence: number | null,
+  first: string | null,
+): JevRanking {
+  const labels = declaredLabels(spec);
+  const order =
+    first && labels.includes(first) ? [first, ...labels.filter((l) => l !== first)] : labels;
+  return {
+    name,
+    ranked: order.map((label, i) => ({ label, p: null, rank: i + 1 })),
+    top: null,
+    confidence,
+    unresolved: true,
+    reason,
+  };
+}
+
+/**
+ * Turn ONE choice/score answer into an actionable order.
+ *
+ * `top` is null whenever the order is not trustworthy, so a caller cannot act on
+ * a leader by accident: it either checks `unresolved`, or reads `ranked[0]` and
+ * accepts the risk. Ties keep declaration order (the sort is stable), so the
+ * same answer always produces the same ranking.
+ */
+export function rankQuestion(
+  name: string,
+  spec: JevQuestion,
+  answer: JevAnswer | undefined,
+): JevRanking {
+  if (!answer || answer.ok === false) {
+    return declaredOrder(name, spec, 'no readable answer', null, null);
+  }
+  if (answer.type === 'noul') {
+    // Unreachable through rankAnswers, but a yes/no answer has no candidates to
+    // order and pretending otherwise would invent a comparison.
+    return declaredOrder(
+      name,
+      spec,
+      'a yes/no answer is a value, not an order',
+      answer.confidence ?? null,
+      null,
+    );
+  }
+
+  const confidence = answer.confidence ?? null;
+  if (!answer.probabilities) {
+    const claimed = answer.type === 'score' ? answer.label : answer.choice;
+    return declaredOrder(
+      name,
+      spec,
+      'no probabilities were returned, so the order is the declared order',
+      confidence,
+      claimed,
+    );
+  }
+
+  const dist = answer.probabilities;
+  const ranked = declaredLabels(spec)
+    .map((label) => ({ label, p: typeof dist[label] === 'number' ? dist[label] : null }))
+    .sort((a, b) => (b.p ?? -1) - (a.p ?? -1))
+    .map((x, i) => ({ ...x, rank: i + 1 }));
+
+  const first = ranked[0] ?? null;
+  const second = ranked[1] ?? null;
+  // A null probability means the distribution did not cover that label, so we
+  // have no basis to compare the two. Only two real numbers can separate them.
+  const gap =
+    typeof first?.p === 'number' && typeof second?.p === 'number' ? first.p - second.p : null;
+  const unresolved = gap === null || gap < RANK_MARGIN;
+
+  return {
+    name,
+    ranked,
+    top: unresolved ? null : first.label,
+    confidence,
+    unresolved,
+    reason: !unresolved
+      ? null
+      : gap === null
+        ? 'the distribution does not cover every candidate, so the order is not comparable'
+        : `the top two are within ${RANK_MARGIN}`,
+  };
+}
+
+/**
+ * Rank every choice/score question in a set, keyed by question name and in
+ * DECLARATION order. `noul` is excluded on purpose: a yes/no answer is a value,
+ * not an order, and a two-item ranking built from it would imply a comparison
+ * nobody asked for.
+ */
+export function rankAnswers(
+  questions: JevQuestions,
+  answers: JevAnswers,
+): Record<string, JevRanking> {
+  const out: Record<string, JevRanking> = {};
+  for (const [name, spec] of Object.entries(questions ?? {})) {
+    if (!spec || spec.type === 'noul') continue;
+    out[name] = rankQuestion(name, spec, answers?.[name]);
+  }
+  return out;
+}
+
+/**
+ * One line for a model or a log: order first, winner first, reason attached when
+ * the order could not be trusted. ASCII only — it lands in a HUD-bound stream.
+ */
+export function describeRanking(r: JevRanking | undefined): string {
+  if (!r) return '';
+  const body = r.ranked.map((x) => (x.p === null ? x.label : `${x.label} ${r2(x.p)}`)).join(' > ');
+  if (!body) return `${r.name}: (no candidates)`;
+  return r.unresolved ? `${r.name}: ${body} (unresolved: ${r.reason})` : `${r.name}: ${body}`;
+}
+
 /**
  * Build a question spec from the flat shape a TOOL CALL can express.
  *
@@ -621,8 +813,8 @@ export function specFromToolArgs(args: {
   options?: unknown;
 }): JevResult<JevQuestions> {
   const kind = String(args?.kind ?? '').trim();
-  if (!(QUESTION_TYPES as readonly string[]).includes(kind)) {
-    return fail(`kind must be one of: ${QUESTION_TYPES.join(', ')}`, 'kind');
+  if (!(TOOL_KINDS as readonly string[]).includes(kind)) {
+    return fail(`kind must be one of: ${TOOL_KINDS.join(', ')}`, 'kind');
   }
   const instructions = String(args?.question ?? '').trim();
   const list = (
@@ -649,7 +841,7 @@ export function specFromToolArgs(args: {
       'options',
     );
   }
-  if (kind === 'choice') {
+  if (kind === 'choice' || kind === 'rank') {
     return validateQuestions({
       answer: {
         type: 'choice',

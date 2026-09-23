@@ -33,7 +33,15 @@ export const settingsCapabilities: Capability[] = [
     run: async () => {
       const st = await fetchAgentStatus();
       if (!st) return { ok: false, summary: 'Could not reach the settings service' };
-      const missing = [!st.llm && 'LLM key', !st.tavily && 'search key'].filter(Boolean);
+      const search = st.search;
+      // Older relays report only the flat `tavily` boolean; treat it as "the
+      // active search provider is configured" rather than claiming a Tavily key.
+      const searchConfigured = search?.configured ?? st.tavily;
+      const searchLabel = search?.provider === 'brave' ? 'Brave Search' : 'Tavily';
+      const missing = [
+        !st.llm && 'LLM key',
+        !searchConfigured && `${searchLabel} key`,
+      ].filter(Boolean);
       return {
         ok: true,
         summary: st.llm ? `${st.provider} / ${st.model}` : 'No LLM key configured',
@@ -41,6 +49,8 @@ export const settingsCapabilities: Capability[] = [
           provider: st.provider,
           model: st.model,
           llm: st.llm,
+          search: search?.provider ?? 'tavily',
+          searchConfigured,
           tavily: st.tavily,
           missing,
           source: st.source,

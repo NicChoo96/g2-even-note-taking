@@ -20,7 +20,7 @@
 //   This capability NEVER returns a default, a prior, or a "probably" — a
 //   fabricated probability is worse than no answer, because the model downstream
 //   cannot tell it apart from a real one.
-import { describeAnswers, parseQuestions, buildRequest } from '../jev/spec';
+import { describeAnswers, describeRanking, parseQuestions, rankAnswers, buildRequest } from '../jev/spec';
 import { jevDecide } from '../../web/jev-client';
 import { GLOBAL_PAGE, type Capability } from '../types';
 import { short } from './shared';
@@ -29,12 +29,15 @@ export const jevCapabilities: Capability[] = [
   {
     name: 'jev.decide',
     page: GLOBAL_PAGE,
+    effect: 'pure',
     title: 'Ask jev',
     description:
       'Make a STRUCTURED decision about a piece of text instead of asking for prose. Ask a yes/no ' +
       'question (a probability comes back), a pick-one question (a label from options you define), or ' +
       'an ordered-rubric question (a position on a scale). Use it for routing ("which page/tool should ' +
       'handle this"), ranking, or verifying that a condition holds — then act on the answer. ' +
+      'A choice or score answer also comes back RANKED, with the candidates ordered by probability, ' +
+      'so you can use it to choose between options rather than only to confirm one. ' +
       'Put the REAL text in `state`; jev only judges what you send it.',
     params: [
       {
@@ -55,6 +58,14 @@ export const jevCapabilities: Capability[] = [
           '{"type":"choice","instructions":"Which team?","criteria":{"billing":"...","technical":"..."}} ' +
           '(2-12 options), or {"type":"score","instructions":"How angry?","criteria":["Calm","Angry"]} ' +
           '(an ORDERED array, low to high, 2-12 steps).',
+      },
+      {
+        name: 'rank',
+        type: 'boolean',
+        description:
+          'Set true when you are CHOOSING BETWEEN candidates and want them ordered by likelihood ' +
+          'instead of only a single winner. It changes which half of the result leads; the raw ' +
+          'answers and the ordering come back either way.',
       },
     ],
     run: async (args) => {
@@ -98,18 +109,35 @@ export const jevCapabilities: Capability[] = [
 
       const text = describeAnswers(reply.answers);
       const lines = text.split('\n');
+      // jev is a RERANKER as well as a decision tool: every choice/score answer
+      // already carries the whole distribution, so the order is derived here for
+      // free rather than costing a second call. `rank: true` only changes which
+      // half of the result leads — the raw answers and the ordering are always in
+      // `data`, so omitting the flag loses nothing.
+      const rankings = rankAnswers(parsed.value, reply.answers);
+      const names = Object.keys(rankings);
+      const wantsRank = args.rank === true || String(args.rank ?? '').trim().toLowerCase() === 'true';
+      const first = wantsRank && names.length ? rankings[names[0]] : undefined;
+      const headline = first?.ranked[0]?.label ?? '';
+      const led = first && headline ? short(`${first.unresolved ? '? ' : ''}${headline}`, 48) : '';
       return {
         ok: true,
-        // ONE line on the glasses: the first answer is the headline. The rest,
-        // with full probabilities, is in `data` for the model.
-        summary: short(lines[0] ?? '', 48),
+        // ONE line on the glasses: the first answer is the headline, or — when
+        // the caller asked for a ranking — the leader, prefixed with `?` when
+        // the order was not separable and so is not safe to act on.
+        summary: led || short(lines[0] ?? '', 48),
         data: {
           text,
           answers: reply.answers,
+          ...(names.length ? { ranking: rankings } : {}),
           ...(reply.model ? { model: reply.model } : {}),
           ...(reply.usage ? { usage: reply.usage } : {}),
         },
-        hint: lines.length > 1 ? 'every answer, with probabilities, is in data.text' : undefined,
+        hint: first
+          ? `${describeRanking(first)}${lines.length > 1 ? ' — every answer is in data.text' : ''}`
+          : lines.length > 1
+            ? 'every answer, with probabilities, is in data.text'
+            : undefined,
       };
     },
   },

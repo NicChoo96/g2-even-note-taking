@@ -12,8 +12,10 @@ import { publishAgents } from './stream';
 import { loadAgentsDurable, loadSessionsDurable, saveAgentsDurable, saveSessionsDurable } from './durable-agents';
 import {
   emptyAgentsState,
+  normalizeTool,
+  normalizeToolId,
   pruneSessions,
-  tavilyTool,
+  webSearchTool,
   uid,
   type AgentDef,
   type AgentMessage,
@@ -53,10 +55,12 @@ function loadLocal(): AgentsState {
       ? parsed.agents.filter((a) => a && typeof a.id === 'string').map(normalizeAgent)
       : [];
     let tools: ToolDef[] = Array.isArray(parsed.tools)
-      ? parsed.tools.filter((t) => t && typeof t.id === 'string')
+      ? parsed.tools.filter((t) => t && typeof t.id === 'string').map(normalizeTool)
       : [];
-    // Always keep the seeded Tavily tool available.
-    if (!tools.some((t) => t.kind === 'tavily')) tools = [tavilyTool(), ...tools];
+    // Always keep the seeded web-search tool available. (Its kind used to be
+    // 'tavily'; normalizeTool above rewrites that on the way in, so this check
+    // catches a legacy snapshot too.)
+    if (!tools.some((t) => t.kind === 'web')) tools = [webSearchTool(), ...tools];
     const llm: LlmSettings = { ...base.llm, ...(parsed.llm ?? {}) };
     const sessions: AgentSession[] = Array.isArray(parsed.sessions)
       ? parsed.sessions.filter((s) => s && typeof s.id === 'string')
@@ -94,6 +98,11 @@ function normalizeAgent(a: AgentDef): AgentDef {
     // Legacy agents predate `updatedAt`; fall back to their creation stamp so
     // the newest-first ordering still has a key to sort on.
     updatedAt: typeof a.updatedAt === 'number' ? a.updatedAt : a.createdAt,
+    // The seeded web-search tool was 'tool-tavily'. Rewriting the id HERE — not
+    // just on the tool — is what keeps the pair consistent: a migrated tool with
+    // an un-migrated reference would leave the agent with no working tools,
+    // silently, which is far worse than the rename itself.
+    toolIds: (Array.isArray(a.toolIds) ? a.toolIds : []).map(normalizeToolId),
   };
 }
 
@@ -137,7 +146,7 @@ export function applyRemoteAgents(next: AgentsState): void {
   const base = emptyAgentsState();
   state = {
     agents: next.agents.map(normalizeAgent),
-    tools: next.tools?.length ? next.tools : base.tools,
+    tools: next.tools?.length ? next.tools.map(normalizeTool) : base.tools,
     llm: { ...base.llm, ...(next.llm ?? {}) },
     sessions: pruneSessions(next.sessions ?? []),
     updatedAt: next.updatedAt ?? Date.now(),
@@ -200,7 +209,7 @@ export async function hydrateAgentsDurable(): Promise<void> {
     // Normalize: a durable snapshot written before 0.3.5 has no `prompt`, and
     // the glasses menu calls `.trim()` on it.
     agents: saved?.agents ? saved.agents.map(normalizeAgent) : state.agents,
-    tools: saved?.tools?.length ? saved.tools : state.tools,
+    tools: saved?.tools?.length ? saved.tools.map(normalizeTool) : state.tools,
     llm: { ...state.llm, ...(saved?.llm ?? {}) },
     sessions: pruneSessions(sessions ?? state.sessions),
     updatedAt: Date.now(),

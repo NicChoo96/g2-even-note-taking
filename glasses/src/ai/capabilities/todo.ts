@@ -29,6 +29,7 @@ export const todoCapabilities: Capability[] = [
   {
     name: 'todo.add',
     page: 'todo',
+    effect: 'write',
     title: 'Add task',
     description:
       'Add one or more to-do items. Put each item on its own line if the user listed several.',
@@ -48,6 +49,7 @@ export const todoCapabilities: Capability[] = [
   {
     name: 'todo.set_done',
     page: 'todo',
+    effect: 'write',
     title: 'Tick or untick task',
     description:
       'Mark an existing task complete or not complete. `target` is the task number shown in the list, ' +
@@ -78,6 +80,7 @@ export const todoCapabilities: Capability[] = [
   {
     name: 'todo.edit',
     page: 'todo',
+    effect: 'write',
     title: 'Edit task text',
     description: 'Replace the text of an existing task.',
     params: [
@@ -99,6 +102,7 @@ export const todoCapabilities: Capability[] = [
   {
     name: 'todo.remove',
     page: 'todo',
+    effect: 'write',
     title: 'Delete task',
     description: 'Delete one task from the list. Removes it permanently.',
     params: [
@@ -118,6 +122,7 @@ export const todoCapabilities: Capability[] = [
   {
     name: 'todo.clear_done',
     page: 'todo',
+    effect: 'write',
     title: 'Clear finished tasks',
     description: 'Delete every task that is already ticked. Leaves open tasks alone.',
     params: [],
@@ -133,6 +138,7 @@ export const todoCapabilities: Capability[] = [
   {
     name: 'todo.clear_all',
     page: 'todo',
+    effect: 'irreversible',
     title: 'Clear the list',
     description: 'Delete EVERY task, including open ones. Only when the user clearly asks to empty the list.',
     params: [],

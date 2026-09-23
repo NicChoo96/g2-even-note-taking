@@ -166,6 +166,104 @@ check(
   false,
 );
 
+// ── An OPEN conversation trims the menu (the collapse) ─────────────────────
+// While a Jarvis conversation is open the menu is the AI group ALONE, because a
+// long-press has to answer one question instead of mixing a half-finished
+// sentence with "Delete Docs". The trim is only allowed because everything
+// removed is reachable another way, so this block pins BOTH halves of that
+// bargain: the menu really is small, and nothing that was the only way out got
+// removed with it.
+const convSections = ['todo', 'docs', 'notes', 'agents'];
+for (const s of convSections) {
+  for (const flag of [{ aiListening: true }, { aiRunning: true }]) {
+    const st = { section: s, hasDocs: true, hasAgents: true, aiUndo: true, ...flag };
+    const which = flag.aiRunning ? 'running' : 'listening';
+    const list = names(sectionMenu(st));
+    const tag = `${s} in-conversation (${which})`;
+    assert(`${tag}: at most 4 items`, list.length <= 4, `${list.length}: ${list.join(', ')}`);
+    assert(`${tag}: well under the 10-item OS cap`, list.length <= 10);
+    check(`${tag}: Stop AI is the way out`, list[0], 'Stop AI');
+    check(`${tag}: …and it is the stop ID`, ids(sectionMenu(st))[0], MENU.JARVIS_STOP);
+    assert(`${tag}: no bare Jarvis item to re-open a live session`, !list.includes('Jarvis'), list.join(','));
+    check(`${tag}: Dictate is never trimmed`, list[list.length - 1], 'Dictate');
+  }
+}
+
+// Exactly the items that would be ambiguous next to a live transcript go away:
+// this tab's own actions. Nothing else.
+const convDocsNames = names(sectionMenu({ section: 'docs', hasDocs: true, aiListening: true }));
+assert(
+  'docs in-conversation: New/Select/Delete Docs are trimmed',
+  !convDocsNames.some((n) => /New Docs|Select Docs|Delete Docs/.test(n)),
+  convDocsNames.join(','),
+);
+const convAgentsNames = names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true, aiListening: true }));
+assert(
+  'agents in-conversation: Trigger is trimmed',
+  !convAgentsNames.includes('Trigger'),
+  convAgentsNames.join(','),
+);
+const convTodoNames = names(sectionMenu({ section: 'todo', hasDocs: true, aiListening: true }));
+assert(
+  'a plain tab in-conversation: the switchers are trimmed',
+  !['To-Do', 'Docs', 'Notes', 'Agents'].some((n) => convTodoNames.includes(n)),
+  convTodoNames.join(','),
+);
+
+// The rule that must survive the trim (0.3.10): never remove the ONLY way off a
+// tab. Back is that way on docs and agents — their switchers are hidden — so it
+// is kept there and only there.
+for (const s of ['docs', 'agents']) {
+  assert(
+    `${s} in-conversation: Back survives (it is the only way off the tab)`,
+    names(sectionMenu({ section: s, hasDocs: true, hasAgents: true, aiListening: true })).includes('Back'),
+  );
+}
+for (const s of ['todo', 'notes']) {
+  assert(
+    `${s} in-conversation: no Back (there is nothing to go back to)`,
+    !names(sectionMenu({ section: s, hasDocs: true, aiListening: true })).includes('Back'),
+  );
+}
+
+// The shrink is a real shrink, and the full menu comes straight back — the trim
+// is a view of the same state, not a mode that has to be exited.
+check(
+  'the conversation shrinks each tab',
+  [
+    names(sectionMenu({ section: 'docs', hasDocs: true })).length,
+    convDocsNames.length,
+  ],
+  [6, 3],
+);
+check(
+  '…including agents',
+  [
+    names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true })).length,
+    convAgentsNames.length,
+  ],
+  [4, 3],
+);
+check('…and the plain tabs', [
+  names(sectionMenu({ section: 'todo', hasDocs: true })).length,
+  convTodoNames.length,
+], [6, 2]);
+check(
+  'ending the conversation restores the identical menu',
+  names(sectionMenu({ section: 'docs', hasDocs: true, aiListening: false })),
+  names(sectionMenu({ section: 'docs', hasDocs: true })),
+);
+check(
+  '…and Undo AI is still reachable between turns',
+  names(sectionMenu({ section: 'docs', hasDocs: true, aiUndo: true, aiListening: true }))[1],
+  'Undo AI',
+);
+check(
+  '…and Suppressed while a turn is in flight, as before',
+  names(sectionMenu({ section: 'docs', hasDocs: true, aiUndo: true, aiRunning: true })).includes('Undo AI'),
+  false,
+);
+
 // ── Global invariants ───────────────────────────────────────────────────────
 const allSections = ['todo', 'docs', 'notes', 'agents'];
 for (const s of allSections) {
@@ -209,19 +307,19 @@ const mkSession = (id, agentId, content) => ({
 
 const view = agentsMasterDetailView(
   {
-    agents: [mkAgent('a1', 'Alpha', ['tool-tavily']), mkAgent('a2', 'Beta')],
+    agents: [mkAgent('a1', 'Alpha', ['tool-web']), mkAgent('a2', 'Beta')],
     sessions: [mkSession('s1', 'a1', 'Newest answer'), mkSession('s2', 'a1', 'Older answer')],
     cursor: 0,
     focus: 'master',
     sessionCursor: 0,
     status: '',
   },
-  (id) => (id === 'tool-tavily' ? 'tavily_search' : id),
+  (id) => (id === 'tool-web' ? 'web_search' : id),
 );
 assert('master lists both agents', view.master.includes('Alpha') && view.master.includes('Beta'));
 assert('master marks the cursor', view.master.includes('▶'));
 assert('detail shows the newest answer', view.detail.includes('Newest answer'), view.detail);
-assert('detail shows the tool name', view.detail.includes('tavily_search'));
+assert('detail shows the tool name', view.detail.includes('web_search'));
 assert('cursor clamped', view.cursor === 0 && view.canPrev === false && view.canNext === true);
 
 // The master list is ordered newest-updated first, on every surface.
@@ -261,12 +359,12 @@ const longAnswer =
   Array.from({ length: 40 }, (_, i) => `Paragraph ${i + 1} explains a detail.`).join(' ');
 const transcript = [
   { role: 'user', content: 'What is new in AI this week?', at: 0 },
-  { role: 'assistant', content: '', tool: 'tavily_search', at: 1 },
-  { role: 'tool', content: 'TOOLRESULT-MARKER '.repeat(30), tool: 'tavily_search', at: 2 },
+  { role: 'assistant', content: '', tool: 'web_search', at: 1 },
+  { role: 'tool', content: 'TOOLRESULT-MARKER '.repeat(30), tool: 'web_search', at: 2 },
   { role: 'assistant', content: longAnswer, at: 3 },
 ];
 const paged = agentsMasterDetailView({
-  agents: [mkAgent('a1', 'Alpha', ['tool-tavily'])],
+  agents: [mkAgent('a1', 'Alpha', ['tool-web'])],
   sessions: [
     {
       id: 's1',
@@ -291,7 +389,7 @@ assert('detail page is clamped to 0', paged.detailPage === 0);
 assert('detail respects the 999-byte cap', Buffer.byteLength(paged.detail, 'utf8') <= 999);
 
 const lastPage = agentsMasterDetailView({
-  agents: [mkAgent('a1', 'Alpha', ['tool-tavily'])],
+  agents: [mkAgent('a1', 'Alpha', ['tool-web'])],
   sessions: [
     {
       id: 's1',
@@ -330,7 +428,7 @@ const session = {
 const seen = [];
 for (let p = 0; p < paged.detailPages; p++) {
   const v = agentsMasterDetailView({
-    agents: [mkAgent('a1', 'Alpha', ['tool-tavily'])],
+    agents: [mkAgent('a1', 'Alpha', ['tool-web'])],
     sessions: [session],
     cursor: 0,
     focus: 'detail',
@@ -378,7 +476,7 @@ assert(
 
 // Tool entries are labelled `[toolname] ` on the glasses (ASCII, so it always
 // draws) and the union of pages must actually contain that label.
-assert('tool entries are labelled [name]', joined.includes('[tavily_search]'));
+assert('tool entries are labelled [name]', joined.includes('[web_search]'));
 
 // Emoji arriving from a search result or the model must be stripped, not drawn
 // as a tofu box that also burns its UTF-8 bytes.

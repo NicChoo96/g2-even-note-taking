@@ -479,6 +479,20 @@ export async function startRun(args: {
   agent: { id: string; name: string; systemPrompt: string; model?: string };
   tools: unknown[];
   prompt: string;
+  /**
+   * The agent's SAVED task, sent ahead of `prompt` when a caller supplied its
+   * own. The agent was configured with that task for a reason, so substituting
+   * the ask must not silently discard it. Omitted (or equal to `prompt`) when
+   * there is nothing to carry, which is what keeps an unchanged caller's wire
+   * bytes identical to before this field existed.
+   */
+  savedPrompt?: string;
+  /**
+   * A one-off directive layered ON TOP of the agent's system prompt — the
+   * wearer's qualifier ("just the prices"). Distinct from `prompt` because
+   * `prompt` REPLACES the saved task while this ADDS to it.
+   */
+  instructions?: string;
   model: string;
 }): Promise<RunStartResult> {
   try {

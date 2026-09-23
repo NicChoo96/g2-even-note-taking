@@ -8,7 +8,7 @@
 import { getAgents, updateAgents } from '../../agents-store';
 import { getRuns } from '../../agent-runs';
 import { fetchRuns, startRun, stopRun } from '../../stream';
-import { tavilyTool, uid, type AgentDef, type AgentMessage, type ToolDef } from '../../types';
+import { SEED_TOOL_ID, webSearchTool, uid, type AgentDef, type AgentMessage, type ToolDef } from '../../types';
 import { enqueueMonitoredRun, monitorAge, type MonitorStatus } from '../monitor';
 import type { Capability, CapabilityResult } from '../types';
 import { resolveAgent, short } from './shared';
@@ -35,7 +35,7 @@ function agentNames(): string {
 /** Phrases that mean "no tools at all". */
 const NO_TOOLS = /^(none|no tools?|nothing|off|clear|empty|remove all|all off|disable all)$/i;
 /** Phrases that clearly mean the seeded web-search tool. */
-const SEARCH_WORDS = /(search|web|internet|online|tavily|google)/i;
+const SEARCH_WORDS = /(search|web|internet|online|tavily|brave|google)/i;
 
 /** Forgiving tool lookup: id → exact name → substring → kind keyword. */
 function findTool(part: string, tools: ToolDef[]): ToolDef | null {
@@ -45,19 +45,19 @@ function findTool(part: string, tools: ToolDef[]): ToolDef | null {
     tools.find((x) => x.id.toLowerCase() === t) ??
     tools.find((x) => x.name.toLowerCase() === t) ??
     tools.find((x) => x.name.toLowerCase().includes(t) || x.id.toLowerCase().includes(t)) ??
-    (SEARCH_WORDS.test(t) ? tools.find((x) => x.kind === 'tavily') ?? null : null)
+    (SEARCH_WORDS.test(t) ? tools.find((x) => x.kind === 'web') ?? null : null)
   );
 }
 
 /**
- * The seeded Tavily tool is the builder's invariant (see agents-store.ts), but a
- * user can remove it from the catalog. Re-seed it before resolving a spoken
- * name, so "add web search" always works.
+ * The seeded web-search tool is the builder's invariant (see agents-store.ts),
+ * but a user can remove it from the catalog. Re-seed it before resolving a
+ * spoken name, so "add web search" always works.
  */
-function toolsWithTavily(): ToolDef[] {
+function toolsWithWebSearch(): ToolDef[] {
   const st = getAgents();
-  if (st.tools.some((t) => t.kind === 'tavily')) return st.tools;
-  const tool = tavilyTool();
+  if (st.tools.some((t) => t.kind === 'web')) return st.tools;
+  const tool = webSearchTool();
   updateAgents((s) => ({ ...s, tools: [tool, ...s.tools] }));
   return [tool, ...st.tools];
 }
@@ -74,7 +74,7 @@ function parseTools(raw: unknown): ToolParse {
   const text = String(raw ?? '').trim();
   if (!text) return { ids: [], unknown: [], cleared: false };
   if (NO_TOOLS.test(text)) return { ids: [], unknown: [], cleared: true };
-  const tools = toolsWithTavily();
+  const tools = toolsWithWebSearch();
   const parts = text
     .split(/,|;|\n|\band\b|\bplus\b/gi)
     .map((p) => p.trim())
@@ -423,26 +423,50 @@ export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.trigger',
     page: 'agents',
+    effect: 'write',
     title: 'Run an agent',
     description:
       'Start a saved agent running on a prompt. Defaults to the agent\'s saved prompt. The run continues in ' +
-      'the background and its transcript appears in the Agents page.',
+      'the background and its transcript appears in the Agents page. Use "instructions" instead of "prompt" ' +
+      'when the wearer is adding a one-off direction ("keep it short", "just the prices") and the agent\'s ' +
+      'own task should still apply — "prompt" REPLACES the saved task, "instructions" is layered on top of it.',
     params: [
       { name: 'agent', type: 'string', description: 'Agent name or number. Omit for the first agent.' },
-      { name: 'prompt', type: 'string', description: 'What to ask. Omit to use the agent\'s saved prompt.' },
+      { name: 'prompt', type: 'string', description: 'The task for THIS run, replacing the agent\'s saved prompt. Omit to use the saved prompt.' },
+      {
+        name: 'instructions',
+        type: 'string',
+        description:
+          'A one-off instruction for this run, ADDED to the agent\'s saved prompt rather than replacing it. ' +
+          'Use this for a spoken qualifier on an agent that already knows its job.',
+      },
     ],
     available: () => agents().length > 0,
     run: async (args) => {
       const st = getAgents();
       const agent = resolveAgent(String(args.agent ?? ''), st.agents);
       if (!agent) return { ok: false, summary: 'No agent matches that name', hint: `agents: ${st.agents.map((a) => a.name).join(', ')}` };
-      const prompt = (String(args.prompt ?? '').trim() || agent.prompt || '').trim();
+      const spoken = String(args.prompt ?? '').trim();
+      const savedTask = String(agent.prompt ?? '').trim();
+      const instructions = String(args.instructions ?? '').trim();
+      const prompt = (spoken || savedTask).trim();
       if (!prompt) return { ok: false, summary: `${short(agent.name, 20)} has no saved prompt`, hint: 'pass a "prompt" argument' };
+      // A spoken task REPLACES the saved one — but "replaces" must not mean
+      // "discards". The agent was configured with a task for a reason, so when
+      // the wearer substitutes their own the saved task is carried along as
+      // context instead of being dropped. Skipped when it would just duplicate
+      // the ask (which is the common case: no speech at all).
+      const savedPrompt = spoken && savedTask && savedTask !== spoken ? savedTask : '';
       const tools = st.tools.filter((t) => agent.toolIds.includes(t.id));
       const started = await startRun({
         agent: { id: agent.id, name: agent.name, systemPrompt: agent.systemPrompt, model: agent.model },
         tools,
         prompt,
+        // Omitted, not empty-stringed, when there is nothing to carry: a caller
+        // that passes neither field must produce the exact wire body it did
+        // before these fields existed.
+        savedPrompt: savedPrompt || undefined,
+        instructions: instructions || undefined,
         model: agent.model || st.llm.model,
       });
       if (!started.runId) return { ok: false, summary: `Could not start ${short(agent.name, 20)}`, hint: started.error };
@@ -459,7 +483,7 @@ export const agentsCapabilities: Capability[] = [
       return {
         ok: true,
         summary: `Started ${short(agent.name, 20)}`,
-        data: { runId: started.runId, prompt, watching: true },
+        data: { runId: started.runId, prompt, savedPrompt, instructions, watching: true },
         hint: 'it now runs in the background — the wearer can watch it in the Jarvis session queue',
       };
     },
@@ -467,6 +491,7 @@ export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.stop',
     page: 'agents',
+    effect: 'write',
     title: 'Stop a running agent',
     description: 'Stop the agent run that is currently in progress.',
     params: [{ name: 'agent', type: 'string', description: 'Agent name or number. Omit to stop whichever run is active.' }],
@@ -487,6 +512,7 @@ export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.create',
     page: 'agents',
+    effect: 'write',
     title: 'Create agent',
     description:
       'Create a new agent. Can set every setting at once: name, role (system prompt), default prompt, tools ' +
@@ -510,8 +536,8 @@ export const agentsCapabilities: Capability[] = [
       // No `tools` argument → web search on, matching the builder's new-agent
       // default. An explicit "none" → no tools.
       const parsed = typeof args.tools === 'string' ? parseTools(args.tools) : null;
-      const toolIds = parsed ? parsed.ids : ['tool-tavily'];
-      if (!parsed) toolsWithTavily();
+      const toolIds = parsed ? parsed.ids : [SEED_TOOL_ID];
+      if (!parsed) toolsWithWebSearch();
       const model = String(args.model ?? '').trim();
       const agent: AgentDef = {
         id: uid(),
@@ -536,6 +562,7 @@ export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.update',
     page: 'agents',
+    effect: 'write',
     title: 'Edit agent',
     description:
       'Change ANY setting of an existing agent IN PLACE: name, role (system prompt), default prompt, tools ' +
@@ -618,6 +645,7 @@ export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.clone',
     page: 'agents',
+    effect: 'write',
     title: 'Clone agent',
     description:
       'Copy an existing agent with ALL of its settings — role, prompt, tools and model. The copy starts with ' +
@@ -651,6 +679,7 @@ export const agentsCapabilities: Capability[] = [
   {
     name: 'agents.delete',
     page: 'agents',
+    effect: 'irreversible',
     title: 'Delete agent',
     description: 'Delete an agent permanently. Its saved sessions remain until they age out.',
     params: [{ name: 'agent', type: 'string', description: 'Agent name or number.', required: true }],
@@ -671,7 +700,7 @@ export const agentsCapabilities: Capability[] = [
       'accept. Call this before setting tools so the names are right.',
     params: [],
     run: () => {
-      const tools = toolsWithTavily();
+      const tools = toolsWithWebSearch();
       if (!tools.length) return { ok: true, summary: 'No tools available', data: { tools: [] } };
       return {
         ok: true,
@@ -683,7 +712,7 @@ export const agentsCapabilities: Capability[] = [
             kind: t.kind,
             description: t.description,
             ...(t.kind === 'http' ? { url: t.url ?? '', method: t.method ?? 'POST' } : {}),
-            ...(t.kind === 'tavily' ? { searchDepth: t.searchDepth ?? 'basic' } : {}),
+            ...(t.kind === 'web' ? { searchDepth: t.searchDepth ?? 'basic' } : {}),
             ...(t.kind === 'jev' ? { note: 'typed decision tool — no configuration' } : {}),
           })),
         },

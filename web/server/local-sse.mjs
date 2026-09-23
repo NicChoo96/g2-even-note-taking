@@ -27,10 +27,10 @@
 //   GET  /api/stt/status          -> is a speech provider configured?
 //   POST /api/stt                 -> raw audio bytes -> transcribed text
 //                                     (auth required; key stays server-side)
-//   GET  /api/agent/status        -> are the LLM + Tavily keys configured?
+//   GET  /api/agent/status        -> are the LLM + web-search keys configured?
 //   POST /api/settings            -> owner sets model / keys (never echoed back)
 //   POST /api/llm                 -> OpenRouter/DeepSeek chat-completions proxy (tools ok)
-//   POST /api/tool                -> Tavily web search / generic REST tool proxy
+//   POST /api/tool                -> web search (Tavily or Brave) / generic REST proxy
 //
 // SECURITY: /api/stream (GET + POST) requires a valid owner session token OR an
 // approved per-device ID. Browsers authenticate via Google SSO; each glasses
@@ -42,11 +42,14 @@
 //
 // Env: PORT, STATE_FILE, AUTH_FILE, GOOGLE_CLIENT_ID, ALLOWED_EMAILS
 // (comma-separated), OPENAI_API_KEY (Whisper) or DEEPGRAM_API_KEY (Nova-2) for
-// voice dictation. Agents LLM: OPENROUTER_API_KEY + TAVILY_API_KEY (+ optional
-// OPENROUTER_MODEL, OPENROUTER_REFERER, OPENROUTER_TITLE, TAVILY_SEARCH_DEPTH),
-// or switch the whole LLM backend to DeepSeek with LLM_PROVIDER=deepseek +
-// DEEPSEEK_API_KEY (+ optional DEEPSEEK_MODEL). Zero runtime dependencies
-// (node built-ins only). Run:
+// voice dictation. Agents LLM: OPENROUTER_API_KEY (+ optional OPENROUTER_MODEL,
+// OPENROUTER_REFERER, OPENROUTER_TITLE), or switch the whole LLM backend to
+// DeepSeek with LLM_PROVIDER=deepseek + DEEPSEEK_API_KEY (+ optional
+// DEEPSEEK_MODEL). Agents web search: TAVILY_API_KEY or BRAVE_SEARCH_API_KEY,
+// with SEARCH_PROVIDER=tavily|brave to choose (default: whichever key is set,
+// Tavily winning when both are), plus an optional WEB_SEARCH_DEPTH (basic or
+// advanced; the legacy TAVILY_SEARCH_DEPTH still works). Zero runtime
+// dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -57,11 +60,26 @@ import { fileURLToPath } from 'node:url';
 // The clock the model never had. Stamps every system prompt with the exact
 // date/time a run started and resolves relative phrases in the user prompt
 // BEFORE the first tool call (see datetime.mjs).
-import { preprocessText, withDateTime, withDateTimeMessages } from './datetime.mjs';
+import { preprocessText, withDateTimeMessages } from './datetime.mjs';
+// The run's chat messages, in a module that can be imported without booting the
+// server (see wire.mjs — it carries the byte-identity contract for a run that
+// has neither a saved task nor a wearer directive).
+import { assembleWire } from './wire.mjs';
 import { looksLikeToolMarkup, stripToolMarkup } from './tool-markup.mjs';
+// Web search — one interface over Tavily and Brave, chosen by SEARCH_PROVIDER
+// (see web-search.mjs). Kept out of this file so both providers can be driven
+// against a stubbed fetch; importing THIS module starts a server.
+import { isWebTool, resolveDepth, searchWeb } from './web-search.mjs';
 // Jev — the typed-decision model. Builds/validates the question spec and reads
 // the answers back. Ships twice (relay + WebView); see the header of jev-spec.mjs.
-import { buildRequest, describeAnswers, normalizeAnswers, specFromToolArgs } from './jev-spec.mjs';
+import {
+  buildRequest,
+  describeAnswers,
+  describeRanking,
+  normalizeAnswers,
+  rankAnswers,
+  specFromToolArgs,
+} from './jev-spec.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -293,8 +311,8 @@ function openaiMultipart(audio, contentType) {
 loadAuthStore();
 
 // ── Agents: LLM + tool proxy ─────────────────────────────────────────────────
-// The LLM (OpenRouter or DeepSeek) and Tavily keys live ONLY here (env vars, or
-// a gitignored .g2-hub-secrets.json written by POST /api/settings from the
+// The LLM (OpenRouter or DeepSeek) and web-search keys live ONLY here (env vars,
+// or a gitignored .g2-hub-secrets.json written by POST /api/settings from the
 // owner's browser). They are never sent to a client, never logged, and never
 // included in any response body — clients only ever learn the boolean `hasKey`.
 //
@@ -306,7 +324,6 @@ const DEFAULT_MODEL = 'inclusionai/ling-3.0-flash-sante:free';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions';
 const DEEPSEEK_DEFAULT_MODEL = 'deepseek-chat';
-const TAVILY_URL = 'https://api.tavily.com/search';
 const LLM_MAX_BYTES = 512 * 1024;
 const TOOL_MAX_BYTES = 32 * 1024;
 
@@ -322,7 +339,18 @@ const JEV_DEFAULT_MODEL = '~typesafe/jev-latest';
 const JEV_MAX_BYTES = 64 * 1024;
 
 /** Persisted overrides (model/referer/title/depth + keys) — see loadSecrets(). */
-const secrets = { openrouterKey: '', deepseekKey: '', tavilyKey: '', model: '', referer: '', title: '', depth: '' };
+const secrets = {
+  openrouterKey: '',
+  deepseekKey: '',
+  tavilyKey: '',
+  braveKey: '',
+  model: '',
+  referer: '',
+  title: '',
+  depth: '',
+  /** '' = auto (whichever key is present). Only 'tavily' | 'brave' are honoured. */
+  searchProvider: '',
+};
 
 /** Per-tool bearer tokens for generic REST tools: { [toolId]: token }. */
 const toolTokens = new Map();
@@ -472,16 +500,64 @@ async function jevDecide(request) {
   };
 }
 
-function tavilyConfig() {
-  const envKey = process.env.TAVILY_API_KEY || '';
-  const fileKey = secrets.tavilyKey || '';
-  const envDepth = process.env.TAVILY_SEARCH_DEPTH || '';
+/**
+ * Web-search config — WHICH provider is live, plus the key and depth for it.
+ *
+ * The search backend became a setting rather than a hardcoded vendor, so this is
+ * the one place that decides. Precedence mirrors llmConfig():
+ *
+ *   1. SEARCH_PROVIDER in the environment  (a host owns the choice)
+ *   2. `searchProvider` in .g2-hub-secrets.json  (the Settings toggle)
+ *   3. AUTO — Tavily if a Tavily key exists, else Brave if a Brave key exists.
+ *      Tavily wins when both are present, so an existing install does not switch
+ *      provider behind the wearer's back the moment a Brave key is added.
+ *
+ * A selected provider with NO key resolves to an empty key on purpose. Falling
+ * back to the other provider's key would answer the question that was asked with
+ * a result from a vendor the caller did not select — a silently fabricated
+ * provenance — so the callers fail loudly and name the missing variable instead.
+ */
+function webSearchConfig() {
+  const envProvider = String(process.env.SEARCH_PROVIDER || '').toLowerCase();
+  const fileProvider = String(secrets.searchProvider || '').toLowerCase();
+  const picked = (v) => (v === 'tavily' || v === 'brave' ? v : '');
+  const chosen = picked(envProvider) || picked(fileProvider);
+
+  const tavilyEnv = process.env.TAVILY_API_KEY || '';
+  const tavilyFile = secrets.tavilyKey || '';
+  const braveEnv = process.env.BRAVE_SEARCH_API_KEY || '';
+  const braveFile = secrets.braveKey || '';
+  const tavilyKey = tavilyEnv || tavilyFile || '';
+  const braveKey = braveEnv || braveFile || '';
+
+  const provider = chosen || (tavilyKey ? 'tavily' : braveKey ? 'brave' : 'tavily');
+  const isBrave = provider === 'brave';
+  const envKey = isBrave ? braveEnv : tavilyEnv;
+  const fileKey = isBrave ? braveFile : tavilyFile;
+  // WEB_SEARCH_DEPTH is the provider-agnostic name; TAVILY_SEARCH_DEPTH is kept
+  // working so an existing deployment does not lose its setting on upgrade.
+  const envDepth = process.env.WEB_SEARCH_DEPTH || process.env.TAVILY_SEARCH_DEPTH || '';
+
   return {
+    provider,
     key: envKey || fileKey || '',
     depth: envDepth || secrets.depth || 'basic', // default: basic
+    /** Which providers have a key at all — the UI needs both, not just the live one. */
+    keys: { tavily: Boolean(tavilyKey), brave: Boolean(braveKey) },
+    /** `${provider} ${envVarName}` for an error a human can act on. */
+    envVar: isBrave ? 'BRAVE_SEARCH_API_KEY' : 'TAVILY_API_KEY',
+    label: isBrave ? 'Brave Search' : 'Tavily',
     source: {
+      provider:
+        picked(envProvider) === provider
+          ? 'env'
+          : picked(fileProvider) === provider
+            ? 'settings'
+            : 'default',
       key: envKey ? 'env' : fileKey ? 'settings' : 'none',
       depth: envDepth ? 'env' : secrets.depth ? 'settings' : 'default',
+      tavilyKey: tavilyEnv ? 'env' : tavilyFile ? 'settings' : 'none',
+      braveKey: braveEnv ? 'env' : braveFile ? 'settings' : 'none',
     },
   };
 }
@@ -493,20 +569,36 @@ function tavilyConfig() {
  */
 function agentStatusPayload() {
   const llm = llmConfig();
-  const tv = tavilyConfig();
+  const ws = webSearchConfig();
   const jev = jevConfig();
   return {
     ok: true,
     provider: llm.provider,
     llm: Boolean(llm.key),
-    tavily: Boolean(tv.key),
     // Jev is gated on the OPENROUTER key, NOT the chat provider — an app running
     // on DeepSeek chat can still have jev available. Clients use this to hide or
     // disable jev affordances rather than offering a tool that will fail.
     jev: Boolean(jev.key),
+    /** The web-search setting: which provider is live, and both key states. */
+    search: {
+      provider: ws.provider,
+      configured: Boolean(ws.key),
+      depth: ws.depth,
+      keys: ws.keys,
+    },
+    // DEPRECATED alias, kept for one release: an older client bundle still reads
+    // `tavily` and `source.tavily`, and dropping them would make it render a
+    // false "key missing" warning on a correctly configured relay. It reports
+    // whether the ACTIVE search provider is configured, whatever that is.
+    tavily: Boolean(ws.key),
     model: llm.model,
-    depth: tv.depth,
-    source: { llm: llm.source, tavily: tv.source, jev: jev.source },
+    depth: ws.depth,
+    source: {
+      llm: llm.source,
+      search: ws.source,
+      jev: jev.source,
+      tavily: { key: ws.source.key, depth: ws.source.depth },
+    },
   };
 }
 
@@ -567,17 +659,30 @@ function broadcastRun(run) {
   for (const client of [...getChannel('agents').clients]) send(client, frame, 'agents');
 }
 
-/** OpenAI-style tool schema — mirrors glasses/src/agents.ts toolSchema(). */
+/** OpenAI-style tool schema — mirrors the tool shapes in glasses/src/types.ts. */
 function toolSchemaFor(t) {
-  if (t?.kind === 'tavily') {
+  if (isWebTool(t)) {
     return {
       type: 'function',
       function: {
-        name: t.name || 'tavily_search',
+        name: t.name || 'web_search',
         description: t.description || 'Search the web for current information.',
         parameters: {
           type: 'object',
-          properties: { query: { type: 'string', description: 'The search query.' } },
+          properties: {
+            query: { type: 'string', description: 'The search query.' },
+            depth: {
+              type: 'string',
+              enum: ['basic', 'advanced'],
+              description:
+                'How much to read: basic (fast, a few sources) or advanced (slower, more sources).',
+            },
+            freshness: {
+              type: 'string',
+              description:
+                'Optional recency filter: pd (past day), pw (past week), pm (past month), py (past year), or a YYYY-MM-DDtoYYYY-MM-DD range.',
+            },
+          },
           required: ['query'],
         },
       },
@@ -607,14 +712,14 @@ function toolSchemaFor(t) {
             },
             kind: {
               type: 'string',
-              enum: ['noul', 'choice', 'score'],
+              enum: ['noul', 'choice', 'score', 'rank'],
               description:
-                'noul = yes/no as a probability; choice = pick exactly one option; score = position on an ordered rubric.',
+                'noul = yes/no as a probability; choice = pick exactly one option; rank = the same as choice, said explicitly when you want the candidates ORDERED and the leader separated enough to act on; score = position on an ordered rubric. A choice, rank or score answer always comes back with its full ranking attached.',
             },
             options: {
               type: 'string',
               description:
-                'Required for choice and score: the options, or the rubric steps ordered low → high, separated by | or commas.',
+                'Required for choice, rank and score: the options, or the rubric steps ordered low → high, separated by | or commas.',
             },
           },
           required: ['state', 'question', 'kind'],
@@ -661,7 +766,7 @@ async function llmOnce(model, messages, tools, signal) {
   };
 }
 
-/** Execute one tool call server-side (Tavily, or a generic REST endpoint). */
+/** Execute one tool call server-side (web search, or a generic REST endpoint). */
 async function runToolOnce(tool, rawArgs, signal) {
   let args = {};
   try {
@@ -685,37 +790,40 @@ async function runToolOnce(tool, rawArgs, signal) {
     if (!req.ok) return `tool error: ${req.error}`;
     try {
       const { answers } = await jevDecide(req.value);
-      return clipText(describeAnswers(answers) || 'tool error: empty decision', 4000);
+      // jev is a RERANKER as well as a tool: the same `choice` answer already
+      // carries the whole distribution, so the order is derived here instead of
+      // costing a second call. Appended always, not on request — a model that
+      // asked for a choice and silently got back only the winner would have no
+      // way to tell a separated leader from a coin toss.
+      const ranking = Object.values(rankAnswers(built.value, answers)).map(describeRanking);
+      const body = [describeAnswers(answers), ...ranking].filter(Boolean).join('\n');
+      return clipText(body || 'tool error: empty decision', 4000);
     } catch (err) {
       return `tool error: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
-  if (tool.kind === 'tavily') {
-    const tv = tavilyConfig();
-    if (!tv.key) return 'tool error: Tavily not configured';
+  if (isWebTool(tool)) {
+    const ws = webSearchConfig();
+    if (!ws.key) return `tool error: ${ws.label} not configured — set ${ws.envVar} or save it in Settings`;
     const query = String(args.query ?? args.input ?? '').trim();
     if (!query) return 'tool error: query is required';
-    const depth =
-      args.search_depth === 'advanced' || args.search_depth === 'basic'
-        ? args.search_depth
-        : tool.searchDepth === 'advanced'
-          ? 'advanced'
-          : tv.depth;
-    const r = await fetch(TAVILY_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tv.key}` },
-      body: JSON.stringify({ query, search_depth: depth }),
-      signal,
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) return `tool error: ${j?.detail?.error || j?.error || `Tavily ${r.status}`}`;
-    const results = Array.isArray(j?.results) ? j.results.slice(0, 5) : [];
-    const lines = results.map(
-      (x, i) =>
-        `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, PER_HIT_CHARS)}`,
-    );
-    const answer = j?.answer ? `Answer: ${j.answer}\n\n` : '';
-    return clipText(`${answer}${lines.join('\n\n')}` || 'No results.', TOOL_RESULT_CHARS);
+    try {
+      return await searchWeb({
+        provider: ws.provider,
+        key: ws.key,
+        query,
+        depth: resolveDepth(args, tool, ws.depth),
+        freshness: args.freshness,
+        perHit: PER_HIT_CHARS,
+        total: TOOL_RESULT_CHARS,
+        clip: clipText,
+        signal,
+      });
+    } catch (err) {
+      // A provider that is down, rate-limited or has gone quiet must report as a
+      // TOOL error the model can read and work around — not take the run down.
+      return `tool error: ${err instanceof Error ? err.message : String(err)}`;
+    }
   }
   const target = String(tool.url || '').trim();
   if (!/^https:\/\//i.test(target)) return 'tool error: tool url must be https://';
@@ -794,10 +902,11 @@ async function executeRun(run) {
   // the tools) reasons about the same "now".
   const now = new Date(run.startedAt);
   const resolved = preprocessText(run.prompt, now);
-  const wire = [
-    { role: 'system', content: withDateTime(run.systemPrompt || 'You are a helpful assistant.', now) },
-    { role: 'user', content: resolved.text },
-  ];
+  // Card -> Directives -> Material -> Ask, in one tested place. Extracted
+  // because this module starts a server on import and so cannot be unit-tested;
+  // `wire.mjs` can, and it asserts that a run with no saved task and no
+  // directive produces byte-for-byte the messages the inline version did.
+  const wire = assembleWire(run, resolved.text, now);
   // Show the resolutions in the transcript so it is obvious the model was not
   // left to guess. Runs with no relative words gain nothing and stay clean.
   // NOTE: ASCII only — the G2 firmware font has no emoji glyphs, so a clock
@@ -1639,6 +1748,12 @@ const server = createServer(async (req, res) => {
       agentId: String(agent.id ?? ''),
       agentName: String(agent.name ?? 'Agent'),
       systemPrompt: String(agent.systemPrompt ?? ''),
+      // Optional, and absent from older clients. Both are layered INTO the wire
+      // rather than replacing anything (see executeRun), and when neither is
+      // present the assembled messages are byte-for-byte what they were before
+      // these fields existed — which is the property the delta plan rests on.
+      savedPrompt: String(body?.savedPrompt ?? ''),
+      instructions: String(body?.instructions ?? ''),
       model: String(body?.model || agent.model || cfg.model),
       prompt,
       title: prompt.slice(0, 48),
@@ -1715,10 +1830,15 @@ const server = createServer(async (req, res) => {
       openrouterKey: 'openrouterKey',
       deepseekKey: 'deepseekKey',
       tavilyKey: 'tavilyKey',
+      braveKey: 'braveKey',
       model: 'model',
       referer: 'referer',
       title: 'title',
       depth: 'depth',
+      // '' means AUTO (whichever provider has a key); anything else is ignored
+      // by webSearchConfig(), so a hand-crafted request cannot select a provider
+      // that does not exist.
+      searchProvider: 'searchProvider',
     };
     let touched = false;
     for (const [field, slot] of Object.entries(map)) {
@@ -1821,9 +1941,9 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Tool proxy — Tavily web search (key + default depth server-side) and any
-  // generic REST endpoint with an optional bearer token, so the WebView never
-  // hits CORS or needs the URL in the manifest whitelist.
+  // Tool proxy — web search (Tavily or Brave; key + provider + default depth
+  // server-side) and any generic REST endpoint with an optional bearer token, so
+  // the WebView never hits CORS or needs the URL in the manifest whitelist.
   if (req.method === 'POST' && url.pathname === '/api/tool') {
     const principal = principalFromToken(readToken(req, url));
     if (!principal) {
@@ -1839,12 +1959,12 @@ const server = createServer(async (req, res) => {
     }
     const args = body?.args && typeof body.args === 'object' ? body.args : {};
     try {
-      if (body?.kind === 'tavily') {
-        const tv = tavilyConfig();
-        if (!tv.key) {
+      if (isWebTool(body)) {
+        const ws = webSearchConfig();
+        if (!ws.key) {
           json(res, 501, {
             ok: false,
-            error: 'Tavily not configured — set TAVILY_API_KEY or save it in Settings',
+            error: `${ws.label} not configured — set ${ws.envVar} or save it in Settings`,
           });
           return;
         }
@@ -1853,34 +1973,17 @@ const server = createServer(async (req, res) => {
           json(res, 400, { ok: false, error: 'query is required' });
           return;
         }
-        const depth =
-          args.search_depth === 'advanced' || args.search_depth === 'basic'
-            ? args.search_depth
-            : tv.depth;
-        const r = await fetch(TAVILY_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tv.key}` },
-          body: JSON.stringify({ query, search_depth: depth }),
+        const result = await searchWeb({
+          provider: ws.provider,
+          key: ws.key,
+          query,
+          depth: resolveDepth(args, body, ws.depth),
+          freshness: args.freshness,
+          perHit: PER_HIT_CHARS,
+          total: TOOL_RESULT_CHARS,
+          clip: clipText,
         });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          json(res, 502, {
-            ok: false,
-            error: j?.detail?.error || j?.error || `Tavily ${r.status}`,
-          });
-          return;
-        }
-        // Compact the payload: the model only needs title/url/snippet.
-        const results = Array.isArray(j?.results) ? j.results.slice(0, 5) : [];
-        const lines = results.map(
-          (x, i) =>
-            `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, PER_HIT_CHARS)}`,
-        );
-        const answer = j?.answer ? `Answer: ${j.answer}\n\n` : '';
-        json(res, 200, {
-          ok: true,
-          result: clipText(`${answer}${lines.join('\n\n')}` || 'No results.', TOOL_RESULT_CHARS),
-        });
+        json(res, 200, { ok: true, result });
         return;
       }
 

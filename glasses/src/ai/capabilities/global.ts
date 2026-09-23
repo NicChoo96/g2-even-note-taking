@@ -10,10 +10,10 @@
 // and a page registered later shows up automatically.
 import { getAppBridge } from '../bridge';
 import { appSnapshotText } from '../context';
-import { capabilitiesForPage, listPages, toWireName } from '../registry';
+import { capabilitiesForPage, listPages, toWireName, asksToConfirm } from '../registry';
 import { getAiFocus, setAiFocus } from '../store';
 import { hasUndo, undoLastAiBatch } from '../undo';
-import { GLOBAL_PAGE, type Capability, type PageId } from '../types';
+import { GLOBAL_PAGE, effectOf, type Capability, type PageId } from '../types';
 import { short } from './shared';
 const PAGE_ARG = 'Page id. Use one of the ids listed in the system prompt or returned by nav.list_pages.';
 
@@ -94,7 +94,11 @@ export const globalCapabilities: Capability[] = [
         name: toWireName(c.name),
         title: c.title,
         description: c.description,
-        confirm: Boolean(c.confirm),
+        confirm: asksToConfirm(c),
+        // Reporting the effect class lets the model prefer a reversible action
+        // (an append) over an irreversible one (a rewrite) when both would
+        // satisfy the request — a preference it could not express before.
+        effect: effectOf(c),
       }));
       return {
         ok: true,
@@ -154,6 +158,7 @@ export const globalCapabilities: Capability[] = [
   {
     name: 'say.reply',
     page: GLOBAL_PAGE,
+    effect: 'pure',
     title: 'Answer',
     description:
       'Answer the user in words with no app change. Use it for a question, for ordinary conversation, or ' +
@@ -182,6 +187,7 @@ export const globalCapabilities: Capability[] = [
   {
     name: 'undo.last',
     page: GLOBAL_PAGE,
+    effect: 'write',
     title: 'Undo AI action',
     description: 'Revert the previous batch of changes this assistant made. Use when the user says "undo".',
     params: [],

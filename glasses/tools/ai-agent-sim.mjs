@@ -1735,14 +1735,14 @@ const capOf = (name) => {
   return c;
 };
 
-// A clean slate: no agents, but the seeded Tavily tool plus a fake REST tool so
-// name resolution has two kinds to choose between.
+// A clean slate: no agents, but the seeded web-search tool plus a fake REST tool
+// so name resolution has two kinds to choose between.
 agents.updateAgents((s) => ({
   ...s,
   agents: [],
   sessions: [],
   tools: [
-    ...s.tools.filter((t) => t.kind === 'tavily'),
+    ...s.tools.filter((t) => t.kind === 'web'),
     {
       id: 'tool-weather',
       name: 'get_weather',
@@ -1755,7 +1755,7 @@ agents.updateAgents((s) => ({
 }));
 
 const toolCatalog = await capOf('tools.list').run({});
-assert('tools.list names the seeded search tool', JSON.stringify(toolCatalog.data).includes('tavily_search'));
+assert('tools.list names the seeded search tool', JSON.stringify(toolCatalog.data).includes('web_search'));
 assert('tools.list names the REST tool', JSON.stringify(toolCatalog.data).includes('get_weather'));
 
 // create: set every setting at once, resolving spoken tool names.
@@ -1770,7 +1770,7 @@ assert('create succeeds', created.ok, created.summary);
 let stored = agents.getAgents().agents;
 check('create stores one agent', stored.length, 1);
 check('create sets the role (system prompt)', stored[0].systemPrompt, 'You are terse.');
-check('create resolves "web search" to Tavily', stored[0].toolIds.includes('tool-tavily'), true);
+check('create resolves "web search" to the web tool', stored[0].toolIds.includes('tool-web'), true);
 check('create resolves "get_weather"', stored[0].toolIds.includes('tool-weather'), true);
 check('create sets the model override', stored[0].model, 'vendor/model:free');
 assert('create stamps updatedAt for newest-first ordering', typeof stored[0].updatedAt === 'number');
@@ -1783,7 +1783,7 @@ check('create with "none" attaches no tools', stored.find((a) => a.name === 'Bar
 // create without tools → web search by default (the builder's own default).
 await capOf('agents.create').run({ name: 'Defaulted' });
 stored = agents.getAgents().agents;
-check('create defaults to web search', stored.find((a) => a.name === 'Defaulted').toolIds, ['tool-tavily']);
+check('create defaults to web search', stored.find((a) => a.name === 'Defaulted').toolIds, ['tool-web']);
 
 // update: in-place edits, including tool add/remove and clearing the model.
 const beforeUpdatedAt = stored.find((a) => a.name === 'Researcher').updatedAt;
@@ -1800,7 +1800,7 @@ stored = agents.getAgents().agents;
 const scout = stored.find((a) => a.name === 'Scout');
 assert('update renames in place', !!scout);
 check('update rewrites the role', scout.systemPrompt, 'Be brief.');
-check('update removes search', scout.toolIds.includes('tool-tavily'), false);
+check('update removes search', scout.toolIds.includes('tool-web'), false);
 check('update adds the REST tool', scout.toolIds.includes('tool-weather'), true);
 check('update clears the model override', scout.model, undefined);
 assert('update re-stamps updatedAt (drives list order)', scout.updatedAt >= beforeUpdatedAt);
@@ -1824,7 +1824,7 @@ stored = agents.getAgents().agents;
 const copy = stored.find((a) => a.id === cloned.data.id);
 assert('clone names the copy "<original> copy"', copy.name === 'Defaulted copy', copy.name);
 assert('clone gets a NEW id', copy.id !== stored.find((a) => a.name === 'Defaulted').id);
-check('clone copies the tools', copy.toolIds, ['tool-tavily']);
+check('clone copies the tools', copy.toolIds, ['tool-web']);
 check(
   'clone copies the role',
   copy.systemPrompt,

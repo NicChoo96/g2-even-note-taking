@@ -8,6 +8,7 @@
 // DATA change (register a PageDef + a list of Capability objects), never a
 // change to the machinery.
 import type { SectionId } from '../types';
+import type { Effect } from './ledger';
 
 /**
  * A navigable surface.
@@ -82,9 +83,38 @@ export interface Capability {
    * tap-to-confirm before this runs (destructive-only policy).
    */
   confirm?: boolean;
+  /**
+   * How much damage this can do — see `Effect` in `ledger.ts`.
+   *
+   * Declared, not inferred, so the ledger's safety invariant ("an irreversible
+   * entry may not succeed without a preceding approved gate") can be stated
+   * ONCE and hold for capabilities that do not exist yet. A per-capability
+   * `confirm` flag only protects the capabilities someone remembered to flag.
+   *
+   * Optional for backwards compatibility: `effectOf()` derives a safe answer
+   * when it is absent, and that fallback reproduces the pre-ledger behaviour
+   * exactly, so adding this field changed nothing that already shipped.
+   */
+  effect?: Effect;
   /** Declarative gating against live state (e.g. only when a doc is open). */
   available?: () => boolean;
   run: (args: Record<string, unknown>) => CapabilityResult | Promise<CapabilityResult>;
+}
+
+/**
+ * Classify a capability for the ledger.
+ *
+ * The fallback deliberately mirrors the old `confirm`-only world so this is
+ * purely additive: no capability's behaviour changed when `effect` was
+ * introduced. What `effect` buys is the middle ground the old flag could not
+ * express — an undoable WRITE (appending to a doc) is neither a harmless read
+ * nor a destruction, and misfiling it as either is how you end up gating
+ * harmless actions (friction) or forgetting to snapshot a real change (data
+ * loss).
+ */
+export function effectOf(cap: Capability): Effect {
+  if (cap.effect) return cap.effect;
+  return cap.confirm ? 'irreversible' : 'read';
 }
 
 /** OpenAI-compatible function tool definition. */

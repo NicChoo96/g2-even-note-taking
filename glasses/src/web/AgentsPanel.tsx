@@ -20,8 +20,9 @@ import {
   emptyLlmSettings,
   jevTool,
   orderedAgents,
-  tavilyTool,
+  SEED_TOOL_ID,
   uid,
+  webSearchTool,
   type AgentDef,
   type AgentMessage,
   type AgentSession,
@@ -84,18 +85,18 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         : [...agent.toolIds, id],
     });
 
-  /** Enable the seeded Tavily tool (creating it if it was removed) and attach it. */
-  const addTavilyToAgent = () =>
+  /** Enable the seeded web-search tool (creating it if it was removed) and attach it. */
+  const addWebSearchToAgent = () =>
     updateAgents((s) => {
-      const has = s.tools.some((t) => t.id === 'tool-tavily');
+      const has = s.tools.some((t) => t.id === SEED_TOOL_ID);
       return {
         ...s,
-        tools: has ? s.tools : [...s.tools, tavilyTool()],
+        tools: has ? s.tools : [...s.tools, webSearchTool()],
         agents: s.agents.map((a) =>
           a.id === agent.id
             ? {
                 ...a,
-                toolIds: [...new Set([...a.toolIds, 'tool-tavily'])],
+                toolIds: [...new Set([...a.toolIds, SEED_TOOL_ID])],
                 updatedAt: Date.now(),
               }
             : a,
@@ -200,7 +201,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         ))}
       </div>
       <div className="docs-actions">
-        <button onClick={addTavilyToAgent}>+ Tavily search</button>
+        <button onClick={addWebSearchToAgent}>+ Web search</button>
         <button onClick={addJevToAgent}>+ Jev decision</button>
         <button onClick={addRestToolToAgent}>+ REST tool</button>
       </div>
@@ -216,8 +217,24 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   );
 }
 
-function ToolEditor({ tool, jevReady }: { tool: ToolDef; jevReady: boolean }) {
+function ToolEditor({
+  tool,
+  jevReady,
+  searchProvider,
+  searchConfigured,
+}: {
+  tool: ToolDef;
+  jevReady: boolean;
+  /** Which backend serves web-search tools, as chosen on the relay. */
+  searchProvider?: string;
+  searchConfigured?: boolean;
+}) {
   const [token, setToken] = useState('');
+  const searchProviderLabel = searchConfigured
+    ? searchProvider === 'brave'
+      ? 'Brave Search'
+      : 'Tavily'
+    : null;
   const patch = (p: Partial<ToolDef>) =>
     updateAgents((s) => ({
       ...s,
@@ -241,7 +258,7 @@ function ToolEditor({ tool, jevReady }: { tool: ToolDef; jevReady: boolean }) {
           placeholder="tool_name"
         />
         <select value={tool.kind} onChange={(e) => patch({ kind: e.target.value as ToolDef['kind'] })}>
-          <option value="tavily">Tavily search</option>
+          <option value="web">Web search</option>
           <option value="jev">Jev decision</option>
           <option value="http">REST API</option>
         </select>
@@ -269,7 +286,7 @@ function ToolEditor({ tool, jevReady }: { tool: ToolDef; jevReady: boolean }) {
         placeholder="What this tool does (the model reads this to decide when to call it)"
       />
 
-      {tool.kind === 'tavily' && (
+      {tool.kind === 'web' && (
         <label className="inline-field">
           Search depth
           <select
@@ -280,6 +297,15 @@ function ToolEditor({ tool, jevReady }: { tool: ToolDef; jevReady: boolean }) {
             <option value="advanced">advanced (deeper)</option>
           </select>
         </label>
+      )}
+
+      {tool.kind === 'web' && (
+        <p className="hint-line">
+          Served by <strong>{searchProviderLabel}</strong>
+          {searchProviderLabel === null
+            ? ' — set a search key in Settings.'
+            : ' (change the provider in Settings; this tool does not change).'}
+        </p>
       )}
 
       {tool.kind === 'jev' && (
@@ -449,13 +475,16 @@ export function AgentsPanel() {
           in the server environment. Agents can be built and saved without it.
         </p>
       )}
-      {statusInfo?.llm && !statusInfo.tavily && (
-        <p className="warn-line">⚠️ Tavily key missing — web-search tools will fail until it is set.</p>
+      {statusInfo?.llm && !statusInfo.search?.configured && (
+        <p className="warn-line">
+          ⚠️ {statusInfo.search?.provider === 'brave' ? 'Brave Search' : 'Tavily'} key missing —
+          web-search tools will fail until it is set.
+        </p>
       )}
       {statusInfo?.llm && statusInfo.source?.llm?.key === 'env' && (
         <p className="hint-line">
           ✓ LLM key provided by the server environment
-          {statusInfo.source?.tavily?.key === 'env' ? ' (Tavily too)' : ''}.
+          {statusInfo.source?.search?.key === 'env' ? ' (web search too)' : ''}.
         </p>
       )}
 
@@ -487,20 +516,26 @@ export function AgentsPanel() {
             Tools
           </div>
           {state.tools.map((t) => (
-            <ToolEditor key={t.id} tool={t} jevReady={statusInfo?.jev === true} />
+            <ToolEditor
+              key={t.id}
+              tool={t}
+              jevReady={statusInfo?.jev === true}
+              searchProvider={statusInfo?.search?.provider}
+              searchConfigured={statusInfo?.search?.configured}
+            />
           ))}
           <div className="docs-actions">
             <button onClick={addTool}>+ Custom REST tool</button>
             <button
               onClick={() =>
                 updateAgents((s) =>
-                  s.tools.some((t) => t.id === 'tool-tavily')
+                  s.tools.some((t) => t.id === SEED_TOOL_ID)
                     ? s
-                    : { ...s, tools: [...s.tools, tavilyTool()] },
+                    : { ...s, tools: [...s.tools, webSearchTool()] },
                 )
               }
             >
-              + Tavily search
+              + Web search
             </button>
           </div>
 
