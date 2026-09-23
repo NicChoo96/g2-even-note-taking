@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.29
+
+v0.3.29 - swappable web search, and a spoken line keeps your task
+
+- Web search runs on Tavily or Brave Search. Pick one in Settings, or let it auto-detect whichever key is set.
+- The search tool is now "Web search" everywhere.
+- Speaking to an agent adds a one-off instruction instead of overwriting the saved task.
+- Destructive actions need an explicit approval in the same run.
+- The menu collapses to the essentials during a Jarvis conversation.
+
 ## 0.3.28
 
 v0.3.28 - a past session reads back whole, not truncated
