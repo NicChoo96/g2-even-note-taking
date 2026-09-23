@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.28
+
+v0.3.28 - a past session reads back whole, not truncated
+
+- Reading back an earlier session kept reporting the history as truncated, because the record was cut short as it was written.
+- Sessions now save exactly what the model saw, so a finished run reads back in full.
+- The decide tool can no longer fall off a crowded page's action menu.
+
 ## 0.3.27
 
 v0.3.27 - Jarvis can decide, not just describe

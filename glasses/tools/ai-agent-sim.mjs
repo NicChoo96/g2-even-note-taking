@@ -93,6 +93,7 @@ await build({
     // single module instance — duplicate module copies would give two stores.
     contents: `
 export * from './ai/index.ts';
+export { selectTools, shortJson } from './ai/agent.ts';
 export * from './ai/store.ts';
 export * from './ai/sync.ts';
 export * from './ai/registry.ts';
@@ -125,6 +126,8 @@ const {
   listPages,
   registerPage,
   registerCapabilities,
+  selectTools,
+  shortJson,
   allCapabilities,
   capabilityByName,
   capabilitiesForPage,
@@ -223,6 +226,37 @@ check(
     .map((c) => c.name),
   [],
 );
+// The OTHER HALF of the two checks above, and the one that was missing. Naming
+// an app-wide action in the prompt is not the same as handing it to the model:
+// the tool budget is trimmed per focus, and jev__decide was silently absent from
+// every docs and agents turn while the PAGES block called it "always callable".
+// An advertised-but-absent tool is worse than an omitted one — the model calls
+// it and reports a failure the wearer cannot act on.
+const RESERVED_WIRE = ['say.reply', 'nav.open_page', 'jev.decide'].map(toWireName);
+for (const p of pages) {
+  const handed = selectTools(p.id).map((s) => s.function.name);
+
+  const lostReserved = RESERVED_WIRE.filter((n) => !handed.includes(n));
+  assert(
+    `reserved actions reach the model on '${p.id}'`,
+    lostReserved.length === 0,
+    `dropped: ${lostReserved.join(', ') || '-'}`,
+  );
+
+  // Reserving is only safe while the page's own actions still fit inside what is
+  // left. A page that outgrows the budget loses an action silently, which is
+  // exactly how jev disappeared the first time.
+  const lostOwn = capabilitiesForPage(p.id)
+    .map((c) => toWireName(c.name))
+    .filter((n) => !handed.includes(n));
+  assert(
+    `no action of '${p.id}' is budgeted away`,
+    lostOwn.length === 0,
+    `dropped: ${lostOwn.join(', ') || '-'}`,
+  );
+
+  assert(`'${p.id}' stays inside the tool budget`, handed.length <= 12, `${handed.length}`);
+}
 // A page may promise MORE than is callable right now (an action gated off is
 // still one the model should plan for) but never less than nav.list_actions
 // would hand it — otherwise the prompt and the tool disagree.
@@ -1808,6 +1842,153 @@ const row = listed.data.agents.find((a) => a.name === 'Scout');
 assert('agents.list returns toolIds', Array.isArray(row.toolIds));
 assert('agents.list returns the model field', 'model' in row);
 assert('agents.list returns the role', typeof row.systemPrompt === 'string');
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sessions: a stored run must be readable back IN FULL
+//
+// The bug this guards: the relay stored each tool result clipped to 600 chars
+// with a literal "…[truncated]" appended, and the reader then cut the whole
+// transcript to 900 more. Jarvis reported every past session as truncated
+// because every past session WAS truncated, in the stored bytes.
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Sessions: full transcripts, not fragments ──');
+
+// A tool result in the shape the relay now stores it: the whole thing, tail
+// included. This is the exact text that used to be cut to 600 characters.
+const TAIL_MARK = 'END-OF-TOOL-RESULT-MARKER';
+const toolResult = `${'Headline and body text. '.repeat(28)}${TAIL_MARK}`;
+assert(
+  'the fixture result exceeds the old 600-char store cap',
+  toolResult.length > 600,
+  `${toolResult.length} chars`,
+);
+
+agents.recordSession({
+  agentId: 'agent-session-fixture',
+  title: 'Fixture run',
+  status: 'done',
+  messages: [
+    { role: 'user', content: 'summarise the news', at: 1 },
+    { role: 'assistant', content: 'Calling tavily_search…', tool: 'tavily_search', at: 2 },
+    { role: 'tool', content: toolResult, tool: 'tavily_search', at: 3 },
+    { role: 'assistant', content: 'Markets moved on the rate decision.', at: 4 },
+  ],
+});
+
+const read = await capOf('agents.sessions').run({ session: '1' });
+assert('a past session can be read', read.ok, read.summary);
+const t = read.data.transcript;
+assert('the transcript is not marked as clipped', !t.includes('omitted'), t.slice(0, 60));
+assert(
+  'the transcript does not open mid-content',
+  !t.startsWith('…'),
+  JSON.stringify(t.slice(0, 40)),
+);
+assert('the END of a stored tool result survives the read', t.includes(TAIL_MARK), `${t.length} chars`);
+assert(
+  'the WHOLE tool result survives the read',
+  t.includes(toolResult),
+  `${toolResult.length} chars in a ${t.length}-char transcript`,
+);
+assert(
+  'the tool result is no longer re-clipped to 220 chars per message',
+  !t.includes(`${toolResult.slice(0, 220)}…`),
+  t.slice(0, 60),
+);
+
+// Over budget: the cut must land on a LINE boundary and name what it dropped,
+// so the model reports a count instead of an impression of truncation. The
+// fixture has to clear the 88000-char guard (5 steps x 16000 tool chars).
+const oversized = [];
+for (let i = 0; i < 40; i++) {
+  oversized.push({ role: 'tool', content: `${'x'.repeat(3000)}-line-${i}`, tool: 't', at: i });
+}
+oversized.push({ role: 'assistant', content: `FINAL-ANSWER-${'y'.repeat(200)}`, at: 99 });
+agents.recordSession({
+  agentId: 'agent-session-fixture',
+  title: 'Oversized run',
+  status: 'done',
+  messages: oversized,
+});
+const big = await capOf('agents.sessions').run({ session: '1' });
+const bt = big.data.transcript;
+assert('an oversized transcript IS trimmed', bt.includes('earlier line'), bt.slice(0, 60));
+assert('…and it stays near the budget', bt.length <= 88080, `${bt.length} chars`);
+assert(
+  '…and it reports how many lines it dropped',
+  /^…\(\d+ earlier lines? omitted\)/.test(bt),
+  JSON.stringify(bt.slice(0, 44)),
+);
+assert('…and the final answer, at the end, is intact', bt.includes('FINAL-ANSWER-'), bt.slice(-60));
+assert(
+  '…and no line is sliced in half',
+  bt.split('\n').slice(1).every((l) => /^[A-Za-z]+: |^\[/.test(l)),
+  bt.split('\n').slice(1).find((l) => !/^[A-Za-z]+: |^\[/.test(l)) ?? '',
+);
+
+// A session the relay could actually produce (5 steps x 16000 tool chars) must
+// survive the read WHOLE — no clip, no marker. This is the case the user hit.
+const fullRun = [
+  { role: 'user', content: 'summarise the news', at: 0 },
+];
+for (let i = 0; i < 5; i++) {
+  fullRun.push({ role: 'assistant', content: 'Calling tavily_search…', tool: 'tavily_search', at: i * 3 + 1 });
+  fullRun.push({ role: 'tool', content: `${'r'.repeat(11839)}${TAIL_MARK}-${i}`, tool: 'tavily_search', at: i * 3 + 2 });
+}
+fullRun.push({ role: 'assistant', content: 'Markets moved on the rate decision.', at: 99 });
+agents.recordSession({
+  agentId: 'agent-session-fixture',
+  title: 'Full 5-step run',
+  status: 'done',
+  messages: fullRun,
+});
+const worst = await capOf('agents.sessions').run({ session: '1' });
+const wt = worst.data.transcript;
+assert('a full 5-step run reads WITHOUT a clip marker', !wt.includes('omitted'), wt.slice(0, 60));
+assert('…and its size matches the stored content', wt.length > 59000, `${wt.length} chars`);
+assert('…and every step tail marker is present',
+  [0, 1, 2, 3, 4].every((i) => wt.includes(`${TAIL_MARK}-${i}`)), `${wt.length} chars`);
+assert(
+  '…and the WHOLE transcript reaches the model, not a shortJson fragment',
+  (() => {
+    const sent = shortJson({ ok: worst.ok, summary: worst.summary, data: worst.data });
+    try {
+      return JSON.parse(sent).data.transcript === wt;
+    } catch {
+      return false;
+    }
+  })(),
+  `${wt.length} in transcript`,
+);
+
+// shortJson must hand back PARSEABLE JSON at any size — the old implementation
+// cut the serialized text and patched the damage with a literal `…"}`.
+const huge = { ok: true, summary: 'big', data: { transcript: 'z'.repeat(300000) } };
+const short = shortJson(huge);
+assert('shortJson bounds an oversized result', short.length <= 120000, `${short.length} chars`);
+let parsed = null;
+try {
+  parsed = JSON.parse(short);
+} catch {
+  /* left null */
+}
+assert('…and what it returns is still valid JSON', parsed !== null, short.slice(-70));
+assert(
+  '…and it marks the clip',
+  typeof parsed?.data?.transcript === 'string' && parsed.data.transcript.endsWith('…(clipped)'),
+  String(parsed?.data?.transcript).slice(-40),
+);
+const small = shortJson({ ok: true, summary: 'fine', data: { a: 1 } });
+assert(
+  'shortJson leaves a normal result byte-identical',
+  small === JSON.stringify({ ok: true, summary: 'fine', data: { a: 1 } }),
+  small,
+);
+assert(
+  'shortJson never emits the hand-rolled `…"}` repair',
+  !small.includes('…"}') && !short.slice(0, -1).includes('…"}'),
+  short.slice(-70),
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${fail === 0 ? 'ALL PASS' : `${fail} FAILURE(S)`}`);

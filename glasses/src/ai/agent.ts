@@ -48,8 +48,21 @@ const MAX_TOOLS = 12;
 function wireName(name: string): string {
   return toWireName(canonicalName(name));
 }
-/** Tool results are fed back verbatim; keep the context bounded. */
-const MAX_RESULT_CHARS = 1500;
+/**
+ * How much of a tool result comes back to the model. Tool results ARE fed back
+ * verbatim, so this is the one place a large payload is still bounded.
+ *
+ * Sized from what the relay can actually store, not picked by feel. A run is at
+ * most MAX_STEPS = 5 tool calls, each bounded at TOOL_RESULT_CHARS = 16000, so a
+ * session's tool content tops out at 80000 chars — and a session read is the
+ * largest result any capability can return. The ceiling sits above that, so it
+ * is a RUNAWAY GUARD rather than a second clip the model has to work around.
+ *
+ * It was 1500, which could not hold a single `agents.sessions` transcript even
+ * after the capability had already trimmed it: a past session read back as a
+ * fragment of a fragment, and the model correctly reported it as truncated.
+ */
+const MAX_RESULT_CHARS = 120000;
 /**
  * Step text: the model's chain of thought, and this loop's label for what it
  * did. ONE line on the HUD, deliberately short — a 400-character reasoning
@@ -86,6 +99,20 @@ const MAX_ANSWER_CHARS = 8000;
 const MANDATORY = ['say.reply', 'nav.open_page'];
 
 /**
+ * App-wide actions that belong to no page and are ADVERTISED as always callable
+ * by `pageCatalogText()`. They are reserved exactly like MANDATORY because
+ * `rest` below is ranked by PRIORITY and then truncated by the final slice: on
+ * a page with enough of its own actions the remainder is eaten before these are
+ * reached, and jev__decide disappeared from every Docs and Agents turn that
+ * way. An advertised-but-absent tool is worse than an omitted one — the PAGES
+ * block tells the model to call it, so it calls it and eats a provider error.
+ */
+const ALWAYS_AVAILABLE = ['jev.decide'];
+
+/** Everything taken out of the budget before page actions are considered. */
+const RESERVED = [...MANDATORY, ...ALWAYS_AVAILABLE];
+
+/**
  * Order for whatever budget is left, highest value first. Page actions sit above
  * the introspection helpers on purpose: the system prompt's PAGES block lists
  * every page and every action, so nav.list_* are a convenience, not a
@@ -101,30 +128,35 @@ const PRIORITY = [
   'nav.back',
 ];
 
-function selectTools(focused: PageId): ToolSchema[] {
+/**
+ * The tool list handed to the model for one focus. Exported because the budget,
+ * not the registry, decides whether a capability is REACHABLE: a registered
+ * action that falls off the end of `ranked` might as well not exist, and the
+ * prompt still advertises it. Only a real per-page selection can test that.
+ */
+export function selectTools(focused: PageId): ToolSchema[] {
   const pageCaps = capabilitiesForPage(focused);
   const pageNames = new Set(pageCaps.map((c) => c.name));
   const global = capabilitiesForPage(GLOBAL_PAGE).filter((c) => !pageNames.has(c.name));
 
-  const mandatory: Capability[] = [];
-  for (const name of MANDATORY) {
+  // Anything not reserved competes for what is left, so cap the page's own
+  // actions BEFORE adding them: their slice must leave the reserve untouched.
+  // Pushing them in first and slicing at the end is what used to let a page
+  // evict the reserve, and what pushed jev off the list entirely.
+  const reserved: Capability[] = [];
+  for (const name of RESERVED) {
     const cap = global.find((c) => c.name === name);
-    if (cap) mandatory.push(cap);
+    if (cap) reserved.push(cap);
   }
-  const rest = global.filter((c) => !MANDATORY.includes(c.name));
+  const rest = global.filter((c) => !RESERVED.includes(c.name));
   rest.sort((a, b) => {
     const ai = PRIORITY.indexOf(a.name);
     const bi = PRIORITY.indexOf(b.name);
     return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
   });
 
-  // Reserve the mandatory slots FIRST. Previously the page's actions were pushed
-  // ahead of them and the budget was sliced afterwards, so a page with enough
-  // actions consumed the whole allowance — say__reply or nav__open_page could
-  // drop out, and the model would report being unable to answer or to reach
-  // another page. A reserve cannot be evicted by a page.
-  const pageBudget = Math.max(0, MAX_TOOLS - mandatory.length);
-  const ranked: Capability[] = [...pageCaps.slice(0, pageBudget), ...mandatory, ...rest];
+  const pageBudget = Math.max(0, MAX_TOOLS - reserved.length);
+  const ranked: Capability[] = [...pageCaps.slice(0, pageBudget), ...reserved, ...rest];
 
   return toToolSchemas(ranked.slice(0, MAX_TOOLS));
 }
@@ -192,8 +224,14 @@ function systemPrompt(converse = false): string {
   ].join('\n');
 }
 
-function shortJson(result: CapabilityResult): string {
-  const payload = {
+/**
+ * The JSON handed back to the model after a capability runs. Exported because
+ * `MAX_RESULT_CHARS` decides what a capability is able to SAY: a transcript the
+ * model cannot fit in a result is a transcript it never reads, and only a real
+ * call through this function can show where the boundary now falls.
+ */
+export function shortJson(result: CapabilityResult): string {
+  const payload: Record<string, unknown> = {
     ok: result.ok,
     summary: result.summary,
     ...(result.hint ? { hint: result.hint } : {}),
@@ -203,9 +241,51 @@ function shortJson(result: CapabilityResult): string {
   try {
     text = JSON.stringify(payload);
   } catch {
-    text = JSON.stringify({ ok: result.ok, summary: result.summary });
+    return JSON.stringify({ ok: result.ok, summary: result.summary });
   }
-  return text.length > MAX_RESULT_CHARS ? `${text.slice(0, MAX_RESULT_CHARS)}…"}` : text;
+  if (text.length <= MAX_RESULT_CHARS) return text;
+  // Over budget. Clip the STRING LEAVES, never the serialized text: a raw slice
+  // of a JSON string can land inside an escape sequence or a key, so the model
+  // receives something it cannot parse. (The old code patched the cut with a
+  // literal `…"}` — a hand-rolled repair for exactly that damage.) Re-serializing
+  // after each clip is what keeps the payload valid JSON at every size.
+  const leaves: Array<{ holder: Record<string, unknown>; key: string }> = [];
+  const collect = (value: unknown, depth: number): void => {
+    if (depth > 8 || !value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item, depth + 1);
+      return;
+    }
+    const holder = value as Record<string, unknown>;
+    for (const key of Object.keys(holder)) {
+      if (typeof holder[key] === 'string') leaves.push({ holder, key });
+      else collect(holder[key], depth + 1);
+    }
+  };
+  collect(payload, 0);
+  // Longest first, so the fewest fields are touched.
+  leaves.sort((a, b) => String(b.holder[b.key]).length - String(a.holder[a.key]).length);
+  const MARK = '…(clipped)';
+  for (const leaf of leaves) {
+    text = JSON.stringify(payload);
+    if (text.length <= MAX_RESULT_CHARS) break;
+    // Escaping grows a string (`"` -> `\"`, newline -> `\n`), so leave headroom.
+    const over = text.length - MAX_RESULT_CHARS + 64;
+    const current = String(leaf.holder[leaf.key]);
+    const keep = Math.max(0, current.length - over - MARK.length);
+    leaf.holder[leaf.key] = keep > 0 ? `${current.slice(0, keep)}${MARK}` : MARK;
+  }
+  text = JSON.stringify(payload);
+  // Pathological payload (huge non-string leaves): a valid stub beats a cut
+  // string the model cannot parse.
+  if (text.length > MAX_RESULT_CHARS) {
+    return JSON.stringify({
+      ok: result.ok,
+      summary: `${String(result.summary).slice(0, 400)}${MARK}`,
+      hint: 'result too large; ask for a narrower slice',
+    });
+  }
+  return text;
 }
 
 /** Human-readable HUD copy for the tap-to-confirm prompt. */

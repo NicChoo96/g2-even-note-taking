@@ -712,10 +712,10 @@ async function runToolOnce(tool, rawArgs, signal) {
     const results = Array.isArray(j?.results) ? j.results.slice(0, 5) : [];
     const lines = results.map(
       (x, i) =>
-        `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, 500)}`,
+        `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, PER_HIT_CHARS)}`,
     );
     const answer = j?.answer ? `Answer: ${j.answer}\n\n` : '';
-    return clipText(`${answer}${lines.join('\n\n')}` || 'No results.', 4000);
+    return clipText(`${answer}${lines.join('\n\n')}` || 'No results.', TOOL_RESULT_CHARS);
   }
   const target = String(tool.url || '').trim();
   if (!/^https:\/\//i.test(target)) return 'tool error: tool url must be https://';
@@ -846,7 +846,7 @@ async function executeRun(run) {
           role: 'assistant',
           content: content || `Calling ${name}…`,
           tool: name,
-          args: clipText(String(rawArgs).replace(/\s+/g, ' '), 160),
+          args: clipText(String(rawArgs).replace(/\s+/g, ' '), ARG_CHARS),
           at: Date.now(),
         });
         run.statusText = `Searching · ${name}…`;
@@ -854,7 +854,9 @@ async function executeRun(run) {
         const tool = run.tools.find((t) => t.name === name);
         const result = await runToolOnce(tool, rawArgs, ac.signal);
         wire.push({ role: 'tool', content: result, tool_call_id: call.id });
-        push({ role: 'tool', content: clipText(result, 600), tool: name, at: Date.now() });
+        // Stored VERBATIM. `result` is already bounded by runToolOnce, so a
+        // second clip here only destroyed the record of what the model saw.
+        push({ role: 'tool', content: result, tool: name, at: Date.now() });
       }
     }
     // The model kept calling tools instead of answering. Rather than failing the
@@ -922,6 +924,21 @@ function clipText(s, n) {
   const t = String(s ?? '');
   return t.length > n ? `${t.slice(0, n)}…[truncated]` : t;
 }
+
+// ── Tool-result budgets ───────────────────────────────────────────────────
+// These bound what the MODEL reads in one step. They were 500/4000, which cut
+// the tail off every search hit before the model ever saw it.
+//
+// The store is deliberately NOT budgeted separately: a run's transcript is the
+// record of what actually happened, and clipping it produced sessions that
+// could not be read back in full. The old stored copy was clipped to 600 chars
+// with a literal "…[truncated]" appended, so a finished session permanently read
+// as truncated — and re-reading the run from `run.prompt` meant that clip
+// protected nothing. What is stored is now exactly what the model was shown.
+const PER_HIT_CHARS = 3000;
+const TOOL_RESULT_CHARS = 16000;
+/** Tool-call arguments are shown in the transcript too; args can be JSON blobs. */
+const ARG_CHARS = 400;
 
 loadSecrets();
 
@@ -1857,12 +1874,12 @@ const server = createServer(async (req, res) => {
         const results = Array.isArray(j?.results) ? j.results.slice(0, 5) : [];
         const lines = results.map(
           (x, i) =>
-            `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, 500)}`,
+            `${i + 1}. ${x.title || '(untitled)'}\n${x.url || ''}\n${String(x.content || '').slice(0, PER_HIT_CHARS)}`,
         );
         const answer = j?.answer ? `Answer: ${j.answer}\n\n` : '';
         json(res, 200, {
           ok: true,
-          result: clipText(`${answer}${lines.join('\n\n')}` || 'No results.', 4000),
+          result: clipText(`${answer}${lines.join('\n\n')}` || 'No results.', TOOL_RESULT_CHARS),
         });
         return;
       }

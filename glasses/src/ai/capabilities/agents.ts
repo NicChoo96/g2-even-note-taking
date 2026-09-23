@@ -222,21 +222,56 @@ function findSession(rows: SessionRow[], raw: string): { row: SessionRow; n: num
   return { row: rows[i], n: i + 1 };
 }
 
+/**
+ * Per-message cap inside a transcript. It has to be at least the relay's
+ * TOOL_RESULT_CHARS (16000), or the reader re-clips what storage deliberately
+ * kept whole — which is the same truncation bug this replaced, just at a higher
+ * threshold. Measured: an advanced-depth search result is ~11800 chars, so the
+ * old 220 (and even 4000) cut the tail off every tool turn.
+ */
+const TRANSCRIPT_MSG_CHARS = 16000;
+
 /** A compact, label-prefixed transcript — the thing the model actually reads. */
-function transcriptText(row: SessionRow, maxChars = 900): string {
+function transcriptText(row: SessionRow, maxChars = 88000): string {
   // Chronological (oldest first) even though the LIST is newest-first: a story
   // read backwards is useless. The tail is kept when it has to be trimmed,
   // because the answer is at the end.
+  //
+  // A whole turn is kept per message: the relay bounded each result when it
+  // STORED the run, so clipping again here only re-loses text the session
+  // actually holds. 220 chars used to cut every tool result down to a fragment,
+  // and 900 then cut the whole transcript to a fragment of that.
+  //
+  // The budget is derived, not guessed: a run is at most MAX_STEPS = 5 tool
+  // calls at TOOL_RESULT_CHARS = 16000 each, so 80000 chars of tool content is
+  // the ceiling — with room for the labels and the closing answer on top. Like
+  // MAX_ANSWER_CHARS in the loop, this is a runaway guard set ABOVE the real
+  // ceiling, so in normal operation the cut below is never reached.
   const lines = row.messages
     .map((m) => {
       const label = m.role === 'user' ? 'You' : m.role === 'tool' ? `[${m.tool ?? 'tool'}]` : 'Agent';
-      const body = flatten(m.content, 220);
+      const body = flatten(m.content, TRANSCRIPT_MSG_CHARS);
       return body ? `${label}: ${body}` : '';
     })
     .filter(Boolean);
-  let text = lines.join('\n');
-  if (text.length > maxChars) text = `…\n${text.slice(text.length - maxChars)}`;
-  return text;
+  const text = lines.join('\n');
+  if (text.length <= maxChars) return text;
+  // Over budget: drop WHOLE LEADING LINES, never a byte range. A character
+  // slice started mid-word (`…\necision and a storm warning`), which reads as
+  // corruption and cannot be counted — the model could only report "truncated".
+  // The cut is now on a boundary and NAMES what it dropped, so it reports a
+  // number instead of an impression.
+  const tail: string[] = [];
+  let kept = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const add = lines[i].length + (tail.length ? 1 : 0); // + the joining newline
+    if (tail.length && kept + add > maxChars) break;
+    tail.unshift(lines[i]);
+    kept += add;
+    if (kept >= maxChars) break;
+  }
+  const omitted = lines.length - tail.length;
+  return `…(${omitted} earlier line${omitted === 1 ? '' : 's'} omitted)\n${tail.join('\n')}`;
 }
 
 export const agentsCapabilities: Capability[] = [

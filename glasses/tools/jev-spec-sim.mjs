@@ -452,7 +452,8 @@ await build({
 // Side effect and helper come from different modules on purpose: pages.ts is the
 // file that REGISTERS the catalog, registry.ts is where the helpers live.
 import './ai/pages.ts';
-export { capabilityByName, toToolSchema, toWireName, callAction } from './ai/registry.ts';
+export { capabilityByName, listPages, toToolSchema, toWireName, callAction } from './ai/registry.ts';
+export { selectTools } from './ai/agent.ts';
 export { emptyAgentsState, jevTool } from './types.ts';
 export { GLOBAL_PAGE } from './ai/types.ts';
 `,
@@ -504,6 +505,21 @@ check(
   ui.emptyAgentsState().tools.some((t) => t.kind === 'jev'),
   false,
 );
+
+// Registering a capability is NOT the same as handing it to the model. The loop
+// sends one TRIMMED tool list per focus, and jev.decide was registered and
+// advertised by the PAGES block as "always callable" while being absent from
+// the list on every docs and agents turn — so Jarvis called a tool that was not
+// there and reported a failure the wearer could not act on. Only the real
+// selection per page proves exposure.
+for (const pid of ui.listPages().map((p) => p.id)) {
+  const handed = ui.selectTools(pid).map((s) => s.function.name);
+  assert(
+    `Jarvis can actually call jev from '${pid}'`,
+    handed.includes('jev__decide'),
+    `handed: ${handed.join(', ')}`,
+  );
+}
 
 // ── 12. the capability answers honestly, and only from real data ────────────
 //
