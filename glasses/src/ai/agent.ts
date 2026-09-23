@@ -79,10 +79,17 @@ const MAX_STEP_CHARS = 240;
 const MAX_ANSWER_CHARS = 8000;
 
 /**
- * Tool budget, highest value first. Page actions sit above the introspection
- * helpers on purpose: the system prompt already lists every page and action, so
- * nav.list_* are a convenience, not a requirement, and they are the first to go
- * when a page is action-heavy.
+ * Actions this loop cannot function without. They are reserved out of the tool
+ * budget BEFORE page actions are considered, so an action-heavy page can never
+ * evict the ability to route to another page or to speak an answer.
+ */
+const MANDATORY = ['say.reply', 'nav.open_page'];
+
+/**
+ * Order for whatever budget is left, highest value first. Page actions sit above
+ * the introspection helpers on purpose: the system prompt's PAGES block lists
+ * every page and every action, so nav.list_* are a convenience, not a
+ * requirement, and they are the first to go when a page is action-heavy.
  */
 const PRIORITY = [
   'say.reply',
@@ -99,22 +106,25 @@ function selectTools(focused: PageId): ToolSchema[] {
   const pageNames = new Set(pageCaps.map((c) => c.name));
   const global = capabilitiesForPage(GLOBAL_PAGE).filter((c) => !pageNames.has(c.name));
 
-  const ranked: Capability[] = [];
-  // 1. page actions — the reason this turn exists
-  ranked.push(...pageCaps);
-  // 2. the two mandatory globals, in the order the model should reach for them
-  for (const name of ['say.reply', 'nav.open_page']) {
+  const mandatory: Capability[] = [];
+  for (const name of MANDATORY) {
     const cap = global.find((c) => c.name === name);
-    if (cap) ranked.push(cap);
+    if (cap) mandatory.push(cap);
   }
-  // 3. everything else, by priority then registration order
-  const rest = global.filter((c) => !['say.reply', 'nav.open_page'].includes(c.name));
+  const rest = global.filter((c) => !MANDATORY.includes(c.name));
   rest.sort((a, b) => {
     const ai = PRIORITY.indexOf(a.name);
     const bi = PRIORITY.indexOf(b.name);
     return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
   });
-  ranked.push(...rest);
+
+  // Reserve the mandatory slots FIRST. Previously the page's actions were pushed
+  // ahead of them and the budget was sliced afterwards, so a page with enough
+  // actions consumed the whole allowance — say__reply or nav__open_page could
+  // drop out, and the model would report being unable to answer or to reach
+  // another page. A reserve cannot be evicted by a page.
+  const pageBudget = Math.max(0, MAX_TOOLS - mandatory.length);
+  const ranked: Capability[] = [...pageCaps.slice(0, pageBudget), ...mandatory, ...rest];
 
   return toToolSchemas(ranked.slice(0, MAX_TOOLS));
 }
@@ -140,10 +150,20 @@ function systemPrompt(converse = false): string {
     '   request genuinely spans pages.',
     '',
     `FOCUSED PAGE RIGHT NOW: ${focus}`,
+    // The tool list is a BUDGET (see selectTools), so it carries the focused
+    // page's actions plus the globals that survived. Saying so, and pointing at
+    // the PAGES block, is what stops a model from reading an absent tool as an
+    // absent permission and telling the wearer it has no access.
+    'NOTE: your tool list only carries the focused page\'s actions. The PAGES block below always',
+    'lists EVERY page\'s actions, so an action you cannot see as a tool most likely still exists —',
+    'route to its page and it becomes callable.',
     '',
     'RULES',
     '- Resolve "it", "the second one", "my shopping list" from the live state below BEFORE acting.',
     '- Never invent ids, titles or positions. Read first (app__status, a *__list or *__read action) if unsure.',
+    '- If the request belongs to another page, route there with nav__open_page and do the work. Never',
+    '  tell the user you lack access, and never claim a write is unsupported — check the PAGES block',
+    '  first, then route.',
     '- Prefer one action over many, and matching an existing item over creating a duplicate.',
     // The answer is not length-limited by the HUD any more — it pages — so the
     // prompt must not be the thing that shortens it. "Short" survives only as a

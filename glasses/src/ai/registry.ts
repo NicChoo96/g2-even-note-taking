@@ -248,7 +248,13 @@ export function prepare(name: string, rawArgs: unknown, focused: PageId): Prepar
   if (cap.page !== GLOBAL_PAGE && cap.page !== focused) {
     return {
       kind: 'error',
-      error: `page "${cap.page}" is not focused (currently on "${focused}")`,
+      // Say outright that the action EXISTS and is permitted. The tool list is
+      // trimmed to a budget, so a model focused elsewhere often has no tool for
+      // this action and only the prompt's action list to go on; a bare refusal
+      // reads to it as "I have no access", which it then tells the user.
+      error:
+        `page "${cap.page}" is not focused (currently on "${focused}") — ${wire} is available, ` +
+        `this is a routing step, not a permission problem`,
       hint: `call ${toWireName('nav.open_page')} with {"page":"${cap.page}"} first, then retry ${wire}`,
     };
   }
@@ -284,17 +290,52 @@ export async function callAction(name: string, rawArgs: unknown, focused: PageId
 // These live here (not in a capability module) so nothing has to import the
 // capability graph just to label a page — keeps the module graph acyclic.
 
-/** Live page table for the system prompt — always reflects current registration. */
+/**
+ * Live page table for the system prompt — always reflects current registration.
+ *
+ * Every page's action names are listed. This is the ONLY place the model can
+ * learn about an action whose tool got trimmed out of this turn's tool budget:
+ * `selectTools` only carries the focused page's actions, so without this a
+ * model asked to write a doc from the To-Do page had neither the tool nor any
+ * mention of `docs__append`, and correctly concluded it had no access.
+ */
 export function pageCatalogText(): string {
-  return listPages()
-    .map((p) => `- ${p.id} — ${p.title}: ${p.summary} (user may say: ${p.synonyms.join(', ')})`)
-    .join('\n');
+  const lines = listPages().map((p) => {
+    const line = `- ${p.id} — ${p.title}: ${p.summary} (user may say: ${p.synonyms.join(', ')})`;
+    const actions = pageDeclaredActionNames(p.id);
+    return actions.length ? `${line}\n  actions: ${actions.join(', ')}` : line;
+  });
+  // The app-wide actions belong to no page (there is no page to route to), and
+  // the budget can still trim nav__back / nav__list_actions / undo__last out of a
+  // given turn's tool list, so name them here rather than leaving them unknown.
+  const appWide = pageDeclaredActionNames(GLOBAL_PAGE);
+  if (appWide.length) {
+    lines.push(
+      `- app-wide (always callable, no routing needed): ${appWide.join(', ')}`,
+    );
+  }
+  return lines.join('\n');
 }
 
 /** Human label for a page id, used by the HUD's layer-1 routing line. */
 export function pageTitle(id: PageId): string {
   if (id === GLOBAL_PAGE) return 'App';
   return pages.get(id)?.title ?? String(id);
+}
+
+/**
+ * Every action a page DECLARES, in wire form, regardless of the `available`
+ * gate. Used by the system prompt, which must tell the model that a capability
+ * exists — an action gated off right now is still one the model should plan for
+ * (e.g. `notes.clear` with no notes yet) rather than believe it cannot do.
+ *
+ * Distinct from `pageActionNames`, which is what `nav.list_actions` returns and
+ * must therefore only ever name something actually callable this instant.
+ */
+export function pageDeclaredActionNames(page: PageId): string[] {
+  return allCapabilities()
+    .filter((c) => c.page === page)
+    .map((c) => toWireName(c.name));
 }
 
 /**

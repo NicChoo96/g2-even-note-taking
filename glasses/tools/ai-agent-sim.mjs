@@ -131,6 +131,9 @@ const {
   toToolSchema,
   toWireName,
   fromWireName,
+  pageActionNames,
+  pageCatalogText,
+  pageDeclaredActionNames,
   canonicalName,
   validateArgs,
   prepare,
@@ -198,6 +201,40 @@ check(
 
 const emptyPages = pages.filter((p) => capabilitiesForPage(p.id).length === 0);
 check('every page exposes at least one action', emptyPages.map((p) => p.id), []);
+
+// The system prompt's PAGES block is the ONLY place a model can learn about an
+// action whose tool was trimmed out of this turn's budget, so it has to name
+// every action of every page — not summarise a page in prose and leave it there.
+const catalog = pageCatalogText();
+const missingFromCatalog = caps
+  .filter((c) => !catalog.includes(toWireName(c.name)))
+  .map((c) => c.name);
+check('the prompt catalog names EVERY action of EVERY page', missingFromCatalog, []);
+check(
+  'the catalog prints them wire-formed (what the model must call)',
+  caps.every((c) => catalog.includes(toWireName(c.name))),
+  true,
+);
+check('the catalog carries an app-wide line', catalog.includes('- app-wide'), true);
+check(
+  'the app-wide line names every global action',
+  caps
+    .filter((c) => c.page === GLOBAL_PAGE && !catalog.includes(toWireName(c.name)))
+    .map((c) => c.name),
+  [],
+);
+// A page may promise MORE than is callable right now (an action gated off is
+// still one the model should plan for) but never less than nav.list_actions
+// would hand it — otherwise the prompt and the tool disagree.
+const understated = pages.filter((p) =>
+  pageActionNames(p.id).some((n) => !pageDeclaredActionNames(p.id).includes(n)),
+);
+check('declared actions are a superset of callable ones', understated.map((p) => p.id), []);
+const noActionsLine = pages
+  .filter((p) => pageDeclaredActionNames(p.id).length > 0)
+  .filter((p) => !catalog.includes(`actions: ${pageDeclaredActionNames(p.id)[0]}`))
+  .map((p) => p.id);
+check('every page with actions prints an actions: line', noActionsLine, []);
 
 const badDef = caps.filter((c) => !c.name.includes('.') || !c.title || !c.description || typeof c.run !== 'function');
 check('every action has name/title/description/run', badDef.map((c) => c.name), []);
@@ -626,6 +663,9 @@ function scripted(replies) {
     seen.push({
       messages: messages.map((m) => m.role),
       toolNames: (tools ?? []).map((t) => t.function.name),
+      // The system prompt itself: the PAGES block in it is the only place the
+      // model can learn about an action whose tool lost the budget race.
+      system: messages[0]?.role === 'system' ? messages[0].content : '',
       // Enough of the outbound transcript to assert on names the provider will
       // validate (`role:'tool'.name` and `assistant.tool_calls[].function.name`).
       full: messages.map((m) => ({
@@ -687,6 +727,105 @@ assert('nav.open_page is always exposed', sentTools.includes('nav__open_page'));
 assert('every name handed to the provider is pattern-safe', sentTools.every((n) => PROVIDER_NAME.test(n)), sentTools.join(','));
 assert('tool count respects the budget', sentTools.length <= 12, `${sentTools.length} tools`);
 check('no duplicate tool names', sentTools.length, new Set(sentTools).size);
+
+// --- 7b-iii. THE BUDGET CANNOT EVICT ROUTING OR SPEECH. Page actions are ranked
+// first and the slice used to happen afterwards, so a page with enough actions
+// could consume the whole allowance and drop say__reply / nav__open_page — the
+// model would then report being unable to answer or to reach another page. The
+// reserve is taken out of the budget before pages are considered.
+for (const page of pages.map((p) => p.id)) {
+  resetAiForTest();
+  const probe = scripted([replyWith(toolCall('say.reply', { text: 'ok' }))]);
+  await runAiAgent({ utterance: 'what can you do?', focus: page, llm: probe });
+  const names = probe.seen[0].toolNames;
+  assert(`[${page}] the budget holds say__reply`, names.includes('say__reply'), names.join(','));
+  assert(
+    `[${page}] the budget holds nav__open_page`,
+    names.includes('nav__open_page'),
+    names.join(','),
+  );
+  assert(`[${page}] stays within the tool budget`, names.length <= 12, `${names.length} tools`);
+}
+
+// --- 7b-iv. THE REPORTED DEFECT. Standing on To-Do, "add a line to my shopping
+// doc" made Jarvis answer that it had no access to docs write. Two causes: the
+// tools for docs are not in that turn's list at all, AND the prompt never named a
+// single docs action — so "I have no access" was a rational conclusion. The tool
+// list is still trimmed (that is by design and measured above); what changed is
+// that the prompt now names every action and forbids the refusal.
+resetAiForTest();
+const fromTodo = scripted([replyWith(toolCall('say.reply', { text: 'ok' }))]);
+await runAiAgent({ utterance: 'add something to my shopping doc', focus: 'todo', llm: fromTodo });
+const todoTurn = fromTodo.seen[0];
+check(
+  'a todo-focused turn carries no docs tool (the premise of the bug)',
+  todoTurn.toolNames.filter((n) => n.startsWith('docs__')),
+  [],
+);
+const docsActions = pageDeclaredActionNames('docs');
+assert('the docs page really does declare several actions', docsActions.length >= 5, docsActions.join(','));
+const unnamed = docsActions.filter((n) => !todoTurn.system.includes(n));
+check('…so the prompt must name every one of them', unnamed, []);
+assert(
+  '…and forbid claiming a lack of access',
+  /never[\s\S]{0,160}lack access/i.test(todoTurn.system),
+  'no "never claim lack of access" rule found in the prompt',
+);
+assert(
+  '…and tell the model to route there instead',
+  /route there with nav__open_page/i.test(todoTurn.system),
+  'no routing rule found in the prompt',
+);
+assert(
+  '…and warn that the tool list is only the focused page\'s',
+  /tool list only carries the focused page/i.test(todoTurn.system),
+  'no NOTE about the trimmed tool list',
+);
+
+// --- 7b-v. AND THE WRITE ACTUALLY LANDS. The refused cross-page call, the route,
+// then the same call succeeding — the user-visible outcome of the whole fix.
+resetAiForTest();
+hub.update(() => ({
+  ...hub.getState(),
+  sections: { todo: [], docs: [], notes: '' },
+  activeDocId: null,
+}));
+const seeded = await callAction('docs.new', { title: 'Shopping', content: 'line one' }, 'docs');
+assert('a doc exists to write into', seeded.ok, seeded.summary);
+const crossPage = scripted([
+  replyWith(toolCall('docs__append', { text: 'eggs' })), // wrong page: refused, with a hint
+  replyWith(toolCall('nav__open_page', { page: 'docs' })),
+  replyWith(toolCall('docs__append', { text: 'eggs' })),
+  replyWith(toolCall('say__reply', { text: 'Added it.' })),
+]);
+const rRouted = await runAiAgent({
+  utterance: 'add eggs to my shopping doc',
+  focus: 'todo',
+  llm: crossPage,
+});
+assert('a cross-page write completes after routing', rRouted.ok, rRouted.error);
+assert(
+  '…and the reply claims no lack of access',
+  !/no access/i.test(rRouted.reply ?? ''),
+  rRouted.reply,
+);
+has('…and the text reached the doc', hub.getState().sections.docs[0].content, 'eggs');
+assert(
+  '…and the loop saw the refusal before routing',
+  crossPage.seen.length >= 3 && crossPage.seen[0].toolNames.length > 0,
+  `${crossPage.seen.length} turns`,
+);
+// The refusal the loop feeds back is itself part of the fix: it must say the
+// action EXISTS and that this is routing, because the model paraphrases whatever
+// wording it is given, and a bare "not focused" reads to it as "no access".
+const refusal = prepare('docs.append', { text: 'x' }, 'todo');
+check('a cross-page call is still refused, as designed', refusal.kind, 'error');
+assert('…saying the action IS available', /is available/.test(refusal.error ?? ''), refusal.error);
+assert(
+  '…and calling it routing, not a permission problem',
+  /routing step, not a permission problem/.test(refusal.error ?? ''),
+  refusal.error,
+);
 
 // --- 7b-ii. WIRE NAMES end to end. The model replies with the provider-safe
 // spelling, and the transcript we send BACK must be wire-safe too, because the

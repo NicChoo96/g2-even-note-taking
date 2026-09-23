@@ -15,6 +15,8 @@ export {
   fromWireName,
   listPages,
   pageActionNames,
+  pageCatalogText,
+  pageDeclaredActionNames,
   pageTitle,
   toWireName,
 } from './registry';

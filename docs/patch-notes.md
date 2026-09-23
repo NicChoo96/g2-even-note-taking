@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.26
+
+v0.3.26 - Jarvis can write to your documents from any page
+
+- Asked to add to a document while on the To-Do page, Jarvis used to reply that it had no access. It now routes to Docs and does it.
+- Jarvis's instructions list every action of every page, so nothing looks off-limits.
+- Speak and route can no longer be dropped from a crowded page's action menu.
+
 ## 0.3.25
 
 v0.3.25 - Jarvis answers in full, however long that takes
