@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.27
+
+v0.3.27 - Jarvis can decide, not just describe
+
+- New: ask a typed question about a piece of text and get a straight answer back - yes or no with a probability, one choice out of options you set, or a step on an ordered scale.
+- Jarvis uses it to route, rank and check its own work instead of guessing at prose.
+- Add it to an agent from the Agents panel. It runs on the OpenRouter key you already saved.
+
 ## 0.3.26
 
 v0.3.26 - Jarvis can write to your documents from any page
