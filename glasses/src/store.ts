@@ -4,7 +4,7 @@
 // echoes). This is what makes ONE app at ONE URL drive the web UI AND the
 // glasses at the same time.
 import { publishState } from './stream';
-import { emptyHubState, type DocEntry, type HubState } from './types';
+import { emptyHubState, type DocEntry, type FileRef, type HubState } from './types';
 
 const LS_KEY = 'hub:state';
 
@@ -29,6 +29,7 @@ const connListeners = new Set<(s: ConnStatus) => void>();
 interface RawSections {
   todo?: unknown;
   docs?: unknown;
+  files?: unknown;
   notes?: unknown;
 }
 type RawState = Partial<HubState> & { sections?: RawSections };
@@ -65,6 +66,14 @@ function loadLocal(): HubState {
       sections: {
         todo: Array.isArray(parsed.sections.todo) ? (parsed.sections.todo as HubState['sections']['todo']) : [],
         docs,
+        // `sections` is rebuilt from explicit keys rather than spread, so a key
+        // missing HERE is silently discarded on every reload — which for a cache
+        // of remote references means the list empties itself after a restart.
+        files: Array.isArray(parsed.sections.files)
+          ? (parsed.sections.files as FileRef[]).filter(
+              (f) => f && typeof f.id === 'string' && f.id.length > 0,
+            )
+          : [],
         notes: typeof parsed.sections.notes === 'string' ? parsed.sections.notes : '',
       },
       activeDocId:

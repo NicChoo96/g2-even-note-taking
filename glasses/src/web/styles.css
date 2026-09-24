@@ -1527,3 +1527,121 @@ li.empty {
   width: 84px;
 }
 
+/* ── Files panel (Jarvis document store) ──────────────────────────────────── */
+.files-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Shown when the relay holds no document-store credential. Same shape as
+   .warn-line but quiet: nothing is broken, one env var is unset. */
+.files-hint {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 12px;
+  margin: 0 0 12px;
+}
+
+.files-search {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 10px;
+  min-width: 0;
+}
+
+.files-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.files-notice {
+  color: var(--accent);
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+
+.files-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+
+.files-list {
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+/* A list row inside a list row: the outer <li> carries no styling, so the
+   button has to look and behave like the agent rows it sits beside. */
+.files-row {
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.files-draft {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  min-width: 0;
+}
+
+.files-draft-note {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.files-preview-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 10px;
+  min-width: 0;
+}
+
+.files-preview-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.files-preview-title strong {
+  overflow-wrap: anywhere;
+}
+
+.files-preview-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* The sandboxed document frame. Tall enough that a report is readable without
+   being scrolled inside a postage stamp, and plain white because the document
+   was authored for its own background, not ours. */
+.files-frame {
+  width: 100%;
+  height: 62vh;
+  min-height: 320px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+@media (max-width: 860px) {
+  .files-frame {
+    height: 48vh;
+  }
+}
+

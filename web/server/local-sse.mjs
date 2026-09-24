@@ -31,6 +31,25 @@
 //   POST /api/settings            -> owner sets model / keys (never echoed back)
 //   POST /api/llm                 -> OpenRouter/DeepSeek chat-completions proxy (tools ok)
 //   POST /api/tool                -> web search (Tavily or Brave) / generic REST proxy
+//   GET  /api/files/status        -> is the Jarvis document store configured?
+//   GET  /api/files               -> list stored HTML documents (relay-proxied)
+//   POST /api/files               -> publish an HTML document
+//   GET  /api/files/:id           -> one document's metadata
+//   GET  /api/files/:id/html      -> the document BODY (bearer only; see below)
+//   DELETE /api/files/:id         -> soft-delete a document
+//
+// THE DOCUMENT STORE (jarvis-files.mjs) holds its own credential and its own
+// session. The BROWSER NEVER TALKS TO IT: the gateway's CORS list is empty, so
+// a direct call from the SPA cannot even preflight. Every call therefore comes
+// through the /api/files routes above, which is also the only reason the
+// credential can stay in this process.
+//
+// A stored document's body is served with `sandbox allow-scripts` and NO
+// `allow-same-origin`, so it runs with an opaque origin: it cannot read this
+// app's DOM, its storage or its session, and it cannot call this API. The SPA
+// renders it by FETCHING the body (bearer-authenticated) and handing it to a
+// sandboxed iframe as `srcdoc` — never by pointing an iframe at a URL, which
+// the gateway's own `X-Frame-Options: SAMEORIGIN` would refuse anyway.
 //
 // SECURITY: /api/stream (GET + POST) requires a valid owner session token OR an
 // approved per-device ID. Browsers authenticate via Google SSO; each glasses
@@ -48,8 +67,11 @@
 // DEEPSEEK_MODEL). Agents web search: TAVILY_API_KEY or BRAVE_SEARCH_API_KEY,
 // with SEARCH_PROVIDER=tavily|brave to choose (default: whichever key is set,
 // Tavily winning when both are), plus an optional WEB_SEARCH_DEPTH (basic or
-// advanced; the legacy TAVILY_SEARCH_DEPTH still works). Zero runtime
-// dependencies (node built-ins only). Run:
+// advanced; the legacy TAVILY_SEARCH_DEPTH still works). Agents document store:
+// JARVIS_FILE_USER + JARVIS_FILE_PWD (password login, the default path) or
+// JARVIS_FILE_API_KEY (a pre-minted `jvk_…` key, which needs no session at all),
+// with JARVIS_FILE_URL to point at a gateway other than the default.
+// Zero runtime dependencies (node built-ins only). Run:
 //   node server/local-sse.mjs          (default port 5174)
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -70,6 +92,19 @@ import { looksLikeToolMarkup, stripToolMarkup } from './tool-markup.mjs';
 // (see web-search.mjs). Kept out of this file so both providers can be driven
 // against a stubbed fetch; importing THIS module starts a server.
 import { isWebTool, resolveDepth, searchWeb } from './web-search.mjs';
+// Jarvis Content Gateway — the external store for HTML documents an agent or
+// Jarvis publishes (see jarvis-files.mjs). Kept out of this file so the whole
+// client — login, the single-flight token rotation, the MCP call shape and the
+// error envelope — can be driven against a stubbed fetch and asserted. Its
+// header records the two things its own docs get wrong.
+import {
+  createFilesClient,
+  filesConfig,
+  filesToolSchema,
+  htmlResponseHeaders,
+  isFilesTool,
+  renderToolResult as renderFilesResult,
+} from './jarvis-files.mjs';
 // Jev — the typed-decision model. Builds/validates the question spec and reads
 // the answers back. Ships twice (relay + WebView); see the header of jev-spec.mjs.
 import {
@@ -350,6 +385,11 @@ const secrets = {
   depth: '',
   /** '' = auto (whichever key is present). Only 'tavily' | 'brave' are honoured. */
   searchProvider: '',
+  /** Jarvis document store: URL, password login, or a pre-minted API key. */
+  filesUrl: '',
+  filesUser: '',
+  filesPwd: '',
+  filesKey: '',
 };
 
 /** Per-tool bearer tokens for generic REST tools: { [toolId]: token }. */
@@ -580,6 +620,97 @@ function webSearchConfig() {
   };
 }
 
+// ── Jarvis document store (agent-authored HTML) ──────────────────────────────
+// ONE client for the process, created lazily and REPLACED only when the
+// effective config changes. This is not an optimisation. The client owns a
+// rotating refresh token, and rotating twice from two live clients would replay
+// a consumed token — which the gateway answers by revoking the whole session
+// family — so there must never be two of them for one set of credentials.
+let filesClientRef = null;
+let filesClientKey = '';
+
+/** How many documents a TOOL result lists. The page asks for more than this. */
+const FILES_TOOL_LIST_LIMIT = 20;
+/**
+ * The request cap for a publish, set just above the gateway's own 4 MiB
+ * `max_html_bytes`. Being OVER that limit must be reported as a validation
+ * failure the caller can act on, so the envelope has to reach the gateway —
+ * rejecting it here with a generic "body too large" would hide which limit bit.
+ */
+const FILES_MAX_BODY_BYTES = 4 * 1024 * 1024 + 64 * 1024;
+/** The author recorded when neither the model nor the tool names one. */
+const DEFAULT_FILES_AGENT = 'g2-hub';
+
+function filesRuntime() {
+  const cfg = filesConfig(process.env, secrets);
+  if (!cfg.url) return { cfg, client: null, error: 'JARVIS_FILE_URL is not a valid http(s) URL' };
+  if (!cfg.configured) return { cfg, client: null, error: `${cfg.hintVar} is not set` };
+  const key = [cfg.url, cfg.apiKey, cfg.username, cfg.password].join('\u0000');
+  if (!filesClientRef || filesClientKey !== key) {
+    filesClientRef = createFilesClient({
+      baseUrl: cfg.url,
+      apiKey: cfg.apiKey,
+      username: cfg.username,
+      password: cfg.password,
+    });
+    filesClientKey = key;
+  }
+  return { cfg, client: filesClientRef, error: '' };
+}
+
+/**
+ * The document store as a TOOL, for the server-side agent loop.
+ *
+ * Never throws: a gateway that is down, unconfigured or out of scope must
+ * report as a `tool error:` line the model can read and route around, exactly
+ * like the web-search and jev branches. A tool failure that took the run down
+ * would throw away the rest of the agent's work.
+ */
+async function runFilesTool(tool, args, signal) {
+  const { client, error } = filesRuntime();
+  if (!client) return `tool error: document store not configured — ${error}`;
+  const action = String(args?.action ?? '').toLowerCase();
+  try {
+    if (action === 'list') {
+      return renderFilesResult(
+        'list_sessions',
+        await client.list({
+          q: args?.q,
+          agent: args?.agent,
+          limit: FILES_TOOL_LIST_LIMIT,
+          signal,
+        }),
+      );
+    }
+    if (action === 'publish') {
+      const doc = await client.create({
+        html: args?.html ?? args?.document ?? args?.body,
+        title: args?.title,
+        agent: args?.agent || DEFAULT_FILES_AGENT,
+        tags: args?.tags,
+        id: args?.id,
+        overwrite: args?.overwrite,
+        signal,
+      });
+      return renderFilesResult('create_session', doc);
+    }
+    if (action === 'read') {
+      const id = String(args?.id ?? '').trim();
+      if (!id) return 'tool error: id is required to read a document';
+      return renderFilesResult('read_session', await client.read(id, { signal }));
+    }
+    if (action === 'delete' || action === 'remove') {
+      const id = String(args?.id ?? '').trim();
+      if (!id) return 'tool error: id is required to delete a document';
+      return renderFilesResult('delete_session', await client.remove(id, { signal }));
+    }
+    return 'tool error: action must be one of publish, list, read, delete';
+  } catch (err) {
+    const code = err?.code ? `${err.code}: ` : '';
+    return `tool error: ${code}${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
 /**
  * The only capability shape any client ever sees: booleans + provenance, never
  * a key value. Shared by /api/agent/status and /api/settings so the two can
@@ -589,6 +720,7 @@ function agentStatusPayload() {
   const llm = llmConfig();
   const ws = webSearchConfig();
   const jev = jevConfig();
+  const files = filesRuntime();
   return {
     ok: true,
     provider: llm.provider,
@@ -597,6 +729,19 @@ function agentStatusPayload() {
     // on DeepSeek chat can still have jev available. Clients use this to hide or
     // disable jev affordances rather than offering a tool that will fail.
     jev: Boolean(jev.key),
+    /**
+     * The document store. `configured` means a CREDENTIAL is present, not that
+     * the gateway answered — probing on every status poll would make the
+     * Settings page slow and would turn a momentary blip into a false "not set
+     * up". `url` and `hint` are not secrets: the URL is already in a public
+     * spec, and the hint names an env var, never a value.
+     */
+    files: {
+      configured: Boolean(files.client),
+      mode: files.cfg.apiKey ? 'api_key' : 'password',
+      url: files.cfg.url,
+      hint: files.error,
+    },
     /** The web-search setting: which provider is live, and both key states. */
     search: {
       provider: ws.provider,
@@ -718,6 +863,10 @@ function toolSchemaFor(t) {
       },
     };
   }
+  // The Jarvis document store. Its schema is built in jarvis-files.mjs, beside
+  // the client that implements it, so the actions the model is offered and the
+  // actions actually handled cannot drift apart.
+  if (isFilesTool(t)) return filesToolSchema(t);
   // jev — a typed decision. The model supplies a question and an option list,
   // and the STRICT spec is built here from that flat shape: a tool-calling model
   // writes prose well and JSON poorly, so it is never asked to author criteria.
@@ -832,6 +981,7 @@ async function runToolOnce(tool, rawArgs, signal) {
       return `tool error: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
+  if (isFilesTool(tool)) return runFilesTool(tool, args, signal);
   if (isWebTool(tool)) {
     const ws = webSearchConfig();
     if (!ws.key) return `tool error: ${ws.label} not configured — set ${ws.envVar} or save it in Settings`;
@@ -1869,6 +2019,15 @@ const server = createServer(async (req, res) => {
       // by webSearchConfig(), so a hand-crafted request cannot select a provider
       // that does not exist.
       searchProvider: 'searchProvider',
+      // The Jarvis document store. Setting any of these REPLACES the client on
+      // the next call (see filesRuntime), which is what makes an edited
+      // credential take effect without a restart — and what makes it safe, since
+      // the replaced client's rotating refresh token is simply dropped rather
+      // than being left alive to replay it.
+      filesUrl: 'filesUrl',
+      filesUser: 'filesUser',
+      filesPwd: 'filesPwd',
+      filesKey: 'filesKey',
     };
     let touched = false;
     for (const [field, slot] of Object.entries(map)) {
@@ -1995,13 +2154,34 @@ const server = createServer(async (req, res) => {
     }
     let body;
     try {
-      body = await readJsonBody(req, TOOL_MAX_BYTES);
+      // Which tool this is can only be read AFTER the body is parsed, so the cap
+      // cannot come from the payload. Content-Length is present on every call
+      // this app makes, so the document ceiling is used for a body that could
+      // BE a document and the small generic cap for everything else — a stored
+      // page is routinely hundreds of KB, and rejecting it here would make the
+      // Files tool unusable through the very route an in-app agent uses.
+      const declared = Number(req.headers['content-length'] || 0);
+      const limit = declared > TOOL_MAX_BYTES ? FILES_MAX_BODY_BYTES : TOOL_MAX_BYTES;
+      body = await readJsonBody(req, limit);
+      if (limit > TOOL_MAX_BYTES && !isFilesTool(body)) {
+        json(res, 413, { ok: false, error: 'tool call is too large' });
+        return;
+      }
     } catch {
       json(res, 400, { ok: false, error: 'invalid or oversized JSON' });
       return;
     }
     const args = body?.args && typeof body.args === 'object' ? body.args : {};
     try {
+      if (isFilesTool(body)) {
+        const { client, error } = filesRuntime();
+        if (!client) {
+          json(res, 501, { ok: false, error: `document store not configured — ${error}` });
+          return;
+        }
+        json(res, 200, { ok: true, result: await runFilesTool(body, args) });
+        return;
+      }
       if (isWebTool(body)) {
         const ws = webSearchConfig();
         if (!ws.key) {
@@ -2106,6 +2286,147 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       json(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
     }
+    return;
+  }
+
+  // ── Jarvis document store (agent-authored HTML) ────────────────────────────
+  // Four reasons every operation is proxied here rather than called from the
+  // browser: the gateway's CORS list is empty (a direct call cannot preflight),
+  // the credential must never reach a client, the gateway's
+  // `X-Frame-Options: SAMEORIGIN` makes its own URL unframeable from any other
+  // origin, and re-serving the body through this origin is the only way to hand
+  // it to a SANDBOXED frame with an opaque origin.
+  if (req.method === 'GET' && url.pathname === '/api/files/status') {
+    const principal = requirePrincipal(req, url);
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    const { cfg, client, error } = filesRuntime();
+    // Never a token, and never a probe: `configured` reports the CREDENTIAL, so
+    // a slow or briefly unavailable gateway cannot read as "not set up".
+    json(res, 200, {
+      ok: true,
+      configured: Boolean(client),
+      mode: cfg.apiKey ? 'api_key' : 'password',
+      url: cfg.url,
+      hint: client ? '' : error,
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/files' || url.pathname.startsWith('/api/files/')) {
+    const principal = requirePrincipal(req, url);
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    const { client, error } = filesRuntime();
+    if (!client) {
+      json(res, 501, { ok: false, error: `document store not configured — ${error}` });
+      return;
+    }
+    // A gateway failure is a 502 the app can render — never an unhandled throw
+    // that would take the relay's request loop down with it.
+    const fail = (err, fallbackStatus = 502) => {
+      const status = Number(err?.status) || fallbackStatus;
+      json(res, status >= 400 && status < 600 ? status : fallbackStatus, {
+        ok: false,
+        code: err?.code || 'gateway_error',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    };
+
+    // The document BODY. Fetched BY the relay with its own credential and
+    // re-served under a sandbox policy, because the browser cannot fetch it
+    // directly from any origin but this one.
+    const bodyMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/html$/.exec(url.pathname);
+    if (req.method === 'GET' && bodyMatch) {
+      try {
+        const doc = await client.body(bodyMatch[1]);
+        // The policy comes from the module that owns it, so the sandbox terms
+        // the frame is served under cannot drift from SANDBOX_CSP.
+        res.writeHead(200, { ...htmlResponseHeaders(), 'Content-Type': doc.contentType });
+        res.end(doc.text);
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // One document's metadata.
+    const oneMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})$/.exec(url.pathname);
+    if (oneMatch && req.method === 'GET') {
+      try {
+        json(res, 200, { ok: true, document: await client.read(oneMatch[1]) });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+    if (oneMatch && req.method === 'DELETE') {
+      try {
+        const hard = url.searchParams.get('hard') === 'true';
+        json(res, 200, { ok: true, deleted: await client.remove(oneMatch[1], { hard }) });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // Publish. The client derives `content_type: text/plain` for a body that
+    // does not look like HTML, because the gateway answers 422 for prose.
+    if (req.method === 'POST' && url.pathname === '/api/files') {
+      let body = null;
+      try {
+        body = await readJsonBody(req, FILES_MAX_BODY_BYTES);
+      } catch {
+        json(res, 400, { ok: false, error: 'invalid JSON body' });
+        return;
+      }
+      if (!String(body?.html ?? '').trim()) {
+        json(res, 400, { ok: false, error: 'html is required' });
+        return;
+      }
+      try {
+        const document = await client.create({
+          html: body.html,
+          title: body.title,
+          agent: body.agent,
+          tags: body.tags,
+          id: body.id,
+          slug: body.slug,
+          overwrite: body.overwrite === true,
+          contentType: body.contentType,
+        });
+        json(res, 200, { ok: true, document });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // List. Nothing here is trusted: each parameter is clamped by the client,
+    // so a hand-crafted `?limit=100000` cannot ask the gateway for the world.
+    if (req.method === 'GET' && url.pathname === '/api/files') {
+      try {
+        const q = url.searchParams;
+        const page = await client.list({
+          limit: q.get('limit') ?? undefined,
+          offset: q.get('offset') ?? undefined,
+          q: q.get('q') || undefined,
+          agent: q.get('agent') || undefined,
+          tag: q.get('tag') || undefined,
+          order: q.get('order') || undefined,
+        });
+        json(res, 200, { ok: true, items: page.items, total: page.total, hasMore: page.hasMore });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    json(res, 405, { ok: false, error: 'method not allowed' });
     return;
   }
 

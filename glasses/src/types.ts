@@ -1,10 +1,10 @@
 // Shared protocol types for G2 Even Reality Hub.
 // Mirror these in web/src/types.ts — keep them in sync.
 
-export type SectionId = 'todo' | 'docs' | 'notes' | 'agents';
+export type SectionId = 'todo' | 'docs' | 'files' | 'notes' | 'agents';
 
 /** Display order, mirrored by `SECTIONS` (glasses menu) and `TAB_ORDER` (web). */
-export const SECTION_IDS: SectionId[] = ['agents', 'todo', 'docs', 'notes'];
+export const SECTION_IDS: SectionId[] = ['agents', 'todo', 'docs', 'files', 'notes'];
 
 export interface TodoItem {
   id: string;
@@ -20,12 +20,38 @@ export interface DocEntry {
   updatedAt: number;
 }
 
+/**
+ * A document in the external store (Files section) — a REFERENCE, never a copy.
+ *
+ * Deliberately has no body field, and must never gain one. These documents are
+ * written by a model and live on the Jarvis Content Gateway; the app stores only
+ * where to find one so the list can be drawn and the body can be fetched on
+ * demand. Two consequences worth stating, because both are the point:
+ *   • HubState is broadcast to every device AND mirrored to the relay's state
+ *     file, so a body stored here would be copied into a public-ish place, and
+ *   • a 4 MiB document would blow the glasses' 999-byte frame budget — the
+ *     list row is all the glasses can ever show anyway.
+ */
+export interface FileRef {
+  id: string;
+  title: string;
+  /** The authoring agent recorded by the publisher ('' when unset). */
+  agent: string;
+  /** Absolute URL of the BODY on the gateway. For display/debug, not to frame
+   *  (the gateway refuses to be framed, so the app fetches the body instead). */
+  url: string;
+  size: number;
+  updatedAt: number;
+}
+
 export interface HubState {
   activeSection: SectionId;
   sections: {
     todo: TodoItem[];
     /** Multiple named docs — pick one with `activeDocId`. */
     docs: DocEntry[];
+    /** References to documents held in the external store. Never their bodies. */
+    files: FileRef[];
     notes: string;
   };
   /** The currently-open doc (Docs mode). Null → fall back to the first doc. */
@@ -41,7 +67,7 @@ export interface StreamFrame<T = HubState> {
 export function emptyHubState(): HubState {
   return {
     activeSection: 'todo',
-    sections: { todo: [], docs: [], notes: '' },
+    sections: { todo: [], docs: [], files: [], notes: '' },
     activeDocId: null,
     updatedAt: Date.now(),
   };
@@ -97,7 +123,7 @@ export function upsertDoc(
  * path (see normalizeTool) because persisted agents, bridge snapshots and an
  * older client bundle can all still carry it, but nothing writes it any more.
  */
-export type ToolKind = 'web' | 'http' | 'jev';
+export type ToolKind = 'web' | 'http' | 'jev' | 'files';
 /** Legacy spelling, read-only — kept so normalizing old state type-checks. */
 export type LegacyToolKind = 'tavily';
 export type WebDepth = 'basic' | 'advanced';
@@ -272,6 +298,32 @@ export function jevTool(): ToolDef {
       'Ask a typed question about a piece of text and get a calibrated answer back: a yes/no ' +
       'probability, a pick from options you define, or a position on an ordered scale. Use for ' +
       'routing, ranking and verification instead of asking for prose.',
+    hasToken: false,
+  };
+}
+
+/** The seeded document-store tool's id. */
+export const FILE_TOOL_ID = 'tool-files';
+
+/**
+ * The document-store tool: publish an HTML report the wearer can actually read.
+ *
+ * The one tool whose OUTPUT is not text. A search result is something the model
+ * consumes; a stored document is something the WEARER consumes, on a screen the
+ * model cannot draw on. That is why its description tells the model the body is
+ * not returned to it — otherwise it would publish a document and then try to
+ * summarise the HTML it never received.
+ */
+export function filesTool(): ToolDef {
+  return {
+    id: FILE_TOOL_ID,
+    name: 'jarvis_files',
+    kind: 'files',
+    description:
+      'Publish an HTML document to the wearer library, or list and read what is already ' +
+      'stored there. Use it when the answer is a report, table, chart or briefing that is ' +
+      'better read on screen than dictated. The document body is NOT returned to you — ' +
+      'the wearer reads it on the Files page.',
     hasToken: false,
   };
 }

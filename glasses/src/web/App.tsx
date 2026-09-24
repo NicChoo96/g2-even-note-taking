@@ -4,6 +4,7 @@ import { useAuth } from './auth';
 import { MicButton } from './Dictate';
 import { AgentsPanel } from './AgentsPanel';
 import { AiPanel } from './AiPanel';
+import { FilesPanel } from './FilesPanel';
 import { SettingsPanel } from './SettingsPanel';
 import { consumeWebTab, getAi, subscribeAi } from '../ai';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
@@ -14,6 +15,7 @@ import { activeDoc, emptyDoc, uid, upsertDoc } from '../types';
 const SECTION_LABELS: Record<SectionId, string> = {
   todo: 'To-Do',
   docs: 'Docs',
+  files: 'Files',
   notes: 'Notes',
   agents: 'Agents',
 };
@@ -25,7 +27,7 @@ type Tab = SectionId | 'settings' | 'jarvis';
 // web tabs keep the same order. Jarvis sits just before Settings: it is an AI
 // surface over the whole app rather than a fifth glasses page, so it groups with
 // the "meta" tab.
-const TAB_ORDER: Tab[] = ['agents', 'todo', 'docs', 'notes', 'jarvis', 'settings'];
+const TAB_ORDER: Tab[] = ['agents', 'todo', 'docs', 'files', 'notes', 'jarvis', 'settings'];
 
 function tabLabel(id: Tab): string {
   if (id === 'settings') return 'Settings';
@@ -109,7 +111,10 @@ export default function App() {
         ...s,
         activeSection,
         activeDocId,
-        sections: { todo: result.todo, docs, notes },
+        // `files` is passed through rather than rebuilt: categorising a paste
+        // must not touch the remote document cache, and this object REPLACES
+        // `sections` wholesale, so an omitted key would silently empty it.
+        sections: { todo: result.todo, docs, files: s.sections.files, notes },
       };
     });
     setPaste('');
@@ -263,9 +268,14 @@ export default function App() {
 
   return (
     // `app-wide` widens the shell for the two-pane tabs: Agents (master list +
-    // editor) and Jarvis (live timeline + action catalog). The 760px reading
-    // width that suits notes/docs would squeeze both.
-    <div className={`app${activeTab === 'agents' || activeTab === 'jarvis' ? ' app-wide' : ''}`}>
+    // editor), Jarvis (live timeline + action catalog) and Files (document list
+    // + sandboxed preview). The 760px reading width that suits notes/docs would
+    // squeeze all three.
+    <div
+      className={`app${
+        activeTab === 'agents' || activeTab === 'jarvis' || activeTab === 'files' ? ' app-wide' : ''
+      }`}
+    >
       <header className="app-header">
         <div>
           <h1>🥽 G2 Even Reality Hub</h1>
@@ -340,6 +350,8 @@ export default function App() {
         {activeTab === 'jarvis' && <AiPanel />}
 
         {activeTab === 'agents' && <AgentsPanel />}
+
+        {activeTab === 'files' && <FilesPanel />}
 
         {activeTab === 'todo' && (
           <div className="todo-panel">

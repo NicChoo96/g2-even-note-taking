@@ -235,6 +235,11 @@ async function main(): Promise<void> {
   let appliedAgentSig = '';
   let todoCursor = 0; // selected todo row
   let docPage = 0; // current docs/notes page
+  // Ring position on the Files page. Separate from docPage because Files is a
+  // cursor window over a list, not a page-flip body — and it is reset on every
+  // section change, since the list is refreshed from outside and an index from
+  // a previous visit could point past the end.
+  let filesCursor = 0;
   // Ring position of the Jarvis HUD, in the HUD's own scroll units: transcript
   // pages first, then one watched-session row each (see aiView). Clamped by the
   // view on every render, so it can never strand the ring past the last page.
@@ -1028,6 +1033,22 @@ async function main(): Promise<void> {
       }));
       return;
     }
+    if (st.activeSection === 'files') {
+      // Files holds REMOTE references (id + URL), so there is nothing here the
+      // glasses can append to. Without this branch the fall-through below would
+      // quietly stuff the utterance into whichever Doc is open — a write to a
+      // page the wearer is not looking at. Notes is the app's free-text
+      // scratchpad, so that is where unsolicited speech is kept instead.
+      update((s) => ({
+        ...s,
+        sections: {
+          ...s.sections,
+          notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
+        },
+      }));
+      console.log('[hub] dictation on Files kept in Notes (remote refs are not editable here)');
+      return;
+    }
     // Docs — append to the open doc, or create one titled from the first line.
     const cur = activeDoc(st);
     if (cur) {
@@ -1125,10 +1146,18 @@ async function main(): Promise<void> {
                   // unit 0 now that the feed reads newest-first.
                   scroll: aiFollow ? 0 : aiScroll,
                 })
-              : sectionView(getState(), todoCursor, docPage);
+              : sectionView(getState(), todoCursor, docPage, filesCursor);
     lastView = view;
     if (pickerActive) pickerCursor = view.todoCursor;
-    else if (!overlayActive) todoCursor = view.todoCursor;
+    else if (!overlayActive) {
+      // The view clamps its own cursor (a list can shrink under the ring), so
+      // its answer wins. It is ONE cursor per view though, and the Files page
+      // keeps its position in that same field, so route it back to the page
+      // that actually owns it — otherwise walking the file list would drag the
+      // To-Do selection along with it.
+      if (getState().activeSection === 'files') filesCursor = view.todoCursor;
+      else todoCursor = view.todoCursor;
+    }
     // The HUD clamps its own scroll, so its answer wins: a transcript that grew
     // a page (or a queue that drained a row) would otherwise leave the stored
     // index pointing at a screen that no longer exists.
@@ -1556,6 +1585,20 @@ async function main(): Promise<void> {
         agentSessionCursor = sNext;
         // Enter the new session from the end the gesture came from.
         agentDetailPage = dir === 1 ? 0 : Number.MAX_SAFE_INTEGER;
+        void renderGlasses();
+      }
+      return;
+    }
+    // Files — the ring walks the document list, exactly like To-Do. There is
+    // nothing to PAGE: one row is all the glasses can ever show of a document
+    // (the body is HTML, and this canvas is 576×288 4-bit), so the swipe is
+    // purely selection and the reading happens on the web page.
+    if (getState().activeSection === 'files') {
+      const refs = getState().sections.files;
+      if (!refs.length) return;
+      const next = Math.min(refs.length - 1, Math.max(0, filesCursor + dir));
+      if (next !== filesCursor) {
+        filesCursor = next;
         void renderGlasses();
       }
       return;

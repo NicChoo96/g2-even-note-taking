@@ -36,6 +36,18 @@ export interface AgentStatus {
    * jev is always OpenRouter, so the two can disagree in either direction.
    */
   jev?: boolean;
+  /**
+   * The document store (agent-authored HTML). `configured` means the relay
+   * holds a CREDENTIAL, never that the gateway answered — a momentary outage
+   * must not make the app claim the feature is unset. `hint` names the env
+   * vars to set and never carries a value.
+   */
+  files?: {
+    configured?: boolean;
+    mode?: 'api_key' | 'password' | string;
+    url?: string;
+    hint?: string;
+  };
   model: string;
   depth: string;
   /**

@@ -30,7 +30,7 @@ await build({
   },
 });
 
-const { sectionMenu, MENU, SECTIONS, agentsMasterDetailView } = await import(
+const { sectionMenu, MENU, SECTIONS, agentsMasterDetailView, sectionView } = await import(
   pathToFileURL(outfile).href
 );
 
@@ -127,12 +127,13 @@ assert(
 
 // ── Plain tabs ──────────────────────────────────────────────────────────────
 // The switcher order comes straight from SECTIONS: Agents leads.
-const switchers = ['Jarvis', 'Agents', 'To-Do', 'Docs', 'Notes', 'Dictate'];
+const switchers = ['Jarvis', 'Agents', 'To-Do', 'Docs', 'Notes', 'Files', 'Dictate'];
 check('todo', names(sectionMenu({ section: 'todo', hasDocs: true })), switchers);
 check('notes', names(sectionMenu({ section: 'notes', hasDocs: true })), switchers);
+check('files', names(sectionMenu({ section: 'files', hasDocs: true })), switchers);
 
 // ── The voice entries must bracket the page's own actions ──────────────────
-for (const s of ['agents', 'todo', 'docs', 'notes']) {
+for (const s of ['agents', 'todo', 'docs', 'notes', 'files']) {
   const list = names(sectionMenu({ section: s, hasDocs: true, hasAgents: true }));
   check(`${s}: Dictate is LAST`, list[list.length - 1], 'Dictate');
   check(`${s}: Jarvis is FIRST`, list[0], 'Jarvis');
@@ -190,7 +191,7 @@ check(
 // removed is reachable another way, so this block pins BOTH halves of that
 // bargain: the menu really is small, and nothing that was the only way out got
 // removed with it.
-const convSections = ['agents', 'todo', 'docs', 'notes'];
+const convSections = ['agents', 'todo', 'docs', 'notes', 'files'];
 for (const s of convSections) {
   for (const flag of [{ aiListening: true }, { aiRunning: true }]) {
     const st = { section: s, hasDocs: true, hasAgents: true, aiUndo: true, ...flag };
@@ -223,7 +224,7 @@ assert(
 const convTodoNames = names(sectionMenu({ section: 'todo', hasDocs: true, aiListening: true }));
 assert(
   'a plain tab in-conversation: the switchers are trimmed',
-  !['Agents', 'To-Do', 'Docs', 'Notes'].some((n) => convTodoNames.includes(n)),
+  !['Agents', 'To-Do', 'Docs', 'Notes', 'Files'].some((n) => convTodoNames.includes(n)),
   convTodoNames.join(','),
 );
 
@@ -236,7 +237,7 @@ for (const s of ['docs', 'agents']) {
     names(sectionMenu({ section: s, hasDocs: true, hasAgents: true, aiListening: true })).includes('Back'),
   );
 }
-for (const s of ['todo', 'notes']) {
+for (const s of ['todo', 'notes', 'files']) {
   assert(
     `${s} in-conversation: no Back (there is nothing to go back to)`,
     !names(sectionMenu({ section: s, hasDocs: true, aiListening: true })).includes('Back'),
@@ -264,7 +265,7 @@ check(
 check('…and the plain tabs', [
   names(sectionMenu({ section: 'todo', hasDocs: true })).length,
   convTodoNames.length,
-], [6, 2]);
+], [7, 2]);
 check(
   'ending the conversation restores the identical menu',
   names(sectionMenu({ section: 'docs', hasDocs: true, aiListening: false })),
@@ -282,7 +283,7 @@ check(
 );
 
 // ── Global invariants ───────────────────────────────────────────────────────
-const allSections = ['agents', 'todo', 'docs', 'notes'];
+const allSections = ['agents', 'todo', 'docs', 'notes', 'files'];
 for (const s of allSections) {
   for (const hasAgents of [false, true]) {
     const list = ids(sectionMenu({ section: s, hasDocs: true, hasAgents }));
@@ -295,22 +296,123 @@ for (const s of allSections) {
 }
 
 // Section switcher ids must match SECTIONS and stay unique across the app.
-// MENU.TODO/DOCS/NOTES/AGENTS intentionally mirror SECTIONS[].menuId, and the
-// ids follow their SECTION, not their position — so the display order is
-// Agents(4) · To-Do(1) · Docs(2) · Notes(3).
+// MENU.TODO/DOCS/NOTES/AGENTS/FILES intentionally mirror SECTIONS[].menuId, and
+// the ids follow their SECTION, not their position — so the display order is
+// Agents(4) · To-Do(1) · Docs(2) · Notes(3) · Files(5).
 const sectionIds = SECTIONS.map((s) => s.menuId);
-check('SECTIONS ids', sectionIds, [MENU.AGENTS, MENU.TODO, MENU.DOCS, MENU.NOTES]);
+check('SECTIONS ids', sectionIds, [MENU.AGENTS, MENU.TODO, MENU.DOCS, MENU.NOTES, MENU.FILES]);
 check('switcher MENU ids match SECTIONS', [
   MENU.AGENTS,
   MENU.TODO,
   MENU.DOCS,
   MENU.NOTES,
+  MENU.FILES,
 ], sectionIds);
 const actionIds = Object.entries(MENU)
-  .filter(([k]) => !['TODO', 'DOCS', 'NOTES', 'AGENTS'].includes(k))
+  .filter(([k]) => !['TODO', 'DOCS', 'NOTES', 'AGENTS', 'FILES'].includes(k))
   .map(([, v]) => v);
 check('action ids unique', new Set(actionIds).size, actionIds.length);
 check('action ids disjoint from switchers', actionIds.some((v) => sectionIds.includes(v)), false);
+
+// ── Files tab (stored documents) ────────────────────────────────────────────
+// The list is a projection of `sections.files`, which holds REFERENCES to
+// documents that live on an outside service. Everything here is about the two
+// things that makes risky: the text is NETWORK text, and the list can be empty
+// for a reason the hardware cannot distinguish ("nothing published" vs "this
+// device has not synced yet").
+
+/** The smallest HubState `sectionView` will accept, with only what it reads. */
+const emptyState = ({ sections = {}, ...over } = {}) => ({
+  activeSection: 'notes',
+  sections: { todo: [], docs: [], files: [], notes: '', ...sections },
+  ...over,
+});
+
+const fileRef = (over = {}) => ({
+  id: 'a'.repeat(32),
+  title: 'Weekly report',
+  agent: 'g2-hub',
+  url: 'http://167.172.77.136/sessions/' + 'a'.repeat(32) + '/html',
+  size: 4096,
+  updatedAt: 0,
+  ...over,
+});
+
+const filesEmpty = sectionView(emptyState({ activeSection: 'files' }), 0, 0, 0);
+assert('files empty: says nothing is stored yet', filesEmpty.text.includes('no documents yet'));
+assert(
+  'files empty: offers BOTH ways to fill it',
+  filesEmpty.text.includes('Ask Jarvis') && filesEmpty.text.includes('web app'),
+  filesEmpty.text.split('\n').slice(2).join(' / '),
+);
+check('files empty: no cursor to move', [filesEmpty.todoCursor, filesEmpty.canPrev, filesEmpty.canNext], [0, false, false]);
+check(
+  'files empty: fits the 999-byte container cap',
+  Buffer.byteLength(filesEmpty.text, 'utf8') <= 999,
+  true,
+);
+
+const twoDocs = [fileRef(), fileRef({ id: 'b'.repeat(32), title: 'Q3 numbers', agent: 'analyst', size: 900 })];
+const filesTop = sectionView(emptyState({ activeSection: 'files', sections: { files: twoDocs } }), 0, 0, 0);
+check('files: header counts the rows', filesTop.text.split('\n')[0], 'Files 1/2');
+check('files: the ring marks the selected row', filesTop.text.split('\n')[1].startsWith('▶ 1. Weekly report'), true);
+check('files: the unselected row is not marked', filesTop.text.split('\n')[2].startsWith('  2. Q3 numbers'), true);
+check('files: footer says where the body is read', filesTop.text.split('\n').at(-1), '▲▼ move · read on web');
+check('files: can swipe on, not back', [filesTop.canPrev, filesTop.canNext], [false, true]);
+
+const filesSecond = sectionView(emptyState({ activeSection: 'files', sections: { files: twoDocs } }), 0, 0, 1);
+check('files: the cursor moves', filesSecond.text.split('\n')[0], 'Files 2/2');
+check('files: …and the marker follows it', filesSecond.text.split('\n')[2].startsWith('▶ 2. Q3 numbers'), true);
+check('files: can swipe back now', [filesSecond.canPrev, filesSecond.canNext], [true, false]);
+check(
+  'files: the cursor is handed back CLAMPED (a shrinking list cannot strand it)',
+  sectionView(emptyState({ activeSection: 'files', sections: { files: twoDocs } }), 0, 0, 99).todoCursor,
+  1,
+);
+check(
+  'files: never a negative cursor',
+  sectionView(emptyState({ activeSection: 'files', sections: { files: twoDocs } }), 0, 0, -5).todoCursor,
+  0,
+);
+
+// The row is the whole story: a document the wearer owns but cannot open. The
+// size and author are why the row is worth drawing at all.
+assert('files: shows the author', filesTop.text.includes('g2-hub'));
+assert('files: shows a size', filesTop.text.includes('4.0k'));
+check('files: a missing author leaves no dangling separator', sectionView(emptyState({
+  activeSection: 'files',
+  sections: { files: [fileRef({ agent: '' })] },
+}), 0, 0, 0).text.split('\n')[1], '▶ 1. Weekly report · 4.0k');
+
+// Remote text is untrusted: an emoji draws as tofu AND costs bytes, and a title
+// containing a newline would forge an extra row (or a fake footer).
+const hostile = sectionView(emptyState({
+  activeSection: 'files',
+  sections: { files: [fileRef({ title: 'Q3 \u{1F4C8} report\nfiles 99/99', agent: '\u{1F916}bot' })] },
+}), 0, 0, 0);
+check('files: a remote title cannot forge a row', hostile.text.split('\n').length, 3);
+check('files: the count is the app\'s, not the title\'s', hostile.text.split('\n')[0], 'Files 1/1');
+assert('files: emoji are stripped from the title', !/[\u{1F4C8}\u{1F916}]/u.test(hostile.text), hostile.text.split('\n')[1]);
+assert(
+  'files: …and from the author, leaving the separator honest',
+  hostile.text.split('\n')[1] === '▶ 1. Q3 report files 99/99 · bot · 4.0k',
+  hostile.text.split('\n')[1],
+);
+
+// The worst case the canvas can be handed: six full-width rows of long remote
+// text. It must clip rather than blow the cap, because an oversized container
+// makes the firmware REJECT the whole page, not just the overflow.
+const worst = sectionView(emptyState({
+  activeSection: 'files',
+  sections: {
+    files: Array.from({ length: 9 }, (_, i) =>
+      fileRef({ id: String(i).padStart(32, '0'), title: '\u{1F4C8}'.repeat(40) + 'x'.repeat(300), agent: 'y'.repeat(60) }),
+    ),
+  },
+}), 0, 0, 4);
+check('files worst case: capped at the cursor window', worst.text.split('\n').length, 8);
+check('files worst case: <= 999 bytes', Buffer.byteLength(worst.text, 'utf8') <= 999, true);
+check('files worst case: still <= the 12-container / 10-line budget', worst.text.split('\n').length <= 10, true);
 
 // ── Master–detail renderer ──────────────────────────────────────────────────
 const mkAgent = (id, name, toolIds = []) => ({ id, name, systemPrompt: '', toolIds, createdAt: 0 });

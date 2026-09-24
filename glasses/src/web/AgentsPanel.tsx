@@ -19,6 +19,8 @@ import { FREE_TOOL_MODELS } from '../models';
 import {
   emptyAgent,
   emptyLlmSettings,
+  FILE_TOOL_ID,
+  filesTool,
   jevTool,
   orderedAgents,
   SEED_TOOL_ID,
@@ -98,6 +100,29 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
             ? {
                 ...a,
                 toolIds: [...new Set([...a.toolIds, SEED_TOOL_ID])],
+                updatedAt: Date.now(),
+              }
+            : a,
+        ),
+      };
+    });
+
+  /**
+   * Enable the document-store tool (creating it if it was removed) and attach it.
+   * Like jev it needs no per-tool configuration — the credential lives on the
+   * relay, which is what lets an agent publish a page without ever holding one.
+   */
+  const addFilesToAgent = () =>
+    updateAgents((s) => {
+      const has = s.tools.some((t) => t.id === FILE_TOOL_ID);
+      return {
+        ...s,
+        tools: has ? s.tools : [...s.tools, filesTool()],
+        agents: s.agents.map((a) =>
+          a.id === agent.id
+            ? {
+                ...a,
+                toolIds: [...new Set([...a.toolIds, FILE_TOOL_ID])],
                 updatedAt: Date.now(),
               }
             : a,
@@ -204,6 +229,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
       <div className="docs-actions">
         <button onClick={addWebSearchToAgent}>+ Web search</button>
         <button onClick={addJevToAgent}>+ Jev decision</button>
+        <button onClick={addFilesToAgent}>+ Stored docs</button>
         <button onClick={addRestToolToAgent}>+ REST tool</button>
       </div>
 
@@ -221,11 +247,14 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
 function ToolEditor({
   tool,
   jevReady,
+  filesReady,
   searchProvider,
   searchConfigured,
 }: {
   tool: ToolDef;
   jevReady: boolean;
+  /** True when the relay holds a credential for the Jarvis document store. */
+  filesReady: boolean;
   /** Which backend serves web-search tools, as chosen on the relay. */
   searchProvider?: string;
   searchConfigured?: boolean;
@@ -262,6 +291,7 @@ function ToolEditor({
           <option value="web">Web search</option>
           <option value="jev">Jev decision</option>
           <option value="http">REST API</option>
+          <option value="files">Stored documents</option>
         </select>
         <button
           className="icon-btn danger"
@@ -314,6 +344,14 @@ function ToolEditor({
           {jevReady
             ? 'Ready — uses the OpenRouter key held server-side, so there is nothing to configure here.'
             : 'No OpenRouter key on the server yet. Add one in Settings; until then this tool reports that it was skipped rather than guessing.'}
+        </p>
+      )}
+
+      {tool.kind === 'files' && (
+        <p className="empty">
+          {filesReady
+            ? 'Ready — publishes HTML pages the wearer reads on the Files tab. The document body is never returned to the model, so agents publish and stop.'
+            : 'No document-store credential on the server yet. Set JARVIS_FILE_USER and JARVIS_FILE_PWD (or JARVIS_FILE_API_KEY) in the relay environment.'}
         </p>
       )}
 
@@ -532,6 +570,7 @@ export function AgentsPanel() {
               key={t.id}
               tool={t}
               jevReady={statusInfo?.jev === true}
+              filesReady={statusInfo?.files?.configured === true}
               searchProvider={statusInfo?.search?.provider}
               searchConfigured={statusInfo?.search?.configured}
             />
@@ -548,6 +587,17 @@ export function AgentsPanel() {
               }
             >
               + Web search
+            </button>
+            <button
+              onClick={() =>
+                updateAgents((s) =>
+                  s.tools.some((t) => t.id === FILE_TOOL_ID)
+                    ? s
+                    : { ...s, tools: [...s.tools, filesTool()] },
+                )
+              }
+            >
+              + Stored docs
             </button>
           </div>
 

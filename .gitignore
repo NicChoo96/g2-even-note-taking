@@ -51,3 +51,4 @@ search-probe.txt
 .tmp-*
 
 .tmp-e2e/
+local/

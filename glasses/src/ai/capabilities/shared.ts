@@ -3,7 +3,7 @@
 // The model refers to things the way a person would ("the milk one", "task 2",
 // "Meeting Minutes"), so every capability that targets an existing item uses
 // the same forgiving resolver instead of inventing its own matching rules.
-import { activeDoc, type DocEntry, type TodoItem } from '../../types';
+import { activeDoc, type DocEntry, type FileRef, type TodoItem } from '../../types';
 
 /** Cap for any string that will be rendered on the glasses. */
 export function short(text: string, max = 40): string {
@@ -81,6 +81,24 @@ export function resolveAgent<T extends { id: string; name: string }>(
     agents.map((a) => ({ id: a.id, label: a.name })),
   );
   return index >= 0 ? agents[index] : null;
+}
+
+/**
+ * Resolve a spoken reference to a stored document (a `FileRef`).
+ *
+ * These are REMOTE items, so there is no "open" one to fall back on the way
+ * `resolveDoc` has: an empty `target` can only mean the first row, which is
+ * what the glasses cursor shows as selected.
+ */
+export function resolveFile(target: string, files: FileRef[]): FileRef | null {
+  if (!files.length) return null;
+  const t = (target ?? '').trim();
+  if (!t) return files[0];
+  const index = resolveIndex(
+    t,
+    files.map((f) => ({ id: f.id, label: f.title || 'Untitled' })),
+  );
+  return index >= 0 ? files[index] : null;
 }
 
 /** Append to existing text with a single blank-line separator. */

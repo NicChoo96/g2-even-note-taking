@@ -8,6 +8,7 @@
 import { registerCapabilities, registerPage } from './registry';
 import { agentsCapabilities } from './capabilities/agents';
 import { docsCapabilities } from './capabilities/docs';
+import { filesCapabilities } from './capabilities/files';
 import { globalCapabilities } from './capabilities/global';
 import { jevCapabilities } from './capabilities/jev';
 import { notesCapabilities } from './capabilities/notes';
@@ -20,6 +21,7 @@ const CAPABILITIES: Capability[] = [
   ...jevCapabilities,
   ...todoCapabilities,
   ...docsCapabilities,
+  ...filesCapabilities,
   ...notesCapabilities,
   ...agentsCapabilities,
   ...settingsCapabilities,
@@ -49,6 +51,14 @@ export function registerDefaultCatalog(): void {
     title: 'Notes',
     synonyms: ['notes', 'scratchpad', 'notepad', 'jot', 'quick notes'],
     summary: 'One free-text scratchpad for quick captures.',
+  });
+  registerPage({
+    id: 'files',
+    title: 'Files',
+    synonyms: ['files', 'documents', 'reports', 'html', 'pages', 'stored documents'],
+    summary:
+      'Documents published to the Jarvis document store (agent-authored HTML). List, publish and delete them; ' +
+      'the pages themselves are only rendered on the web Files tab.',
   });
   registerPage({
     id: 'agents',

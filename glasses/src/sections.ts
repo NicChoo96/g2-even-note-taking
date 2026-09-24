@@ -21,6 +21,7 @@ import {
   type AgentDef,
   type AgentSession,
   type DocEntry,
+  type FileRef,
   type HubState,
   type SectionId,
   type TodoItem,
@@ -41,6 +42,9 @@ export const SECTIONS: SectionDef[] = [
   { id: 'todo', title: 'To-Do', menuId: 1 },
   { id: 'docs', title: 'Docs', menuId: 2 },
   { id: 'notes', title: 'Notes', menuId: 3 },
+  // Added last, with the next free id: `menuId` is bound to the SECTION, not to
+  // its position, so appending cannot renumber an installed page's menu items.
+  { id: 'files', title: 'Files', menuId: 5 },
 ];
 
 export function sectionTitle(id: SectionId): string {
@@ -54,6 +58,12 @@ export const MENU = {
   NOTES: 3,
   /** Section switcher: the Agents master-detail view. */
   AGENTS: 4,
+  /**
+   * Section switcher: the stored-documents list. Bound to its SECTION like the
+   * others, so it is the next FREE id rather than the next position — appending
+   * a page cannot renumber an installed page's menu.
+   */
+  FILES: 5,
   DOC_NEW: 10,
   DOC_SELECT: 11,
   DOC_DELETE: 12,
@@ -534,11 +544,102 @@ function docView(state: HubState, page: number): SectionView {
   return bodyView(doc.title, doc.content, page);
 }
 
+/** Human byte size, short enough for a list row. */
+function fileSize(n: number): string {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)}k`;
+  return `${(v / (1024 * 1024)).toFixed(1)}M`;
+}
+
+const FILE_ROW_TITLE = 26;
+const FILE_ROW_AGENT = 10;
+
+/**
+ * One line of REMOTE text, ready for a list row.
+ *
+ * A document's title and author come from the document store — an outside
+ * system this app never fully trusts — so they are flattened exactly like a
+ * search result: unsupported glyphs removed, all runs of whitespace (including
+ * the newlines a title is not supposed to contain) folded to single spaces.
+ */
+function cleanRemote(s: string): string {
+  return stripUnsupported(String(s ?? ''))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * The Files page: documents stored OUTSIDE the app, drawn as a cursor window.
+ *
+ * This is a projection of `sections.files`, which holds REFERENCES only — the
+ * body lives on the gateway and is fetched on demand by the web app. Two
+ * consequences shape this view:
+ *
+ *   • There is nothing here to open. A build can list a document but cannot
+ *     render HTML on a 576×288 4-bit canvas, so the row is the whole story and
+ *     the footer points at where the body actually is. Adding an "open" action
+ *     would promise something the hardware cannot do.
+ *   • Which documents exist is decided by whoever SYNCED the list (the web page
+ *     or an agent run), so an empty list means "nothing published yet OR the
+ *     list has not been refreshed on this device" — the empty state says both
+ *     rather than implying the library is empty.
+ *
+ * Safe glyphs only: `▶` marks the cursor and `·` separates fields, both of
+ * which are in the firmware font (see SAFE_NON_ASCII).
+ */
+function filesView(refs: FileRef[], cursor: number): SectionView {
+  if (refs.length === 0) {
+    return {
+      text: clipBytes(
+        'Files\n------------------\n(no documents yet)\nAsk Jarvis or an agent to\npublish one, or open the Files\ntab on the web app to sync.',
+        MAX_CONTENT_BYTES,
+      ),
+      todoCursor: 0,
+      canPrev: false,
+      canNext: false,
+    };
+  }
+  const clamped = Math.min(refs.length - 1, Math.max(0, cursor));
+  const half = Math.floor(VISIBLE_ITEMS / 2);
+  let start = Math.max(0, clamped - half);
+  let end = Math.min(refs.length, start + VISIBLE_ITEMS);
+  start = Math.max(0, end - VISIBLE_ITEMS);
+
+  const lines: string[] = [`Files ${clamped + 1}/${refs.length}`];
+  for (let i = start; i < end; i++) {
+    const f = refs[i];
+    const sel = i === clamped ? '▶' : ' ';
+    // These two fields come from the GATEWAY, not from this app, so they are
+    // network text and get the same treatment as a tool result: unsupported
+    // glyphs dropped (they would draw as tofu and still cost bytes), and
+    // whitespace collapsed so a title containing a newline cannot forge extra
+    // list rows or fake the footer.
+    const title = cleanRemote(f.title) || 'Untitled';
+    const agent = cleanRemote(f.agent);
+    const by = agent ? ` · ${truncate(agent, FILE_ROW_AGENT)}` : '';
+    lines.push(`${sel} ${i + 1}. ${truncate(title, FILE_ROW_TITLE)}${by} · ${fileSize(f.size)}`);
+  }
+  lines.push('▲▼ move · read on web');
+  return {
+    text: clipBytes(lines.join('\n'), MAX_CONTENT_BYTES),
+    todoCursor: clamped,
+    canPrev: clamped > 0,
+    canNext: clamped < refs.length - 1,
+  };
+}
+
 /** Render the active section (todo cursor window, active-doc page, or notes). */
-export function sectionView(state: HubState, todoCursor: number, docPage: number): SectionView {
+export function sectionView(
+  state: HubState,
+  todoCursor: number,
+  docPage: number,
+  filesCursor = 0,
+): SectionView {
   const section = state.activeSection;
   if (section === 'todo') return todoView(state.sections.todo, todoCursor);
   if (section === 'docs') return docView(state, docPage);
+  if (section === 'files') return filesView(state.sections.files, filesCursor);
   return bodyView(sectionTitle('notes'), state.sections.notes, docPage);
 }
 
