@@ -30,6 +30,10 @@ export interface StoredDoc {
   url: string;
   updatedAt: number;
   deleted: boolean;
+  /** When it was soft-deleted (ms epoch), or null while it is live. */
+  deletedAt?: number | null;
+  /** What removed it, e.g. `deleted by mcp client`. Empty while it is live. */
+  deletedReason?: string;
 }
 
 export interface FilesStatus {
@@ -127,20 +131,44 @@ export interface ReadResult {
   error?: string;
 }
 
-/** The result of a delete, or an error to render. */
+/**
+ * The result of a delete, or an error to render.
+ *
+ * `deleted` is a BOOLEAN and the relay is obliged to keep it one: this type used
+ * to promise a boolean while the relay nested the whole document under that key,
+ * so `res.deleted === true` was false for a delete that had actually succeeded.
+ */
 export interface DeleteResult {
   ok: boolean;
+  id?: string;
+  /** True when the stored bytes were purged rather than flagged. */
+  hard?: boolean;
   deleted?: boolean;
   error?: string;
 }
 
-/** The stored documents, newest first by default (the gateway's own order). */
+/** The result of a restore, or an error to render. */
+export interface RestoreResult {
+  ok: boolean;
+  document?: StoredDoc;
+  error?: string;
+}
+
+/**
+ * The stored documents, newest first by default (the gateway's own order).
+ *
+ * `includeDeleted` is what a restore list is built from. Without it the relay's
+ * list carries only live documents, so a soft-deleted one is unreachable from
+ * this app entirely — not in the list, a 404 to a direct read — even though its
+ * bytes are still on the gateway.
+ */
 export async function listFiles(opts: {
   limit?: number;
   offset?: number;
   q?: string;
   agent?: string;
   tag?: string;
+  includeDeleted?: boolean;
 } = {}): Promise<ListResult> {
   const q = new URLSearchParams();
   if (opts.limit) q.set('limit', String(opts.limit));
@@ -148,6 +176,7 @@ export async function listFiles(opts: {
   if (opts.q) q.set('q', opts.q);
   if (opts.agent) q.set('agent', opts.agent);
   if (opts.tag) q.set('tag', opts.tag);
+  if (opts.includeDeleted) q.set('include_deleted', 'true');
   const suffix = q.toString() ? `?${q}` : '';
   const res = await getJson<ListResult>(`/api/files${suffix}`);
   return {
@@ -170,13 +199,29 @@ export function publishFile(input: PublishInput): Promise<ReadResult> {
 }
 
 /**
- * Delete a document. Soft by default: the gateway keeps the bytes so the
- * deletion is reversible, which is why the page asks twice rather than sending
- * an irreversible instruction on a single click.
+ * Delete a document. SOFT by default — the gateway keeps the bytes, and the
+ * Files page lists it under "Deleted" with a Restore button, so the deletion is
+ * genuinely reversible. Pass `hard: true` to purge the stored bytes, which is
+ * the only version of this that cannot be undone.
+ *
+ * The response is the FLAT relay payload `{ ok, id, hard, deleted }`: `deleted`
+ * answers "is it gone from the live list?", not "did the request work?" (that is
+ * `ok`).
  */
 export function deleteFile(id: string, hard = false): Promise<DeleteResult> {
   const suffix = hard ? '?hard=true' : '';
   return sendJson<DeleteResult>('DELETE', `/api/files/${encodeURIComponent(id)}${suffix}`);
+}
+
+/**
+ * Undo a SOFT delete.
+ *
+ * The relay reaches the gateway's REST surface for this one, because the gateway
+ * exposes no MCP restore tool. Restoring a document that is still live is
+ * harmless upstream, so this can be called without knowing the current state.
+ */
+export function restoreFile(id: string): Promise<RestoreResult> {
+  return sendJson<RestoreResult>('POST', `/api/files/${encodeURIComponent(id)}/restore`);
 }
 
 /**

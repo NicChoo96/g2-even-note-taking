@@ -212,10 +212,19 @@ export const filesCapabilities: Capability[] = [
     name: 'files.delete',
     page: 'files',
     effect: 'irreversible',
-    title: 'Delete a stored document',
+    // Deliberately HARD, and deliberately worded as such.
+    //
+    // This is the app's one PURGE path: the web page's own delete only flags a
+    // document and lists it under Deleted with a Restore button, so this is what
+    // reclaims the bytes. Because that makes it the only delete that cannot be
+    // undone, it is marked `irreversible` and gated behind `confirm`, and both
+    // the title the wearer sees in the confirmation and the summary they hear
+    // afterwards say "permanently" — a soft-sounding word on an irreversible
+    // action is how the wearer ends up surprised.
+    title: 'Permanently delete a stored document',
     description:
-      'Permanently delete a document from the Jarvis document store. Use only when explicitly asked to ' +
-      'remove a stored page.',
+      'Permanently delete a document from the Jarvis document store, purging its stored bytes. ' +
+      'This cannot be undone. Use only when explicitly asked to remove a stored page for good.',
     params: [
       { name: 'document', type: 'string', description: 'Document title, part of a title, or its number.', required: true },
     ],
@@ -235,8 +244,11 @@ export const filesCapabilities: Capability[] = [
       syncRefs(files().filter((f) => f.id !== target.id));
       return {
         ok: true,
-        summary: oneLine(`Deleted "${short(target.title, 24)}"`),
-        data: { id: target.id, deleted: res.deleted === true },
+        // Says "permanently" because that is what happened: the relay's delete
+        // response is a flat { ok, id, hard, deleted }, and `hard` is what
+        // distinguishes a purged document from a restorable one.
+        summary: oneLine(`Permanently deleted "${short(target.title, 24)}"`),
+        data: { id: target.id, hard: res.hard === true, deleted: res.deleted === true },
       };
     },
   },

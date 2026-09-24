@@ -235,6 +235,23 @@ eq('an unparseable date still yields an instant', Number.isFinite(compactDoc({ i
 eq('a deleted flag is kept as a boolean', compactDoc({ id: 'z', deleted: 1 }).deleted, true);
 eq('no base URL leaves the path relative', compactDoc({ id: 'z' }).url, '/sessions/z/html');
 
+// Deletion provenance: what makes a restore list informative rather than a bare
+// set of greyed-out titles.
+const gone = compactDoc(
+  {
+    id: 'z',
+    deleted: true,
+    deleted_at: '2024-05-06T07:08:09.000Z',
+    deleted_reason: 'deleted by mcp client',
+  },
+  BASE,
+);
+eq('a deleted document records WHEN', gone.deletedAt, Date.parse('2024-05-06T07:08:09.000Z'));
+eq('…and WHY', gone.deletedReason, 'deleted by mcp client');
+eq('a live document records no deletion time', doc.deletedAt, null);
+eq('…and no reason', doc.deletedReason, '');
+eq('an unparseable deleted_at is null, not NaN', compactDoc({ id: 'z', deleted: true, deleted_at: 'nope' }).deletedAt, null);
+
 const pageIn = {
   items: [record, { id: 'b' }, null],
   total: 99,
@@ -262,8 +279,12 @@ has('a publish confirms the id', published, doc.id);
 has('…and points at where it is read', published, 'Files page');
 lacks('…and never the body', published, 'the whole document');
 
-has('a soft delete says it is restorable', renderToolResult('delete_session', doc), 'soft: restorable');
-has('a hard delete says the bytes are gone', renderToolResult('delete_session', { ...doc, hard: true }), 'bytes purged');
+has('a soft delete says it is restorable', renderToolResult('delete_session', doc), 'recoverable');
+has('…and names where it is restored', renderToolResult('delete_session', doc), 'Files page');
+has('a hard delete says the bytes are gone', renderToolResult('delete_session', { ...doc, hard: true }), 'Permanently deleted');
+has('…and that it cannot come back', renderToolResult('delete_session', { ...doc, hard: true }), 'cannot be restored');
+lacks('a soft delete never claims permanence', renderToolResult('delete_session', doc), 'cannot be restored');
+lacks('a hard delete never claims recoverability', renderToolResult('delete_session', { ...doc, hard: true }), 'recoverable');
 has('an update names the version', renderToolResult('update_session', doc), 'v3');
 assert('a result with no document still answers', renderToolResult('list_sessions', null).length > 0);
 
@@ -447,7 +468,8 @@ console.log('\n§8b  the nested REST envelope');
   const err = await throws('an in-band tool error is an error', () => client.list(), 'not_found');
   eq('…with its own message', err.message, 'no such document');
   eq('…and its detail', err.detail, { id: 'x' });
-  eq('…carried on a 200, because that is what the gateway sends', err.status, 200);
+  eq('…carried on a 200, because that is what the gateway sends', err.transportStatus, 200);
+  eq('…while the relay is told 404, so a missing document is not a bad gateway', err.status, 404);
   eq('…and the session it took is still usable', stub.calls.length, 2);
 }
 {
@@ -762,6 +784,82 @@ console.log('\n§10d  delete');
   const stub = scripted([loginOk(), mcpOk({ id: 'a'.repeat(32), deleted: false })]);
   const out = await clientFor(stub).remove('a'.repeat(32));
   eq('a refusal to delete is not reported as success', out.deleted, false);
+}
+
+// ── 10d2. restore — the ONE operation the gateway has no MCP tool for ───────
+// This is the whole point of the fix: a soft delete was advertised as
+// restorable and there was no way to restore it, because `restore_session` does
+// not exist and `restore_revision` does not undelete a session. The only route
+// back is REST, so what matters is that the client takes that route and does not
+// silently settle for a JSON-RPC error.
+console.log('\n§10d2  restore (REST, because there is no MCP tool)');
+{
+  const restored = {
+    id: 'a'.repeat(32),
+    title: 'Weekly report',
+    agent: 'analyst',
+    size: 1234,
+    version: 3,
+    deleted: false,
+    html_url: `/sessions/${'a'.repeat(32)}/html`,
+  };
+  const stub = scripted([loginOk(), { json: restored }]);
+  const out = await clientFor(stub).restore('a'.repeat(32));
+  eq('it goes to the REST path, not MCP', stub.calls[1].path, `/sessions/${'a'.repeat(32)}/restore`);
+  eq('…as a POST', stub.calls[1].method, 'POST');
+  eq('…with the session token', stub.calls[1].headers.Authorization, 'Bearer at-1');
+  eq('…and NO JSON-RPC envelope', 'jsonrpc' in (stub.calls[1].body || {}), false);
+  eq('it returns the restored document', [out.id, out.deleted], ['a'.repeat(32), false]);
+  eq('…as full metadata, not a bare flag', out.title, 'Weekly report');
+}
+{
+  const stub = scripted([loginOk(), { json: { id: 'x', deleted: false } }]);
+  await clientFor(stub).restore('a b/c');
+  eq('an awkward id is URL-encoded', stub.calls[1].path, '/sessions/a%20b%2Fc/restore');
+}
+{
+  const stub = stubFetch((c) =>
+    c.path === '/auth/login'
+      ? loginOk()
+      : { status: 404, json: { error: { code: 'not_found', message: 'document not found' } } },
+  );
+  const err = await throws('restoring a missing document is not_found', () => clientFor(stub).restore('gone'), 'not_found');
+  eq('…and keeps the gateway status', err.status, 404);
+}
+{
+  const stub = stubFetch((c) => (c.path === '/auth/login' ? loginOk() : { status: 500, json: { message: 'boom' } }));
+  await throws('a gateway fault is not read as a successful restore', () => clientFor(stub).restore('x'), 'restore_failed');
+}
+{
+  const stub = scripted([loginOk(), { json: {} }]);
+  const out = await clientFor(stub).restore('a'.repeat(32));
+  eq('a 200 with a body we cannot read still names the id back', out.id, 'a'.repeat(32));
+}
+
+// ── 10f. not_found is a 404, never a 502 ────────────────────────────────────
+// The relay maps a FilesError's `status` straight onto the HTTP response, and a
+// bare JSON-RPC tool error arrives over HTTP 200 — so a missing document used to
+// surface as "502 bad gateway", which tells the app the SERVICE is broken when
+// the document is simply gone (a soft delete reads exactly the same way).
+console.log('\n§10f  a missing document is a 404, not a 502');
+{
+  const stub = scripted([loginOk(), mcpToolError({ code: 'not_found', message: 'document not found' })]);
+  const err = await throws(
+    'a missing or soft-deleted document reads as not_found',
+    () => clientFor(stub).read('a'.repeat(32)),
+    'not_found',
+  );
+  eq('…and is reported as 404', err.status, 404);
+}
+{
+  const stub = scripted([loginOk(), mcpToolError({ code: 'insufficient_scope', message: 'nope' })]);
+  const err = await throws('a scope denial keeps its own code', () => clientFor(stub).read('x'), 'insufficient_scope');
+  eq('…and is NOT dressed up as a 404', err.status, 200);
+}
+{
+  const stub = scripted([loginOk(), mcpOk({ title: 'no id here' })]);
+  const err = await throws('a record with no id is not_found', () => clientFor(stub).read('x'), 'not_found');
+  eq('…also as a 404', err.status, 404);
 }
 
 console.log('\n§10e  body (the only reason the relay proxies at all)');

@@ -2354,6 +2354,20 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // UNDO a soft delete. A route of its own rather than a flag on DELETE,
+    // because it is a different operation on a different transport: the gateway
+    // has no `restore_session` MCP tool, so this is the one files route that
+    // calls the gateway's REST surface (see `restore` in jarvis-files.mjs).
+    const restoreMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/restore$/.exec(url.pathname);
+    if (req.method === 'POST' && restoreMatch) {
+      try {
+        json(res, 200, { ok: true, document: await client.restore(restoreMatch[1]) });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
     // One document's metadata.
     const oneMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})$/.exec(url.pathname);
     if (oneMatch && req.method === 'GET') {
@@ -2367,7 +2381,18 @@ const server = createServer(async (req, res) => {
     if (oneMatch && req.method === 'DELETE') {
       try {
         const hard = url.searchParams.get('hard') === 'true';
-        json(res, 200, { ok: true, deleted: await client.remove(oneMatch[1], { hard }) });
+        // FLATTENED deliberately. `client.remove` answers { id, hard, deleted },
+        // and nesting it under `deleted` (as this route used to) made the HTTP
+        // field `deleted` an OBJECT while the client's own type declared a
+        // boolean — so `res.deleted === true` was false for a delete that had
+        // in fact succeeded. Every consumer that asked "did it work?" got "no".
+        const removed = await client.remove(oneMatch[1], { hard });
+        json(res, 200, {
+          ok: true,
+          id: removed.id,
+          hard: removed.hard,
+          deleted: removed.deleted,
+        });
       } catch (err) {
         fail(err);
       }
@@ -2418,6 +2443,12 @@ const server = createServer(async (req, res) => {
           agent: q.get('agent') || undefined,
           tag: q.get('tag') || undefined,
           order: q.get('order') || undefined,
+          // Without this the relay silently answered EVERY list with only the
+          // live documents, so a soft-deleted one became unreachable by the UI
+          // that had just promised it was restorable: invisible to the list, a
+          // 404 to a direct read, and still on disk. The flag is what makes the
+          // restore list possible at all.
+          includeDeleted: q.get('include_deleted') === 'true',
         });
         json(res, 200, { ok: true, items: page.items, total: page.total, hasMore: page.hasMore });
       } catch (err) {

@@ -135,13 +135,28 @@ export function filesConfig(env = {}, saved = {}) {
   };
 }
 
-/** One error type for every failure, so callers read `code` and not a string. */
+/**
+ * One error type for every failure, so callers read `code` and not a string.
+ *
+ * TWO statuses, deliberately, because conflating them was a real bug:
+ *
+ *   `transportStatus` is what the gateway's HTTP response actually was. It is the
+ *   honest fact, and it stays here because the gateway sends `200 OK` for a
+ *   JSON-RPC error — including "no such document".
+ *
+ *   `status` is what THIS relay should answer with. Only this one reaches the
+ *   app: the relay maps it straight onto the response code. So it defaults to
+ *   the transport status, and is raised to 404 only where a 200 would be a lie
+ *   the app acts on (a document that is missing, or soft-deleted, is not a
+ *   "502 bad gateway" — nothing is broken, the document is gone).
+ */
 export class FilesError extends Error {
-  constructor(code, message, { status = 0, detail = null } = {}) {
+  constructor(code, message, { status = 0, transportStatus = status, detail = null } = {}) {
     super(message || code);
     this.name = 'FilesError';
     this.code = code || 'error';
     this.status = status;
+    this.transportStatus = transportStatus;
     this.detail = detail;
   }
 }
@@ -189,6 +204,17 @@ export function compactDoc(record, baseUrl = '') {
      */
     url: base && rel.startsWith('/') ? `${base}${rel}` : rel,
     deleted: Boolean(record.deleted),
+    /**
+     * When and why the document was soft-deleted, or null when it is live.
+     *
+     * This is what makes a restore list INFORMATIVE rather than a bare list of
+     * greyed-out titles: `deletedAt` lets the page say WHEN, and
+     * `deletedReason` says WHAT removed it (the gateway records `deleted by mcp
+     * client` for a tool-driven delete), which is the difference between "a row I
+     * can undo" and "a row whose origin I can actually judge".
+     */
+    deletedAt: record.deleted ? Date.parse(String(record.deleted_at ?? '')) || null : null,
+    deletedReason: record.deleted ? String(record.deleted_reason ?? '') : '',
   };
 }
 
@@ -247,7 +273,13 @@ export function renderToolResult(action, data) {
     );
   }
   if (run === 'delete_session') {
-    return `Deleted ${d.id}${d.hard ? ' (bytes purged)' : ' (soft: restorable)'}.`;
+    // The words a MODEL reads back, so they must describe what actually
+    // happened. A soft delete really is recoverable — the wearer restores it
+    // from the Files page — and a hard delete really is not, so neither branch
+    // may promise something the other one does.
+    return d.hard
+      ? `Permanently deleted ${d.id} — the stored bytes are gone and it cannot be restored.`
+      : `Deleted ${d.id}. It is recoverable: the wearer can restore it from the Files page.`;
   }
   if (run === 'update_session' || run === 'restore_revision') {
     return clip(`Updated ${d.id} — ${head}.`);
@@ -534,10 +566,13 @@ export function createFilesClient(opts = {}) {
     if (!result) throw new FilesError('empty_result', 'gateway returned no result', { status: r.status });
     if (result.isError) {
       const e = result.structuredContent?.error;
+      const code = String(e?.code || 'tool_error');
       throw new FilesError(
-        String(e?.code || 'tool_error'),
+        code,
         String(e?.message || result.content?.[0]?.text || 'the operation failed'),
-        { status: r.status, detail: e?.detail ?? null },
+        // See the FilesError doc comment: `transportStatus` keeps the truth (the
+        // gateway answered 200) while `status` tells the relay what to send back.
+        { status: code === 'not_found' ? 404 : r.status, transportStatus: r.status, detail: e?.detail ?? null },
       );
     }
     return result.structuredContent ?? {};
@@ -580,7 +615,7 @@ export function createFilesClient(opts = {}) {
     const args = { id: String(id), include_html: Boolean(includeHtml) };
     const rec = await call('read_session', args, { signal });
     const doc = compactDoc(rec, baseUrl);
-    if (!doc) throw new FilesError('not_found', 'document not found');
+    if (!doc) throw new FilesError('not_found', 'document not found', { status: 404 });
     return includeHtml ? { ...doc, html: String(rec.html ?? '') } : doc;
   }
 
@@ -620,6 +655,36 @@ export function createFilesClient(opts = {}) {
     if (reason) args.reason = String(reason).slice(0, 200);
     const r = await call('delete_session', args, { signal });
     return { id: String(r?.id ?? id), hard: Boolean(r?.hard), deleted: r?.deleted !== false };
+  }
+
+  /**
+   * Undo a SOFT delete.
+   *
+   * THIS IS A REST CALL, NOT AN MCP TOOL — and that is not a stylistic choice.
+   * The gateway's MCP transport exposes eleven tools and a restore is not among
+   * them: `restore_session` answers `-32601` (no such tool), and
+   * `restore_revision` makes an old REVISION current rather than undeleteing a
+   * session — pointed at a deleted id it returns `not_found`. Verified live:
+   * the ONLY way back is `POST /sessions/{id}/restore`, which answers 200 with
+   * the full document record and `deleted: false`.
+   *
+   * Restoring a document that is NOT deleted is harmless upstream (it answers
+   * 200 with the record), so this needs no pre-flight read — the caller does not
+   * have to know the current state to ask for the state it wants.
+   */
+  async function restore(id, { signal } = {}) {
+    const token = await ensureToken(signal);
+    const r = await request(`/sessions/${encodeURIComponent(String(id))}/restore`, {
+      method: 'POST',
+      token,
+      signal,
+    });
+    if (!r.ok) throw errorOf(r.body, r.status, 'restore_failed');
+    const doc = compactDoc(r.body, baseUrl);
+    // A 200 with a body we cannot read is NOT a success we can report: the
+    // caller is about to tell the wearer their document is back, so it must be
+    // able to name it. Fall back to the id we were given rather than lie.
+    return doc ?? { id: String(id), title: '', deleted: false, restored: true };
   }
 
   async function stats({ signal } = {}) {
@@ -667,6 +732,7 @@ export function createFilesClient(opts = {}) {
     read,
     create,
     remove,
+    restore,
     stats,
     body,
   };

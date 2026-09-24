@@ -379,6 +379,20 @@ select {
   border: 1px solid var(--border);
 }
 
+/* The same icon button as an ANCHOR. "Open in its own tab" has to be a real
+   link or the browser will not offer middle-click / "open link in new tab",
+   and `window.open` cannot report a blocked popup reliably. An <a> is not a
+   block container, so the shared width/height would do nothing; inline-flex
+   gives it the identical 26px square. Hover colour is already covered by the
+   class-based rule below. */
+a.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  font: inherit;
+}
+
 .icon-btn:hover {
   color: var(--text);
 }
@@ -1559,10 +1573,122 @@ li.empty {
   min-width: 0;
 }
 
+/* The notice row now carries an ACTION (Undo, right after a delete), so it is a
+   row: the text takes the space it needs and the action sits at the end, one
+   click away from the thing it reverses. */
 .files-notice {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
   color: var(--accent);
   font-size: 12px;
   margin: 0 0 8px;
+  min-width: 0;
+}
+
+.files-notice span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Library / Deleted. Two tabs rather than one merged list, because the rows are
+   not the same kind of thing: one set previews, the other restores or purges. */
+.files-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.files-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.files-tab:hover {
+  color: var(--text);
+}
+
+.files-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* A deleted row is a plain <li>, NOT a button: it holds buttons of its own, and
+   a button inside a button is invalid markup whose inner control stops working.
+   So this row cannot be clicked to select — which is right, since a deleted
+   document has no body to preview (its HTML endpoint answers 404). */
+.files-row-deleted {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 8px 10px;
+  margin: 0 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  min-width: 0;
+}
+
+/* Muted and clamped, because the title is no longer something you can open.
+   These properties are repeated from `.files-row .agent-name` rather than
+   inherited: a deleted row is deliberately NOT a `.files-row`, since that class
+   means "clickable document" and `cursor: pointer` on a row that cannot be
+   clicked is a lie. */
+.files-row-deleted .agent-name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  color: var(--muted);
+}
+
+.files-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* The restore button is a smaller primary than a page-level action: it belongs
+   to a row, so it must not compete with the page's own buttons for attention. */
+.files-row-actions button.primary {
+  padding: 5px 12px;
+  font-size: 12px;
+}
+
+/* The Deleted tab's explainer. `div.empty` has no styling of its own (only
+   `li.empty` does), so this states everything it needs. */
+.files-deleted-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: left;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  padding: 12px;
+}
+
+.files-deleted-note p {
+  margin: 0;
+}
+
+.files-deleted-note strong {
+  color: var(--text);
 }
 
 .files-error {
@@ -1574,6 +1700,11 @@ li.empty {
 
 .files-list {
   max-height: 46vh;
+  /* Vertical only. A long title used to widen a row past its card, and because
+     a `visible` `overflow-x` next to an `auto` `overflow-y` computes to `auto`,
+     the list grew a horizontal scrollbar underneath itself. Clipping x means no
+     row can ever do that again, whatever a title happens to contain. */
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -1582,10 +1713,32 @@ li.empty {
 .files-row {
   width: 100%;
   flex-direction: column;
-  align-items: flex-start;
+  /* `stretch`, not `flex-start`: a column flex item sized to its content has no
+     definite width, so a long unbreakable title pushed past the card instead of
+     wrapping inside it. Stretching hands every child the row's own width, which
+     is what lets the clamp below take effect. */
+  align-items: stretch;
   gap: 2px;
   text-align: left;
   cursor: pointer;
+  overflow: hidden;
+}
+
+/* The shared `.agent-name` is `nowrap` + ellipsis, which assumes a ROW. This row
+   is a COLUMN, so there was no narrow box for an ellipsis to fit into and the
+   title simply ran off the card edge. Titles here are whole sentences, so let
+   them wrap instead, capped at two lines: enough to tell two documents apart,
+   and every row keeps the same height. The detail pane beside the list always
+   shows the full title. */
+.files-row .agent-name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  overflow: hidden;
 }
 
 .files-draft {

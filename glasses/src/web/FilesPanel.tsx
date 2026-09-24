@@ -27,6 +27,7 @@ import {
   listFiles,
   publishFile,
   readFile,
+  restoreFile,
   toFileRef,
   type FilesStatus,
   type StoredDoc,
@@ -65,11 +66,25 @@ function sameRefs(a: FileRef[], b: FileRef[]): boolean {
 
 export function FilesPanel() {
   const [docs, setDocs] = useState<StoredDoc[]>([]);
+  /**
+   * Soft-deleted documents, i.e. flagged gone but still on the gateway.
+   *
+   * Held separately from `docs` because they are NOT members of the library any
+   * more — they must not reach the glasses mirror or the preview frame — but
+   * they are also not truly gone, and hiding them was the defect: a delete whose
+   * whole selling point was that it could be undone left the document reachable
+   * from nowhere.
+   */
+  const [deleted, setDeleted] = useState<StoredDoc[]>([]);
+  /** Which list the left column is showing. */
+  const [showDeleted, setShowDeleted] = useState(false);
   const [status, setStatus] = useState<FilesStatus | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  /** The last soft delete, offered as an inline Undo beside the notice. */
+  const [undo, setUndo] = useState<{ id: string; title: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   /** Bumped to force the frame to re-fetch (a revision may have landed). */
   const [frameKey, setFrameKey] = useState(0);
@@ -98,21 +113,38 @@ export function FilesPanel() {
     async (q?: string) => {
       setBusy(true);
       setError(null);
-      const res = await listFiles({ limit: PAGE_LIMIT, q: q?.trim() || undefined });
+      // ONE request answers both questions. `include_deleted` returns the live
+      // documents AND the deleted ones, and each row says which it is, so the two
+      // lists are a partition of a single page rather than two pages that can
+      // disagree with each other (a delete landing between them would make the
+      // counts lie).
+      const res = await listFiles({
+        limit: PAGE_LIMIT,
+        q: q?.trim() || undefined,
+        includeDeleted: true,
+      });
       setBusy(false);
       if (!res.ok) {
         setError(res.error || 'could not reach the document store');
         return;
       }
-      const items = res.items.filter((d) => !d.deleted);
-      setDocs(items);
-      syncRefs(items);
+      const items = res.items ?? [];
+      const live = items.filter((d) => !d.deleted);
+      const gone = items.filter((d) => d.deleted);
+      setDocs(live);
+      setDeleted(gone);
+      // Only LIVE documents are mirrored to the glasses: the Files section there
+      // lists what the wearer can open, and a soft-deleted document no longer
+      // has a readable body (its HTML endpoint answers 404).
+      syncRefs(live);
       // Keep a selection across a refresh, and pick the first document when the
       // previous selection is gone — an empty preview pane with a full list is
       // the one state a reader cannot interpret.
       setSelected((cur) =>
-        cur && items.some((d) => d.id === cur) ? cur : (items[0]?.id ?? null),
+        cur && live.some((d) => d.id === cur) ? cur : (live[0]?.id ?? null),
       );
+      // A list with nothing deleted has no Deleted tab to be looking at.
+      if (!gone.length) setShowDeleted(false);
     },
     [syncRefs],
   );
@@ -128,14 +160,17 @@ export function FilesPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const active = useMemo(() => docs.find((d) => d.id === selected) ?? null, [docs, selected]);
+  const listed = showDeleted ? deleted : docs;
+  const active = useMemo(() => listed.find((d) => d.id === selected) ?? null, [listed, selected]);
 
   // Read the chosen document's METADATA (never its body) so the header can show
   // the version and revision time, which is what tells a reader whether the
   // frame in front of them is the latest revision.
   const [meta, setMeta] = useState<StoredDoc | null>(null);
   useEffect(() => {
-    if (!selected || !configured) {
+    // A soft-deleted document has no readable metadata (the read answers 404),
+    // so asking would only earn a pointless failed request.
+    if (!selected || !configured || showDeleted) {
       setMeta(null);
       return;
     }
@@ -147,20 +182,62 @@ export function FilesPanel() {
     return () => {
       live = false;
     };
-  }, [selected, configured, frameKey]);
+  }, [selected, configured, frameKey, showDeleted]);
+
+  /** Put a soft-deleted document back in the library. Also the Undo handler. */
+  const onRestore = async (target: { id: string; title: string }) => {
+    setBusy(true);
+    setError(null);
+    const res = await restoreFile(target.id);
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.error || 'restore failed');
+      return;
+    }
+    setNotice(`Restored "${res.document?.title || target.title}"`);
+    setUndo(null);
+    await refresh(query);
+    setSelected(target.id);
+  };
 
   const onDelete = async (doc: StoredDoc) => {
-    if (!window.confirm(`Delete "${doc.title}"? It is a soft delete, so the bytes stay restorable.`)) {
+    if (!window.confirm(`Move "${doc.title}" to Deleted? You can restore it from the Deleted tab.`)) {
       return;
     }
     setBusy(true);
+    setError(null);
     const res = await deleteFile(doc.id);
     setBusy(false);
     if (!res.ok) {
       setError(res.error || 'delete failed');
       return;
     }
-    setNotice(`Deleted "${doc.title}"`);
+    setNotice(`Moved "${doc.title}" to Deleted`);
+    // JEV's ruling put the undo in BOTH places: here, one click from the action,
+    // and in the Deleted tab for anyone who comes back later.
+    setUndo({ id: doc.id, title: doc.title });
+    await refresh(query);
+  };
+
+  /** Purge the stored bytes. The one delete here that cannot be undone. */
+  const onPurge = async (doc: StoredDoc) => {
+    if (
+      !window.confirm(
+        `Permanently delete "${doc.title}"? This purges the stored bytes and cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const res = await deleteFile(doc.id, true);
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.error || 'permanent delete failed');
+      return;
+    }
+    setNotice(`Permanently deleted "${doc.title}"`);
+    if (undo?.id === doc.id) setUndo(null);
     await refresh(query);
   };
 
@@ -214,10 +291,85 @@ export function FilesPanel() {
             </button>
           </div>
 
-          {notice && <div className="files-notice">{notice}</div>}
+          {/*
+            Live / Deleted. A toggle rather than one merged list, because the two
+            rows are not the same kind of thing: a deleted document can be
+            restored or purged but not read, and mixing them into one list would
+            invite a click on a row whose preview can never load.
+          */}
+          {deleted.length > 0 && (
+            <div className="files-tabs">
+              <button
+                className={showDeleted ? 'files-tab' : 'files-tab active'}
+                onClick={() => setShowDeleted(false)}
+              >
+                Library ({docs.length})
+              </button>
+              <button
+                className={showDeleted ? 'files-tab active' : 'files-tab'}
+                onClick={() => setShowDeleted(true)}
+              >
+                Deleted ({deleted.length})
+              </button>
+            </div>
+          )}
+
+          {notice && (
+            <div className="files-notice">
+              <span>{notice}</span>
+              {undo && (
+                <button
+                  className="link-btn"
+                  onClick={() => void onRestore(undo)}
+                  disabled={busy}
+                  title={`Restore "${undo.title}"`}
+                >
+                  Undo
+                </button>
+              )}
+            </div>
+          )}
           {error && <div className="files-error">{error}</div>}
 
-          {docs.length === 0 ? (
+          {showDeleted ? (
+            <ul className="agent-list files-list">
+              {deleted.map((d) => (
+                <li key={d.id} className="files-row-deleted">
+                  <span className="agent-name" title={d.title || 'Untitled'}>
+                    {d.title || 'Untitled'}
+                  </span>
+                  <span className="agent-meta">
+                    {d.agent || 'unknown'} · {sizeLabel(d.size)}
+                    {d.deletedAt ? ` · deleted ${whenLabel(d.deletedAt)}` : ''}
+                  </span>
+                  {/*
+                    NOT a button wrapping another button: the row itself is not
+                    clickable here, because selecting a deleted document has
+                    nothing to preview — its body endpoint answers 404.
+                  */}
+                  <span className="files-row-actions">
+                    <button
+                      className="primary"
+                      onClick={() => void onRestore(d)}
+                      disabled={busy}
+                      title="Put this document back in the library"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      className="icon-btn danger"
+                      onClick={() => void onPurge(d)}
+                      disabled={busy}
+                      title="Purge the stored bytes — cannot be undone"
+                      aria-label="Delete permanently"
+                    >
+                      🗑
+                    </button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : docs.length === 0 ? (
             <div className="empty">
               {configured
                 ? 'No documents yet — ask Jarvis to publish one, or write one below.'
@@ -243,13 +395,18 @@ export function FilesPanel() {
             </ul>
           )}
 
-          <div className="docs-actions">
-            <button className="primary" onClick={() => setDraftOpen((v) => !v)} disabled={!configured}>
-              {draftOpen ? 'Cancel' : '+ New document'}
-            </button>
-          </div>
+          {/* Publishing from the Deleted tab would write into the library the
+              wearer is not currently looking at, so the box belongs on the
+              Library tab only. */}
+          {!showDeleted && (
+            <div className="docs-actions">
+              <button className="primary" onClick={() => setDraftOpen((v) => !v)} disabled={!configured}>
+                {draftOpen ? 'Cancel' : '+ New document'}
+              </button>
+            </div>
+          )}
 
-          {draftOpen && (
+          {!showDeleted && draftOpen && (
             <div className="files-draft">
               <input
                 value={draftTitle}
@@ -281,7 +438,32 @@ export function FilesPanel() {
         </div>
 
         <div className="agents-detail">
-          {!active ? (
+          {showDeleted ? (
+            /*
+              A deleted document has no preview to show — its body endpoint
+              answers 404 while it is flagged deleted — so the pane explains the
+              two actions instead of pretending to render something. Saying WHY
+              the frame is empty is the point: the row used to disappear with no
+              trace at all, which is what made the delete feel irreversible.
+            */
+            <div className="empty files-deleted-note">
+              <p>
+                {deleted.length === 1
+                  ? '1 document is deleted but not purged.'
+                  : `${deleted.length} documents are deleted but not purged.`}
+              </p>
+              <p>
+                A delete here only flags the document: its bytes stay on the gateway and its stored
+                size is still counted. <strong>Restore</strong> puts it back in the library.
+                <strong> Delete permanently</strong> purges the bytes and ends that document for
+                good.
+              </p>
+              <p className="agent-meta">
+                A document still appears here when Jarvis or the glasses removed one, so a delete
+                made anywhere in the app is visible and reversible in this one place.
+              </p>
+            </div>
+          ) : !active ? (
             <div className="empty">
               Select a document to preview it. Documents render in a sandboxed frame that cannot
               reach this app.
@@ -306,6 +488,35 @@ export function FilesPanel() {
                   >
                     ⟳
                   </button>
+                  {/*
+                    Open the document OUTSIDE the pane, in a tab of its own.
+
+                    An ANCHOR rather than a button calling `window.open`, for
+                    three reasons: the browser only offers middle-click and
+                    "open link in new tab" for a real link; `window.open` with
+                    `noopener` returns null even on success, so a blocked-popup
+                    check would cry wolf; and `rel="noopener"` is what denies
+                    the opened document a `window.opener` handle back into this
+                    app — the very reach the sandbox exists to deny.
+
+                    The href is the SAME relay URL the frame loads, token
+                    included, so it authenticates identically. A new tab is NOT
+                    a way around the sandbox: the relay serves that response
+                    under `Content-Security-Policy: sandbox allow-scripts`
+                    whatever asks for it, so the document still runs with an
+                    opaque origin. What it buys is a full-window read of a wide
+                    report, instead of the 62vh letterbox the split allows.
+                  */}
+                  <a
+                    className="icon-btn"
+                    href={fileBodyUrl(active.id)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="Open this document in its own tab"
+                    aria-label="Open this document in its own tab"
+                  >
+                    ↗
+                  </a>
                   <button
                     className="icon-btn danger"
                     onClick={() => void onDelete(active)}
