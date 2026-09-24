@@ -47,9 +47,39 @@ export function runById(id: string | null | undefined): AgentRun | null {
   return runs.find((r) => r.id === id) ?? null;
 }
 
-/** Newest run for an agent, running or not. */
-export function latestRunFor(agentId: string): AgentRun | null {
-  return runs.find((r) => r.agentId === agentId) ?? null;
+/**
+ * Pick the run a pane should paint for ONE agent: a live one if there is any,
+ * otherwise the newest remembered, otherwise null.
+ *
+ * SCOPE IS THE WHOLE POINT, and it is why this takes an agentId instead of
+ * returning "the newest run anywhere". The relay runs agents concurrently and a
+ * client can have several runs in flight, so a panel that falls back to the
+ * newest run it knows about keeps streaming the PREVIOUS agent's transcript
+ * after the master list moves the highlight — one agent's words under another
+ * agent's name. Resolving strictly by agentId is what makes "scroll the master
+ * list to a backgrounded agent and watch its run" work.
+ *
+ * Pure (hence exported) so the rule can be pinned without an SSE stream; the
+ * store-backed `latestRunFor` is a one-liner over it.
+ */
+export function pickRunForAgent(
+  all: readonly AgentRun[],
+  agentId: string | null | undefined,
+): AgentRun | null {
+  if (!agentId) return null;
+  const mine = all.filter((r) => r.agentId === agentId);
+  // Running wins over newer: a run still executing owns the pane whatever its age.
+  return mine.find((r) => r.status === 'running') ?? mine[0] ?? null;
+}
+
+/** The run to show for an agent: the live one if any, else the newest remembered. */
+export function latestRunFor(agentId: string | null | undefined): AgentRun | null {
+  return pickRunForAgent(runs, agentId);
+}
+
+/** True while the relay is executing a run for this agent. */
+export function isAgentRunning(agentId: string | null | undefined): boolean {
+  return !!agentId && runs.some((r) => r.agentId === agentId && r.status === 'running');
 }
 
 /** Drop a finished run once its transcript has been saved as a session. */

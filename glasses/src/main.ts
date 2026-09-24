@@ -10,7 +10,7 @@ import {
   type MenuContainerProperty,
 } from '@evenrealities/even_hub_sdk';
 import { connectAgentsStream, connectStream, startRun, stopRun, type AgentRun } from './stream';
-import { getRuns, subscribeRuns } from './agent-runs';
+import { getRuns, isAgentRunning, latestRunFor, subscribeRuns } from './agent-runs';
 import {
   AGENT_LAYOUT,
   agentsMasterDetailView,
@@ -262,11 +262,20 @@ async function main(): Promise<void> {
   // be isEventCapture:1, so the ring is routed by this flag, not by the event.
   let agentFocus: AgentFocus = 'master';
   let agentCursor = 0;
-  let agentRunning = false;
-  let agentStatus = '';
-  let agentError = '';
-  /** Relay run id we started, until its transcript is saved as a session. */
-  let agentRunId: string | null = null;
+  /**
+   * A LOCAL note about the LAST trigger, for one agent only:
+   *   • the optimistic "Thinking…" between asking for a run and the relay's
+   *     first run frame for it, and
+   *   • a trigger that never became a run at all (offline, 401, no API key).
+   *
+   * Nothing else about run state is held here. Whether an agent is running, its
+   * status text and its error all come from the run store, resolved per agent.
+   * This page used to keep ONE `agentRunning`/`agentStatus`/`agentError` triple
+   * for the whole tab, which is what let the detail pane keep streaming one
+   * agent's run while another one was highlighted — and what stopped a second
+   * agent from being triggered at all while the first was in flight.
+   */
+  let agentNotice: { agentId: string; status?: string; error?: string } | null = null;
   /** Which of the (max 5) stored sessions the detail pane is showing. */
   let agentSessionCursor = 0;
   /** Page of the detail pane's transcript (0 = newest content). */
@@ -600,6 +609,18 @@ async function main(): Promise<void> {
     // Newest-updated agent first; the cursor indexes THIS order, so the render,
     // agentSelected() and the web panel always agree on who is highlighted.
     const list = orderedAgents(a.agents);
+    // Clamp BEFORE reading the selection. The renderer clamps too, but reading
+    // `list[agentCursor]` unclamped picked the wrong agent's run whenever the
+    // cursor outlived the list it pointed at (an agent deleted on the phone, a
+    // list that shrank after a sync).
+    const cur = list.length ? Math.min(list.length - 1, Math.max(0, agentCursor)) : 0;
+    const selected = list[cur] ?? null;
+    // Resolve the run PER AGENT — never "the newest run anywhere". That fallback
+    // was the leak: moving the master cursor to a second agent left the right
+    // pane painting the first agent's live transcript, because the lookup fell
+    // back to whichever run this client last started.
+    const live = latestRunFor(selected?.id);
+    const notice = agentNotice && agentNotice.agentId === selected?.id ? agentNotice : null;
     const view = agentsMasterDetailView(
       {
         agents: list,
@@ -608,8 +629,20 @@ async function main(): Promise<void> {
         focus: agentFocus,
         sessionCursor: agentSessionCursor,
         detailPage: agentDetailPage,
-        status: agentStatus || agentsStatusLine(agentRunning, agentError),
-        run: liveRunFor(list[agentCursor]?.id),
+        // Precedence: a local note (the gap before the relay's first frame, or a
+        // trigger that never ran) > the run's own status text > nothing.
+        status: notice
+          ? notice.status || agentsStatusLine(false, notice.error)
+          : live && live.status === 'running'
+            ? live.statusText || 'Thinking…'
+            : '',
+        run: live,
+        // Every agent with a run in flight, so a run that keeps going while you
+        // browse a neighbour is visible in the master list instead of only in
+        // the pane your cursor happens to be parked on.
+        runningAgentIds: getRuns()
+          .filter((r) => r.status === 'running')
+          .map((r) => r.agentId),
       },
       (id) => a.tools.find((t) => t.id === id)?.name ?? id,
     );
@@ -658,7 +691,7 @@ async function main(): Promise<void> {
       section: st.activeSection,
       hasDocs: st.sections.docs.length > 0,
       hasAgents: getAgents().agents.length > 0,
-      agentRunning: getRuns().some((r) => r.status === 'running'),
+      agentRunning: isAgentRunning(agentSelected()?.id),
       // 'confirm' counts as running: the menu must keep offering a way OUT of
       // the HUD, since "Stop AI" is also how a destructive action is refused.
       aiRunning: ai.status === 'running' || ai.status === 'confirm',
@@ -1240,18 +1273,23 @@ async function main(): Promise<void> {
    */
   async function agentsTrigger(): Promise<void> {
     const agent = agentSelected();
-    if (!agent || agentRunning) return;
+    if (!agent) return;
+    // Guarded per AGENT, not per page. Runs execute server-side and up to eight
+    // can be in flight, so firing a SECOND agent while the first is thinking is
+    // allowed on purpose — that is what lets you scroll the master list between
+    // agents and watch each one's pane live. Only re-firing the SAME agent while
+    // its run is in flight is refused.
+    if (isAgentRunning(agent.id)) return;
     if (!agent.prompt.trim()) {
-      agentError = 'no saved prompt';
+      agentNotice = { agentId: agent.id, error: 'no saved prompt' };
       agentFocus = 'detail';
       void renderGlasses();
       return;
     }
     const st = getAgents();
     const tools = st.tools.filter((t) => agent.toolIds.includes(t.id));
-    agentRunning = true;
-    agentError = '';
-    agentStatus = 'Thinking…';
+    // Optimistic: the relay's first run frame replaces this within a round trip.
+    agentNotice = { agentId: agent.id, status: 'Thinking…' };
     agentFocus = 'detail';
     agentSessionCursor = 0;
     agentDetailPage = 0;
@@ -1268,34 +1306,24 @@ async function main(): Promise<void> {
       model: agent.model || st.llm.model,
     });
     if (!started.runId) {
-      agentRunning = false;
-      agentStatus = '';
-      agentError = started.error || 'relay refused the run';
+      // No run was created, so no frame is coming to correct the pane — the
+      // note IS the error channel, and it belongs to the agent just fired.
+      agentNotice = { agentId: agent.id, error: started.error || 'relay refused the run' };
       void renderGlasses();
       return;
     }
-    agentRunId = started.runId;
   }
 
-  /** Contextual menu → "Stop": cancel the in-flight run. */
+  /** Contextual menu → "Stop": cancel the in-flight run for the agent on screen. */
   async function agentsStop(): Promise<void> {
-    const active = getRuns().find((r) => r.status === 'running');
-    if (!active) return;
-    agentStatus = 'Stopping…';
+    // Scoped to the agent the menu is being read against. This used to stop
+    // "the newest running run anywhere", which with concurrent runs means the
+    // wearer stops a run they are not looking at while their own keeps going.
+    const active = latestRunFor(agentSelected()?.id);
+    if (!active || active.status !== 'running') return;
+    agentNotice = { agentId: active.agentId, status: 'Stopping…' };
     void renderGlasses();
     await stopRun(active.id);
-  }
-
-  /**
-   * The live run for an agent, if the relay is still executing one. Read by the
-   * detail pane so the transcript streams in turn by turn.
-   */
-  function liveRunFor(agentId: string | undefined): AgentRun | null {
-    if (!agentId) return null;
-    return (
-      getRuns().find((r) => r.agentId === agentId && r.status === 'running') ??
-      (agentRunId ? (getRuns().find((r) => r.id === agentRunId) ?? null) : null)
-    );
   }
 
   /**
@@ -1305,13 +1333,16 @@ async function main(): Promise<void> {
    */
   function settleRun(run: AgentRun): void {
     if (run.status === 'running') return;
-    const already = getAgents().sessions.some((s) => s.id === run.id);
-    if (already) {
-      if (run.id === agentRunId) agentRunId = null;
-      return;
-    }
+    // This agent's run has landed, so any local note about it is superseded —
+    // including when the OTHER surface recorded the session first and the
+    // early return below skips the rest of this function.
+    if (agentNotice?.agentId === run.agentId) agentNotice = null;
+    if (getAgents().sessions.some((s) => s.id === run.id)) return;
+    // Reset the pane only when the agent ON SCREEN settled. Runs for several
+    // agents can be in flight, and a neighbour finishing must not yank the
+    // session/page the wearer is reading out from under them.
     const selected = agentSelected();
-    const mine = run.id === agentRunId || (!!selected && selected.id === run.agentId);
+    const mine = !!selected && selected.id === run.agentId;
     recordSession({
       id: run.id,
       agentId: run.agentId,
@@ -1325,11 +1356,7 @@ async function main(): Promise<void> {
       })),
       status: run.status === 'done' ? 'done' : 'error',
     });
-    if (run.id === agentRunId) agentRunId = null;
-    if (mine && selected?.id === run.agentId) {
-      agentRunning = false;
-      agentStatus = '';
-      agentError = run.status === 'error' ? (run.error ?? 'failed') : '';
+    if (mine) {
       // The finished transcript just became session 0 — show its newest page
       // instead of leaving the pane on an older page/session.
       agentSessionCursor = 0;
@@ -1351,12 +1378,14 @@ async function main(): Promise<void> {
     docPage = 0;
     lastView = null;
     // Agents pane navigation is per-visit; reset so each entry starts clean.
+    // Only NAVIGATION lives here: a run in flight is not this page's to reset,
+    // and clearing it (as the old global status flags did) is how a live run
+    // lost its status line the moment the wearer switched tabs and back.
     agentFocus = 'master';
     agentCursor = 0;
     agentSessionCursor = 0;
     agentDetailPage = 0;
-    agentStatus = '';
-    agentError = '';
+    agentNotice = null;
     update((s) => ({ ...s, activeSection: next }));
   }
 
@@ -1669,11 +1698,14 @@ async function main(): Promise<void> {
   // Live run frames (server-side execution) re-render the detail pane so each
   // turn appears as it is produced, and settle the run into a session once.
   subscribeRuns(() => {
-    const active = getRuns().find((r) => r.status === 'running');
-    if (active && active.agentId === agentSelected()?.id) {
-      agentRunning = true;
-      agentStatus = active.statusText || 'Thinking…';
-    }
+    // The relay OWNS the status of an agent it is executing, so a local note
+    // about that agent is stale — but only about THAT agent, and only once the
+    // run is actually live: clearing on any remembered run would drop the
+    // optimistic "Thinking…" the moment a frame for a neighbour arrived.
+    const note = agentNotice;
+    if (note && isAgentRunning(note.agentId)) agentNotice = null;
+    // Every finished run becomes a session, whoever started it: the relay's run
+    // store is shared, so a run the phone began lands in the same history.
     for (const run of getRuns()) settleRun(run);
     // The runs Jarvis itself asked for are being WATCHED: keep their HUD rows
     // current, and when one lands, tell the model. This handler is the only

@@ -33,6 +33,22 @@ await build({
 const { sectionMenu, MENU, SECTIONS, agentsMasterDetailView } = await import(
   pathToFileURL(outfile).href
 );
+
+// The per-agent run lookup lives in the run store, and it is the actual fix for
+// the master-list/detail-pane desync (see §Master–detail below), so it is built
+// here too and pinned directly. `define` supplies the Vite env the store's
+// stream module reads at import time.
+const runsFile = join(out, 'agent-runs.mjs');
+await build({
+  entryPoints: ['src/agent-runs.ts'],
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  outfile: runsFile,
+  define: { 'import.meta.env': '{}' },
+  logLevel: 'silent',
+});
+const { pickRunForAgent } = await import(pathToFileURL(runsFile).href);
 const names = (m) => (m.menuItems ?? []).map((i) => i.itemName);
 const ids = (m) => (m.menuItems ?? []).map((i) => i.itemID);
 
@@ -348,6 +364,99 @@ const browsed = agentsMasterDetailView({
   status: '',
 });
 assert('detail browses older sessions', browsed.detail.includes('Older answer'), browsed.detail);
+
+// ── Concurrent runs, per agent ──────────────────────────────────────────────
+// Reported: "the agent trigger when I see in glasses, even in the master list
+// when I change agents, the right side panel still see the latest agent trigger
+// going on". Runs execute server-side and the relay allows several at once, but
+// the glasses kept ONE `agentRunning`/`agentStatus`/`agentError` triple for the
+// whole tab and resolved the pane's run as "the newest run this client started",
+// ignoring which agent it belonged to. So the pane kept streaming the previous
+// agent's transcript after the cursor moved, and a second agent could not be
+// triggered while the first was in flight. Both halves are pinned here.
+const mkRun = (id, agentId, status, startedAt) => ({
+  id,
+  agentId,
+  agentName: agentId,
+  prompt: '',
+  title: '',
+  messages: [],
+  status,
+  statusText: '',
+  startedAt,
+  updatedAt: startedAt,
+});
+const mkLive = (id, agentId, text) => ({
+  id,
+  agentId,
+  status: 'running',
+  statusText: text,
+  messages: [],
+});
+
+const RUNS = [
+  mkRun('r-a', 'a1', 'running', 10),
+  mkRun('r-b', 'a2', 'running', 20),
+  mkRun('r-old', 'a1', 'done', 1),
+];
+check('a run resolves only for its own agent', pickRunForAgent(RUNS, 'a2')?.id, 'r-b');
+assert(
+  'an agent keeps its OWN run and not the newest anywhere',
+  pickRunForAgent(RUNS, 'a1')?.id === 'r-a',
+  pickRunForAgent(RUNS, 'a1')?.id,
+);
+assert('an agent with no run resolves to null', pickRunForAgent(RUNS, 'a3') === null);
+assert('no agent id resolves to null', pickRunForAgent(RUNS, null) === null);
+assert(
+  'a live run outranks a newer finished one',
+  pickRunForAgent([mkRun('done', 'a1', 'done', 99), mkRun('live', 'a1', 'running', 1)], 'a1')?.id ===
+    'live',
+);
+
+// The renderer refuses a run that is not the highlighted agent's, so a caller
+// regression cannot paint one agent's transcript under another agent's name.
+const alphaLive = mkLive('r-a', 'a1', 'Alpha is mid-answer');
+const leaked = agentsMasterDetailView({
+  agents: [mkAgent('a1', 'Alpha'), mkAgent('a2', 'Beta')],
+  sessions: [],
+  cursor: 1,
+  focus: 'detail',
+  status: '',
+  run: alphaLive,
+});
+assert(
+  "a neighbour's run is dropped, not painted",
+  !leaked.detail.includes('Alpha is mid-answer'),
+  leaked.detail,
+);
+const own = agentsMasterDetailView({
+  agents: [mkAgent('a1', 'Alpha'), mkAgent('a2', 'Beta')],
+  sessions: [],
+  cursor: 0,
+  focus: 'detail',
+  status: '',
+  run: alphaLive,
+});
+assert('the same run paints on its own agent', own.detail.includes('Alpha is mid-answer'), own.detail);
+
+// Parked on an idle agent while a neighbour still streams: the run is marked in
+// the master list, and the highlighted row keeps the cursor glyph.
+const parked = agentsMasterDetailView({
+  agents: [mkAgent('a1', 'Alpha'), mkAgent('a2', 'Beta')],
+  sessions: [],
+  cursor: 1,
+  focus: 'master',
+  status: '',
+  run: null,
+  runningAgentIds: ['a1'],
+});
+assert('a run left behind is marked in the list', /●1\.Alpha/.test(parked.master), parked.master);
+assert('the highlighted row keeps the cursor glyph', /▶2\.Beta/.test(parked.master), parked.master);
+assert(
+  'an idle list shows no run markers',
+  !view.master.includes('●'),
+  view.master,
+);
 
 const emptyView = agentsMasterDetailView({ agents: [], sessions: [], cursor: 5, focus: 'master' });
 assert('empty state clamps cursor to 0', emptyView.cursor === 0);

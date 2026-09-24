@@ -1051,6 +1051,12 @@ export interface AgentsView {
 /** Minimal shape of a live run — kept local so this module stays store-free. */
 export interface LiveRun {
   id: string;
+  /**
+   * The agent this run belongs to. REQUIRED, and checked by the detail
+   * renderer: the relay runs several agents at once, so a run is only ever
+   * valid on the pane of the agent that owns it.
+   */
+  agentId: string;
   status: string;
   statusText: string;
   error?: string;
@@ -1068,8 +1074,15 @@ export interface AgentsViewInput {
   detailPage?: number;
   /** Transient status line while a run is in flight ("Thinking…"). */
   status?: string;
-  /** The relay-owned live run for the selected agent, if any. */
+  /** The relay-owned live run for the SELECTED agent, if any. */
   run?: LiveRun | null;
+  /**
+   * Agents with a run in flight right now, selected one included. Several runs
+   * can be going at once, so the master list needs its own marker: without it a
+   * run that is still streaming while you browse another agent is invisible,
+   * and the only pane that looks alive is the one the cursor happens to sit on.
+   */
+  runningAgentIds?: readonly string[];
 }
 
 /** Inner width of the 368px detail panel (paddingLength 4 each side). */
@@ -1146,8 +1159,18 @@ function transcriptLines(messages: readonly { role: string; content: string; too
   return out;
 }
 
-/** Left panel: numbered agent list with a ▶ cursor on the highlighted agent. */
-function agentListView(agents: AgentDef[], cursor: number, focus: AgentFocus): string {
+/**
+ * Left panel: numbered agent list, one gutter glyph per row —
+ *   ▶  the highlighted agent,   ●  a backgrounded run,   (blank) idle.
+ * The cursor glyph wins the gutter, so a highlighted agent's own run is not
+ * double-marked: the right pane is already showing that run live.
+ */
+function agentListView(
+  agents: AgentDef[],
+  cursor: number,
+  focus: AgentFocus,
+  running: ReadonlySet<string>,
+): string {
   const head = `Agents ${agents.length}${focus === 'master' ? ' ◀' : ''}`;
   if (agents.length === 0) {
     return clipBytes(
@@ -1163,7 +1186,7 @@ function agentListView(agents: AgentDef[], cursor: number, focus: AgentFocus): s
 
   const lines: string[] = [head];
   for (let i = start; i < end; i++) {
-    const sel = i === clamped ? '▶' : ' ';
+    const sel = i === clamped ? '▶' : running.has(agents[i].id) ? '●' : ' ';
     lines.push(`${sel}${i + 1}.${truncate(agents[i].name || '(unnamed)', AGENT_ITEM_TEXT)}`);
   }
   lines.push(focus === 'master' ? '▲▼ move · tap open' : 'double-tap = back');
@@ -1310,6 +1333,12 @@ export function agentsMasterDetailView(
   const sessionCursor = mine.length
     ? Math.min(mine.length - 1, Math.max(0, input.sessionCursor ?? 0))
     : 0;
+  // Only ever paint THIS agent's run. A mismatch is dropped rather than shown:
+  // leaking a neighbour's live transcript under the highlighted agent's name is
+  // the master-list/detail-pane desync, and it fails silently, so the check
+  // lives here instead of relying on every caller resolving per agent.
+  const liveRun = input.run && agent && input.run.agentId === agent.id ? input.run : null;
+  const running = new Set(input.runningAgentIds ?? []);
   const detail = agentDetailView(
     agent,
     sessions,
@@ -1317,10 +1346,10 @@ export function agentsMasterDetailView(
     sessionCursor,
     input.detailPage ?? 0,
     input.status ?? '',
-    input.run ?? null,
+    liveRun,
   );
   return {
-    master: agentListView(agents, clamped, focus),
+    master: agentListView(agents, clamped, focus, running),
     detail: detail.text,
     cursor: clamped,
     sessionCursor,

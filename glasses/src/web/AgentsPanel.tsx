@@ -371,38 +371,49 @@ export function AgentsPanel() {
   const shown: AgentSession | null =
     sessions.find((s) => s.id === openSession) ?? sessions[0] ?? null;
 
-  // A run started HERE (or on the glasses) streams in over SSE. Show the newest
-  // one for this agent, running or just-finished.
+  // A run started HERE (or on the glasses) streams in over SSE. Show THIS
+  // agent's running run and nothing else. The old fallback to myRunId is what
+  // let a neighbouring agent's live transcript paint under this agent's header
+  // and left Run disabled for an agent that was not running at all.
   const live = agent
     ? (runs.find((r) => r.agentId === agent.id && r.status === 'running') ??
-      runs.find((r) => r.id === myRunId) ??
       null)
     : null;
   const running = live?.status === 'running';
   const status = live?.statusText ?? '';
 
+  // The run this tab started, tracked by RUN id wherever the master list has
+  // moved since — the transcript pane above is not its home any more.
+  const myRun = myRunId ? (runs.find((r) => r.id === myRunId) ?? null) : null;
+
+  // An outcome message belongs to the agent that produced it.
+  useEffect(() => setError(''), [agent?.id]);
+
   // Persist the transcript as a session exactly once, using the RUN id so the
   // browser and the glasses converge on the same session id.
   useEffect(() => {
-    if (!live || live.status === 'running' || live.id !== myRunId) return;
+    if (!myRun || myRun.status === 'running') return;
     setMyRunId(null);
-    setError(live.status === 'error' ? (live.error ?? 'run failed') : '');
+    // Only surface the outcome on the agent it belongs to.
+    if (agent && myRun.agentId === agent.id) {
+      setError(myRun.status === 'error' ? (myRun.error ?? 'run failed') : '');
+    }
     setOpenSession(
       recordSession({
-        id: live.id,
-        agentId: live.agentId,
-        title: live.title || live.prompt.slice(0, 48),
-        messages: live.messages.map((m) => ({
+        id: myRun.id,
+        agentId: myRun.agentId,
+        title: myRun.title || myRun.prompt.slice(0, 48),
+        messages: myRun.messages.map((m) => ({
           role: m.role,
           content: m.content,
           tool: m.tool,
           args: m.args,
           at: m.at,
         })),
-        status: live.status === 'done' ? 'done' : 'error',
+        status: myRun.status === 'done' ? 'done' : 'error',
       }),
     );
-  }, [live, myRunId]);
+  }, [myRun, myRunId, agent?.id]);
 
   const addAgent = () => {
     const a = emptyAgent(`Agent ${state.agents.length + 1}`);
