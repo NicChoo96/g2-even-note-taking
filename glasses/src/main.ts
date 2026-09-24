@@ -24,6 +24,7 @@ import {
   sectionByMenuId,
   sectionMenu,
   sectionView,
+  signInView,
   type AgentFocus,
   type SectionView,
 } from './sections';
@@ -47,6 +48,7 @@ import {
   subscribeAgents,
 } from './agents-store';
 import { getStreamToken, onStreamToken } from './auth-token';
+import { getPairCode, onPairCode } from './pair-code';
 import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
 import {
   activeDoc,
@@ -103,12 +105,12 @@ import { mountUi } from './web/ui';
 const CONTAINER_ID = 1;
 const CONTAINER_NAME = 'main';
 
-// Shown on the glasses while no credential is active — nobody has signed in and
-// this device holds no pairing token. Signing in is the normal path on EVERY
-// surface (including the Even App WebView); pairing is the opt-in fallback for a
-// device that cannot sign in.
-const SIGNIN_TEXT =
-  'Sign in to start\n\nOpen the hub and sign in\nwith your Google account.\nOne account, every device.\n\nPairing is only for a device\nthat cannot sign in.\n\nControl with your R1 ring.';
+// The page shown while no credential is active is `signInView(code)` in
+// sections.ts, next to the line/byte limits it has to respect. It is a function
+// rather than a constant here because it carries the LIVE pending pairing code:
+// signing in is the normal path on every surface (including the Even App
+// WebView), pairing is the opt-in fallback — and while it is pending the code has
+// to be legible on the lens, which is the whole point of it being there.
 
 /** Diagnostic logging only — the phone screen stays clean (just the web UI). */
 function setStatus(line: string): void {
@@ -583,6 +585,14 @@ async function main(): Promise<void> {
       }
     }
   }
+
+  // A pending pairing code is drawn ON the sign-in page, so a change to it is a
+  // reason to repaint. Registered here rather than up with the other
+  // subscriptions because a render is what this wakes, and both `renderGlasses`
+  // and the render lock it reads only exist once the bridge has resolved.
+  onPairCode(() => {
+    void renderGlasses();
+  });
 
   /** The G2 page text container — event-capturing, byte-clipped. */
   function textContainer(content: string): TextContainerProperty {
@@ -1081,7 +1091,7 @@ async function main(): Promise<void> {
     // Before anyone signs in (and with no pairing token), the glasses show
     // onboarding instead of an empty pasteboard.
     if (!getStreamToken()) {
-      const text = SIGNIN_TEXT;
+      const text = signInView(getPairCode());
       if (!started) {
         const res = await createPage(text);
         started = res === StartUpPageCreateResult.success;

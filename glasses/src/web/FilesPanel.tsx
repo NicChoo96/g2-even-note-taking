@@ -22,6 +22,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MicButton } from './Dictate';
 import {
   deleteFile,
+  fetchFileMedia,
   fetchFilesStatus,
   fileBodyUrl,
   listFiles,
@@ -30,6 +31,7 @@ import {
   restoreFile,
   toFileRef,
   type FilesStatus,
+  type MediaRef,
   type StoredDoc,
 } from './files-client';
 import { update } from '../store';
@@ -98,6 +100,36 @@ export function FilesPanel() {
    * render that writing triggers.
    */
   const mirrored = useRef<FileRef[]>([]);
+  /**
+   * Videos the selected document points at, as the relay resolved them.
+   * Empty for most documents, which is not an error and renders nothing.
+   */
+  const [media, setMedia] = useState<MediaRef[]>([]);
+  /** Which of them the box above the document is currently playing, if any. */
+  const [playing, setPlaying] = useState<MediaRef | null>(null);
+
+  /**
+   * Ask the relay what videos the selected document holds.
+   *
+   * The relay, not this page: the body goes straight into a sandboxed frame
+   * with an opaque origin, so nothing here can read it. The request is cheap
+   * and answers `media: []` for a document with none — the common case — so it
+   * needs no pre-flight knowledge of what a document contains.
+   */
+  useEffect(() => {
+    setPlaying(null);
+    setMedia([]);
+    if (!selected || showDeleted) return;
+    let live = true;
+    void fetchFileMedia(selected).then((r) => {
+      // Guarded: a selection made while this was in flight must not have its
+      // own, correct list overwritten by this one's late answer.
+      if (live) setMedia(r.ok && Array.isArray(r.media) ? r.media : []);
+    });
+    return () => {
+      live = false;
+    };
+  }, [selected, showDeleted]);
 
   const configured = status?.configured !== false && !status?.error;
 
@@ -529,21 +561,123 @@ export function FilesPanel() {
                 </div>
               </div>
               {/*
+                The videos in this document, if it has any.
+
+                They are played HERE, above the document, rather than inside it
+                — and that is not a stylistic choice. The document's own embeds
+                cannot work: the frame is served under
+                `Content-Security-Policy: sandbox allow-scripts`, which carries
+                no `frame-src` (so a nested YouTube frame falls back to
+                `default-src 'none'` and is refused) and, deliberately, no
+                `allow-same-origin` (so the nested document gets an opaque
+                origin and YouTube's player will not initialise — it needs
+                cookies, storage and postMessage). Measured live, in both
+                directions. Granting `allow-same-origin` is the one thing this
+                page must not do, because that is what would make a
+                model-authored document same-origin with this app.
+
+                So these thumbnails and the player below them are ordinary
+                elements of THIS document, on this origin, loading YouTube's own
+                origin in a plain cross-origin frame. The sandboxed document is
+                untouched by any of it and never sees this list.
+              */}
+              {media.length > 0 && (
+                <div className="files-media">
+                  <span className="agent-meta">
+                    {media.length === 1
+                      ? '1 video in this document'
+                      : `${media.length} videos in this document`}
+                  </span>
+                  <ul className="files-media-strip">
+                    {media.map((v) => (
+                      <li key={`${v.provider}:${v.id}`}>
+                        <button
+                          className={
+                            playing?.id === v.id
+                              ? 'files-media-thumb active'
+                              : 'files-media-thumb'
+                          }
+                          onClick={() => setPlaying(playing?.id === v.id ? null : v)}
+                          title={`${playing?.id === v.id ? 'Close' : 'Play'} ${v.label} ${v.id}`}
+                          aria-label={`${playing?.id === v.id ? 'Close' : 'Play'} ${v.label} video`}
+                          aria-pressed={playing?.id === v.id}
+                        >
+                          <img src={v.thumb} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                          <span className="files-media-play" aria-hidden="true">
+                            {playing?.id === v.id ? '■' : '▶'}
+                          </span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {/*
                 `sandbox="allow-scripts"` and NOTHING else. No `allow-same-origin`
                 means the frame runs with an opaque origin, so a generated document
                 cannot read this app's DOM, its storage or its session token — and
                 `allow-scripts` is kept so inline charts still work. This matches
                 the relay's own `Content-Security-Policy: sandbox allow-scripts`;
                 the two are belt and braces, and neither one alone is relied on.
+
+                While a video is open this frame is REPLACED rather than stacked
+                under it: the pane is a letterbox already, and a 16:9 player above
+                a 62vh document would leave neither one usable.
               */}
-              <iframe
-                key={`${active.id}:${frameKey}`}
-                className="files-frame"
-                title={active.title || 'Document preview'}
-                sandbox="allow-scripts"
-                referrerPolicy="no-referrer"
-                src={fileBodyUrl(active.id)}
-              />
+              {playing ? (
+                <div className="files-player">
+                  <iframe
+                    key={`${playing.provider}:${playing.id}`}
+                    className="files-player-frame"
+                    title={`${playing.label} video ${playing.id}`}
+                    src={playing.embed}
+                    /*
+                      NO `sandbox` here, and that is deliberate — it is the whole
+                      reason this works. This frame is YouTube's OWN content on
+                      YouTube's own origin, not model-authored code on ours, so it
+                      needs the ordinary privileges a player requires:
+                      `allow-same-origin` keeps it on youtube-nocookie.com rather
+                      than an opaque origin (it is still not THIS origin, which is
+                      what would matter), and `allow-presentation` lets it go
+                      fullscreen. Sandboxing it the way the document is sandboxed
+                      is exactly what produced a blank box in testing.
+                    */
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                    referrerPolicy="strict-origin-when-cross-origin"
+                    allowFullScreen
+                  />
+                  <div className="files-player-bar">
+                    <span className="agent-meta">
+                      {playing.label} · {playing.id}
+                    </span>
+                    <a
+                      className="link-btn"
+                      href={playing.watch}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Watch on {playing.label} ↗
+                    </a>
+                    <button
+                      className="icon-btn"
+                      onClick={() => setPlaying(null)}
+                      title="Close the video and show the document"
+                      aria-label="Close the video and show the document"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <iframe
+                  key={`${active.id}:${frameKey}`}
+                  className="files-frame"
+                  title={active.title || 'Document preview'}
+                  sandbox="allow-scripts"
+                  referrerPolicy="no-referrer"
+                  src={fileBodyUrl(active.id)}
+                />
+              )}
             </>
           )}
         </div>

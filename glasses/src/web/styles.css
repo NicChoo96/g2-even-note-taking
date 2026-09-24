@@ -160,6 +160,15 @@ button {
   cursor: pointer;
   border: none;
   border-radius: 8px;
+  /* This document never declares `color-scheme: dark`, so a <button> that sets no
+     colour of its own inherits the UA's LIGHT-scheme default — pure black. On this
+     palette that is unreadable: black on --panel-2 (#18211e) is 1.3:1, and black on
+     the selected row's --accent-dim (#1e4d35) is 2.2:1, against a 4.5:1 minimum.
+     Every title in the Files master list rendered black for exactly this reason.
+     Setting the default here fixes the whole class of bug rather than one row — and
+     the rules below still win wherever a button wants a different colour
+     (`button.primary`, `.icon-btn`, `.link-btn`, `.files-tab`). */
+  color: var(--text);
   transition: filter 0.15s ease, background 0.15s ease;
 }
 
@@ -1796,5 +1805,115 @@ li.empty {
   .files-frame {
     height: 48vh;
   }
+}
+
+/* Videos found in a stored document.
+
+   These live OUTSIDE the sandboxed document frame, and they have to: that frame
+   is served under `sandbox allow-scripts` with no `frame-src`, so a nested
+   YouTube frame is refused outright — and even if one were allowed, the frame's
+   opaque origin stops YouTube's player initialising, because it needs cookies,
+   storage and postMessage. Both measured live; see `extractMedia` in
+   web/server/jarvis-files.mjs. So the player is an ordinary element of this
+   page instead, and the document keeps exactly the privileges it had. */
+
+.files-media {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 10px;
+  min-width: 0;
+}
+
+/* One row, scrolled sideways rather than wrapped: a watch-later document can
+   hold dozens, and wrapping them would push the document itself off-screen. */
+.files-media-strip {
+  list-style: none;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 0 6px;
+  margin: 0;
+}
+
+.files-media-strip > li {
+  flex: 0 0 auto;
+}
+
+.files-media-thumb {
+  position: relative;
+  display: block;
+  width: 128px;
+  aspect-ratio: 16 / 9;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  cursor: pointer;
+}
+
+.files-media-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* The play glyph sits over the poster so a thumbnail reads as playable rather
+   than as a picture of a video. It is the ONLY thing marking the active row, so
+   the border and the scrim change together. */
+.files-media-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  color: #fff;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9);
+  background: rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.files-media-thumb.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
+.files-media-thumb.active .files-media-play {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.files-player {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 16:9, and capped to the same height the document frame uses so swapping
+   between the two does not jump the pane. */
+.files-player-frame {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 62vh;
+  border: 0;
+  border-radius: 10px;
+  background: #000;
+}
+
+.files-player-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.files-player-bar .agent-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 

@@ -246,6 +246,56 @@ export function fileBodyUrl(id: string): string {
   return `${API_BASE}/api/files/${encodeURIComponent(id)}/html${q}`;
 }
 
+/**
+ * One video a stored document points at, already resolved to safe URLs.
+ *
+ * Every field is built by the RELAY from an id that matched a strict pattern,
+ * so nothing a document wrote reaches these strings — see `extractMedia` in
+ * `web/server/jarvis-files.mjs`. That matters because the document is untrusted
+ * code: if its own text were passed through, a body could put a `javascript:`
+ * URL in `embed` and the panel would hand it to an iframe.
+ */
+export interface MediaRef {
+  provider: string;
+  /** Human-facing provider name, e.g. `YouTube`. */
+  label: string;
+  id: string;
+  /** Poster frame. */
+  thumb: string;
+  /** What an `<iframe>` in this app's OWN DOM points at. */
+  embed: string;
+  /** Where to send a reader who wants the provider's page. */
+  watch: string;
+}
+
+export interface MediaResult {
+  ok: boolean;
+  media: MediaRef[];
+  error?: string;
+}
+
+/**
+ * The videos in a document, or an empty list.
+ *
+ * WHY THIS IS A REQUEST AND NOT SOMETHING READ FROM THE FRAME
+ *   The document's own `<iframe>` embeds cannot work, and that is not a bug to
+ *   be fixed where they sit. The relay serves a body under
+ *   `Content-Security-Policy: sandbox allow-scripts`, which has no `frame-src`
+ *   (so a nested YouTube frame falls back to `default-src 'none'` and is
+ *   refused) and, deliberately, no `allow-same-origin` (so the nested document
+ *   gets an opaque origin, and YouTube's player needs a real one). Both were
+ *   measured live. Granting `allow-same-origin` would make agent-authored HTML
+ *   same-origin with this app — the exact thing the sandbox exists to prevent —
+ *   so instead the videos are played out here, in this app's own DOM, where a
+ *   plain cross-origin iframe is unremarkable.
+ *
+ * A document with no videos answers `{ ok: true, media: [] }`, which is not an
+ * error: most documents have none, and the panel renders nothing extra.
+ */
+export function fetchFileMedia(id: string): Promise<MediaResult> {
+  return getJson<MediaResult>(`/api/files/${encodeURIComponent(id)}/media`);
+}
+
 /** Reduce a stored document to the small ref the glasses list keeps. */
 export function toFileRef(doc: StoredDoc): FileRef {
   return {

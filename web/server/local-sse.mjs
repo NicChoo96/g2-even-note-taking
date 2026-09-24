@@ -99,6 +99,7 @@ import { isWebTool, resolveDepth, searchWeb } from './web-search.mjs';
 // header records the two things its own docs get wrong.
 import {
   createFilesClient,
+  extractMedia,
   filesConfig,
   filesToolSchema,
   htmlResponseHeaders,
@@ -2348,6 +2349,27 @@ const server = createServer(async (req, res) => {
         // the frame is served under cannot drift from SANDBOX_CSP.
         res.writeHead(200, { ...htmlResponseHeaders(), 'Content-Type': doc.contentType });
         res.end(doc.text);
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // The VIDEOS a document points at.
+    //
+    // Extracted HERE, by the relay, because the client cannot do it: the body is
+    // streamed straight into a sandboxed frame with an opaque origin, so nothing
+    // in this app can look inside it — not a fetch (CORS is empty upstream), not
+    // the parent document (the frame is not same-origin). The relay already
+    // holds the credential and already knows how to fetch the bytes, so this is
+    // the one place the question can be answered. The list is small and rebuilt
+    // from validated ids; see the header of extractMedia for why no URL from the
+    // body is ever passed through.
+    const mediaMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/media$/.exec(url.pathname);
+    if (req.method === 'GET' && mediaMatch) {
+      try {
+        const doc = await client.body(mediaMatch[1]);
+        json(res, 200, { ok: true, media: extractMedia(doc.text) });
       } catch (err) {
         fail(err);
       }

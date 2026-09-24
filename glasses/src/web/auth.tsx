@@ -23,6 +23,10 @@ import {
 } from 'react';
 import { API_BASE } from '../stream';
 import { onAuthRejected, setStreamToken } from '../auth-token';
+// Aliased: this component already has a `setPairCode` — the React state setter for
+// the pair code it fetched. Importing the publisher under the same name would be
+// shadowed by it and silently do nothing but re-set state to its own value.
+import { setPairCode as publishPairCode } from '../pair-code';
 import {
   clearDeviceSession,
   clearOwnerSession,
@@ -390,6 +394,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (timer) window.clearTimeout(timer);
     };
   }, [pairing]);
+
+  // The pending code belongs on the LENS as much as on this screen — that is where
+  // it gets read from when the phone is in a pocket and the browser doing the
+  // approving is on a desk. Publishing it is all this side has to do; the glasses
+  // renderer subscribes to `pair-code`.
+  useEffect(() => {
+    publishPairCode(pairCode);
+  }, [pairCode]);
+
+  // NOTE — pairing is deliberately NOT started automatically here, even though a
+  // code on the lens would then be up before the wearer looks at the glasses.
+  // Pairing is OPT-IN by design (see the header): gating the Even App behind the
+  // pair screen is the thing that used to make the app unusable on the phone. An
+  // unconditional start would also mint a pending device row on every launch, and
+  // the relay has no TTL and hides pending rows from Settings — so that row would
+  // be valid and invisible forever. The code reaches the lens the moment the
+  // wearer actually opts in, from Settings or from the login screen's fallback
+  // link, which is what puts it in front of them.
 
   // ONE place decides the stream credential. An owner session always wins — it
   // is strictly stronger (it can also write settings) — and an approved device

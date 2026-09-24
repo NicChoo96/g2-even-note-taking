@@ -254,6 +254,45 @@ const VISIBLE_ITEMS = 6; // todo rows in the cursor window
 const INNER_W = 568; // 576 - 2 * paddingLength(4)
 const PAGE_BODY_LINES = 9; // body lines per page; compact 1-line header above
 const PAGE_BYTES = 900; // body byte budget per page (≤ 999 - header)
+
+/**
+ * The page shown on the glasses while no credential is active.
+ *
+ * Two builds, because there are two things a device can be doing. The second is
+ * the reason this is a FUNCTION and not a constant: a pairing code is meant to be
+ * read off the LENS and typed into a browser that is already signed in, and the
+ * phone it is also printed on is precisely the thing that is out of reach in that
+ * moment.
+ *
+ * BOTH BUILDS ARE THE SAME HEIGHT ON PURPOSE. The canvas holds ten 27px lines and
+ * the plain page already fills all ten — three of them blank. Appending a code
+ * line took it to twelve, and one line past the screen the firmware scrolls the
+ * container instead of leaving it alone, which swallows the ring's swipe (see the
+ * AI_SCREEN_LINES note below). So the code build SPENDS the two lines the no-code
+ * build gives to "Pairing is only for a device / that cannot sign in." instead of
+ * adding to them. Measured with @evenrealities/pretext at the container's 568px
+ * inner width: both builds are 10 lines / 270px.
+ */
+export function signInView(pairCode: string | null): string {
+  if (!pairCode) {
+    return (
+      'Sign in to start\n\nOpen the hub and sign in\nwith your Google account.\n' +
+      'One account, every device.\n\nPairing is only for a device\nthat cannot sign in.\n\n' +
+      'Control with your R1 ring.'
+    );
+  }
+  // Six characters read as two groups: one solid block of six is easy to misread
+  // off a lens. The relay's alphabet already drops every shape that could be a
+  // 0/O/1/I. A longer code still renders — it is byte-clipped by the caller — so
+  // this must not assume six.
+  const code = pairCode.length === 6 ? `${pairCode.slice(0, 3)} ${pairCode.slice(3)}` : pairCode;
+  return (
+    'Sign in to start\n\nOpen the hub and sign in\nwith your Google account.\n' +
+    `One account, every device.\n\nOr pair this device:\n${code}\n\n` +
+    'Control with your R1 ring.'
+  );
+}
+
 // Jarvis HUD. The canvas shows ~10 rendered lines; the HUD spends 3 of them on
 // chrome (header, rule, controls) and up to 3 more on the watched-run block, so
 // a transcript page gets what is left. Staying UNDER the screen is what makes

@@ -28,6 +28,7 @@ import {
   FILES_TOOL_ID,
   FILES_TOOL_NAME,
   MAX_HTML_BYTES,
+  MEDIA_MAX,
   RENEW_SKEW_MS,
   LIST_MAX_LIMIT,
   LIST_MAX_PAGES,
@@ -36,6 +37,7 @@ import {
   compactDoc,
   compactList,
   createFilesClient,
+  extractMedia,
   filesConfig,
   filesToolSchema,
   htmlResponseHeaders,
@@ -317,6 +319,69 @@ eq('the type cannot be sniffed', headers['X-Content-Type-Options'], 'nosniff');
 lacks('no referrer leaks to the gateway', headers['Referrer-Policy'], 'unsafe');
 has('nothing is cached', headers['Cache-Control'], 'no-store');
 eq('the policy is one join, not a hand-built string', SANDBOX_CSP.split('; ').length, 9);
+
+// ── 6b. extractMedia — the videos in a document ─────────────────────────────
+//
+// This is the ONE feature that reads the document body, so the tests that
+// matter are not "does it find a video" but "can the BODY influence what the
+// panel loads". A document is model-authored code; every URL the panel plays
+// must be rebuilt from an id, never passed through.
+console.log('\n§6b  extractMedia');
+{
+  // Every shape a model actually writes, including the escaped separator that a
+  // hand-built tag produces, plus one exact duplicate.
+  const doc = [
+    '<iframe src="https://www.youtube.com/embed/O7he_E-H8Xg?si=OYEun4uzfanT6vM0"></iframe>',
+    '<iframe src="https://www.youtube-nocookie.com/embed/BZbC3NpgVfM"></iframe>',
+    '<iframe src="https://m.youtube.com/watch?v=dBFm3zm_3l8&amp;t=42s"></iframe>',
+    '<a href="https://youtu.be/DdCEmlAydcw">short form</a>',
+    "<a href='https://www.youtube.com/shorts/m35NljDbPTI'>shorts</a>",
+    '<iframe src="https://www.youtube.com/embed/O7he_E-H8Xg"></iframe>',
+  ].join('\n');
+  const found = extractMedia(doc);
+  eq('every embed shape is found, the duplicate collapses', found.length, 5);
+  eq(
+    '…and they come back in document order',
+    found.map((v) => v.id),
+    ['O7he_E-H8Xg', 'BZbC3NpgVfM', 'dBFm3zm_3l8', 'DdCEmlAydcw', 'm35NljDbPTI'],
+  );
+  eq('the provider is named', found[0].provider, 'youtube');
+  eq('…and labelled for the button', found[0].label, 'YouTube');
+  eq('the `?si=` tracking param never reaches the id', found[0].id, 'O7he_E-H8Xg');
+  eq(
+    'the thumbnail is built from the id alone',
+    found[0].thumb,
+    'https://i.ytimg.com/vi/O7he_E-H8Xg/hqdefault.jpg',
+  );
+  has('the embed is the no-cookie host', found[0].embed, 'youtube-nocookie.com/embed/O7he_E-H8Xg');
+  eq(
+    '…and the watch link is the real page',
+    found[0].watch,
+    'https://www.youtube.com/watch?v=O7he_E-H8Xg',
+  );
+
+  // ── the rule that makes reading a body safe ──
+  const hostile = [
+    '<a href="javascript:alert(1)">x</a>',
+    '<iframe src="data:text/html,<script>alert(1)</script>"></iframe>',
+    '<a href="https://evil.example/watch?v=O7he_E-H8Xg">decoy</a>',
+    '<iframe src="//evil.example/embed/O7he_E-H8Xg"></iframe>',
+    '<a href="/watch?v=O7he_E-H8Xg">relative</a>',
+    '<iframe src="https://www.youtube.com.evil.example/watch?v=O7he_E-H8Xg"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/TOOSHORT"></iframe>',
+  ].join('\n');
+  eq('a body cannot inject a URL into the player', extractMedia(hostile).length, 0);
+
+  const ids = Array.from({ length: 80 }, (_, i) => `vid${i}`.padEnd(11, 'x'));
+  const flood = ids
+    .map((id) => `<iframe src="https://www.youtube.com/embed/${id}"></iframe>`)
+    .join('\n');
+  eq('a flood is capped so one body cannot fill the panel', extractMedia(flood).length, MEDIA_MAX);
+
+  eq('a document with no videos says so with an empty list', extractMedia('<p>prose</p>'), []);
+  eq('an empty body is safe', extractMedia(''), []);
+  eq('…and so is a missing one', extractMedia(null), []);
+}
 
 // ── 7. The client: lazy login, one session, one request shape ──────────────
 console.log('\n§7  the client');
@@ -920,8 +985,25 @@ console.log('\n§12  the relay is wired to this module');
   lacks('…with no inline copy of the frame policy', relay, "'X-Frame-Options'");
   has('…and the HTML proxy route exists', relay, '/api/files/');
   has('…including the body route', relay, '/html$');
+  has('…and the media route', relay, '/media$');
+  has('…extracting through the module that owns the document contract', relay, 'extractMedia(');
   has('…and status', relay, '/api/files/status');
   lacks('…with no gateway credential baked into the relay', relay, 'JARVIS_FILE_PWD=');
+
+  // The panel is where the sandbox and the player meet, and the ONE way to
+  // break video without breaking any server test is to sandbox the player too —
+  // which is exactly what produced a blank box when this was tested. Pin both
+  // halves so neither can be "hardened" back into not working.
+  const panel = readFileSync(new URL('../src/web/FilesPanel.tsx', import.meta.url), 'utf8');
+  has('the document frame is still sandboxed', panel, 'sandbox="allow-scripts"');
+  lacks(
+    '…and is never handed our origin',
+    panel,
+    'sandbox="allow-scripts allow-same-origin',
+  );
+  has('the videos are asked of the relay', panel, 'fetchFileMedia(');
+  has('…and played in this app\'s own DOM', panel, 'files-player-frame');
+  has('…as a real cross-origin frame, not a sandboxed one', panel, 'allowFullScreen');
 
   const clientSrc = readFileSync(new URL('../../web/server/jarvis-files.mjs', import.meta.url), 'utf8');
   has('the gateway password is never logged or returned', clientSrc, 'hintVar');

@@ -341,6 +341,151 @@ export function isHtmlish(text) {
   return HTML_RE.test(String(text ?? ''));
 }
 
+// ── Videos inside a document ─────────────────────────────────────────────────
+//
+// WHY THIS EXISTS AT ALL, GIVEN A DOCUMENT IS ALREADY SHOWN IN A FRAME
+//   A model-published document can embed videos — a watch-later list is exactly
+//   that. Those embeds CANNOT work in the frame the relay serves them in:
+//
+//     • the frame's policy carries no `frame-src`, so a nested
+//       `<iframe src="https://www.youtube.com/embed/…">` falls back to
+//       `default-src 'none'` and is refused before it ever loads, and
+//     • even with `frame-src` relaxed, `sandbox allow-scripts` (deliberately
+//       with NO `allow-same-origin`) forces the nested document into an opaque
+//       origin, and YouTube's player needs a real one — it reaches for cookies,
+//       storage and postMessage.
+//
+//   BOTH ARE MEASURED, NOT ASSUMED. Four frames holding one video were rendered
+//   side by side: with the sandbox as it stands the player is blank, and the
+//   identical video in a frame carrying `allow-same-origin` plays. The URL was
+//   never the problem — every configuration LOADED youtube.com; only the player
+//   refused to draw, which is why this cannot be caught by checking the URL.
+//
+//   `allow-same-origin` is the one flag this app must not grant: it is precisely
+//   what would let an agent-authored document be same-origin with the SPA, and
+//   read its DOM, its storage and its session token. So the embed cannot be
+//   repaired where it sits — but it does not need to be. The RELAY can read the
+//   body (it already holds the credential), find the videos and hand the client
+//   a small, validated list; the client then plays them in its OWN DOM, outside
+//   the sandbox. That frame is a plain cross-origin iframe on YouTube's origin,
+//   which is a privilege the DOCUMENT never gains — it never sees this list, and
+//   its own frame is served under exactly the terms it was before.
+//
+// THE RULE THAT MAKES THIS SAFE: NO URL FROM THE BODY IS EVER PASSED THROUGH
+//   The body is untrusted code written by a model. So nothing in it is echoed to
+//   the client: every field below is REBUILT from an id that matched a strict
+//   pattern. A document therefore cannot smuggle a `javascript:` URL, a
+//   different host or a crafted query into the player, because no part of its
+//   text survives — only eleven characters from a fixed alphabet.
+
+/** How many videos one document may contribute, so a hostile body cannot flood the panel. */
+export const MEDIA_MAX = 50;
+
+/** YouTube ids are exactly this, always. Checked BEFORE any URL is built. */
+const YT_ID = /^[A-Za-z0-9_-]{11}$/;
+
+/**
+ * The id of the YouTube video a URL names, or ''.
+ *
+ * Accepts the shapes a model actually writes: `/embed/`, `/watch?v=`,
+ * `/shorts/`, `/live/`, `/v/`, and the `youtu.be` short form, on
+ * youtube.com, youtube-nocookie.com and their m/my/music subdomains.
+ */
+function youTubeId(u) {
+  const host = u.hostname.toLowerCase().replace(/^(?:www|m|music)\./, '');
+  if (host === 'youtu.be') {
+    const id = u.pathname.replace(/^\//, '').split('/')[0];
+    return YT_ID.test(id) ? id : '';
+  }
+  if (host !== 'youtube.com' && host !== 'youtube-nocookie.com') return '';
+  const path = /^\/(?:embed|shorts|live|v)\/([A-Za-z0-9_-]{11})(?:\/|$)/.exec(u.pathname);
+  if (path) return path[1];
+  if (/^\/(?:watch|embed)\/?$/.test(u.pathname)) {
+    const v = u.searchParams.get('v') ?? '';
+    return YT_ID.test(v) ? v : '';
+  }
+  return '';
+}
+
+/**
+ * The providers this app can play, as a TABLE rather than a hardcoded branch.
+ *
+ * Adding Vimeo, or a bare `https://…/clip.mp4`, is a new entry here and nothing
+ * else: extraction, the cap, de-duplication, the relay route, the panel and the
+ * harness all work off `{ provider, id }` and never name YouTube.
+ */
+export const MEDIA_PROVIDERS = [
+  {
+    id: 'youtube',
+    label: 'YouTube',
+    parse: youTubeId,
+    /** Always present — unlike maxresdefault, which 404s on older uploads. */
+    thumb: (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+    /** The no-cookie host: the same player, minus the tracking cookie until play. */
+    embed: (id) => `https://www.youtube-nocookie.com/embed/${id}?rel=0`,
+    watch: (id) => `https://www.youtube.com/watch?v=${id}`,
+  },
+];
+
+/** Parse an absolute http(s) URL, or null. Refuses `javascript:`, `data:` and relatives. */
+function absoluteUrl(raw) {
+  const s = raw.startsWith('//') ? `https:${raw}` : raw;
+  if (!/^https?:\/\//i.test(s)) return null;
+  try {
+    return new URL(s);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The videos a stored document points at, in document order, de-duplicated.
+ *
+ * Reads `src` and `href` attributes only — the two places a document names a
+ * video — and refuses relative or non-http(s) values. The attribute pattern is
+ * bounded and its character class excludes the quote, so it cannot backtrack on
+ * a hostile body.
+ */
+export function extractMedia(html) {
+  const text = String(html ?? '');
+  const out = [];
+  const seen = new Set();
+  // Built per call rather than shared: a module-level /g regex carries
+  // `lastIndex` between calls, which is a bug waiting for the first nested
+  // caller and a silent skip of the first match for the second.
+  const attr = /(?:src|href)\s*=\s*(?:"([^"]{1,2048})"|'([^']{1,2048})')/gi;
+  let m;
+  while ((m = attr.exec(text)) !== null) {
+    // A document may escape the separator — `?v=ab&amp;t=2` is what a model
+    // writes when it hand-builds the tag — so undo entities before parsing, or
+    // the id is read as `ab` and the video silently disappears.
+    const raw = (m[1] ?? m[2])
+      .replace(/&amp;/gi, '&')
+      .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+      .trim();
+    const url = absoluteUrl(raw);
+    if (!url) continue;
+    for (const p of MEDIA_PROVIDERS) {
+      const id = p.parse(url);
+      if (!id) continue;
+      const key = `${p.id}:${id}`;
+      if (seen.has(key)) break;
+      seen.add(key);
+      out.push({
+        provider: p.id,
+        label: p.label,
+        id,
+        thumb: p.thumb(id),
+        embed: p.embed(id),
+        watch: p.watch(id),
+      });
+      break;
+    }
+    if (out.length >= MEDIA_MAX) break;
+  }
+  return out;
+}
+
 // ── The client ───────────────────────────────────────────────────────────────
 
 /**
