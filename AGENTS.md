@@ -101,7 +101,7 @@ arrive as `event.menuItemClickEvent` with the `itemID` you declared, **ignoring 
 | Swipe up / down | `textEvent` 1 / 2 | Scroll active content (native) |
 | Single press | `sysEvent` type 0 / `listEvent` | Select list item / confirm (To-Do toggle) |
 | Double press | `sysEvent` type 3 | System exit dialog (canonical — not the menu) |
-| Tap then long press | OS-owned | Opens the contextual menu (items: To-Do / Docs / Notes) |
+| Tap then long press | OS-owned | Opens the contextual menu (items: Agents / To-Do / Docs / Notes) |
 | Menu selection | `menuItemClickEvent.itemID` | Switch section (fire-and-forget; menu closes) |
 
 ## Commands

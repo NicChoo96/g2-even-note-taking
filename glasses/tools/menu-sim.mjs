@@ -110,12 +110,13 @@ assert(
 );
 
 // ── Plain tabs ──────────────────────────────────────────────────────────────
-const switchers = ['Jarvis', 'To-Do', 'Docs', 'Notes', 'Agents', 'Dictate'];
+// The switcher order comes straight from SECTIONS: Agents leads.
+const switchers = ['Jarvis', 'Agents', 'To-Do', 'Docs', 'Notes', 'Dictate'];
 check('todo', names(sectionMenu({ section: 'todo', hasDocs: true })), switchers);
 check('notes', names(sectionMenu({ section: 'notes', hasDocs: true })), switchers);
 
 // ── The voice entries must bracket the page's own actions ──────────────────
-for (const s of ['todo', 'docs', 'notes', 'agents']) {
+for (const s of ['agents', 'todo', 'docs', 'notes']) {
   const list = names(sectionMenu({ section: s, hasDocs: true, hasAgents: true }));
   check(`${s}: Dictate is LAST`, list[list.length - 1], 'Dictate');
   check(`${s}: Jarvis is FIRST`, list[0], 'Jarvis');
@@ -173,7 +174,7 @@ check(
 // removed is reachable another way, so this block pins BOTH halves of that
 // bargain: the menu really is small, and nothing that was the only way out got
 // removed with it.
-const convSections = ['todo', 'docs', 'notes', 'agents'];
+const convSections = ['agents', 'todo', 'docs', 'notes'];
 for (const s of convSections) {
   for (const flag of [{ aiListening: true }, { aiRunning: true }]) {
     const st = { section: s, hasDocs: true, hasAgents: true, aiUndo: true, ...flag };
@@ -206,7 +207,7 @@ assert(
 const convTodoNames = names(sectionMenu({ section: 'todo', hasDocs: true, aiListening: true }));
 assert(
   'a plain tab in-conversation: the switchers are trimmed',
-  !['To-Do', 'Docs', 'Notes', 'Agents'].some((n) => convTodoNames.includes(n)),
+  !['Agents', 'To-Do', 'Docs', 'Notes'].some((n) => convTodoNames.includes(n)),
   convTodoNames.join(','),
 );
 
@@ -265,7 +266,7 @@ check(
 );
 
 // ── Global invariants ───────────────────────────────────────────────────────
-const allSections = ['todo', 'docs', 'notes', 'agents'];
+const allSections = ['agents', 'todo', 'docs', 'notes'];
 for (const s of allSections) {
   for (const hasAgents of [false, true]) {
     const list = ids(sectionMenu({ section: s, hasDocs: true, hasAgents }));
@@ -278,14 +279,16 @@ for (const s of allSections) {
 }
 
 // Section switcher ids must match SECTIONS and stay unique across the app.
-// MENU.TODO/DOCS/NOTES/AGENTS intentionally mirror SECTIONS[].menuId.
+// MENU.TODO/DOCS/NOTES/AGENTS intentionally mirror SECTIONS[].menuId, and the
+// ids follow their SECTION, not their position — so the display order is
+// Agents(4) · To-Do(1) · Docs(2) · Notes(3).
 const sectionIds = SECTIONS.map((s) => s.menuId);
-check('SECTIONS ids', sectionIds, [1, 2, 3, 4]);
+check('SECTIONS ids', sectionIds, [MENU.AGENTS, MENU.TODO, MENU.DOCS, MENU.NOTES]);
 check('switcher MENU ids match SECTIONS', [
+  MENU.AGENTS,
   MENU.TODO,
   MENU.DOCS,
   MENU.NOTES,
-  MENU.AGENTS,
 ], sectionIds);
 const actionIds = Object.entries(MENU)
   .filter(([k]) => !['TODO', 'DOCS', 'NOTES', 'AGENTS'].includes(k))

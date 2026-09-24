@@ -3,7 +3,8 @@
 
 export type SectionId = 'todo' | 'docs' | 'notes' | 'agents';
 
-export const SECTION_IDS: SectionId[] = ['todo', 'docs', 'notes', 'agents'];
+/** Display order, mirrored by `SECTIONS` (glasses menu) and `TAB_ORDER` (web). */
+export const SECTION_IDS: SectionId[] = ['agents', 'todo', 'docs', 'notes'];
 
 export interface TodoItem {
   id: string;

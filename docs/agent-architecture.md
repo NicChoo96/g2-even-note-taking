@@ -173,7 +173,7 @@ The fixed order (`sectionMenu`, `glasses/src/sections.ts`):
 4. this tab's own actions
      Docs   → New Docs · Select Docs · Delete Docs
      Agents → Trigger (→ Stop while a run is in flight)
-     other  → To-Do · Docs · Notes · Agents switchers
+     other  → Agents · To-Do · Docs · Notes switchers
 5. Dictate  — always LAST and never trimmed
 ```
 

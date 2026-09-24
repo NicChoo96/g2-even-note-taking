@@ -33,11 +33,14 @@ export interface SectionDef {
   menuId: number;
 }
 
+// Array order IS the order the OS contextual menu lists the switchers in.
+// `menuId` stays bound to its section rather than to its position, so the ids
+// the firmware echoes back never move when this list is reordered.
 export const SECTIONS: SectionDef[] = [
+  { id: 'agents', title: 'Agents', menuId: 4 },
   { id: 'todo', title: 'To-Do', menuId: 1 },
   { id: 'docs', title: 'Docs', menuId: 2 },
   { id: 'notes', title: 'Notes', menuId: 3 },
-  { id: 'agents', title: 'Agents', menuId: 4 },
 ];
 
 export function sectionTitle(id: SectionId): string {
@@ -124,7 +127,7 @@ export interface MenuState {
  *   4. **The page's own actions**, in this tab's order:
  *      • Docs → New Docs · Select Docs · Delete Docs
  *      • Agents → Trigger (becomes Stop while a run is in flight)
- *      • Any other tab → the To-Do · Docs · Notes · Agents switchers
+ *      • Any other tab → the Agents · To-Do · Docs · Notes switchers
  *   5. **Dictate** — always LAST. Same trigger, same speech engine as Jarvis;
  *      the difference is that the sentence is typed into the page instead of
  *      being routed through the agent. Keeping it last means the raw,

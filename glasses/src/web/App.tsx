@@ -21,9 +21,11 @@ const SECTION_LABELS: Record<SectionId, string> = {
 /** Local tabs — Settings is browser-only and never becomes the glasses section. */
 type Tab = SectionId | 'settings' | 'jarvis';
 
-// Jarvis sits just before Settings: it is an AI surface over the whole app
-// rather than a fifth glasses page, so it groups with the "meta" tab.
-const TAB_ORDER: Tab[] = ['todo', 'docs', 'notes', 'agents', 'jarvis', 'settings'];
+// Agents leads: it is the page the switcher offers first on the glasses, so the
+// web tabs keep the same order. Jarvis sits just before Settings: it is an AI
+// surface over the whole app rather than a fifth glasses page, so it groups with
+// the "meta" tab.
+const TAB_ORDER: Tab[] = ['agents', 'todo', 'docs', 'notes', 'jarvis', 'settings'];
 
 function tabLabel(id: Tab): string {
   if (id === 'settings') return 'Settings';
