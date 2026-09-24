@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.33
+
+v0.3.33 - agent-written pages, stored and read back
+
+- New Files page on the glasses, after Notes. It lists HTML pages that Jarvis or an agent has published to your document store.
+- Scroll the list on the glasses; open the Files tab on the web to read a page in a locked-down frame.
+- Only the reference is saved on the device, never the page itself. Publishing and deleting ask first.
+
 ## 0.3.32
 
 v0.3.32 - each agent keeps its own run
