@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.35
+
+v0.3.35 - video plays in stored pages
+
+- A stored page with embedded videos now plays them in the web Files tab,
+ on the page itself instead of a blocked box.
+- The glasses sign-in screen now shows your pairing code, so you can read
+ it off the lens.
+- Buttons in the Files list were black on black; the text is readable now.
+
 ## 0.3.34
 
 v0.3.34 - deletes you can take back
