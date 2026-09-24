@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.34
+
+v0.3.34 - deletes you can take back
+
+- Deleting a stored page no longer hides it for good. The web Files tab now has
+ a Deleted list where a removed page can be restored, or purged for real.
+- A delete tells you what it did and offers Undo on the spot.
+- Reading a page that was deleted says so, instead of blaming the network.
+
 ## 0.3.33
 
 v0.3.33 - agent-written pages, stored and read back
