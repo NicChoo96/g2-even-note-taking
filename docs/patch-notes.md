@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.30
+
+v0.3.30 - save any setting, and let it stick
+
+- Every field on the Settings page is editable now and saves on its own. Changing one no longer rewrites another.
+- A value you save wins over the server environment. The environment only fills in what you have not saved. Use "remove saved value" to hand a field back.
+- Switching your web search provider no longer touches your LLM model.
+- Each field says where its value comes from.
+
 ## 0.3.29
 
 v0.3.29 - swappable web search, and a spoken line keeps your task
