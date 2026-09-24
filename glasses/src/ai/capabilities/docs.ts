@@ -6,7 +6,7 @@
 import { getState, update } from '../../store';
 import { activeDoc, emptyDoc, upsertDoc, type DocEntry } from '../../types';
 import type { Capability } from '../types';
-import { appendText, resolveDoc, short } from './shared';
+import { READ_CHARS, appendText, readFrom, resolveDoc, short } from './shared';
 
 function docs(): DocEntry[] {
   return getState().sections.docs;
@@ -170,20 +170,51 @@ export const docsCapabilities: Capability[] = [
     name: 'docs.read',
     page: 'docs',
     title: 'Read document',
-    description: 'Read the text of a document so you can answer questions about it or summarise it.',
+    description:
+      'Read the text of a document so you can answer questions about it or summarise it. A document longer than ' +
+      'one read comes back in slices: the text then ends with a marker naming the offset to continue from. Keep ' +
+      'calling with that offset until a read comes back WITHOUT the marker — that is the end of the document.',
     params: [
       { name: 'doc', type: 'string', description: 'Document title or number. Omit for the open document.' },
+      {
+        name: 'offset',
+        type: 'number',
+        description:
+          'Character to start from, for continuing a long document. Omit to read from the start. A truncated ' +
+          'read reports the exact offset to pass next.',
+      },
     ],
     run: (args) => {
       const list = docs();
       const target = resolveDoc(String(args.doc ?? ''), list, getState().activeDocId);
       if (!target) return { ok: false, summary: 'There is no document to read' };
-      const max = 4000;
-      const body = target.content.length > max ? `${target.content.slice(0, max)}\n…(truncated)` : target.content;
+      const content = target.content;
+      const total = content.length;
+      const from = readFrom(args.offset, total);
+      const to = Math.min(total, from + READ_CHARS);
+      const more = to < total;
+      // The cut is MARKED, and the marker says how to get the rest. It used to
+      // be a flat 4000 with no way to ask for more, so a longer document could
+      // never be read in full however the request was phrased. A read that ends
+      // WITHOUT the marker is now provably the whole document.
+      const body = content.slice(from, to);
       return {
         ok: true,
-        summary: `Read "${short(titleOf(target))}" (${target.content.length} chars)`,
-        data: { id: target.id, title: titleOf(target), content: body },
+        summary: more
+          ? `Read "${short(titleOf(target))}" (${from}-${to} of ${total} chars)`
+          : `Read "${short(titleOf(target))}" (${total} chars)`,
+        data: {
+          id: target.id,
+          title: titleOf(target),
+          content: more
+            ? `${body}\n…(truncated at ${to} of ${total} chars — call again with offset ${to})`
+            : body,
+          offset: from,
+          next: more ? to : null,
+          total,
+          more,
+        },
+        ...(more ? { hint: `the document continues — call docs.read again with offset ${to}` } : {}),
       };
     },
   },

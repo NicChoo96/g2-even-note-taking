@@ -4,7 +4,7 @@
 // clear / read. It is the natural target for "note that down".
 import { getState, update } from '../../store';
 import type { Capability } from '../types';
-import { appendText, short } from './shared';
+import { READ_CHARS, appendText, readFrom, short } from './shared';
 
 function notes(): string {
   return getState().sections.notes ?? '';
@@ -65,15 +65,39 @@ export const notesCapabilities: Capability[] = [
     name: 'notes.read',
     page: 'notes',
     title: 'Read notes',
-    description: 'Read the notes so you can answer questions about them or summarise them.',
-    params: [],
-    run: () => {
+    description:
+      'Read the notes so you can answer questions about them or summarise them. Notes longer than one read come ' +
+      'back in slices: the text then ends with a marker naming the offset to continue from. Keep calling with that ' +
+      'offset until a read comes back WITHOUT the marker — that is the end of the notes.',
+    params: [
+      {
+        name: 'offset',
+        type: 'number',
+        description:
+          'Character to start from, for continuing long notes. Omit to read from the start. A truncated read ' +
+          'reports the exact offset to pass next.',
+      },
+    ],
+    run: (args) => {
       const body = notes();
-      const max = 4000;
+      const total = body.length;
+      const from = readFrom(args.offset, total);
+      const to = Math.min(total, from + READ_CHARS);
+      const more = to < total;
+      const slice = body.slice(from, to);
       return {
         ok: true,
-        summary: `Notes: ${body.length} chars`,
-        data: { content: body.length > max ? `${body.slice(0, max)}\n…(truncated)` : body },
+        summary: more ? `Notes: ${from}-${to} of ${total} chars` : `Notes: ${total} chars`,
+        data: {
+          content: more
+            ? `${slice}\n…(truncated at ${to} of ${total} chars — call again with offset ${to})`
+            : slice,
+          offset: from,
+          next: more ? to : null,
+          total,
+          more,
+        },
+        ...(more ? { hint: `the notes continue — call notes.read again with offset ${to}` } : {}),
       };
     },
   },

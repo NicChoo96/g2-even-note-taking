@@ -12,6 +12,34 @@ export function short(text: string, max = 40): string {
 }
 
 /**
+ * How much of a document or the notes blob ONE read returns.
+ *
+ * A wearer's text has no size limit, so a read has to be bounded or a single
+ * call could swallow the run's whole context budget (see MAX_RESULT_CHARS in
+ * ../agent). What the bound must never be is a DEAD END: at a flat 4000 with no
+ * way to ask for the rest, a longer document could not be read in full by
+ * Jarvis however the request was phrased — while the lens pages the very same
+ * body happily. Every read now reports the offset to resume from, and the
+ * loop's `maxSteps` is enough turns to walk a long document to its end.
+ */
+export const READ_CHARS = 12000;
+
+/**
+ * Clamp a requested read offset to a real position in `total` characters.
+ *
+ * Absent, NaN, negative or fractional all mean "from the start". A model that
+ * mis-sends an offset must get the beginning of the text: an out-of-range
+ * offset handed straight to `String.prototype.slice` comes back EMPTY, which
+ * reads to the model as "the document is blank" — the one wrong answer that
+ * looks like a successful read.
+ */
+export function readFrom(raw: unknown, total: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.floor(n), total);
+}
+
+/**
  * Resolve a spoken reference to a list index.
  * Accepts a 1-based number ("2"), an id, an exact match, or a substring —
  * in that order of confidence. Returns -1 when nothing matches.
