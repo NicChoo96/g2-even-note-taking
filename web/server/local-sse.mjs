@@ -106,6 +106,20 @@ import {
   isFilesTool,
   renderToolResult as renderFilesResult,
 } from './jarvis-files.mjs';
+// The DOCUMENT ORIGIN — where untrusted, agent-authored pages are framed from
+// when that must not be this app's own origin. See its header for why a sandbox
+// on this origin can be neither relaxed, circumvented from inside, nor avoided
+// any other way, and why the content gateway is deliberately left untouched.
+import {
+  DOC_TICKET_TTL_MS,
+  docFrameUrl,
+  docResponseHeaders,
+  docTicketFromPath,
+  newDocSecret,
+  normalizeDocOrigin,
+  signDocTicket,
+  verifyDocTicket,
+} from './doc-origin.mjs';
 // Jev — the typed-decision model. Builds/validates the question spec and reads
 // the answers back. Ships twice (relay + WebView); see the header of jev-spec.mjs.
 import {
@@ -224,6 +238,39 @@ const GLASSES_DIST = fileURLToPath(new URL('../glasses-dist', import.meta.url));
 const STATE_FILE = process.env.STATE_FILE || join(process.cwd(), '.g2-hub-state.json');
 // Auth store (owner sessions + approved devices) — also persisted to disk.
 const AUTH_FILE = process.env.AUTH_FILE || join(process.cwd(), '.g2-hub-auth.json');
+
+// ── The DOCUMENT ORIGIN (optional) ───────────────────────────────────────────
+// Where a stored document is FRAMED FROM, when that is not this app's origin.
+// The sandbox that protects our origin is also the thing that stops a document
+// playing its own videos, and a second host is the only fix that does not put
+// agent-authored HTML on our origin. See doc-origin.mjs for the live evidence.
+//
+//   DOCS_ORIGIN=http://localhost:5199   base URL a browser reaches it on
+//   DOC_LISTEN_PORT=5199                ALSO serve it from this process
+//   DOC_FRAME_ANCESTOR=…                who may embed a document (default: app)
+//   DOC_TICKET_SECRET=…                 shared HMAC key; REQUIRED when the
+//                                       document origin is a SECOND process
+//
+// Unset — the default — changes nothing at all: documents keep being served
+// from this origin under SANDBOX_CSP, and the app keeps playing videos beside
+// the page. The feature is opt-in in both directions, so a deployment that does
+// not configure it cannot regress.
+const DOCS_ORIGIN = normalizeDocOrigin(process.env.DOCS_ORIGIN);
+const DOC_LISTEN_PORT = Number(process.env.DOC_LISTEN_PORT || 0);
+const DOC_FRAME_ANCESTOR =
+  String(process.env.DOC_FRAME_ANCESTOR || '').trim() ||
+  [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`].join(' ');
+const DOC_TICKET_SECRET = String(process.env.DOC_TICKET_SECRET || '').trim() || newDocSecret();
+// A second process serving documents must share THIS process's HMAC key, or every
+// ticket minted here fails its signature over there and the frame comes up blank
+// — the exact symptom this feature removes. Cheaper to say so at boot than to
+// rediscover it from a blank frame, so name the misconfiguration outright.
+if (DOCS_ORIGIN && DOC_LISTEN_PORT === 0 && !process.env.DOC_TICKET_SECRET) {
+  console.warn(
+    '[g2-hub] DOCS_ORIGIN is set, this process is NOT serving it, and DOC_TICKET_SECRET is unset: ' +
+      'tickets minted here cannot be verified by that host — set DOC_TICKET_SECRET on both.',
+  );
+}
 
 // ── Auth store: owner sessions + approved devices ────────────────────────────
 // sessions: { [token]: { email, createdAt } }
@@ -2312,6 +2359,11 @@ const server = createServer(async (req, res) => {
       mode: cfg.apiKey ? 'api_key' : 'password',
       url: cfg.url,
       hint: client ? '' : error,
+      // Where a document can be framed from WITHOUT a sandbox, or '' when there
+      // is no second origin. The app reads this to decide one thing only:
+      // whether to ask for a ticket and drop `sandbox` on the frame. Empty is
+      // the fully-sandboxed, unchanged behaviour.
+      docOrigin: DOCS_ORIGIN,
     });
     return;
   }
@@ -2373,6 +2425,37 @@ const server = createServer(async (req, res) => {
       } catch (err) {
         fail(err);
       }
+      return;
+    }
+
+    // A FRAME TICKET — proof that THIS relay authorised ONE document to be
+    // framed, for ~2 minutes, for a caller that has already proved it is signed
+    // in (requirePrincipal above ran before this branch).
+    //
+    // The frame URL must not carry the session token: the document can read
+    // `location`, so putting the owner credential in the src would hand
+    // agent-authored code the key to the whole store. The token never leaves
+    // this process; the ticket is the only thing the browser sees.
+    //
+    // The document is NOT pre-checked against the gateway here. A ticket is
+    // harmless on its own — the document origin re-reads the body through the
+    // same credential and answers 502 for one that is gone — and a pre-check
+    // would add a gateway round trip to every frame render.
+    const ticketMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/ticket$/.exec(url.pathname);
+    if (req.method === 'POST' && ticketMatch) {
+      if (!DOCS_ORIGIN) {
+        json(res, 501, {
+          ok: false,
+          code: 'no_doc_origin',
+          error: 'no document origin is configured (set DOCS_ORIGIN)',
+        });
+        return;
+      }
+      json(res, 200, {
+        ok: true,
+        url: docFrameUrl(DOCS_ORIGIN, signDocTicket(ticketMatch[1], { secret: DOC_TICKET_SECRET })),
+        ttlMs: DOC_TICKET_TTL_MS,
+      });
       return;
     }
 
@@ -2648,6 +2731,59 @@ server.on('upgrade', (req, socket) => {
   });
 });
 
+// ── The document origin's own server ─────────────────────────────────────────
+// Started only when DOC_LISTEN_PORT is set. It serves exactly ONE route and
+// holds no session: the ticket in the path IS the whole authorisation, which is
+// why this can sit on a host the app does not control — and why it sets no
+// cookie, so the document it serves has no ambient authority to spend.
+//
+// A deployment on a host that exposes one port per process (Railway, Fly) runs
+// this same file a second time with DOCS_ORIGIN set to its own public URL and
+// DOC_LISTEN_PORT set to its own port. The two processes never share a listener;
+// they share DOC_TICKET_SECRET, which is the only state the ticket needs.
+function startDocServer(port) {
+  const docServer = createServer(async (req, res) => {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (req.method !== 'GET') {
+      json(res, 405, { ok: false, error: 'method not allowed' });
+      return;
+    }
+    const ticket = docTicketFromPath(url.pathname);
+    if (ticket === null) {
+      json(res, 404, { ok: false, error: 'not found' });
+      return;
+    }
+    const verdict = verifyDocTicket(ticket, { secret: DOC_TICKET_SECRET });
+    if (!verdict.ok) {
+      // 410 for a ticket that was right but has aged out, so a reader can tell
+      // "ask for another" apart from "that was never valid".
+      json(res, verdict.reason === 'expired' ? 410 : 403, {
+        ok: false,
+        code: `ticket_${verdict.reason}`,
+        error: `frame ticket ${verdict.reason}`,
+      });
+      return;
+    }
+    const { client, error } = filesRuntime();
+    if (!client) {
+      json(res, 501, { ok: false, error: `document store not configured — ${error}` });
+      return;
+    }
+    try {
+      const doc = await client.body(verdict.id);
+      res.writeHead(200, docResponseHeaders(DOC_FRAME_ANCESTOR, doc.contentType));
+      res.end(doc.text);
+    } catch (err) {
+      json(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  docServer.listen(port, () => {
+    console.log(`[g2-hub]   Docs:  GET  ${DOCS_ORIGIN}/d/<ticket>`);
+    console.log(`[g2-hub]          frame-ancestors: ${DOC_FRAME_ANCESTOR}`);
+  });
+  return docServer;
+}
+
 await loadPersistedState();
 
 server.listen(PORT, () => {
@@ -2655,4 +2791,5 @@ server.listen(PORT, () => {
   console.log(`[g2-hub]   Web:   GET  http://localhost:${PORT}/`);
   console.log(`[g2-hub]   SSE:   GET  http://localhost:${PORT}/api/stream?channel=hub`);
   console.log(`[g2-hub]   State: POST http://localhost:${PORT}/api/stream`);
+  if (DOC_LISTEN_PORT > 0) startDocServer(DOC_LISTEN_PORT);
 });

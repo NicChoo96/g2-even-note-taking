@@ -10,10 +10,14 @@
 //      (id, title, agent, size, updated) and the body is loaded by the browser
 //      straight into a frame. Nothing here is written to the synced state, which
 //      is also why the body survives a reload without being re-uploaded.
-//   2. The frame cannot reach this app. It is served by the relay under
-//      `Content-Security-Policy: sandbox allow-scripts` and the `sandbox`
+//   2. The frame cannot reach this app. On this app's OWN origin it is served
+//      under `Content-Security-Policy: sandbox allow-scripts` and the `sandbox`
 //      attribute below agrees with that: no `allow-same-origin`, so the document
 //      gets an opaque origin and cannot touch our DOM, storage or session token.
+//      When the deployment configures a DOCUMENT ORIGIN the frame is served from
+//      a DIFFERENT HOST instead and the sandbox is dropped — an origin split is
+//      a stronger guarantee than the flag, and it is the only way a document can
+//      play the videos it embeds. See web/server/doc-origin.mjs.
 //
 // The list IS mirrored into the shared state (references only) so the glasses
 // page can show what exists — that is the whole point of the Files section
@@ -22,6 +26,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MicButton } from './Dictate';
 import {
   deleteFile,
+  fetchDocTicket,
   fetchFileMedia,
   fetchFilesStatus,
   fileBodyUrl,
@@ -107,6 +112,11 @@ export function FilesPanel() {
   const [media, setMedia] = useState<MediaRef[]>([]);
   /** Which of them the box above the document is currently playing, if any. */
   const [playing, setPlaying] = useState<MediaRef | null>(null);
+  /**
+   * The frame URL for the selected document ON THE DOCUMENT ORIGIN, when this
+   * deployment has one. `null` means "use the sandboxed proxy instead".
+   */
+  const [docUrl, setDocUrl] = useState<string | null>(null);
 
   /**
    * Ask the relay what videos the selected document holds.
@@ -132,6 +142,14 @@ export function FilesPanel() {
   }, [selected, showDeleted]);
 
   const configured = status?.configured !== false && !status?.error;
+  /**
+   * A second origin for stored documents, or '' when there is none.
+   *
+   * When it is set the frame comes from a host that is not this app's, so the
+   * sandbox can — and must — be dropped, which is what lets a document play its
+   * own videos. See web/server/doc-origin.mjs for why that is the only fix.
+   */
+  const docOrigin = status?.docOrigin || '';
 
   /** Mirror the REFERENCE list into shared state so the glasses can list it. */
   const syncRefs = useCallback((items: StoredDoc[]) => {
@@ -215,6 +233,26 @@ export function FilesPanel() {
       live = false;
     };
   }, [selected, configured, frameKey, showDeleted]);
+
+  // A FRAME TICKET, when documents are served from an origin of their own.
+  //
+  // Re-minted whenever the frame is rebuilt (`frameKey`), because a ticket is
+  // short-lived by design and a rebuild is exactly when the old one may have
+  // aged out. A failure here is NOT surfaced as an error: it means the sandboxed
+  // proxy is used, which is the pre-existing behaviour, and the document still
+  // renders — just without its own embeds working.
+  useEffect(() => {
+    setDocUrl(null);
+    if (!selected || !configured || showDeleted || !docOrigin) return;
+    let live = true;
+    void (async () => {
+      const res = await fetchDocTicket(selected);
+      if (live && res.ok && res.url) setDocUrl(res.url);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [selected, configured, frameKey, showDeleted, docOrigin]);
 
   /** Put a soft-deleted document back in the library. Also the Undo handler. */
   const onRestore = async (target: { id: string; title: string }) => {
@@ -531,17 +569,19 @@ export function FilesPanel() {
                     the opened document a `window.opener` handle back into this
                     app — the very reach the sandbox exists to deny.
 
-                    The href is the SAME relay URL the frame loads, token
-                    included, so it authenticates identically. A new tab is NOT
-                    a way around the sandbox: the relay serves that response
-                    under `Content-Security-Policy: sandbox allow-scripts`
-                    whatever asks for it, so the document still runs with an
-                    opaque origin. What it buys is a full-window read of a wide
-                    report, instead of the 62vh letterbox the split allows.
+                    The href follows the frame: the ticket URL on the document
+                    origin when there is one, otherwise the relay URL with the
+                    token, which authenticates identically. Without a document
+                    origin a new tab is NOT a way around the sandbox — the relay
+                    serves that response under
+                    `Content-Security-Policy: sandbox allow-scripts` whatever
+                    asks for it, so the document still runs with an opaque
+                    origin. What it buys either way is a full-window read of a
+                    wide report, instead of the 62vh letterbox the split allows.
                   */}
                   <a
                     className="icon-btn"
-                    href={fileBodyUrl(active.id)}
+                    href={docUrl || fileBodyUrl(active.id)}
                     target="_blank"
                     rel="noopener noreferrer"
                     title="Open this document in its own tab"
@@ -613,12 +653,19 @@ export function FilesPanel() {
                 </div>
               )}
               {/*
-                `sandbox="allow-scripts"` and NOTHING else. No `allow-same-origin`
-                means the frame runs with an opaque origin, so a generated document
-                cannot read this app's DOM, its storage or its session token — and
-                `allow-scripts` is kept so inline charts still work. This matches
-                the relay's own `Content-Security-Policy: sandbox allow-scripts`;
-                the two are belt and braces, and neither one alone is relied on.
+                The frame is sandboxed ONLY while it is served from this app's own
+                origin. There it is `sandbox="allow-scripts"` and NOTHING else:
+                no `allow-same-origin`, so the document runs with an opaque origin
+                and cannot read this app's DOM, its storage or its session token,
+                while `allow-scripts` is kept so inline charts still work. That
+                matches the relay's own `Content-Security-Policy: sandbox
+                allow-scripts`; the two are belt and braces.
+
+                With a DOCUMENT ORIGIN (`docUrl` is set) the frame is a different
+                host entirely, so the sandbox is dropped. An origin split is a
+                stronger guarantee than the flag, and removing the flag is what
+                lets a document play the videos it embeds — the sandbox is
+                precisely what broke them (see web/server/doc-origin.mjs).
 
                 While a video is open this frame is REPLACED rather than stacked
                 under it: the pane is a letterbox already, and a 16:9 player above
@@ -673,9 +720,9 @@ export function FilesPanel() {
                   key={`${active.id}:${frameKey}`}
                   className="files-frame"
                   title={active.title || 'Document preview'}
-                  sandbox="allow-scripts"
+                  sandbox={docUrl ? undefined : 'allow-scripts'}
                   referrerPolicy="no-referrer"
-                  src={fileBodyUrl(active.id)}
+                  src={docUrl || fileBodyUrl(active.id)}
                 />
               )}
             </>

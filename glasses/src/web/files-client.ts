@@ -42,6 +42,14 @@ export interface FilesStatus {
   configured?: boolean;
   mode?: 'api_key' | 'password' | string;
   url?: string;
+  /**
+   * A second origin for stored documents, or '' when the deployment has none.
+   *
+   * Its presence is the ONE thing that decides whether a document is framed
+   * from another host — and therefore whether that frame still needs a sandbox.
+   * See web/server/doc-origin.mjs.
+   */
+  docOrigin?: string;
   /** What to set when `configured` is false, naming the env vars. */
   hint?: string;
   error?: string;
@@ -239,11 +247,41 @@ export function restoreFile(id: string): Promise<RestoreResult> {
  *
  * The response is served under `Content-Security-Policy: sandbox allow-scripts`,
  * i.e. an opaque origin — the frame is a renderer, not a script host.
+ *
+ * THAT SANDBOX IS ALSO WHY A DOCUMENT CANNOT PLAY ITS OWN VIDEOS, so this is now
+ * the FALLBACK rather than the only option. When the deployment has a document
+ * origin (`status.docOrigin`), prefer `fetchDocTicket`: the document is then
+ * framed from a host that is not this app's, which needs no sandbox at all and
+ * lets its own embeds work. This URL remains the answer where there is none.
  */
 export function fileBodyUrl(id: string): string {
   const token = getStreamToken();
   const q = token ? `?token=${encodeURIComponent(token)}` : '';
   return `${API_BASE}/api/files/${encodeURIComponent(id)}/html${q}`;
+}
+
+/**
+ * A short-lived ticket that lets ONE document be framed cross-origin.
+ *
+ * The RELAY mints it, because this app's session token must never appear in a
+ * frame URL: the framed document can read `location`, and it is agent-authored
+ * code. The ticket is bound to one document id and lives about two minutes, so
+ * it is not a credential worth stealing — it is permission to render one page.
+ *
+ * `ok: false` is an ordinary outcome, not a failure to surface. It means the
+ * deployment has no document origin, and the caller falls back to the sandboxed
+ * `fileBodyUrl` above — which is exactly what every deployment did before.
+ */
+export interface TicketResult {
+  ok: boolean;
+  /** The absolute frame URL, ticket included. */
+  url?: string;
+  ttlMs?: number;
+  error?: string;
+}
+
+export function fetchDocTicket(id: string): Promise<TicketResult> {
+  return sendJson<TicketResult>('POST', `/api/files/${encodeURIComponent(id)}/ticket`, {});
 }
 
 /**

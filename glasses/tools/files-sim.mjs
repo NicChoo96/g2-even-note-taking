@@ -46,6 +46,15 @@ import {
   normalizeBaseUrl,
   renderToolResult,
 } from '../../web/server/jarvis-files.mjs';
+import {
+  DOC_TICKET_TTL_MS,
+  docCsp,
+  docFrameUrl,
+  docResponseHeaders,
+  docTicketFromPath,
+  signDocTicket,
+  verifyDocTicket,
+} from '../../web/server/doc-origin.mjs';
 import { readFileSync } from 'node:fs';
 
 let fail = 0;
@@ -995,12 +1004,25 @@ console.log('\n§12  the relay is wired to this module');
   // which is exactly what produced a blank box when this was tested. Pin both
   // halves so neither can be "hardened" back into not working.
   const panel = readFileSync(new URL('../src/web/FilesPanel.tsx', import.meta.url), 'utf8');
-  has('the document frame is still sandboxed', panel, 'sandbox="allow-scripts"');
+  // Pinned in its EXACT code form, not as the attribute text: the comments in
+  // this file quote `sandbox="allow-scripts"` in prose, so an attribute-text
+  // assertion would pass on a comment even if the frame lost its sandbox.
+  has(
+    'the document frame is sandboxed on our own origin',
+    panel,
+    "sandbox={docUrl ? undefined : 'allow-scripts'}",
+  );
   lacks(
     '…and is never handed our origin',
     panel,
     'sandbox="allow-scripts allow-same-origin',
   );
+  has(
+    '…and only a real document origin drops it',
+    panel,
+    'src={docUrl || fileBodyUrl(active.id)}',
+  );
+  has('…a ticket that is asked of the relay', panel, 'fetchDocTicket(');
   has('the videos are asked of the relay', panel, 'fetchFileMedia(');
   has('…and played in this app\'s own DOM', panel, 'files-player-frame');
   has('…as a real cross-origin frame, not a sandboxed one', panel, 'allowFullScreen');
@@ -1008,6 +1030,154 @@ console.log('\n§12  the relay is wired to this module');
   const clientSrc = readFileSync(new URL('../../web/server/jarvis-files.mjs', import.meta.url), 'utf8');
   has('the gateway password is never logged or returned', clientSrc, 'hintVar');
   lacks('…no console.log of a token', clientSrc, 'console.log(accessToken');
+}
+
+// ── 13. The document origin: a ticket, and a frame with no sandbox ──────────
+console.log('\n§13  a document can be served from an origin of its own');
+{
+  const SECRET = 'unit-test-secret';
+  const at = 1_700_000_000_000;
+  const expiry = at + DOC_TICKET_TTL_MS;
+
+  const ticket = signDocTicket('doc-abc_123', { secret: SECRET, now: at });
+  const parts = ticket.split('.');
+
+  eq('a ticket is id, expiry and signature', parts.length, 3);
+  eq('…the id comes back verbatim', parts[0], 'doc-abc_123');
+  eq('…the expiry is now plus the TTL', Number(parts[1]), expiry);
+  assert(
+    '…and the whole thing is URL-path safe',
+    /^[A-Za-z0-9_-]+\.[0-9]+\.[A-Za-z0-9_-]+$/.test(ticket),
+    ticket,
+  );
+
+  const ok = verifyDocTicket(ticket, { secret: SECRET, now: at });
+  eq('a fresh ticket verifies', [ok.ok, ok.id], [true, 'doc-abc_123']);
+  eq('…and reports when it dies', ok.expiresAt, expiry);
+  eq(
+    'one millisecond before expiry it still works',
+    verifyDocTicket(ticket, { secret: SECRET, now: expiry - 1 }).ok,
+    true,
+  );
+  eq(
+    'at expiry it is refused',
+    verifyDocTicket(ticket, { secret: SECRET, now: expiry }),
+    { ok: false, reason: 'expired' },
+  );
+
+  // The whole point of the ticket: a browser holding one cannot forge another,
+  // and cannot widen this one to a different document.
+  eq(
+    'a different secret is refused',
+    verifyDocTicket(ticket, { secret: 'not-the-secret', now: at }),
+    { ok: false, reason: 'signature' },
+  );
+  eq('no secret is refused', verifyDocTicket(ticket, { now: at }), {
+    ok: false,
+    reason: 'signature',
+  });
+  const macB = signDocTicket('doc-other', { secret: SECRET, now: at }).split('.')[2];
+  eq(
+    'another document\'s signature does not open this one',
+    verifyDocTicket(`${parts[0]}.${parts[1]}.${macB}`, { secret: SECRET, now: at }),
+    { ok: false, reason: 'signature' },
+  );
+  // The expiry is signed as the TEXT it arrived as, so a padded form is not
+  // quietly normalised into the value it looks like.
+  eq(
+    'a zero-padded expiry fails the signature, not the parse',
+    verifyDocTicket(`${parts[0]}.0${parts[1]}.${parts[2]}`, { secret: SECRET, now: at }),
+    { ok: false, reason: 'signature' },
+  );
+
+  for (const [label, bad] of [
+    ['an empty string', ''],
+    ['not a string', 42],
+    ['two parts', 'a.b'],
+    ['four parts', 'a.b.c.d'],
+    ['a non-numeric expiry', 'doc-abc.zzz.sig'],
+    ['no signature', 'doc-abc.123.'],
+    ['an unusable id', 'has space.123.sig'],
+    ['an oversized id', `${'a'.repeat(65)}.123.sig`],
+    ['an absurdly long string', 'a'.repeat(600)],
+    ['nothing at all', null],
+  ]) {
+    eq(`malformed is refused: ${label}`, verifyDocTicket(bad, { secret: SECRET, now: at }), {
+      ok: false,
+      reason: 'malformed',
+    });
+  }
+
+  const refuse = (fn) => {
+    try {
+      fn();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  assert(
+    'minting refuses an id the relay would not serve',
+    refuse(() => signDocTicket('has space', { secret: SECRET })),
+  );
+  assert('…and refuses to mint without a secret', refuse(() => signDocTicket('ok-id', {})));
+
+  // ── The policy that replaces the sandbox ──────────────────────────────────
+  const csp = docCsp('http://localhost:5198');
+  has('the document policy names who may embed it', csp, 'frame-ancestors http://localhost:5198');
+  lacks('…and carries NO sandbox directive at all', csp, 'sandbox');
+  lacks('…so the document keeps a real origin', csp, 'allow-same-origin');
+  has('…while nested frames a page embeds are allowed through', csp, "frame-src 'self' https: http:");
+  has('…and inline scripts still run', csp, "script-src 'self' 'unsafe-inline'");
+  has('…and it still refuses to be a form target', csp, "form-action 'none'");
+
+  const headers = docResponseHeaders('https://app.example.com');
+  has(
+    'the response lets exactly that app frame it',
+    headers['Content-Security-Policy'],
+    'frame-ancestors https://app.example.com',
+  );
+  assert(
+    '…and sends NO X-Frame-Options, which would blank the frame',
+    !('X-Frame-Options' in headers),
+    JSON.stringify(Object.keys(headers)),
+  );
+  eq('…it does not let the browser guess the type', headers['X-Content-Type-Options'], 'nosniff');
+  eq(
+    '…and a cross-origin subresource never learns the ticket in the path',
+    headers['Referrer-Policy'],
+    'strict-origin-when-cross-origin',
+  );
+  has('…and a document is never cached', headers['Cache-Control'], 'no-store');
+
+  eq('the frame URL is origin + prefix + ticket', docFrameUrl('http://localhost:5199/', 'tkt'), 'http://localhost:5199/d/tkt');
+  eq('…and a doubling slash does not survive', docFrameUrl('http://localhost:5199///', 'tkt'), 'http://localhost:5199/d/tkt');
+  eq('…and an unusable origin is refused, not concatenated', docFrameUrl('not a url', 'tkt'), '/d/tkt');
+
+  eq('the ticket is read out of the path', docTicketFromPath('/d/abc.123.sig'), 'abc.123.sig');
+  eq('…a bare prefix is not a ticket', docTicketFromPath('/d/'), null);
+  eq('…a deeper path is not a ticket', docTicketFromPath('/d/a/b'), null);
+  eq('…and neither is any other route', docTicketFromPath('/api/files'), null);
+
+  // ── The wiring cannot drift, and the safety argument still holds ─────────
+  const relay = readFileSync(new URL('../../web/server/local-sse.mjs', import.meta.url), 'utf8');
+  has('the relay imports the document origin', relay, "from './doc-origin.mjs'");
+  has('…mints a ticket beside the body route', relay, '/ticket$');
+  has('…drawing the policy from the module that owns it', relay, 'docResponseHeaders(');
+  has('…verifying a ticket before it fetches anything', relay, 'verifyDocTicket(');
+  has('…on a listener of its own', relay, 'startDocServer(');
+  has('…and tells the app, so it can drop the sandbox', relay, 'docOrigin: DOCS_ORIGIN');
+  // The ENTIRE safety argument for a second origin is that no ambient authority
+  // exists to leak. That is true today only because this relay sets no cookie,
+  // so a document served from the other host inherits nothing. If a cookie is
+  // ever introduced, this assertion is what should stop the build.
+  lacks('…and no cookie exists anywhere for a document to inherit', relay, 'Set-Cookie');
+  lacks('…and the gateway credential stays out of the frame path', relay, 'JARVIS_FILE_PWD=');
+
+  const filesClientSrc = readFileSync(new URL('../src/web/files-client.ts', import.meta.url), 'utf8');
+  has('the browser asks the relay for a ticket, never builds one', filesClientSrc, '/ticket');
+  lacks('…and holds no ticket secret', filesClientSrc, 'DOC_TICKET_SECRET');
+  has('…and keeps the sandboxed proxy as the fallback', filesClientSrc, 'fileBodyUrl');
 }
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : `${fail} FAILED`}`);
