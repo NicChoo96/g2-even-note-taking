@@ -7,7 +7,10 @@
 import { getStreamToken } from '../auth-token';
 import { API_BASE } from '../stream';
 
-/** Where a value came from: the host env wins over the settings page. */
+/**
+ * Where a value came from: a value saved on the settings page wins over the
+ * host environment, which is only the fallback for a field nobody has saved.
+ */
 export type ValueSource = 'env' | 'settings' | 'default' | 'none';
 
 export interface AgentStatus {
@@ -35,7 +38,25 @@ export interface AgentStatus {
   jev?: boolean;
   model: string;
   depth: string;
-  /** Provenance per field, so the UI can lock env-managed inputs. */
+  /**
+   * Every NON-SECRET setting at its current value, so the page can seed each
+   * field with the truth rather than guessing a default and writing it back.
+   * Keys are absent on purpose — they are booleans only, above.
+   */
+  fields?: {
+    model?: string;
+    depth?: string;
+    /** The SAVED provider setting — '' means auto. */
+    searchProvider?: SearchProvider | '';
+    referer?: string;
+    title?: string;
+  };
+  /**
+   * Provenance per field. NOTE: a field being 'env' does NOT lock its input —
+   * a saved setting wins over the environment, so this only says where the
+   * CURRENT value comes from (and therefore what the field falls back to when
+   * cleared).
+   */
   source?: {
     llm?: {
       key?: ValueSource;
@@ -73,6 +94,13 @@ export interface SettingsPatch {
   depth?: string;
   /** Generic REST tool bearer tokens, keyed by tool id. */
   toolTokens?: Record<string, string>;
+  /**
+   * Field names to REMOVE, so each one falls back to the environment value (or
+   * its built-in default). Explicit because a blank string cannot carry this
+   * meaning: a write-only key is never echoed back, so an empty key box is
+   * indistinguishable from "leave it alone".
+   */
+  clear?: string[];
 }
 
 export interface WireToolCall {
@@ -134,8 +162,9 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 }
 
 /**
- * Are the LLM and web-search keys configured, which search provider is live, and
- * what is the effective model?
+ * Are the LLM and web-search keys configured, which search provider is live,
+ * and what is the effective model? Also returns the current value of every
+ * non-secret setting so the page can seed its fields.
  */
 export async function fetchAgentStatus(): Promise<AgentStatus | null> {
   try {

@@ -54,20 +54,26 @@ const fileTavily = String(secrets.tavilyKey || '');
 const fileBrave = String(secrets.braveKey || '');
 const fileProvider = String(secrets.searchProvider || '').toLowerCase();
 
-// Mirror the relay's precedence exactly: env -> saved file -> auto (Tavily first).
-const tavilyKey = envTavily || fileTavily;
-const braveKey = envBrave || fileBrave;
-const declared = (envProvider === 'tavily' || envProvider === 'brave' ? envProvider : '') ||
-  (fileProvider === 'tavily' || fileProvider === 'brave' ? fileProvider : '');
+// Mirror the relay's precedence EXACTLY: settings page -> env -> auto (Tavily
+// first). Settings-first is the whole point of the page: a value saved there
+// overrides the host environment, and the env is only the fallback for a field
+// nobody has saved. Keep this in step with `webSearchConfig()` in
+// web/server/local-sse.mjs — a probe that disagrees with the relay is worse than
+// no probe, because it reports on a resolver that does not exist.
+const tavilyKey = fileTavily || envTavily;
+const braveKey = fileBrave || envBrave;
+const declared = (fileProvider === 'tavily' || fileProvider === 'brave' ? fileProvider : '') ||
+  (envProvider === 'tavily' || envProvider === 'brave' ? envProvider : '');
+
 const provider = declared || (tavilyKey ? 'tavily' : braveKey ? 'brave' : 'tavily');
 const key = provider === 'brave' ? braveKey : tavilyKey;
 
 out.push('── keys ──');
-out.push(`TAVILY_API_KEY          ${mask(tavilyKey)}${envTavily ? '  [env]' : fileTavily ? '  [saved]' : ''}`);
-out.push(`BRAVE_SEARCH_API_KEY    ${mask(braveKey)}${envBrave ? '  [env]' : fileBrave ? '  [saved]' : ''}`);
+out.push(`TAVILY_API_KEY          ${mask(tavilyKey)}${fileTavily ? '  [saved]' : envTavily ? '  [env]' : ''}`);
+out.push(`BRAVE_SEARCH_API_KEY    ${mask(braveKey)}${fileBrave ? '  [saved]' : envBrave ? '  [env]' : ''}`);
 out.push('');
 out.push('── resolution ──');
-out.push(`SEARCH_PROVIDER         ${envProvider || '(unset)'}${fileProvider ? `   saved: ${fileProvider}` : ''}`);
+out.push(`SEARCH_PROVIDER         ${fileProvider || '(unset)'}   env: ${envProvider || '(unset)'}`);
 out.push(`=> provider             ${provider}${declared ? ' (declared)' : ' (auto)'}`);
 out.push(`=> key                  ${mask(key)}`);
 if (!key) {

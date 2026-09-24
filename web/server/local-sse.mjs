@@ -386,12 +386,22 @@ function persistSecrets() {
 }
 
 /**
- * Effective config — env wins over the persisted file, so a host (Railway,
- * Docker, systemd…) can own the keys and the settings page cannot shadow them.
+ * Effective config — a SAVED setting wins over the environment, ONE FIELD AT A
+ * TIME, so the Settings page owns every value it shows.
+ *
+ * WHY THIS WAY ROUND: it used to be environment-first, and that made the page
+ * decorative. You could type a model, watch it save, and the relay would go on
+ * using the environment's value — the page and the process held two different
+ * answers to the same question and nothing said so. The environment is now the
+ * FALLBACK, so a host (Railway, Docker, systemd…) can still supply keys with no
+ * page visit, while a field the page HAS set is the one that runs. `clear` in a
+ * save removes a stored value, which is how a field returns to its fallback;
+ * without it a value set once could never be un-set.
+ *
+ * Precedence is decided per field, so no field's value depends on any other's.
  * `LLM_PROVIDER` picks the backend: 'openrouter' (default) or 'deepseek'.
- * `source` records WHICH layer won for each field so the UI can say "managed by
- * the server environment" instead of showing an empty box and a false
- * "no key" warning. Values themselves are still never echoed to a client.
+ * `source` records WHICH layer is serving each field, so the UI can label it
+ * honestly. Values themselves are still never echoed to a client.
  */
 function llmConfig() {
   const provider = String(process.env.LLM_PROVIDER || 'openrouter').toLowerCase() === 'deepseek'
@@ -417,35 +427,36 @@ function llmConfig() {
   return {
     provider,
     url: isDeepseek ? DEEPSEEK_URL : OPENROUTER_URL,
-    key: envKey || fileKey || '',
-    model: envModel || fileModel || defaultModel,
-    referer: envReferer || secrets.referer || '',
-    title: envTitle || secrets.title || 'G2 Even Reality Hub',
+    key: fileKey || envKey || '',
+    model: fileModel || envModel || defaultModel,
+    referer: secrets.referer || envReferer || '',
+    title: secrets.title || envTitle || 'G2 Even Reality Hub',
     source: {
       provider: providerFromEnv ? 'env' : 'default',
-      key: envKey ? 'env' : fileKey ? 'settings' : 'none',
-      model: envModel ? 'env' : fileModel ? 'settings' : 'default',
-      referer: envReferer ? 'env' : secrets.referer ? 'settings' : 'none',
-      title: envTitle ? 'env' : secrets.title ? 'settings' : 'default',
-      openrouterKey: openrouterEnvKey ? 'env' : secrets.openrouterKey ? 'settings' : 'none',
-      deepseekKey: deepseekEnvKey ? 'env' : secrets.deepseekKey ? 'settings' : 'none',
+      key: fileKey ? 'settings' : envKey ? 'env' : 'none',
+      model: fileModel ? 'settings' : envModel ? 'env' : 'default',
+      referer: secrets.referer ? 'settings' : envReferer ? 'env' : 'none',
+      title: secrets.title ? 'settings' : envTitle ? 'env' : 'default',
+      openrouterKey: secrets.openrouterKey ? 'settings' : openrouterEnvKey ? 'env' : 'none',
+      deepseekKey: secrets.deepseekKey ? 'settings' : deepseekEnvKey ? 'env' : 'none',
     },
   };
 }
 
 /**
  * Jev config — the OpenRouter key, independent of `LLM_PROVIDER`.
- * Env wins over the persisted settings file, exactly like llmConfig().
+ * Decided per field exactly like llmConfig(): a saved setting wins, the
+ * environment is the fallback.
  */
 function jevConfig() {
   const envKey = process.env.OPENROUTER_API_KEY || '';
   const fileKey = secrets.openrouterKey || '';
   return {
-    key: envKey || fileKey || '',
+    key: fileKey || envKey || '',
     model: process.env.JEV_MODEL || JEV_DEFAULT_MODEL,
-    referer: process.env.OPENROUTER_REFERER || secrets.referer || '',
-    title: process.env.OPENROUTER_TITLE || secrets.title || 'G2 Even Reality Hub',
-    source: envKey ? 'env' : fileKey ? 'settings' : 'none',
+    referer: secrets.referer || process.env.OPENROUTER_REFERER || '',
+    title: secrets.title || process.env.OPENROUTER_TITLE || 'G2 Even Reality Hub',
+    source: fileKey ? 'settings' : envKey ? 'env' : 'none',
   };
 }
 
@@ -506,11 +517,12 @@ async function jevDecide(request) {
  * The search backend became a setting rather than a hardcoded vendor, so this is
  * the one place that decides. Precedence mirrors llmConfig():
  *
- *   1. SEARCH_PROVIDER in the environment  (a host owns the choice)
- *   2. `searchProvider` in .g2-hub-secrets.json  (the Settings toggle)
+ *   1. `searchProvider` in .g2-hub-secrets.json  (the Settings toggle)
+ *   2. SEARCH_PROVIDER in the environment  (a host's default)
  *   3. AUTO — Tavily if a Tavily key exists, else Brave if a Brave key exists.
- *      Tavily wins when both are present, so an existing install does not switch
- *      provider behind the wearer's back the moment a Brave key is added.
+ *      Tavily wins when both are present, so an install with no explicit choice
+ *      does not switch provider behind the wearer's back the moment a Brave key
+ *      is added.
  *
  * A selected provider with NO key resolves to an empty key on purpose. Falling
  * back to the other provider's key would answer the question that was asked with
@@ -521,14 +533,14 @@ function webSearchConfig() {
   const envProvider = String(process.env.SEARCH_PROVIDER || '').toLowerCase();
   const fileProvider = String(secrets.searchProvider || '').toLowerCase();
   const picked = (v) => (v === 'tavily' || v === 'brave' ? v : '');
-  const chosen = picked(envProvider) || picked(fileProvider);
+  const chosen = picked(fileProvider) || picked(envProvider);
 
   const tavilyEnv = process.env.TAVILY_API_KEY || '';
   const tavilyFile = secrets.tavilyKey || '';
   const braveEnv = process.env.BRAVE_SEARCH_API_KEY || '';
   const braveFile = secrets.braveKey || '';
-  const tavilyKey = tavilyEnv || tavilyFile || '';
-  const braveKey = braveEnv || braveFile || '';
+  const tavilyKey = tavilyFile || tavilyEnv || '';
+  const braveKey = braveFile || braveEnv || '';
 
   const provider = chosen || (tavilyKey ? 'tavily' : braveKey ? 'brave' : 'tavily');
   const isBrave = provider === 'brave';
@@ -540,8 +552,14 @@ function webSearchConfig() {
 
   return {
     provider,
-    key: envKey || fileKey || '',
-    depth: envDepth || secrets.depth || 'basic', // default: basic
+    /**
+     * The SAVED setting — '' means auto. Distinct from `provider`, which is the
+     * resolved answer; the page needs the setting to render Auto correctly
+     * without pinning it.
+     */
+    setting: picked(fileProvider),
+    key: fileKey || envKey || '',
+    depth: secrets.depth || envDepth || 'basic', // default: basic
     /** Which providers have a key at all — the UI needs both, not just the live one. */
     keys: { tavily: Boolean(tavilyKey), brave: Boolean(braveKey) },
     /** `${provider} ${envVarName}` for an error a human can act on. */
@@ -549,15 +567,15 @@ function webSearchConfig() {
     label: isBrave ? 'Brave Search' : 'Tavily',
     source: {
       provider:
-        picked(envProvider) === provider
-          ? 'env'
-          : picked(fileProvider) === provider
-            ? 'settings'
+        picked(fileProvider) === provider
+          ? 'settings'
+          : picked(envProvider) === provider
+            ? 'env'
             : 'default',
-      key: envKey ? 'env' : fileKey ? 'settings' : 'none',
-      depth: envDepth ? 'env' : secrets.depth ? 'settings' : 'default',
-      tavilyKey: tavilyEnv ? 'env' : tavilyFile ? 'settings' : 'none',
-      braveKey: braveEnv ? 'env' : braveFile ? 'settings' : 'none',
+      key: fileKey ? 'settings' : envKey ? 'env' : 'none',
+      depth: secrets.depth ? 'settings' : envDepth ? 'env' : 'default',
+      tavilyKey: tavilyFile ? 'settings' : tavilyEnv ? 'env' : 'none',
+      braveKey: braveFile ? 'settings' : braveEnv ? 'env' : 'none',
     },
   };
 }
@@ -593,6 +611,18 @@ function agentStatusPayload() {
     tavily: Boolean(ws.key),
     model: llm.model,
     depth: ws.depth,
+    /**
+     * Every NON-SECRET setting at its current value, so the page can seed each
+     * field with the truth instead of guessing a default and writing it back.
+     * Keys are deliberately absent — they stay boolean-only above.
+     */
+    fields: {
+      model: llm.model,
+      depth: ws.depth,
+      searchProvider: ws.setting,
+      referer: llm.referer,
+      title: llm.title,
+    },
     source: {
       llm: llm.source,
       search: ws.source,
@@ -1844,6 +1874,19 @@ const server = createServer(async (req, res) => {
     for (const [field, slot] of Object.entries(map)) {
       if (typeof body[field] === 'string') {
         secrets[slot] = body[field].trim();
+        touched = true;
+      }
+    }
+    // Remove a stored value so the field falls back to the environment/its
+    // default again. A BLANK STRING cannot mean this: the page never reads a key
+    // back, so an empty key box is indistinguishable from "leave it alone", and
+    // sending it would delete a working key. Clearing is therefore explicit, and
+    // the names are whitelisted against `map` so a crafted request cannot clear
+    // anything that is not a settings field.
+    if (Array.isArray(body?.clear)) {
+      for (const name of body.clear) {
+        if (typeof name !== 'string' || !(name in map)) continue;
+        secrets[map[name]] = '';
         touched = true;
       }
     }

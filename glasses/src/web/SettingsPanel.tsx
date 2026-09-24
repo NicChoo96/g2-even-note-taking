@@ -17,8 +17,9 @@ import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
 import { compactMemory, getMemoryView, resetMemory, subscribeMemory, type MemoryView } from '../ai';
 import { FREE_TOOL_MODELS, DEEPSEEK_MODELS } from '../models';
 import { DEFAULT_MODEL } from '../types';
-import { fetchAgentStatus, saveSettings, type AgentStatus, type ValueSource } from './agents-client';
+import { fetchAgentStatus, saveSettings, type AgentStatus, type SettingsPatch, type ValueSource } from './agents-client';
 import { DevicesPanel } from './DevicesPanel';
+import { buildSettingsSave, settingsBody } from './settings-patch';
 
 /** A small pill that says where a value comes from. */
 function SourceBadge({ source }: { source?: ValueSource }) {
@@ -111,6 +112,59 @@ function MemoryPanel() {
   );
 }
 
+/**
+ * One line under a field saying where its CURRENT value comes from and what is
+ * used if the box is emptied.
+ *
+ * Every field is EDITABLE. The environment is a fallback, not a lock, so this
+ * explains the fallback instead of disabling the control — a locked box with a
+ * value you cannot change is precisely how the model read as "switched by the
+ * web-search provider".
+ */
+function FieldNote({ source, envVar }: { source?: ValueSource; envVar: string }) {
+  if (source === 'settings') {
+    return (
+      <p className="hint-line">
+        Saved on this page. Clear it to fall back to <code>{envVar}</code>.
+      </p>
+    );
+  }
+  if (source === 'env') {
+    return (
+      <p className="hint-line">
+        From the server environment (<code>{envVar}</code>). A value saved here overrides it.
+      </p>
+    );
+  }
+  if (source === 'default') {
+    return (
+      <p className="hint-line">
+        Built-in default. Set <code>{envVar}</code> in the environment, or type a value here.
+      </p>
+    );
+  }
+  return (
+    <p className="hint-line">
+      Not set anywhere. <code>{envVar}</code> in the environment, or a value here, will be used.
+    </p>
+  );
+}
+
+/**
+ * "Remove the saved value", pending until Save.
+ *
+ * Needed because a key is write-only: the relay reports only whether one exists,
+ * so an empty box cannot be told apart from "leave it alone" and must not be
+ * sent as blank. Removing therefore has to be said explicitly.
+ */
+function ClearToggle({ pending, onToggle }: { pending: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" className={pending ? 'clear-toggle pending' : 'clear-toggle'} onClick={onToggle}>
+      {pending ? '↺ will be removed on save — undo' : '↺ remove saved value'}
+    </button>
+  );
+}
+
 export function SettingsPanel() {
   const [info, setInfo] = useState<AgentStatus | null>(null);
   const [openrouterKey, setOpenrouterKey] = useState('');
@@ -119,10 +173,34 @@ export function SettingsPanel() {
   const [braveKey, setBraveKey] = useState('');
   /** '' = auto: whichever key is present (the relay's own default). */
   const [searchProvider, setSearchProvider] = useState<'' | 'tavily' | 'brave'>('');
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  /**
+   * The model field is a DRAFT plus a "has the wearer actually typed here?"
+   * flag, because two other values must never be mistaken for a choice:
+   *
+   *   • `relayModel` — the relay's `model` slot. Only a FALLBACK: every client
+   *     sends its own model, and the relay resolves `body.model || cfg.model`.
+   *   • `storeModel` — the synced agents store. This is what a run actually
+   *     sends, so it is what really decides.
+   *
+   * One shared `model` state was fed by both, so the field flipped on its own,
+   * and `save()` echoed whatever it happened to hold back into the shared store.
+   * That is how saving the web-search provider rewrote the LLM model.
+   */
+  const [model, setModel] = useState('');
+  const [modelTouched, setModelTouched] = useState(false);
+  const [relayModel, setRelayModel] = useState('');
+  const [storeModel, setStoreModel] = useState('');
   const [depth, setDepth] = useState<'basic' | 'advanced'>('basic');
   const [referer, setReferer] = useState('');
   const [title, setTitle] = useState('G2 Even Reality Hub');
+  /**
+   * Saved values the wearer has asked to REMOVE, applied on Save. Held as a list
+   * rather than mutating immediately so a save stays one atomic action and an
+   * accidental click can be undone.
+   */
+  const [clearFields, setClearFields] = useState<string[]>([]);
+  const toggleClear = (name: string) =>
+    setClearFields((f) => (f.includes(name) ? f.filter((x) => x !== name) : [...f, name]));
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
@@ -131,27 +209,35 @@ export function SettingsPanel() {
     const s = await fetchAgentStatus();
     setInfo(s);
     if (s) {
-      setModel(s.model || DEFAULT_MODEL);
-      setDepth((s.search?.depth ?? s.depth) === 'advanced' ? 'advanced' : 'basic');
-      // Only echo back an EXPLICIT choice. 'default' means the relay is on auto,
-      // and pinning the select to the resolved provider here would silently turn
-      // auto into an explicit pin the moment anything is saved.
-      const p = s.search?.provider;
-      const chosen = s.source?.search?.provider;
-      setSearchProvider(
-        chosen === 'env' || chosen === 'settings'
-          ? p === 'brave'
+      setRelayModel(s.model || '');
+      // Seed every field from the relay's own values, so what is shown IS what
+      // is stored. Guessing a default and writing it back is how a field ends up
+      // carrying a value nobody chose.
+      setDepth((s.fields?.depth ?? s.search?.depth ?? s.depth) === 'advanced' ? 'advanced' : 'basic');
+      setReferer(s.fields?.referer ?? '');
+      setTitle(s.fields?.title ?? 'G2 Even Reality Hub');
+      // Only echo an EXPLICIT choice. 'default' means the relay is on auto, and
+      // pinning the select to the resolved provider here would silently turn
+      // auto into a pin the moment anything is saved. An older relay reports no
+      // `fields`, so fall back to reading the provenance.
+      const saved = s.fields
+        ? s.fields.searchProvider
+        : s.source?.search?.provider === 'env' || s.source?.search?.provider === 'settings'
+          ? s.search?.provider === 'brave'
             ? 'brave'
             : 'tavily'
-          : '',
-      );
+          : '';
+      setSearchProvider(saved === 'brave' ? 'brave' : saved === 'tavily' ? 'tavily' : '');
     }
   };
 
   useEffect(() => {
     void refresh();
-    // Keep the local model field in sync with the synced store.
-    const unsub = subscribeAgents(() => setModel(getAgents().llm.model || DEFAULT_MODEL));
+    // Track the synced store, NOT the relay's fallback slot: the store's model
+    // is what a run sends, so it is the one the field has to reflect.
+    const sync = () => setStoreModel(getAgents().llm.model || '');
+    const unsub = subscribeAgents(sync);
+    sync();
     return unsub;
   }, []);
 
@@ -163,61 +249,99 @@ export function SettingsPanel() {
   const search = info?.search;
   const liveProvider = (search?.provider ?? 'tavily') === 'brave' ? 'brave' : 'tavily';
   const liveLabel = liveProvider === 'brave' ? 'Brave Search' : 'Tavily';
-  const openrouterFromEnv = isEnv(src?.llm?.openrouterKey);
-  const deepseekFromEnv = isEnv(src?.llm?.deepseekKey);
+  /**
+   * Does this relay understand the provider setting at all? One older than the
+   * web-search release reports no `search` block; it would accept our POST and
+   * silently ignore `searchProvider`, so the choice would look saved and do
+   * nothing. A control that lies is worse than a disabled one that explains.
+   */
+  const relaySupportsProvider = search !== undefined;
+  /**
+   * What the field shows while the wearer is not editing it: the model a run
+   * will ACTUALLY use. `storeModel` wins because a run always sends its own
+   * model and the relay only ever falls back to its slot (see local-sse.mjs,
+   * `body.model || cfg.model`). DEFAULT_MODEL is the last resort, for when
+   * neither source has an opinion yet.
+   */
+  const effectiveModel = storeModel || relayModel || DEFAULT_MODEL;
+  const shownModel = modelTouched ? model : effectiveModel;
+  /**
+   * The two backends do not share a model namespace. The DeepSeek API serves
+   * only `deepseek*` names, so a model saved while the OTHER provider was active
+   * is not merely odd here — it will be rejected. One saved value surviving a
+   * provider switch is exactly the kind of silent mismatch worth naming.
+   * (The reverse is not checkable: OpenRouter legitimately serves both sets.)
+   */
+  const modelWrongForProvider =
+    provider === 'deepseek' && !effectiveModel.toLowerCase().startsWith('deepseek');
+  /** Offer the active provider's models first; the other set stays available. */
+  const modelChoices =
+    provider === 'deepseek' ? [...DEEPSEEK_MODELS, ...FREE_TOOL_MODELS] : [...FREE_TOOL_MODELS, ...DEEPSEEK_MODELS];
   const openrouterHasKey = (src?.llm?.openrouterKey ?? 'none') !== 'none';
   const deepseekHasKey = (src?.llm?.deepseekKey ?? 'none') !== 'none';
-  const tavilyFromEnv = isEnv(searchSrc?.tavilyKey ?? src?.tavily?.key);
-  const braveFromEnv = isEnv(searchSrc?.braveKey);
-  const searchProviderFromEnv = isEnv(searchSrc?.provider);
+  const searchKeysKnown = search?.keys !== undefined;
   const modelFromEnv = isEnv(src?.llm?.model);
-  const depthFromEnv = isEnv(searchSrc?.depth ?? src?.tavily?.depth);
-  const refererFromEnv = isEnv(src?.llm?.referer);
-  const titleFromEnv = isEnv(src?.llm?.title);
   const anyEnv =
-    openrouterFromEnv ||
-    deepseekFromEnv ||
-    tavilyFromEnv ||
-    braveFromEnv ||
-    searchProviderFromEnv ||
+    isEnv(src?.llm?.openrouterKey) ||
+    isEnv(src?.llm?.deepseekKey) ||
+    isEnv(searchSrc?.tavilyKey ?? src?.tavily?.key) ||
+    isEnv(searchSrc?.braveKey) ||
+    isEnv(searchSrc?.provider) ||
     modelFromEnv ||
-    depthFromEnv;
+    isEnv(searchSrc?.depth ?? src?.tavily?.depth);
 
   /** Does the provider the relay will actually use have a key? */
   const searchConfigured = search?.configured ?? info?.tavily ?? false;
   /** An explicit choice whose key is missing — the silent-failure case to flag. */
   const searchMissingKey =
     searchProvider !== '' &&
-    !(searchProvider === 'brave' ? search?.keys?.brave : search?.keys?.tavily);
+    searchKeysKnown &&
+    !(searchProvider === 'brave' ? search.keys?.brave : search.keys?.tavily);
 
   const save = async () => {
     setBusy(true);
     setMsg('');
     setErr('');
-    // Never send a field the server environment owns — it would be stored but
-    // silently ignored, which is exactly the confusion this panel is fixing.
-    const patch: Record<string, string> = {};
-    if (!modelFromEnv) patch.model = model;
-    if (!depthFromEnv) patch.depth = depth;
-    if (!titleFromEnv) patch.title = title;
-    if (!openrouterFromEnv && openrouterKey.trim()) patch.openrouterKey = openrouterKey.trim();
-    if (!deepseekFromEnv && deepseekKey.trim()) patch.deepseekKey = deepseekKey.trim();
-    if (!tavilyFromEnv && tavilyKey.trim()) patch.tavilyKey = tavilyKey.trim();
-    if (!braveFromEnv && braveKey.trim()) patch.braveKey = braveKey.trim();
-    // Sent unconditionally: '' is a MEANINGFUL value (auto), so skipping it when
-    // empty would make it impossible to switch back from an explicit pin.
-    if (!searchProviderFromEnv) patch.searchProvider = searchProvider;
-    if (!refererFromEnv && referer.trim()) patch.referer = referer.trim();
-    const r = await saveSettings(patch);
+    // The body is built by a pure function so that the independence of these
+    // settings is a TESTED property rather than a habit. The model is the one
+    // field sent only when the wearer edited it: its displayed value is the
+    // EFFECTIVE model whenever nothing was typed, so echoing it back on every
+    // save made an unrelated change — the web-search provider — rewrite it.
+    const save = buildSettingsSave({
+      model: { value: model, touched: modelTouched },
+      depth: { value: depth },
+      title: { value: title },
+      openrouterKey: { value: openrouterKey },
+      deepseekKey: { value: deepseekKey },
+      tavilyKey: { value: tavilyKey },
+      braveKey: { value: braveKey },
+      searchProvider: { value: searchProvider },
+      referer: { value: referer },
+    });
+    // A field the wearer marked for removal is an explicit instruction, so it
+    // joins the clear list whatever else this save is doing.
+    for (const name of clearFields) if (!save.clear.includes(name)) save.clear.push(name);
+    const r = await saveSettings(settingsBody(save) as SettingsPatch);
     setBusy(false);
     if (r.ok) {
       setInfo(r);
+      setRelayModel(r.model || '');
       setOpenrouterKey('');
       setDeepseekKey('');
       setTavilyKey('');
       setBraveKey('');
+      setClearFields([]);
+      // Same rule for the synced store, and this is the half the glasses feel:
+      // a run sends the STORE's model, so an unedited save must not touch it.
+      // Writing it on every save is what let the web-search provider silently
+      // retarget the LLM.
+      if (modelTouched) {
+        const edited = model.trim();
+        updateAgents((s) => ({ ...s, llm: { ...s.llm, model: edited } }));
+        setStoreModel(edited);
+      }
+      void refresh();
       setMsg('Saved server-side ✓');
-      updateAgents((s) => ({ ...s, llm: { ...s.llm, model } }));
     } else {
       setErr(r.error ?? 'save failed');
     }
@@ -227,8 +351,8 @@ export function SettingsPanel() {
     <div className="settings-panel">
       {anyEnv && (
         <p className="hint-line ok-line">
-          ✓ Some values are injected by the server environment. Those fields are locked here —
-          the environment always wins.
+          ✓ Some values also come from the server environment. Nothing here is locked — a value
+          saved on this page wins over the environment, and clearing a field hands it back.
         </p>
       )}
 
@@ -252,9 +376,11 @@ export function SettingsPanel() {
           {info?.jev ? '✓ Jev ready' : '✕ Jev needs OpenRouter key'}
           <SourceBadge source={src?.jev?.key} />
         </span>
+        {/* The EFFECTIVE model, not the relay's fallback slot — and the badge
+            describes where the value actually shown came from. */}
         <span className="pill">
-          model: {info?.model ?? model}
-          <SourceBadge source={src?.llm?.model} />
+          model: {effectiveModel}
+          {!storeModel && <SourceBadge source={src?.llm?.model} />}
         </span>
         <span className="pill">
           search: {liveLabel}
@@ -269,64 +395,68 @@ export function SettingsPanel() {
       <label className="field-label">
         OpenRouter API key <SourceBadge source={src?.llm?.openrouterKey} />
       </label>
-      {openrouterFromEnv ? (
-        <p className="locked-field">
-          🔒 Managed by <code>OPENROUTER_API_KEY</code> in the server environment.
-        </p>
-      ) : (
-        <input
-          type="password"
-          value={openrouterKey}
-          onChange={(e) => setOpenrouterKey(e.target.value)}
-          placeholder={openrouterHasKey ? '••••••• (saved — type to replace)' : 'sk-or-v1-…'}
+      <input
+        type="password"
+        value={openrouterKey}
+        onChange={(e) => setOpenrouterKey(e.target.value)}
+        placeholder={openrouterHasKey ? '••••••• (saved — type to replace)' : 'sk-or-v1-…'}
+      />
+      <FieldNote source={src?.llm?.openrouterKey} envVar="OPENROUTER_API_KEY" />
+      {src?.llm?.openrouterKey === 'settings' && (
+        <ClearToggle
+          pending={clearFields.includes('openrouterKey')}
+          onToggle={() => toggleClear('openrouterKey')}
         />
       )}
 
       <label className="field-label">
         DeepSeek API key <SourceBadge source={src?.llm?.deepseekKey} />
       </label>
-      {deepseekFromEnv ? (
-        <p className="locked-field">
-          🔒 Managed by <code>DEEPSEEK_API_KEY</code> in the server environment.
-        </p>
-      ) : (
-        <input
-          type="password"
-          value={deepseekKey}
-          onChange={(e) => setDeepseekKey(e.target.value)}
-          placeholder={deepseekHasKey ? '••••••• (saved — type to replace)' : 'sk-…'}
+      <input
+        type="password"
+        value={deepseekKey}
+        onChange={(e) => setDeepseekKey(e.target.value)}
+        placeholder={deepseekHasKey ? '••••••• (saved — type to replace)' : 'sk-…'}
+      />
+      <FieldNote source={src?.llm?.deepseekKey} envVar="DEEPSEEK_API_KEY" />
+      {src?.llm?.deepseekKey === 'settings' && (
+        <ClearToggle
+          pending={clearFields.includes('deepseekKey')}
+          onToggle={() => toggleClear('deepseekKey')}
         />
       )}
 
       <label className="field-label">
         Tavily API key <SourceBadge source={searchSrc?.tavilyKey ?? src?.tavily?.key} />
       </label>
-      {tavilyFromEnv ? (
-        <p className="locked-field">
-          🔒 Managed by <code>TAVILY_API_KEY</code> in the server environment.
-        </p>
-      ) : (
-        <input
-          type="password"
-          value={tavilyKey}
-          onChange={(e) => setTavilyKey(e.target.value)}
-          placeholder={info?.search?.keys?.tavily ? '••••••• (saved — type to replace)' : 'tvly-dev-…'}
+      <input
+        type="password"
+        value={tavilyKey}
+        onChange={(e) => setTavilyKey(e.target.value)}
+        placeholder={info?.search?.keys?.tavily ? '••••••• (saved — type to replace)' : 'tvly-dev-…'}
+      />
+      <FieldNote source={searchSrc?.tavilyKey ?? src?.tavily?.key} envVar="TAVILY_API_KEY" />
+      {(searchSrc?.tavilyKey ?? src?.tavily?.key) === 'settings' && (
+        <ClearToggle
+          pending={clearFields.includes('tavilyKey')}
+          onToggle={() => toggleClear('tavilyKey')}
         />
       )}
 
       <label className="field-label">
         Brave Search API key <SourceBadge source={searchSrc?.braveKey} />
       </label>
-      {braveFromEnv ? (
-        <p className="locked-field">
-          🔒 Managed by <code>BRAVE_SEARCH_API_KEY</code> in the server environment.
-        </p>
-      ) : (
-        <input
-          type="password"
-          value={braveKey}
-          onChange={(e) => setBraveKey(e.target.value)}
-          placeholder={info?.search?.keys?.brave ? '••••••• (saved — type to replace)' : 'BSA…'}
+      <input
+        type="password"
+        value={braveKey}
+        onChange={(e) => setBraveKey(e.target.value)}
+        placeholder={info?.search?.keys?.brave ? '••••••• (saved — type to replace)' : 'BSA…'}
+      />
+      <FieldNote source={searchSrc?.braveKey} envVar="BRAVE_SEARCH_API_KEY" />
+      {searchSrc?.braveKey === 'settings' && (
+        <ClearToggle
+          pending={clearFields.includes('braveKey')}
+          onToggle={() => toggleClear('braveKey')}
         />
       )}
 
@@ -336,12 +466,19 @@ export function SettingsPanel() {
       <select
         value={searchProvider}
         onChange={(e) => setSearchProvider(e.target.value as '' | 'tavily' | 'brave')}
-        disabled={searchProviderFromEnv}
+        disabled={!relaySupportsProvider}
       >
         <option value="">Auto — whichever key is set (Tavily first)</option>
         <option value="tavily">Tavily</option>
         <option value="brave">Brave Search</option>
       </select>
+      {!relaySupportsProvider && (
+        <p className="warn-line">
+          ⚠️ The running relay is older than swappable web search, so it ignores the setting above.
+          Restart the relay — it loads its own code at boot — then reload this page.
+        </p>
+      )}
+      <FieldNote source={searchSrc?.provider} envVar="SEARCH_PROVIDER" />
       {searchMissingKey && (
         <p className="warn-line">
           ⚠️{' '}
@@ -351,37 +488,66 @@ export function SettingsPanel() {
         </p>
       )}
 
+      {/* Always editable — there is no lock to inherit. This field edits the
+          SYNCED STORE's model, which is what a run sends and therefore what
+          takes effect; the relay's own model is the fallback behind it, and the
+          web-search provider is not consulted for it at all. */}
       <label className="field-label">
-        Default model <SourceBadge source={src?.llm?.model} />
+        Default model {!storeModel && <SourceBadge source={src?.llm?.model} />}
       </label>
       <input
         list="settings-models"
-        value={model}
-        onChange={(e) => setModel(e.target.value)}
-        disabled={modelFromEnv}
+        value={shownModel}
+        onChange={(e) => {
+          setModel(e.target.value);
+          setModelTouched(true);
+        }}
       />
       <datalist id="settings-models">
-        {[...FREE_TOOL_MODELS, ...DEEPSEEK_MODELS].map((m) => (
+        {modelChoices.map((m) => (
           <option key={m} value={m} />
         ))}
       </datalist>
+      {storeModel ? (
+        <p className="hint-line">
+          <code>{storeModel}</code>, from the synced agents store — this is what a run sends, so
+          it is what takes effect. Saving a change here updates both sides.
+        </p>
+      ) : (
+        <FieldNote
+          source={src?.llm?.model}
+          envVar={provider === 'deepseek' ? 'DEEPSEEK_MODEL' : 'OPENROUTER_MODEL'}
+        />
+      )}
+      {src?.llm?.model === 'settings' && (
+        <ClearToggle
+          pending={clearFields.includes('model')}
+          onToggle={() => toggleClear('model')}
+        />
+      )}
+      {modelWrongForProvider && (
+        <p className="warn-line">
+          ⚠️ <code>{effectiveModel}</code> is not a DeepSeek model name, but the active provider
+          is DeepSeek — the value was saved while the other provider was selected, and DeepSeek
+          will reject it. Pick one of the <code>deepseek*</code> models above, or set{' '}
+          <code>LLM_PROVIDER</code> back.
+        </p>
+      )}
       <p className="hint-line">
         Free models must advertise <code>tools</code> support or the agent loop will fail. The list
         above is the verified free + tool-capable set, plus DeepSeek models for when the provider
-        is switched to DeepSeek.
+        is switched to DeepSeek. Your own API keys do not belong in this box — they go in the fields
+        above.
       </p>
 
       <label className="field-label">
         Default search depth <SourceBadge source={searchSrc?.depth ?? src?.tavily?.depth} />
       </label>
-      <select
-        value={depth}
-        onChange={(e) => setDepth(e.target.value as 'basic' | 'advanced')}
-        disabled={depthFromEnv}
-      >
+      <select value={depth} onChange={(e) => setDepth(e.target.value as 'basic' | 'advanced')}>
         <option value="basic">basic (fast, cheap — default)</option>
         <option value="advanced">advanced (deeper, slower)</option>
       </select>
+      <FieldNote source={searchSrc?.depth ?? src?.tavily?.depth} envVar="WEB_SEARCH_DEPTH" />
       <p className="hint-line">
         Applies to whichever provider is active; each tool can still override it. On Brave this
         maps onto its context budget (sources + tokens), on Tavily onto{' '}
@@ -391,22 +557,24 @@ export function SettingsPanel() {
       <label className="field-label">
         OpenRouter HTTP-Referer (optional) <SourceBadge source={src?.llm?.referer} />
       </label>
-      {refererFromEnv ? (
-        <p className="locked-field">
-          🔒 Managed by <code>OPENROUTER_REFERER</code> in the server environment.
-        </p>
-      ) : (
-        <input
-          value={referer}
-          onChange={(e) => setReferer(e.target.value)}
-          placeholder="https://your-app.example"
-        />
+      <input
+        value={referer}
+        onChange={(e) => setReferer(e.target.value)}
+        placeholder="https://your-app.example"
+      />
+      <FieldNote source={src?.llm?.referer} envVar="OPENROUTER_REFERER" />
+      {src?.llm?.referer === 'settings' && (
+        <ClearToggle pending={clearFields.includes('referer')} onToggle={() => toggleClear('referer')} />
       )}
 
       <label className="field-label">
         OpenRouter X-OpenRouter-Title (optional) <SourceBadge source={src?.llm?.title} />
       </label>
-      <input value={title} onChange={(e) => setTitle(e.target.value)} disabled={titleFromEnv} />
+      <input value={title} onChange={(e) => setTitle(e.target.value)} />
+      <FieldNote source={src?.llm?.title} envVar="OPENROUTER_TITLE" />
+      {src?.llm?.title === 'settings' && (
+        <ClearToggle pending={clearFields.includes('title')} onToggle={() => toggleClear('title')} />
+      )}
 
       <div className="docs-actions">
         <button className="primary" onClick={() => void save()} disabled={busy}>
@@ -418,10 +586,11 @@ export function SettingsPanel() {
       {err && <p className="warn-line">⚠️ {err}</p>}
       <p className="hint-line">
         Keys are written to <code>.g2-hub-secrets.json</code> on the relay (never synced, never in
-        the glasses bundle). Set <code>OPENROUTER_API_KEY</code> / <code>TAVILY_API_KEY</code> /{' '}
-        <code>BRAVE_SEARCH_API_KEY</code> in <code>web/.env.local</code> (or your host's env vars)
-        to override — environment values win, including the provider via{' '}
-        <code>SEARCH_PROVIDER</code>.
+        the glasses bundle). Everything on this page is stored the same way and each field is
+        independent: saving one never rewrites another. Values from the server environment —{' '}
+        <code>OPENROUTER_API_KEY</code>, <code>TAVILY_API_KEY</code>, <code>BRAVE_SEARCH_API_KEY</code>,{' '}
+        <code>OPENROUTER_MODEL</code>, <code>SEARCH_PROVIDER</code>, … — are used only where nothing
+        is saved here; use "remove saved value" to hand a field back to them.
       </p>
 
       <MemoryPanel />
