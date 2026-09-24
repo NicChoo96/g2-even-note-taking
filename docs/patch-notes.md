@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.31
+
+v0.3.31 - history stays put, and Agents leads the menu
+
+- Finishing a run no longer clears the session list you were reading. The 5-session limit is per agent now, not one pool for the whole app.
+- History merges rather than overwriting, so a backgrounded phone cannot delete runs another device recorded.
+- Clearing an agent's history still removes it everywhere.
+- The page switcher now reads Agents, To-Do, Docs, Notes. The app still opens on To-Do.
+
 ## 0.3.30
 
 v0.3.30 - save any setting, and let it stick
