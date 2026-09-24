@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.36
+
+v0.3.36 - embedded video plays in a stored page
+
+- Videos embedded in a stored page now play on the page itself,
+ instead of showing a blocked box.
+- Stored pages are served from a second address of their own, so a
+ video player inside one is no longer shut out.
+- One setup step: point the server at that second address. Until it
+ is set, pages behave exactly as before.
+
 ## 0.3.35
 
 v0.3.35 - video plays in stored pages
