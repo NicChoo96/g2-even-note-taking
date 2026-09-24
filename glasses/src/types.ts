@@ -207,13 +207,29 @@ export interface AgentsState {
   agents: AgentDef[];
   tools: ToolDef[];
   llm: LlmSettings;
-  /** Most recent FIRST, capped at MAX_SESSIONS. */
+  /** Most recent FIRST, capped at MAX_SESSIONS per agent. */
   sessions: AgentSession[];
+  /**
+   * agentId -> ms. Every session for that agent stamped at or before it is GONE
+   * on every device. This is what keeps an explicit delete working under the
+   * merge in `mergeSessions`: sessions are append-only, so "missing from a
+   * frame" cannot mean "deleted", and a plain union would resurrect history the
+   * wearer just cleared.
+   */
+  sessionsClearedAt?: Record<string, number>;
   updatedAt: number;
 }
 
-/** Only the 5 most recent sessions are kept + synced (user-set optimisation). */
+/** Sessions kept + synced PER AGENT (user-set optimisation). */
 export const MAX_SESSIONS = 5;
+
+/**
+ * Hard ceiling across all agents. This list is published in full on every
+ * `agents` edit and persisted verbatim by the relay, so it must not be
+ * unbounded. At MAX_SESSIONS per agent this starts to bite at 7+ agents that
+ * all hold full histories.
+ */
+export const MAX_SESSIONS_TOTAL = MAX_SESSIONS * 6;
 
 /** Free OpenRouter model that actually supports tool calling. */
 export const DEFAULT_MODEL = 'inclusionai/ling-3.0-flash-sante:free';
@@ -314,9 +330,91 @@ export function latestSession(s: AgentsState, agentId: string): AgentSession | n
   return sessionsForAgent(s, agentId)[0] ?? null;
 }
 
-/** Keep only the newest MAX_SESSIONS, most-recent-first. */
+/**
+ * Cap history to the newest MAX_SESSIONS PER AGENT, most-recent-first overall.
+ *
+ * WHY PER AGENT — this is the reported bug. Both read paths already promise a
+ * per-agent history: the web panel prints "History · last N/5" for the SELECTED
+ * agent, and the glasses detail pane pages within one agent's list. But the cap
+ * was applied to the whole array, so "5 sessions" really meant "5 sessions for
+ * the entire app". Finishing a run for agent B inserted a session and evicted
+ * the globally-oldest one — routinely the last surviving session of agent A.
+ * The panel, filtered to A, dropped towards "No sessions yet.", which reads
+ * exactly as "my session history was cleared when the run finished". Nothing
+ * was deleted; a shared pool was drained by a neighbour.
+ */
 export function pruneSessions(list: AgentSession[]): AgentSession[] {
-  return [...list]
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .slice(0, MAX_SESSIONS);
+  const sorted = [...list].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  const perAgent = new Map<string, number>();
+  const out: AgentSession[] = [];
+  for (const s of sorted) {
+    const n = perAgent.get(s.agentId) ?? 0;
+    if (n >= MAX_SESSIONS) continue;
+    perAgent.set(s.agentId, n + 1);
+    out.push(s);
+  }
+  return out.length > MAX_SESSIONS_TOTAL ? out.slice(0, MAX_SESSIONS_TOTAL) : out;
+}
+
+/**
+ * Merge two session lists into one that can only ever GROW (then get capped).
+ *
+ * WHY THIS IS A MERGE AND NOT A REPLACE: `sessions` is append-only, but it
+ * rides the `agents` channel, whose payload is whole-state last-write-wins.
+ * Every device that settles a run publishes ITS list — and a device that was
+ * backgrounded never learned about the runs it did not witness (the run replay
+ * carries only RUNNING runs), so its list is legitimately shorter. Replacing
+ * with that shorter list deleted the sessions the other device had recorded, in
+ * the relay's cached and persisted copy too. That is the reported "my session
+ * history was cleared out when the run finished": the run that finishes is a
+ * new session, and everything else disappears with it.
+ *
+ * For a shared id the RICHER transcript wins, so a device holding a
+ * half-streamed run can never truncate the copy another device stored in full.
+ * Otherwise the INCOMING copy wins — including when it is stamped older, which
+ * is deliberate: a caller may legitimately rewrite one of its own sessions (a
+ * correction, or backdating a fixture). "Fresher timestamp wins" looks safer but
+ * silently swallows those rewrites — it made the monitor harness's backdated
+ * fixtures a no-op and flipped its newest-first ordering.
+ * Ordering and the cap are `pruneSessions`' job.
+ */
+export function mergeSessions(
+  local: readonly AgentSession[],
+  incoming: readonly AgentSession[],
+  clearedAt: Record<string, number> = {},
+): AgentSession[] {
+  const byId = new Map<string, AgentSession>();
+  for (const s of [...local, ...incoming]) {
+    if (!s || typeof s.id !== 'string') continue;
+    const prev = byId.get(s.id);
+    if (!prev) {
+      byId.set(s.id, s);
+      continue;
+    }
+    // Incoming wins unless it is strictly POORER than what we hold. Writing it
+    // the other way round (`>` on the local side) makes the incoming rewrite lose
+    // on equal lengths, which breaks backdating and corrections.
+    if ((s.messages?.length ?? 0) >= (prev.messages?.length ?? 0)) byId.set(s.id, s);
+  }
+  // Tombstones drop BEFORE the cap, or a cleared session would still consume a
+  // slot a live one could have used. No stamp means nothing was ever cleared for
+  // that agent, so every session is kept — the filter must never act as an
+  // accidental "updatedAt > 0" test.
+  const live = [...byId.values()].filter((s) => {
+    const stamp = clearedAt[s.agentId];
+    return !stamp || (s.updatedAt ?? 0) > stamp;
+  });
+  return pruneSessions(live);
+}
+
+/** Newest-wins union of two clear-stamp maps — a later clear beats an earlier. */
+export function mergeClearedAt(
+  local: Record<string, number> | undefined,
+  incoming: Record<string, number> | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = { ...(local ?? {}) };
+  for (const [id, at] of Object.entries(incoming ?? {})) {
+    if (typeof at === 'number' && at > (out[id] ?? 0)) out[id] = at;
+  }
+  return out;
 }

@@ -58,8 +58,12 @@ async function durableGet(key: string): Promise<string | null> {
 /** Persist agent definitions + tools + LLM settings (never the API keys). */
 export async function saveAgentsDurable(state: AgentsState): Promise<void> {
   if (!isStartupReady()) return;
-  const { agents, tools, llm } = state;
-  await durableSet(AGENTS_KEY, JSON.stringify({ agents, tools, llm }));
+  // `sessionsClearedAt` rides along: the session list has its own key, but the
+  // tombstone that says "these were deliberately deleted" has only this one. A
+  // WebView teardown that forgot it would let the next frame resurrect cleared
+  // history.
+  const { agents, tools, llm, sessionsClearedAt } = state;
+  await durableSet(AGENTS_KEY, JSON.stringify({ agents, tools, llm, sessionsClearedAt }));
 }
 
 /** Persist the (already pruned) session list. */
@@ -79,7 +83,7 @@ export async function loadAgentsDurable(): Promise<Partial<AgentsState> | null> 
   }
 }
 
-/** Load the durable session list (already capped at 5 on write). */
+/** Load the durable session list (already capped per agent on write). */
 export async function loadSessionsDurable(): Promise<AgentSession[] | null> {
   const raw = await durableGet(SESSIONS_KEY);
   if (!raw) return null;

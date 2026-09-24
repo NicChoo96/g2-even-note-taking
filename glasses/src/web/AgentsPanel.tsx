@@ -7,6 +7,7 @@
 // glasses instantly — and vice versa.
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import {
+  clearSessionsFor,
   getAgents,
   recordSession,
   subscribeAgents,
@@ -410,11 +411,11 @@ export function AgentsPanel() {
   };
 
   const removeAgent = (id: string) => {
-    updateAgents((s) => ({
-      ...s,
-      agents: s.agents.filter((a) => a.id !== id),
-      sessions: s.sessions.filter((x) => x.agentId !== id),
-    }));
+    // The agent's history goes with it, through the SAME tombstoned delete as
+    // the Clear-history button: filtering the array here would be undone by the
+    // next merged frame that still carried those sessions.
+    clearSessionsFor(id);
+    updateAgents((s) => ({ ...s, agents: s.agents.filter((a) => a.id !== id) }));
     if (selected === id) setSelected(null);
   };
 
@@ -648,12 +649,7 @@ export function AgentsPanel() {
                   <div className="docs-actions">
                     <button
                       className="icon-btn wide danger"
-                      onClick={() =>
-                        updateAgents((s) => ({
-                          ...s,
-                          sessions: s.sessions.filter((x) => x.agentId !== agent.id),
-                        }))
-                      }
+                      onClick={() => clearSessionsFor(agent.id)}
                     >
                       Clear history
                     </button>

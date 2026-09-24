@@ -12,9 +12,10 @@ import { publishAgents } from './stream';
 import { loadAgentsDurable, loadSessionsDurable, saveAgentsDurable, saveSessionsDurable } from './durable-agents';
 import {
   emptyAgentsState,
+  mergeClearedAt,
+  mergeSessions,
   normalizeTool,
   normalizeToolId,
-  pruneSessions,
   webSearchTool,
   uid,
   type AgentDef,
@@ -65,7 +66,19 @@ function loadLocal(): AgentsState {
     const sessions: AgentSession[] = Array.isArray(parsed.sessions)
       ? parsed.sessions.filter((s) => s && typeof s.id === 'string')
       : [];
-    return { agents, tools, llm, sessions: pruneSessions(sessions), updatedAt: Date.now() };
+    const cleared = parsed.sessionsClearedAt;
+    return {
+      agents,
+      tools,
+      llm,
+      // Load through the merge, not a bare prune: the durable bridge mirrors
+      // `{agents,tools,llm}` while localStorage holds the full state, so the two
+      // copies disagree about sessions by design. Merging them here is what
+      // stops the narrower copy from deleting the other one's history.
+      sessions: mergeSessions([], sessions, cleared),
+      sessionsClearedAt: cleared,
+      updatedAt: Date.now(),
+    };
   } catch {
     /* ignore */
   }
@@ -129,10 +142,20 @@ export function subscribeAgents(fn: () => void): () => void {
   };
 }
 
-/** Apply a local edit and broadcast it to all devices. Sessions are pruned. */
+/** Apply a local edit and broadcast it to all devices. Sessions never shrink. */
 export function updateAgents(fn: (s: AgentsState) => AgentsState): void {
   const next = fn(state);
-  state = { ...next, sessions: pruneSessions(next.sessions), updatedAt: Date.now() };
+  const sessionsClearedAt = mergeClearedAt(state.sessionsClearedAt, next.sessionsClearedAt);
+  state = {
+    ...next,
+    // One invariant, applied in one place: the stored list is the UNION of what
+    // was there and what the edit produced (minus anything tombstoned). An edit
+    // that rebuilt `sessions` from a stale snapshot therefore cannot delete
+    // history — only `clearSessionsFor` can, and it leaves a stamp.
+    sessions: mergeSessions(state.sessions, next.sessions, sessionsClearedAt),
+    sessionsClearedAt,
+    updatedAt: Date.now(),
+  };
   persist(state);
   schedulePublish();
   emit();
@@ -144,11 +167,19 @@ export function applyRemoteAgents(next: AgentsState): void {
   sawServerState = true;
   if (next.updatedAt === lastPublishedAt) return; // our own echo — already applied
   const base = emptyAgentsState();
+  const sessionsClearedAt = mergeClearedAt(state.sessionsClearedAt, next.sessionsClearedAt);
   state = {
     agents: next.agents.map(normalizeAgent),
     tools: next.tools?.length ? next.tools.map(normalizeTool) : base.tools,
     llm: { ...base.llm, ...(next.llm ?? {}) },
-    sessions: pruneSessions(next.sessions ?? []),
+    // MERGE, never replace. `agents`/`tools`/`llm` are edited by one surface at
+    // a time and last-write-wins is right for them, but `sessions` is
+    // append-only and every device that settles a run publishes its own list —
+    // a peer that was backgrounded ships a shorter one, and replacing with it
+    // deleted history the wearer had already recorded (and the relay persisted
+    // that deletion). See mergeSessions.
+    sessions: mergeSessions(state.sessions, next.sessions ?? [], sessionsClearedAt),
+    sessionsClearedAt,
     updatedAt: next.updatedAt ?? Date.now(),
   };
   persist(state);
@@ -205,13 +236,15 @@ export async function hydrateAgentsDurable(): Promise<void> {
   // written by THIS device only, so applying it afterwards would silently revert
   // agents another device added — the same clobber, just via a different path.
   if (sawServerState) return;
+  const sessionsClearedAt = mergeClearedAt(state.sessionsClearedAt, saved?.sessionsClearedAt);
   state = {
     // Normalize: a durable snapshot written before 0.3.5 has no `prompt`, and
     // the glasses menu calls `.trim()` on it.
     agents: saved?.agents ? saved.agents.map(normalizeAgent) : state.agents,
     tools: saved?.tools?.length ? saved.tools.map(normalizeTool) : state.tools,
     llm: { ...state.llm, ...(saved?.llm ?? {}) },
-    sessions: pruneSessions(sessions ?? state.sessions),
+    sessions: mergeSessions(state.sessions, sessions ?? [], sessionsClearedAt),
+    sessionsClearedAt,
     updatedAt: Date.now(),
   };
   persist(state);
@@ -243,9 +276,30 @@ export function recordSession(input: {
       createdAt: created,
       updatedAt: Date.now(),
     };
-    return { ...s, sessions: [session, ...s.sessions.filter((x) => x.id !== id)] };
+    // Merge rather than prepend-and-drop: BOTH devices settle the same run (the
+    // run id IS the session id), and the second one to publish may be holding a
+    // transcript it only partly streamed. `[session, ...filter]` used to let
+    // that shorter copy overwrite the complete one.
+    return { ...s, sessions: mergeSessions(s.sessions, [session], s.sessionsClearedAt) };
   });
   return id;
+}
+
+/**
+ * Delete one agent's whole history — and REMEMBER that it was deleted.
+ *
+ * The stamp is the whole trick. Sessions are merged, not replaced, so a bare
+ * filter would be undone by the very next frame that still carried them (the
+ * other device's copy, or this device's own in-flight publish). `mergeSessions`
+ * drops anything at or before the stamp, so the deletion is idempotent, travels
+ * with the state, and survives a restart.
+ */
+export function clearSessionsFor(agentId: string): void {
+  updateAgents((s) => ({
+    ...s,
+    sessions: s.sessions.filter((x) => x.agentId !== agentId),
+    sessionsClearedAt: { ...(s.sessionsClearedAt ?? {}), [agentId]: Date.now() },
+  }));
 }
 
 export function getAgentsConn(): ConnStatus {
