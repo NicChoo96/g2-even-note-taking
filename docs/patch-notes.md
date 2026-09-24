@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.32
+
+v0.3.32 - each agent keeps its own run
+
+- Switching agents in the list no longer showed the other agent's live run in the detail pane.
+- Two agents can run at the same time now; scroll the list to watch whichever one you want.
+- Stop only stops the agent you are looking at.
+- A run left going in the background is marked with a dot in the list.
+
 ## 0.3.31
 
 v0.3.31 - history stays put, and Agents leads the menu
