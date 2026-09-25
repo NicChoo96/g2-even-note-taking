@@ -130,6 +130,14 @@ import {
   rankAnswers,
   specFromToolArgs,
 } from './jev-spec.mjs';
+// The MCP tool layer. `mcp-tools.mjs` makes a server's OWN `tools/list` the
+// source of truth for the schemas we hand the model, so adding a server is a
+// transport rather than a hand-written schema; `mcp-router.mjs` uses JEV as a
+// reranker to decide which of that catalogue a turn is actually offered. Both
+// are split out because importing THIS module starts a server, so neither could
+// be asserted against a stub if it lived here.
+import { normalizeCatalogue, foldDrift } from './mcp-tools.mjs';
+import { describeRoute, routeTools } from './mcp-router.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -850,6 +858,11 @@ function llmHeaders(cfg) {
 // `{ type: 'run', run }` frames and kept in a small ring for replay. The final
 // transcript is persisted by the CLIENTS as a normal session (capped at 5).
 const MAX_STEPS = 5;
+// How many of an agent's tools one turn is offered once the catalogue is big
+// enough to be worth ranking (see offerTools). Deliberately small: MAX_STEPS is
+// the loop's other budget, and a shortlist wider than the loop can use would
+// spend the model's attention without buying a step.
+const ROUTE_TOP = 4;
 const MAX_RUNS = 8;
 const RUN_TTL_MS = 30 * 60e3; // drop finished runs after 30 min
 const RUN_MAX_BYTES = 256 * 1024;
@@ -1118,6 +1131,40 @@ function answerText(raw) {
 }
 
 /**
+ * JEV, shaped the way the router wants it: a built request in, the answers out.
+ *
+ * Returns null when no ranker is configured, which `routeTools` reads as "no
+ * ranker configured" and fails open on — so a relay with no OpenRouter key keeps
+ * behaving exactly as it did, without a branch here to keep in sync.
+ */
+function jevResponder() {
+  if (!jevConfig().key) return null;
+  return async (request) => (await jevDecide(request)).answers;
+}
+
+/**
+ * WHICH of a run's tools this turn is offered, and why.
+ *
+ * `run.tools` is the relay's own agent catalogue — web search, the document
+ * store, jev, a generic REST tool — so today it is small and `routeTools`
+ * declines to rank it ("the catalogue already fits") and returns every tool
+ * unchanged. That is the correct outcome rather than a no-op: routing exists so
+ * that the catalogue can GROW. Add a fifth server and this is the line that
+ * stops the model being handed six descriptions that do not apply to the turn.
+ *
+ * It also means the common run spends NO extra request: `respond` is only
+ * reached once the catalogue is bigger than the shortlist.
+ */
+async function offerTools(run, ask) {
+  const catalogue = run.tools.map((t) => ({
+    name: String(t?.name ?? ''),
+    serverName: String(t?.name ?? ''),
+    description: String(t?.description ?? ''),
+  }));
+  return routeTools({ ask, catalogue, top: ROUTE_TOP, respond: jevResponder() });
+}
+
+/**
  * Run the agent loop and stream every turn to both clients. Never throws: the
  * failure is recorded on the run so the glasses and the browser both show it.
  */
@@ -1147,7 +1194,28 @@ async function executeRun(run) {
     });
     broadcastRun(run);
   }
-  const schemas = run.tools.map(toolSchemaFor);
+  // Which of the agent's tools THIS turn is offered. Ranked against the request
+  // itself, and it FAILS OPEN in every unhappy case — see the router's header.
+  // The rule being protected: a turn with too many tools is degraded, a turn
+  // with NO tools is broken, because the model then tells the wearer it has no
+  // access to something it does have.
+  const route = await offerTools(run, resolved.text);
+  const keptNames = new Set(route.chosen.map((c) => c.name));
+  const schemas = run.tools.filter((t) => keptNames.has(t.name)).map(toolSchemaFor);
+  if (run.tools.length > 1) console.log(`[g2-hub] agent run: ${describeRoute(route)}`);
+  // Recorded ONLY when the toolset was actually narrowed. A fail-open line would
+  // be noise on every ordinary run, while a narrowed one is the missing
+  // explanation for a model that went looking for a tool it could not see.
+  if (route.routed) {
+    push({
+      role: 'assistant',
+      content:
+        `[tools] offered ${schemas.length} of ${run.tools.length}: ` +
+        `${route.chosen.map((c) => c.name).join(', ')}` +
+        `${route.unresolved ? ' (order unresolved)' : ''}`,
+      at: Date.now(),
+    });
+  }
   const ac = new AbortController();
   runAbort.set(run.id, ac);
   try {
@@ -1189,7 +1257,13 @@ async function executeRun(run) {
         run.statusText = `Searching · ${name}…`;
         broadcastRun(run);
         const tool = run.tools.find((t) => t.name === name);
-        const result = await runToolOnce(tool, rawArgs, ac.signal);
+        // A tool the router did NOT OFFER is not an unknown tool, and saying so
+        // would send the model hunting for a typo instead of recovering. Naming
+        // what is actually callable lets it retry in one step.
+        const result = tool
+          ? await runToolOnce(tool, rawArgs, ac.signal)
+          : `tool error: ${name} is not available for this request. Call one of: `
+            + `${schemas.map((s) => s.function.name).join(', ') || '(no tools)'}`;
         wire.push({ role: 'tool', content: result, tool_call_id: call.id });
         // Stored VERBATIM. `result` is already bounded by runToolOnce, so a
         // second clip here only destroyed the record of what the model saw.
@@ -2784,6 +2858,82 @@ function startDocServer(port) {
   return docServer;
 }
 
+/**
+ * The four gateway operations the ONE `jarvis_files` tool folds into its
+ * `action` enum, each mapped to the server tool that implements it.
+ *
+ * This map IS the contract between `filesToolSchema()` (what the model is told)
+ * and the client that carries the call out — and it is exactly where the drift
+ * lived: the schema offered `id` for delete while the client sent
+ * `{ id, hard, reason }`, and the gateway accepted both. Nothing compared them,
+ * because nothing had ever read the gateway's own catalogue.
+ */
+const FILES_FOLD = {
+  publish: 'create_session',
+  list: 'list_sessions',
+  read: 'read_session',
+  delete: 'delete_session',
+};
+
+/**
+ * The check the hand-written schema never had, run ONCE at boot.
+ *
+ * It reports in the two directions `diffParams` separates, because only one of
+ * them is dangerous:
+ *   • `missingOnServer` — we advertise a parameter the gateway does not define,
+ *     so the model sends it and EVERY such call fails. That is a lie, and it is
+ *     logged as an error.
+ *   • `missingLocally` — the gateway defines a parameter we never offer. No call
+ *     fails; a capability is merely UNREACHABLE. This is the `hard` case, and it
+ *     is logged as a note.
+ *
+ * It also names the gateway tools the fold does not reference at all, which is a
+ * capability that does not exist as far as the model is concerned.
+ *
+ * NEVER throws and never blocks boot: a gateway that is down, unconfigured or
+ * out of scope must not stop the relay serving the app. Its whole output is the
+ * log — which is more than the previous version produced, since it asked nothing.
+ */
+async function checkFilesSchemaDrift() {
+  const { client } = filesRuntime();
+  if (!client) return;
+  try {
+    // `catalogue()` unwraps `result.tools`; normalizeCatalogue() expects the
+    // `{ tools }` envelope, so it is re-wrapped rather than second-guessed here.
+    const remote = normalizeCatalogue({ tools: await client.catalogue() });
+    if (!remote.length) {
+      console.log('[g2-hub] jarvis_files schema check: the gateway listed no tools');
+      return;
+    }
+    const { missingOnServer, missingLocally, unknownFoldedTools, unusedTools } = foldDrift({
+      localProperties: filesToolSchema({}).function.parameters.properties,
+      fold: FILES_FOLD,
+      catalogue: remote,
+    });
+    // The one that is a LIE, so it is the one that shouts.
+    if (missingOnServer.length) {
+      console.error(
+        '[g2-hub] jarvis_files SCHEMA LIE: the model is told to send '
+          + `${missingOnServer.join(', ')}, which the gateway does not accept, so every such call fails`,
+      );
+    }
+    if (unknownFoldedTools.length) {
+      console.error(`[g2-hub] jarvis_files FOLD STALE: ${unknownFoldedTools.join(', ')} no longer exist on the gateway`);
+    }
+    if (missingLocally.length) {
+      console.log(`[g2-hub] jarvis_files unreachable params: ${missingLocally.join(', ')}`);
+    }
+    if (unusedTools.length) {
+      console.log(`[g2-hub] gateway tools with no schema here: ${unusedTools.join(', ')}`);
+    }
+    if (!missingOnServer.length && !missingLocally.length && !unknownFoldedTools.length && !unusedTools.length) {
+      console.log(`[g2-hub] jarvis_files schema agrees with the gateway (${remote.length} tools)`);
+    }
+  } catch (err) {
+    console.log(`[g2-hub] jarvis_files schema check skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 await loadPersistedState();
 
 server.listen(PORT, () => {
@@ -2792,4 +2942,6 @@ server.listen(PORT, () => {
   console.log(`[g2-hub]   SSE:   GET  http://localhost:${PORT}/api/stream?channel=hub`);
   console.log(`[g2-hub]   State: POST http://localhost:${PORT}/api/stream`);
   if (DOC_LISTEN_PORT > 0) startDocServer(DOC_LISTEN_PORT);
+  // Fire-and-forget: the drift check must never delay or fail the boot.
+  void checkFilesSchemaDrift();
 });

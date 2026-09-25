@@ -723,6 +723,60 @@ export function createFilesClient(opts = {}) {
     return result.structuredContent ?? {};
   }
 
+  /**
+   * The server's OWN tool catalogue — `tools/list`, signed in the same way.
+   *
+   * This exists because the model-facing schema was a hand-written COPY of the
+   * server's, and copies drift with nothing to notice. Measured against the live
+   * gateway, the copy in filesToolSchema() had already silently lost `hard` and
+   * `reason` from delete_session — so the model could not hard-delete — and
+   * `include_html` from read_session, so it could never read a body. Seven of the
+   * server's eleven tools were not represented at all. Nothing in this file could
+   * detect any of that, because nothing ever asked.
+   *
+   * Deliberately mirrors `call` rather than reusing it: `call` hard-codes the
+   * `tools/call` method, and this must not become a SECOND auth path — so it
+   * shares `ensureToken`, the one auth retry, and the same error mapping.
+   *
+   * Returns the raw `result.tools` array, unwrapped on purpose: normalising it is
+   * mcp-tools.mjs's job, and doing it here would put a second interpretation of
+   * the MCP envelope in the codebase.
+   */
+  async function catalogue({ signal, retried = false } = {}) {
+    const token = await ensureToken(signal);
+    const r = await request(MCP_PATH, {
+      method: 'POST',
+      token,
+      signal,
+      body: { jsonrpc: '2.0', id: idSeq++, method: 'tools/list', params: {} },
+    });
+    const authFailure =
+      r.status === 401 ||
+      (r.ok && r.body?.error && Number(r.body.error.code) === -32001);
+    if (authFailure && !retried && !apiKey) {
+      forget();
+      return catalogue({ signal, retried: true });
+    }
+    if (!r.ok) throw errorOf(r.body, r.status, 'gateway_error');
+    if (r.body?.error) {
+      const code = Number(r.body.error.code);
+      // -32601 here means the server does not implement discovery at all, which
+      // is a different fact from `call`'s -32601 (a wrong tool name).
+      throw new FilesError(
+        code === -32002
+          ? 'insufficient_scope'
+          : code === -32601
+            ? 'unsupported_method'
+            : `jsonrpc_${code}`,
+        String(r.body.error.message || 'gateway rejected tools/list'),
+        { status: r.status, detail: r.body.error.data ?? null },
+      );
+    }
+    const result = r.body?.result;
+    if (!result) throw new FilesError('empty_result', 'tools/list returned no result', { status: r.status });
+    return Array.isArray(result.tools) ? result.tools : [];
+  }
+
   // ── Operations ─────────────────────────────────────────────────────────────
 
   /** List documents, newest first by default. One page — see `listAll`. */
@@ -870,6 +924,7 @@ export function createFilesClient(opts = {}) {
       };
     },
     call,
+    catalogue,
     /** The SHARED sign-in, not the raw one: an outside caller cannot bypass it. */
     login: signIn,
     list,
