@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.37
+
+v0.3.37 - Jarvis actions come from the server
+
+- The actions Jarvis can take on your stored pages are now read from
+ the document server itself. The list used to be a copy kept by hand,
+ and a copy can fall behind the server with nothing to notice.
+- If Jarvis asks for an action it was not offered, it is told which
+ ones it can use and corrects itself in one step.
+- The relay checks its list against the server at startup and reports
+ anything missing.
+
 ## 0.3.36
 
 v0.3.36 - embedded video plays in a stored page
