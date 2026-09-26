@@ -307,10 +307,23 @@ console.log('\n── Mirror: source invariants ──');
 //     are broadcast once and forgotten.)
 const relaySrc = readFileSync(new URL('../../web/server/local-sse.mjs', import.meta.url), 'utf8');
 assert('the relay declares its transient channels', /TRANSIENT_CHANNELS = new Set\(\['ai', 'ai-ctl'\]\)/.test(relaySrc));
+// What matters is the RULE, not the number of writers. Originally there was one
+// writer and this counted it; the hub tools added a second, because a change an
+// agent makes must publish exactly like a tap does. An UNGUARDED write is the
+// actual bug — it would cache a live `ai` frame and hand it to the next client
+// as its `init`. So: count the writes, count the guarded ones, require parity.
 const writes = relaySrc.match(/channel\.lastState = state;/g) ?? [];
-const guarded = /if \(!TRANSIENT_CHANNELS\.has\(channel\.name\)\) \{\s*channel\.lastState = state;/.test(relaySrc);
-check('the relay caches state in exactly one place', writes.length, 1);
-assert('…and that place refuses transient channels', guarded);
+const guarded = relaySrc.match(/if \(!TRANSIENT_CHANNELS\.has\(channel\.name\)\) \{\s*channel\.lastState = state;/g) ?? [];
+assert('the relay caches state somewhere', writes.length > 0);
+check('every cache write refuses transient channels', writes.length, guarded.length);
+assert(
+  '…the agent-tool publisher obeys it too',
+  /function publishHubState[\s\S]{0,600}?if \(!TRANSIENT_CHANNELS\.has\(channel\.name\)\) \{\s*channel\.lastState = state;/.test(relaySrc),
+);
+assert(
+  '…but still broadcasts even for a transient channel',
+  /function publishHubState[\s\S]{0,900}?\n  const frame = \{ type: 'state', state \};/.test(relaySrc),
+);
 
 // 6b. The menu must not promise "Stop AI" for a HUD that is not there: the item
 //     is derived from what is on screen (a held reply, or an open Jarvis mic),

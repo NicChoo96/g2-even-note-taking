@@ -119,11 +119,18 @@ export function upsertDoc(
  * yes/no, pick-one or rubric question and returns a calibrated probability. jev
  * has no per-tool config — it uses the relay's OpenRouter key.
  *
- * 'tavily' is the LEGACY kind for the same tool. It is accepted on every read
+ * 'todo', 'docs' and 'notes' are the HUB's own stores, held by the relay in
+ * `HubState` and executed by it (`web/server/hub-tools.mjs`). They are the only
+ * tools that write state the wearer sees without the model having to describe
+ * it, and the only ones whose effect is visible on the glasses the moment the
+ * call returns. Note 'docs' is the wearer's own document LIBRARY (the Docs tab);
+ * 'files' is the different, gateway-backed store.
+ *
+ * 'tavily' is the LEGACY kind for the same web tool. It is accepted on every read
  * path (see normalizeTool) because persisted agents, bridge snapshots and an
  * older client bundle can all still carry it, but nothing writes it any more.
  */
-export type ToolKind = 'web' | 'http' | 'jev' | 'files';
+export type ToolKind = 'web' | 'http' | 'jev' | 'files' | 'todo' | 'docs' | 'notes';
 /** Legacy spelling, read-only — kept so normalizing old state type-checks. */
 export type LegacyToolKind = 'tavily';
 export type WebDepth = 'basic' | 'advanced';
@@ -144,6 +151,18 @@ export interface ToolDef {
   url?: string;
   /** http tools: request method (default POST). */
   method?: 'GET' | 'POST';
+  /**
+   * http tools: a JSON object the user authors, used as the request body (POST)
+   * or the query string (GET).
+   *
+   * Its KEYS become the parameters the model is offered, so this is how a REST
+   * tool stops being a guessing game: write `{"query": "", "limit": 5}` and the
+   * model is told to send `query` and `limit` instead of inventing a shape. An
+   * empty or null value is marked REQUIRED; a filled one is the default the
+   * model may omit. Left blank, the tool falls back to asking the model for a
+   * free-form `body` object.
+   */
+  bodyTemplate?: string;
   /** Secret is stored server-side (relay env / settings store) — never here. */
   hasToken?: boolean;
   /** Web search only — how much to read. Defaults to 'basic'. */
@@ -284,14 +303,20 @@ export function webSearchTool(): ToolDef {
   };
 }
 
+/** The seeded typed-decision tool's id. */
+export const JEV_TOOL_ID = 'tool-jev';
+
 /**
  * A tool that decides rather than describes. The agent supplies the text to
  * judge plus one typed question, and gets back a probability or a label — not a
  * paragraph it would have to interpret. Needs no token of its own.
+ *
+ * It is also the reranker Jarvis uses to choose between tools, which is why the
+ * same kind can be attached to an agent for either job.
  */
 export function jevTool(): ToolDef {
   return {
-    id: 'tool-jev',
+    id: JEV_TOOL_ID,
     name: 'jev_decide',
     kind: 'jev',
     description:
@@ -324,6 +349,72 @@ export function filesTool(): ToolDef {
       'stored there. Use it when the answer is a report, table, chart or briefing that is ' +
       'better read on screen than dictated. The document body is NOT returned to you — ' +
       'the wearer reads it on the Files page.',
+    hasToken: false,
+  };
+}
+
+// ── The hub's own stores ─────────────────────────────────────────────────────
+// Three tools that read and write what the wearer already has on the glasses,
+// executed SERVER-SIDE by the relay (`web/server/hub-tools.mjs`) against the live
+// hub channel — not by the client, because a client-side write would fight the
+// relay's own copy of `HubState` and the wearer could end up looking at the list
+// the edit did not reach.
+//
+// All three need no token and no configuration, and NOTHING about them is
+// pre-attached: like jev and files, an agent gets one only because someone opted
+// in. See SEED_TOOLS in ai/capabilities/agents.ts for the voice path.
+
+/** The seeded to-do tool's id. */
+export const TODO_TOOL_ID = 'tool-todo';
+/** The seeded document-library tool's id. */
+export const DOCS_TOOL_ID = 'tool-docs';
+/** The seeded notes tool's id. */
+export const NOTES_TOOL_ID = 'tool-notes';
+
+/** Add, tick, rename, delete or list the wearer's tasks. */
+export function todoTool(): ToolDef {
+  return {
+    id: TODO_TOOL_ID,
+    name: 'jarvis_todo',
+    kind: 'todo',
+    description:
+      'Read and change the To-Do list on the wearer\u2019s glasses. Add a task, tick one off, ' +
+      'rename or delete one, list what is outstanding, or clear the finished ones. Changes ' +
+      'show on the glasses immediately.',
+    hasToken: false,
+  };
+}
+
+/**
+ * Create, read and edit the wearer's own documents — the Docs tab, NOT the
+ * gateway-backed store the `jarvis_files` tool writes to. The two are easy to
+ * confuse and the descriptions say so explicitly, because a model that publishes
+ * a report into the wrong store leaves the wearer looking in the wrong place.
+ */
+export function docsTool(): ToolDef {
+  return {
+    id: DOCS_TOOL_ID,
+    name: 'jarvis_docs',
+    kind: 'docs',
+    description:
+      'Read and change the wearer\u2019s own saved documents on the glasses (the Docs tab — ' +
+      'to publish a page to a link, use the document-store tool instead). List the ' +
+      'documents, read one, write a new one, append to one, replace or rename one, or ' +
+      'delete one.',
+    hasToken: false,
+  };
+}
+
+/** Read and edit the single free-text Notes blob. */
+export function notesTool(): ToolDef {
+  return {
+    id: NOTES_TOOL_ID,
+    name: 'jarvis_notes',
+    kind: 'notes',
+    description:
+      'Read and change the wearer\u2019s Notes scratchpad on the glasses. Read the notes, add ' +
+      'a line to them, or rewrite them. Notes is one free-text blob, unlike the Docs ' +
+      'tab\u2019s separate documents.',
     hasToken: false,
   };
 }

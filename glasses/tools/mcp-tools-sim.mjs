@@ -247,7 +247,46 @@ console.log('\n§3  the two failure levels stay separate');
   eq('catalog() is the flat shape the router ranks', Object.keys(listed[0]).sort(), ['description', 'name', 'parameters', 'serverName']);
 }
 
-// ── §4  the drift check reports both directions ─────────────────────────────
+// ── the gateway's own catalogue ─────────────────────────────────────────────
+//
+// Kept verbatim, as the live `tools/list` returned it, and declared HERE rather
+// than next to the section that first needed it: a fixture invented for
+// convenience would assert the drift check against a shape that does not exist,
+// and every section that compares the hand-written schema against the server has
+// to compare it against the same real one. Duplicating it was how §4 ended up
+// asking about ten parameters out of the twenty-two the gateway accepts.
+
+/** `[tool name, [every parameter it accepts]]` — the whole server, nothing added. */
+const GATEWAY_PAIRS = [
+  ['create_session', ['html', 'agent', 'title', 'tags', 'content_type', 'id', 'overwrite', 'slug']],
+  ['read_session', ['id', 'include_html']],
+  ['update_session', ['id', 'html', 'title', 'agent', 'tags', 'content_type', 'if_version']],
+  ['delete_session', ['id', 'hard', 'reason']],
+  ['list_sessions', ['limit', 'offset', 'agent', 'tag', 'q', 'order', 'include_deleted']],
+  ['search_sessions', ['q', 'limit']],
+  ['session_stats', []],
+  ['list_revisions', ['id', 'change', 'subject', 'agent', 'order', 'limit', 'offset']],
+  ['read_revision', ['id', 'revision', 'include_html']],
+  ['restore_revision', ['id', 'revision', 'restore_metadata', 'if_version', 'subject']],
+  ['revision_stats', ['id']],
+];
+
+const GATEWAY = GATEWAY_PAIRS.map(([name, props]) =>
+  tool(name, Object.fromEntries(props.map((p) => [p, { type: 'boolean' }]))),
+);
+const gatewayCatalogue = normalizeCatalogue({ tools: GATEWAY });
+
+/**
+ * Every parameter name the gateway accepts anywhere, plus our own switch key.
+ *
+ * This is the ONE correct answer to "what may the model be told to send?", and
+ * deriving it from the fixture is the point: a hand-typed list is a second
+ * hand-written schema, which is the exact failure this whole module exists to
+ * catch.
+ */
+const GATEWAY_PARAMS = ['action', ...new Set(GATEWAY_PAIRS.flatMap(([, props]) => props))];
+
+// ── §4  the drift check reports both directions ──────────────────────────────
 console.log('\n§4  drift is reported in both directions, and they are not the same thing');
 
 eq(
@@ -273,19 +312,23 @@ eq('agreement produces no drift', diffParams({ id: {} }, ['id']), { missingOnSer
 }
 
 {
-  // THE REAL BUG, PINNED. `hard` and `reason` exist upstream and are implemented
-  // in our own client (remove() in jarvis-files.mjs), but the schema the model is
-  // shown omits both — so "delete it permanently" said to Jarvis is a soft delete
-  // and nothing anywhere reported the gap. This assertion is what reports it now.
-  const files = filesToolSchema();
-  const advertised = files.function.parameters.properties;
-  const server = ['action', 'html', 'title', 'tags', 'id', 'overwrite', 'q', 'agent', 'hard', 'reason'];
-  const d = diffParams(advertised, server);
+  // THE REAL BUG, PINNED — now as the guard on its own fix.
+  //
+  // `hard` and `reason` existed upstream and were implemented in our own client
+  // (remove() in jarvis-files.mjs), while the schema the model was shown omitted
+  // both — so "delete it permanently" said to Jarvis was a soft delete and
+  // nothing anywhere reported the gap. The same was true of seven whole tools.
+  // Checked in BOTH directions against the verbatim catalogue, because
+  // over-claiming fails every call that uses the parameter and under-offering
+  // silently removes a capability: they are different bugs and this schema had
+  // one of each.
+  const advertised = filesToolSchema().function.parameters.properties;
+  const d = diffParams(advertised, GATEWAY_PARAMS);
   eq('the files tool over-claims nothing', d.missingOnServer, []);
   eq(
-    'the files tool UNDER-offers exactly the two we know about',
+    'the files tool under-offers nothing',
     d.missingLocally,
-    ['hard', 'reason'],
+    [],
     '(hard is what makes a delete permanent; reason is its audit note)',
   );
 }
@@ -551,31 +594,22 @@ console.log('\n§9  fold drift: the check the hand-written schema never had');
 
 /**
  * The gateway's OWN catalogue, exactly as the live `tools/list` returned it.
- * Kept verbatim because a fixture invented for convenience would assert the
- * drift check against a shape that does not exist — and this drift is the whole
- * reason the check exists.
+ * Defined once, above §4 — see GATEWAY_PAIRS there for why it is not repeated.
  */
-const GATEWAY = [
-  ['create_session', ['html', 'agent', 'title', 'tags', 'content_type', 'id', 'overwrite', 'slug']],
-  ['read_session', ['id', 'include_html']],
-  ['update_session', ['id', 'html', 'title', 'agent', 'tags', 'content_type', 'if_version']],
-  ['delete_session', ['id', 'hard', 'reason']],
-  ['list_sessions', ['limit', 'offset', 'agent', 'tag', 'q', 'order', 'include_deleted']],
-  ['search_sessions', ['q', 'limit']],
-  ['session_stats', []],
-  ['list_revisions', ['id', 'change', 'subject', 'agent', 'order', 'limit', 'offset']],
-  ['read_revision', ['id', 'revision', 'include_html']],
-  ['restore_revision', ['id', 'revision', 'restore_metadata', 'if_version', 'subject']],
-  ['revision_stats', ['id']],
-].map(([name, props]) => tool(name, Object.fromEntries(props.map((p) => [p, { type: 'boolean' }]))));
-const gatewayCatalogue = normalizeCatalogue({ tools: GATEWAY });
 
 /** The fold the relay actually declares. Must match FILES_FOLD in local-sse.mjs. */
 const FOLD = {
   publish: 'create_session',
   list: 'list_sessions',
+  search: 'search_sessions',
+  stats: 'session_stats',
   read: 'read_session',
+  update: 'update_session',
   delete: 'delete_session',
+  history: 'list_revisions',
+  revision: 'read_revision',
+  revert: 'restore_revision',
+  revision_stats: 'revision_stats',
 };
 
 {
@@ -597,23 +631,23 @@ const FOLD = {
     [],
     '(a stale name here is a dead action)',
   );
-  // THE regression this whole module exists for. `hard` and `reason` were live
-  // on delete_session the entire time; the hand-written schema never offered
-  // them, so the model could not hard-delete and nothing said so.
-  assert(
-    'the unreachable parameters include the ones that started this',
-    drift.missingLocally.includes('hard') && drift.missingLocally.includes('reason'),
-    drift.missingLocally.join(', '),
-  );
   assert(
     'the fold does not cry wolf about its own switch key',
     !drift.missingOnServer.includes('action') && !drift.missingLocally.includes('action'),
     'action is ours, no server tool defines it',
   );
-  // Seven of eleven, measured. A fold that hides most of a server is the reason
-  // discovery has to come FROM the server rather than from a copy of it.
-  eq('most of the gateway is unreachable through the fold', drift.unusedTools.length, 7);
-  assert('…and that includes the editing and history tools', [
+  // ELEVEN OF ELEVEN. This started as "7 of the gateway is unreachable through
+  // the fold", measured — a fold covering four tools out of eleven, which left
+  // editing a document, its whole history, reading a past revision, reverting to
+  // one, searching, and both stats calls impossible to express. The number in
+  // this assertion is the feature: it is the one place the gap is counted.
+  eq('every gateway tool is reachable through the fold', drift.unusedTools, []);
+  assert(
+    'nothing the gateway defines is left unreachable',
+    drift.missingLocally.length === 0,
+    drift.missingLocally.join(', '),
+  );
+  assert('…so the editing and history tools are no longer orphans', [
     'update_session',
     'search_sessions',
     'session_stats',
@@ -621,7 +655,7 @@ const FOLD = {
     'read_revision',
     'restore_revision',
     'revision_stats',
-  ].every((n) => drift.unusedTools.includes(n)));
+  ].every((n) => !drift.unusedTools.includes(n)), drift.unusedTools.join(', '));
 }
 
 {

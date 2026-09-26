@@ -229,6 +229,57 @@ export function compactList(page, baseUrl = '') {
   };
 }
 
+/**
+ * One revision row -> the compact shape both the relay and the app read.
+ *
+ * `revision` and `version` are DIFFERENT numbers and conflating them is the easy
+ * mistake here: the revision number is a position in the history log (it never
+ * repeats), while the version is the document version that row produced. A
+ * restore moves the document to a new version but appends a row, so history
+ * grows monotonically while versions jump.
+ *
+ * Returns null for a row with no usable revision number rather than inventing
+ * one, so a caller can tell "this was not a revision" from "revision 0".
+ */
+export function compactRevision(record) {
+  if (!record || typeof record !== 'object') return null;
+  const revision = Number(record.revision);
+  if (!Number.isFinite(revision)) return null;
+  return {
+    id: String(record.session_id ?? record.id ?? ''),
+    revision,
+    /** The DOCUMENT version this revision produced — not the revision number. */
+    version: Number(record.version) || 0,
+    /** create | update | replace | delete | restore | purge | revert */
+    change: String(record.change ?? ''),
+    title: String(record.title ?? ''),
+    agent: String(record.agent ?? ''),
+    size: Number(record.size) || 0,
+    contentType: String(record.content_type ?? ''),
+    /** False for a row that only moved metadata, so a listing can mark it. */
+    contentChanged: Boolean(record.content_changed),
+    /** When the change was made (ms), or null when the gateway did not say. */
+    createdAt: Date.parse(String(record.created_at ?? '')) || null,
+    tags: Array.isArray(record.tags) ? record.tags.map(String) : [],
+  };
+}
+
+/**
+ * The revision page envelope. Like compactList, but the gateway wraps a
+ * single-document query in `{ session_id, document, items }` and an ARCHIVE-wide
+ * one in `{ items }` — this normalises both to the items, so the caller does not
+ * have to know which shape it asked for.
+ */
+export function compactRevisions(page) {
+  const items = Array.isArray(page?.items) ? page.items : [];
+  return {
+    items: items.map(compactRevision).filter(Boolean),
+    total: Number(page?.total ?? page?.count ?? items.length) || 0,
+    hasMore: Boolean(page?.has_more),
+    nextOffset: page?.next_offset == null ? null : Number(page.next_offset),
+  };
+}
+
 // ── Rendering ────────────────────────────────────────────────────────────────
 
 const bytes = (n) => {
@@ -240,6 +291,19 @@ const bytes = (n) => {
 
 const clip = (s, n = RESULT_CHARS) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
+/** The gateway's change verbs as past-tense prose, for a human-readable log. */
+const CHANGE_LABEL = {
+  create: 'created',
+  replace: 'replaced',
+  update: 'updated',
+  delete: 'deleted',
+  restore: 'undeleted',
+  purge: 'purged',
+  revert: 'reverted',
+};
+
+const dayOf = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : 'unknown date');
+
 /**
  * The text a MODEL reads back.
  *
@@ -250,19 +314,77 @@ const clip = (s, n = RESULT_CHARS) => (s.length > n ? `${s.slice(0, n)}…` : s)
  */
 export function renderToolResult(action, data) {
   const run = String(action || '');
+
+  // The change log. Checked BEFORE the items branch below, because a revision
+  // page carries `items` too and would otherwise be reported to the model as a
+  // list of documents — the same field name, a different thing entirely.
+  if (run === 'list_revisions' && data && Array.isArray(data.items)) {
+    const { items, total, hasMore } = data;
+    if (!items.length) return 'No changes recorded yet.';
+    const lines = items.map(
+      (r, i) =>
+        `${i + 1}. ${CHANGE_LABEL[r.change] || r.change || 'changed'} v${r.version} ` +
+        `(revision ${r.revision}) "${r.title || 'untitled'}" [${r.agent || 'unknown'}] ` +
+        `${dayOf(r.createdAt)} · ${r.id}`,
+    );
+    return clip(
+      `Change history, newest first (${items.length} of ${total}${hasMore ? ', more available' : ''}):\n`
+        + lines.join('\n'),
+    );
+  }
+
   if (data && Array.isArray(data.items)) {
     const { items, total, hasMore } = data;
-    if (!items.length) return 'No documents stored yet.';
+    // A search answers with the same envelope as a list, so the heading is the
+    // only thing telling the model it asked a narrower question.
+    const heading = run === 'search_sessions' ? 'Matching documents' : 'Stored documents';
+    if (!items.length) {
+      return run === 'search_sessions' ? 'No document matches that search.' : 'No documents stored yet.';
+    }
     const lines = items.map(
       (d, i) =>
         `${i + 1}. ${d.title} [${d.agent || 'unknown'}] ${bytes(d.size)} · ${d.id}` +
         (d.tags.length ? ` #${d.tags.join(' #')}` : ''),
     );
     return clip(
-      `Stored documents (${items.length} of ${total}${hasMore ? ', more available' : ''}):\n` +
-        lines.join('\n'),
+      `${heading} (${items.length} of ${total}${hasMore ? ', more available' : ''}):\n` + lines.join('\n'),
     );
   }
+
+  // One history entry read on its own.
+  if (run === 'read_revision' && data && Number.isFinite(Number(data.revision))) {
+    const r = data;
+    return clip(
+      `Revision ${r.revision} of ${r.id} — ${CHANGE_LABEL[r.change] || r.change || 'changed'} on `
+        + `${dayOf(r.createdAt)}${r.contentChanged ? '' : ', metadata only'}. `
+        + `It produced version ${r.version}. Revert to it with action "revert".`,
+    );
+  }
+
+  // Library totals. These answer with no document of their own, so without a
+  // branch here they would fall through to the bare "done." line and tell the
+  // model nothing about the question it just asked.
+  if (run === 'session_stats' && data && Number.isFinite(Number(data.sessions))) {
+    const bits = [
+      `${Number(data.live_sessions) || 0} live documents`,
+      `${Number(data.deleted_sessions) || 0} soft-deleted`,
+      `${bytes(data.storage_bytes)} stored`,
+      `${Number(data.agents) || 0} authors`,
+      `${Number(data.tags) || 0} tags`,
+    ];
+    return clip(
+      `Library: ${bits.join(', ')}. `
+        + 'Soft-deleted documents are still recoverable from the Files page.',
+    );
+  }
+  if (run === 'revision_stats' && data && Number.isFinite(Number(data.revisions))) {
+    return clip(
+      `History: ${Number(data.revisions) || 0} revisions, `
+        + `${Number(data.content_changes) || 0} of them content changes, `
+        + `${bytes(data.revision_bytes)} of stored snapshots.`,
+    );
+  }
+
   const d = data && data.id ? data : null;
   if (!d) return clip(`jarvis_files ${run}: done.`);
   const head = `${d.title} [${d.agent || 'unknown'}] ${bytes(d.size)} · v${d.version}`;
@@ -281,8 +403,17 @@ export function renderToolResult(action, data) {
       ? `Permanently deleted ${d.id} — the stored bytes are gone and it cannot be restored.`
       : `Deleted ${d.id}. It is recoverable: the wearer can restore it from the Files page.`;
   }
-  if (run === 'update_session' || run === 'restore_revision') {
+  if (run === 'update_session') {
     return clip(`Updated ${d.id} — ${head}.`);
+  }
+  if (run === 'restore_revision') {
+    // Measured live: a revert appends a row rather than rewriting history, so
+    // saying so is accurate and it is the fact the model needs to reassure the
+    // wearer with.
+    return clip(
+      `Reverted ${d.id} — ${head}. Nothing was discarded: every version is still in the `
+        + 'history and the one just replaced can be reverted to in the same way.',
+    );
   }
   return clip(head);
 }
@@ -886,8 +1017,194 @@ export function createFilesClient(opts = {}) {
     return doc ?? { id: String(id), title: '', deleted: false, restored: true };
   }
 
+  /**
+   * The library's own totals — `session_stats`. Document and agent counts, tag
+   * usage, bytes, and (verified live) the archive-wide revision stats nested
+   * under `revisions`, which is why `revisionStats()` below is only needed when
+   * the question is scoped to ONE document.
+   */
   async function stats({ signal } = {}) {
     return call('session_stats', {}, { signal });
+  }
+
+  /**
+   * Edit a stored document IN PLACE — `update_session`.
+   *
+   * A different operation from `create` with `overwrite`, not a synonym: create
+   * mints a version from a REPLACEMENT body, while this one can change the
+   * metadata alone and leave the stored bytes exactly as they were. Measured
+   * live, a title-only edit bumps the version (1 -> 2) and re-derives the slug
+   * (`schema-probe` -> `schema-probe-v2`), so it is a real write even with no
+   * `html`.
+   *
+   * `if_version` is optimistic concurrency. Measured live: a stale value is
+   * answered `FilesError conflict` — "the document was modified by someone
+   * else" — instead of clobbering the other writer. Omitted, the edit always
+   * wins, which is right for a wearer editing their own document and wrong for a
+   * retry loop, so a caller that retries should pass the version it read.
+   */
+  async function update(id, { html, title, tags, agent, contentType, ifVersion, signal } = {}) {
+    const docId = String(id ?? '').trim();
+    if (!docId) throw new FilesError('validation_error', 'id is required');
+    const args = { id: docId };
+    let touched = false;
+    if (html != null) {
+      const next = String(html);
+      if (!next.trim()) {
+        // The gateway accepts an empty string here and stores a document with no
+        // body, which is never what "edit this" meant.
+        throw new FilesError('validation_error', 'html cannot be emptied — delete the document instead');
+      }
+      if (Buffer.byteLength(next, 'utf8') > MAX_HTML_BYTES) {
+        throw new FilesError('payload_too_large', `document exceeds ${bytes(MAX_HTML_BYTES)}`);
+      }
+      args.html = next;
+      touched = true;
+    }
+    if (title != null) {
+      args.title = String(title).slice(0, 300);
+      touched = true;
+    }
+    if (tags != null) {
+      // Accepts the comma-separated string the wearer's tool sends as well as a
+      // real array, because `tags` means "the full new set" here — an absent key
+      // leaves the old tags alone, and there is no way to clear them but to
+      // send an empty set (which the gateway then stores as no tags).
+      const list = (Array.isArray(tags) ? tags : String(tags).split(','))
+        .map((t) => String(t).trim())
+        .filter(Boolean)
+        .slice(0, 12);
+      args.tags = list;
+      touched = true;
+    }
+    if (agent) {
+      args.agent = String(agent);
+      touched = true;
+    }
+    if (contentType) {
+      args.content_type = String(contentType);
+      touched = true;
+    }
+    // An `update_session` with nothing to change still appends a revision and
+    // bumps the version, so refusing here keeps a no-op from filling the
+    // history with rows that say nothing happened.
+    if (!touched) {
+      throw new FilesError('validation_error', 'nothing to update — pass html, title, tags, agent or contentType');
+    }
+    if (Number.isFinite(Number(ifVersion)) && Number(ifVersion) > 0) args.if_version = Number(ifVersion);
+    const rec = await call('update_session', args, { signal });
+    const doc = compactDoc(rec, baseUrl);
+    if (!doc) throw new FilesError('empty_result', 'the gateway did not return the updated document');
+    return doc;
+  }
+
+  /**
+   * A document's change history — `list_revisions`.
+   *
+   * With NO id this is the WHOLE ARCHIVE's history, newest first. Verified live:
+   * a single-document query answers `{ session_id, document, items }` and the
+   * archive query answers `{ items }` with no `document` envelope, so this
+   * doubles as "what changed lately" without naming a document first.
+   *
+   * `change` filters by kind (create | replace | update | delete | restore |
+   * purge | revert), so "what did an agent DELETE" is one call.
+   */
+  async function revisions({ id, change, subject, agent, order, limit = LIST_DEFAULT_LIMIT, offset = 0, signal } = {}) {
+    const args = {
+      limit: Math.min(LIST_MAX_LIMIT, Math.max(1, Number(limit) || LIST_DEFAULT_LIMIT)),
+      offset: Math.max(0, Number(offset) || 0),
+    };
+    const docId = String(id ?? '').trim();
+    if (docId) args.id = docId;
+    if (change) args.change = String(change);
+    if (subject) args.subject = String(subject);
+    if (agent) args.agent = String(agent);
+    if (order) args.order = String(order);
+    const page = await call('list_revisions', args, { signal });
+    return { ...compactRevisions(page), raw: page };
+  }
+
+  /**
+   * ONE revision — `read_revision`.
+   *
+   * The body comes back only when asked for, for the same reason `read`
+   * defaults it off: a past body is still a whole document, and the model has no
+   * use for the bytes. A revision that does not exist is a `not_found`, verified
+   * live against revision 999.
+   */
+  async function revision(id, revision, { includeHtml = false, signal } = {}) {
+    const docId = String(id ?? '').trim();
+    const rev = Number(revision);
+    if (!docId) throw new FilesError('validation_error', 'id is required');
+    if (!Number.isFinite(rev) || rev < 1) {
+      throw new FilesError('validation_error', 'revision must be a positive integer');
+    }
+    const rec = await call(
+      'read_revision',
+      { id: docId, revision: rev, include_html: Boolean(includeHtml) },
+      { signal },
+    );
+    const meta = compactRevision(rec);
+    if (!meta) throw new FilesError('not_found', 'revision not found', { status: 404 });
+    return includeHtml ? { ...meta, html: String(rec.html ?? '') } : meta;
+  }
+
+  /**
+   * Make an old revision current again — `restore_revision`.
+   *
+   * Measured live: this does NOT rewrite history. It appends a `revert` row and
+   * moves the document to a NEW version whose bytes are the old ones (version
+   * 2 -> 3 with revision 1's sha256), so the restore is itself undoable. That is
+   * why the app offers it as a normal write rather than an irreversible one.
+   *
+   * `restore_metadata` (gateway default true) brings the title, tags and agent
+   * back along with the body; the live probe showed the slug reverting with the
+   * title. Pass false to revert the content while keeping today's metadata.
+   */
+  async function restoreRevision(id, revision, { restoreMetadata = true, ifVersion, subject, signal } = {}) {
+    const docId = String(id ?? '').trim();
+    const rev = Number(revision);
+    if (!docId) throw new FilesError('validation_error', 'id is required');
+    if (!Number.isFinite(rev) || rev < 1) {
+      throw new FilesError('validation_error', 'revision must be a positive integer');
+    }
+    const args = { id: docId, revision: rev, restore_metadata: Boolean(restoreMetadata) };
+    if (subject) args.subject = String(subject);
+    if (Number.isFinite(Number(ifVersion)) && Number(ifVersion) > 0) args.if_version = Number(ifVersion);
+    const rec = await call('restore_revision', args, { signal });
+    const doc = compactDoc(rec, baseUrl);
+    // The gateway answers with the DOCUMENT record, not a revision row (verified
+    // live), so this reports the document that is now current.
+    if (!doc) throw new FilesError('empty_result', 'the gateway did not return the restored document');
+    return doc;
+  }
+
+  /**
+   * Substring search over titles and AGENT NAMES — `search_sessions`.
+   *
+   * Narrower than `list` on purpose: no paging, no filters, and `q` is required,
+   * so it is the cheap "find that document" call rather than a query builder.
+   */
+  async function search({ q, limit = LIST_DEFAULT_LIMIT, signal } = {}) {
+    const term = String(q ?? '').trim();
+    if (!term) throw new FilesError('validation_error', 'q is required to search');
+    const page = await call(
+      'search_sessions',
+      { q: term, limit: Math.min(LIST_MAX_LIMIT, Math.max(1, Number(limit) || LIST_DEFAULT_LIMIT)) },
+      { signal },
+    );
+    return { ...compactList(page, baseUrl), raw: page };
+  }
+
+  /**
+   * How much history is kept and how much disk the snapshots occupy —
+   * `revision_stats`. Scoped to one document when given an id, archive-wide when
+   * not (verified live: `revisions` follows the id while the archive totals, such
+   * as `documents_tracked`, stay global either way).
+   */
+  async function revisionStats(id, { signal } = {}) {
+    const docId = String(id ?? '').trim();
+    return call('revision_stats', docId ? { id: docId } : {}, { signal });
   }
 
   /**
@@ -929,11 +1246,17 @@ export function createFilesClient(opts = {}) {
     login: signIn,
     list,
     listAll,
+    search,
     read,
     create,
+    update,
     remove,
     restore,
     stats,
+    revisions,
+    revision,
+    restoreRevision,
+    revisionStats,
     body,
   };
 }
@@ -942,6 +1265,24 @@ export function createFilesClient(opts = {}) {
  * The model-facing tool schema, built here so it cannot drift from the client
  * that implements it. Mirrors toolSchemaFor() in local-sse.mjs for the other
  * kinds: one flat object the model can write well, with the actions enumerated.
+ *
+ * WHY ONE TOOL AND NOT ELEVEN
+ *   The gateway exposes eleven tools; this is the ONE the model sees. The reason
+ *   is a budget, not taste: the client offers a page at most `MAX_TOOLS` tools in
+ *   total, and eleven document tools would evict the page's own navigation to
+ *   make room — leaving the model unable to open the page whose tools it was just
+ *   given. The `action` switch is what makes eleven capabilities cost one slot.
+ *
+ * WHY EVERY PARAMETER IS DECLARED HERE
+ *   This object is the ONLY description of the parameter layer the model gets, so
+ *   a parameter the gateway accepts but this omits is a capability nothing can
+ *   reach — which is exactly how `hard`, `reason` and `include_html` were lost.
+ *   The set below is therefore the UNION of the eleven tools' parameters, and
+ *   checkFilesSchemaDrift() in local-sse.mjs verifies that claim at every boot
+ *   against the gateway's own `tools/list`. Because the parameters overlap
+ *   (`id`, `html`, `title`, `agent`, `tags` and `content_type` each serve several
+ *   actions), each description names the actions it belongs to; a parameter used
+ *   by exactly one action says so and is ignored otherwise.
  */
 export function filesToolSchema(t) {
   return {
@@ -950,43 +1291,148 @@ export function filesToolSchema(t) {
       name: t?.name || FILES_TOOL_NAME,
       description:
         t?.description ||
-        'Store an HTML document in the wearer documents library, or read what is already there. ' +
-          'Use it to publish a report, briefing, table or chart the wearer can open on the Files page. ' +
+        'Store HTML documents in the wearer documents library, and edit, search, delete or ' +
+          'version them. Use it to publish a report, briefing, table or chart the wearer can open ' +
+          'on the Files page, to change one that is already there, or to look at what changed. ' +
           'The document body is NOT returned to you — the wearer reads it on screen.',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['publish', 'list', 'read', 'delete'],
+            enum: [
+              'publish',
+              'list',
+              'search',
+              'stats',
+              'read',
+              'update',
+              'delete',
+              'history',
+              'revision',
+              'revert',
+              'revision_stats',
+            ],
             description:
-              'publish = create an HTML document; list = what is already stored; ' +
-              'read = one document metadata; delete = remove a document.',
-          },
-          html: {
-            type: 'string',
-            description:
-              'publish only: the FULL document. Use real HTML (<h1>, <table>, <ul>…). ' +
-              'Inline CSS is allowed and is the easiest way to make a chart or a table readable.',
-          },
-          title: { type: 'string', description: 'publish only: a short human title.' },
-          tags: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'publish only: up to 12 short tags, e.g. ["daily","finance"].',
+              'publish = create a document; list = what is stored; search = find one by title or ' +
+              'author; stats = library totals and disk use; read = one document metadata; ' +
+              'update = change a document in place; delete = remove a document; ' +
+              'history = the change log (one document, or everything when id is omitted); ' +
+              'revision = one entry of that history; revert = make an old revision current again; ' +
+              'revision_stats = how much history is kept.',
           },
           id: {
             type: 'string',
             description:
-              'publish/read/delete: the 32-character document id. Publishing WITH an id is ' +
-              'idempotent, so a retried publish cannot create two copies.',
+              'The 32-character document id. Required by read/update/delete/revision/revert; ' +
+              'optional for history and revision_stats (omit for the whole archive). Publishing ' +
+              'WITH an id is idempotent, so a retried publish cannot create two copies.',
+          },
+          html: {
+            type: 'string',
+            description:
+              'publish: the FULL document. update: the replacement body. Use real HTML (<h1>, ' +
+              '<table>, <ul>…). Inline CSS is allowed and is the easiest way to make a chart or ' +
+              'a table readable.',
+          },
+          title: {
+            type: 'string',
+            description:
+              'publish/update: a short human title. Derived from <title>/<h1> when omitted. ' +
+              'Changing it on update also re-derives the document slug.',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'publish/update: up to 12 short tags, e.g. ["daily","finance"]. On update this is ' +
+              'the FULL new set, so send every tag that should remain.',
+          },
+          agent: {
+            type: 'string',
+            description:
+              'publish/update: the author name recorded on the document. Also filters list and history.',
+          },
+          content_type: {
+            type: 'string',
+            enum: ['text/html', 'text/plain', 'application/xhtml+xml'],
+            description:
+              'publish/update: the body media type. Set text/plain for prose, because the ' +
+              'gateway rejects a body that does not look like HTML.',
+          },
+          slug: {
+            type: 'string',
+            description: 'publish only: the URL-ish name used in download filenames.',
           },
           overwrite: {
             type: 'boolean',
             description: 'publish only: with an id, replace that document instead of failing.',
           },
-          q: { type: 'string', description: 'list only: free-text term to filter titles by.' },
-          agent: { type: 'string', description: 'Optional author name recorded on the document.' },
+          hard: {
+            type: 'boolean',
+            description:
+              'delete only: true purges the stored bytes and it CANNOT be restored. Default ' +
+              'false is a soft delete the wearer can undo from the Files page.',
+          },
+          reason: {
+            type: 'string',
+            description: 'delete only: why it was removed, recorded on the document.',
+          },
+          if_version: {
+            type: 'integer',
+            description:
+              'update/revert: optimistic concurrency guard. The version you read; the call fails ' +
+              'with a conflict instead of overwriting somebody else’s newer edit.',
+          },
+          restore_metadata: {
+            type: 'boolean',
+            description:
+              'revert only: also bring the title, tags and agent back (default true). False ' +
+              'reverts the content but keeps today’s metadata.',
+          },
+          subject: {
+            type: 'string',
+            description: 'history/revert: filter or record changes made by this subject.',
+          },
+          revision: {
+            type: 'integer',
+            description:
+              'revision/revert: the history position to read or restore. This is the REVISION ' +
+              'number, not the document version — history never reuses a number.',
+          },
+          change: {
+            type: 'string',
+            enum: ['create', 'replace', 'update', 'delete', 'restore', 'purge', 'revert'],
+            description: 'history only: keep just changes of this kind.',
+          },
+          include_html: {
+            type: 'boolean',
+            description:
+              'read/revision: ask for the document body too. Accepted because the document server ' +
+              'defines it, but this app never puts a body in a tool result — the wearer reads ' +
+              'documents on screen — so asking changes nothing. Leave it false.',
+          },
+          q: {
+            type: 'string',
+            description: 'list/search: free-text term matched against titles and author names.',
+          },
+          tag: { type: 'string', description: 'list only: keep only documents carrying this tag.' },
+          order: {
+            type: 'string',
+            description:
+              'list: created_desc | created_asc | updated_desc | updated_asc | title_asc | ' +
+              'title_desc | title_similarity_desc | agent_asc. history: revision_desc | ' +
+              'revision_asc | created_desc | created_asc.',
+          },
+          include_deleted: {
+            type: 'boolean',
+            description: 'list only: also return soft-deleted documents, which can be restored.',
+          },
+          limit: {
+            type: 'integer',
+            description: 'list/search/history: how many rows to return (1–200).',
+          },
+          offset: { type: 'integer', description: 'list/history only: rows to skip.' },
         },
         required: ['action'],
       },

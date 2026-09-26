@@ -1758,6 +1758,32 @@ const toolCatalog = await capOf('tools.list').run({});
 assert('tools.list names the seeded search tool', JSON.stringify(toolCatalog.data).includes('web_search'));
 assert('tools.list names the REST tool', JSON.stringify(toolCatalog.data).includes('get_weather'));
 
+// The list must advertise every kind the RELAY can execute, not just the tools
+// the catalog happens to hold. This is what makes the document store and jev
+// discoverable by a voice-only wearer: before, the list was built from the
+// catalog alone, so an install holding only web search answered
+// "1 tool(s): web_search" and naming either of the others matched nothing.
+assert(
+  'tools.list advertises the document store it does not hold yet',
+  JSON.stringify(toolCatalog.data).includes('jarvis_files'),
+);
+assert('tools.list advertises jev', JSON.stringify(toolCatalog.data).includes('jev_decide'));
+check(
+  '…and marks exactly the un-created kinds as available',
+  toolCatalog.data.tools
+    .filter((t) => t.available)
+    .map((t) => t.kind)
+    .sort(),
+  ['files', 'jev'],
+);
+// ASKING is not OPTING IN: a read must not create them, or a deleted tool would
+// come back the moment anything listed what was on offer.
+check(
+  'listing tools creates nothing (opt-in is still the wearer\'s word)',
+  agents.getAgents().tools.filter((t) => t.kind === 'files' || t.kind === 'jev').length,
+  0,
+);
+
 // create: set every setting at once, resolving spoken tool names.
 const created = await capOf('agents.create').run({
   name: 'Researcher',
@@ -1842,6 +1868,45 @@ const row = listed.data.agents.find((a) => a.name === 'Scout');
 assert('agents.list returns toolIds', Array.isArray(row.toolIds));
 assert('agents.list returns the model field', 'model' in row);
 assert('agents.list returns the role', typeof row.systemPrompt === 'string');
+
+// Opt in to a tool by DESCRIBING it. This is the whole fix: the web panel could
+// always attach the document store with one button, but the wearer of the
+// glasses has no keyboard and no panel, so "give it the document store" has to
+// create the tool AND attach it in one spoken phrase.
+console.log('\n── Agent builder: opting in to a tool by describing it ──');
+
+const withDocs = await capOf('agents.create').run({ name: 'Archivist', tools: 'stored documents' });
+assert('create succeeds describing the document store', withDocs.ok, withDocs.summary);
+stored = agents.getAgents().agents;
+check('…creates the tool and attaches it', stored.find((a) => a.name === 'Archivist').toolIds, ['tool-files']);
+check('…and the catalog now holds it', agents.getAgents().tools.some((t) => t.kind === 'files'), true);
+
+const withJev = await capOf('agents.create').run({ name: 'Adjudicator', tools: 'jev decision' });
+assert('create succeeds describing jev', withJev.ok, withJev.summary);
+stored = agents.getAgents().agents;
+check('…creates jev and attaches it', stored.find((a) => a.name === 'Adjudicator').toolIds, ['tool-jev']);
+
+// …and through addTools/removeTools on the SAME described phrasing.
+const added = await capOf('agents.update').run({ agent: 'Archivist', addTools: 'web search' });
+assert('update adds a second tool by description', added.ok, added.summary);
+stored = agents.getAgents().agents;
+check('…keeping the first', stored.find((a) => a.name === 'Archivist').toolIds, ['tool-files', 'tool-web']);
+
+await capOf('agents.update').run({ agent: 'Archivist', removeTools: 'stored documents' });
+stored = agents.getAgents().agents;
+check(
+  'update removes the document store by description',
+  stored.find((a) => a.name === 'Archivist').toolIds,
+  ['tool-web'],
+);
+
+// A kind the relay cannot execute must NOT be invented. Agent runs execute
+// server-side in the relay, which has routes for web search, the document
+// gateway and jev and nothing else — so todos/docs/notes do not exist for an
+// agent however they are phrased, and saying so is better than a silent no-op.
+const bogus = await capOf('agents.update').run({ agent: 'Adjudicator', tools: 'manage my todos' });
+check('an unexecutable tool is refused, not invented', bogus.ok, false);
+assert('…with the unmatched phrase reported back', /no such tool/.test(bogus.hint ?? ''), bogus.hint);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Sessions: a stored run must be readable back IN FULL

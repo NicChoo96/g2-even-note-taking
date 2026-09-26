@@ -106,7 +106,7 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 async function sendJson<T>(
-  method: 'POST' | 'DELETE',
+  method: 'POST' | 'PATCH' | 'DELETE',
   path: string,
   body?: unknown,
 ): Promise<T> {
@@ -230,6 +230,173 @@ export function deleteFile(id: string, hard = false): Promise<DeleteResult> {
  */
 export function restoreFile(id: string): Promise<RestoreResult> {
   return sendJson<RestoreResult>('POST', `/api/files/${encodeURIComponent(id)}/restore`);
+}
+
+/**
+ * What an in-place edit may change. Every field is optional because the gateway
+ * treats "edit" as a patch, not a replacement: sending only `title` leaves the
+ * stored bytes exactly as they were and still mints a new version.
+ */
+export interface UpdateInput {
+  html?: string;
+  title?: string;
+  tags?: string[];
+  agent?: string;
+  contentType?: string;
+  /**
+   * Refuse the edit if the document has moved past this version.
+   *
+   * Worth setting whenever the version is known, because the gateway's
+   * answer when it is stale is a real `conflict` rather than a silent
+   * overwrite — and the wearer re-reads instead of losing someone's work.
+   */
+  ifVersion?: number;
+}
+
+/**
+ * Edit a document in place.
+ *
+ * Distinct from `publishFile`, and the distinction is the gateway's own: publish
+ * mints a version from a REPLACEMENT body, while this can change the title or
+ * the tags alone and leave the stored document untouched. Sending an empty
+ * `html` is refused upstream rather than stored, because an edit that blanks a
+ * document is always a mistake — deleting is the operation that means that.
+ */
+export function updateFile(id: string, input: UpdateInput): Promise<ReadResult> {
+  return sendJson<ReadResult>('PATCH', `/api/files/${encodeURIComponent(id)}`, input);
+}
+
+/**
+ * One entry in a document's change log.
+ *
+ * `revision` and `version` are NOT the same number and the difference matters:
+ * `revision` is the position in the history (1, 2, 3, … — every change gets
+ * one), while `version` is the document version that entry produced. A metadata
+ * edit appends a revision without moving the version.
+ */
+export interface RevisionRef {
+  id: string;
+  revision: number;
+  version: number;
+  /** `create` | `replace` | `update` | `delete` | `restore` | `purge` | `revert`. */
+  change: string;
+  title: string;
+  agent: string;
+  size: number;
+  contentType?: string;
+  /** False when the entry only touched metadata — a rename, or a tag change. */
+  contentChanged: boolean;
+  createdAt: number;
+  tags: string[];
+}
+
+export interface RevisionListResult {
+  ok: boolean;
+  items: RevisionRef[];
+  total: number;
+  hasMore: boolean;
+  error?: string;
+}
+
+export interface RevisionResult {
+  ok: boolean;
+  revision?: RevisionRef;
+  error?: string;
+}
+
+/**
+ * A document's change log, newest first.
+ *
+ * `change` filters by kind, which is what makes "what has anything deleted?"
+ * one call. `order` is the gateway's own enum (`revision_desc` by default).
+ */
+export async function listRevisions(
+  id: string,
+  opts: { change?: string; subject?: string; order?: string; limit?: number; offset?: number } = {},
+): Promise<RevisionListResult> {
+  const q = new URLSearchParams();
+  if (opts.change) q.set('change', opts.change);
+  if (opts.subject) q.set('subject', opts.subject);
+  if (opts.order) q.set('order', opts.order);
+  if (opts.limit) q.set('limit', String(opts.limit));
+  if (opts.offset) q.set('offset', String(opts.offset));
+  const suffix = q.toString() ? `?${q}` : '';
+  const res = await getJson<RevisionListResult>(
+    `/api/files/${encodeURIComponent(id)}/revisions${suffix}`,
+  );
+  return {
+    ok: res.ok === true,
+    items: Array.isArray(res.items) ? res.items : [],
+    total: Number(res.total) || 0,
+    hasMore: Boolean(res.hasMore),
+    error: res.error,
+  };
+}
+
+/** One past revision's metadata. Never its body — same rule as `readFile`. */
+export function readRevision(id: string, revision: number): Promise<RevisionResult> {
+  return getJson<RevisionResult>(
+    `/api/files/${encodeURIComponent(id)}/revisions/${encodeURIComponent(String(revision))}`,
+  );
+}
+
+/**
+ * Make a past revision current again.
+ *
+ * NOT the inverse of `deleteFile` — that is `restoreFile`. This is the gateway's
+ * `restore_revision`, and it works by APPENDING a `revert` entry rather than
+ * rewinding: the versions it replaced stay in the history, so a revert is itself
+ * undoable and nothing needs confirming twice.
+ */
+export function restoreRevision(
+  id: string,
+  revision: number,
+  opts: { restoreMetadata?: boolean; ifVersion?: number } = {},
+): Promise<RestoreResult> {
+  return sendJson<RestoreResult>(
+    'POST',
+    `/api/files/${encodeURIComponent(id)}/revisions/${encodeURIComponent(String(revision))}/restore`,
+    { restoreMetadata: opts.restoreMetadata !== false, ...(opts.ifVersion ? { ifVersion: opts.ifVersion } : {}) },
+  );
+}
+
+/**
+ * Library totals — the archive's own answer to "how much is stored here?"
+ *
+ * Every field is optional because the gateway's two stats tools answer with
+ * different, overlapping sets and neither is documented: a client that typed
+ * them as required would be inventing keys. Render what is present.
+ */
+export interface FileStats {
+  ok: boolean;
+  error?: string;
+  /** `session_stats` only. */
+  sessions?: number;
+  live_sessions?: number;
+  deleted_sessions?: number;
+  agents?: number;
+  tags?: number;
+  bytes?: number;
+  database_bytes?: number;
+  storage_bytes?: number;
+  oldest_created_at?: number | null;
+  newest_created_at?: number | null;
+  /** Both tools report revision counts; archive-wide unless an id was given. */
+  revisions?: number;
+  content_changes?: number;
+  revision_bytes?: number;
+}
+
+/**
+ * The archive's totals, or one document's revision totals when `id` is given.
+ *
+ * The relay picks the gateway tool: `session_stats` for the archive, which is
+ * the only one that knows how many documents exist, and `revision_stats` when a
+ * document is named, which is the only one that can scope to it.
+ */
+export function fetchFileStats(id?: string): Promise<FileStats> {
+  const suffix = id ? `?id=${encodeURIComponent(id)}` : '';
+  return getJson<FileStats>(`/api/files/stats${suffix}`);
 }
 
 /**

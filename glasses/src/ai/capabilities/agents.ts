@@ -8,7 +8,20 @@
 import { getAgents, updateAgents } from '../../agents-store';
 import { getRuns } from '../../agent-runs';
 import { fetchRuns, startRun, stopRun } from '../../stream';
-import { SEED_TOOL_ID, webSearchTool, uid, type AgentDef, type AgentMessage, type ToolDef } from '../../types';
+import {
+  SEED_TOOL_ID,
+  webSearchTool,
+  filesTool,
+  jevTool,
+  todoTool,
+  docsTool,
+  notesTool,
+  uid,
+  type AgentDef,
+  type AgentMessage,
+  type ToolDef,
+  type ToolKind,
+} from '../../types';
 import { enqueueMonitoredRun, monitorAge, type MonitorStatus } from '../monitor';
 import type { Capability, CapabilityResult } from '../types';
 import { resolveAgent, short } from './shared';
@@ -34,19 +47,106 @@ function agentNames(): string {
 
 /** Phrases that mean "no tools at all". */
 const NO_TOOLS = /^(none|no tools?|nothing|off|clear|empty|remove all|all off|disable all)$/i;
-/** Phrases that clearly mean the seeded web-search tool. */
-const SEARCH_WORDS = /(search|web|internet|online|tavily|brave|google)/i;
+/**
+ * A seed tool an agent can be given, plus the words a wearer is likely to say
+ * INSTEAD of its name.
+ *
+ * There is one entry per kind the relay can actually execute. The table exists
+ * because web search used to be the only kind with a keyword fallback: "add the
+ * document store" matched nothing, landed in `unknown`, and the agent came out
+ * of it with no tools at all — while the web panel attached the same tool with
+ * one button. A phrase that describes a kind now MATERIALISES that kind's seed
+ * tool, which is exactly what the panel's "+ Stored docs" button already did.
+ *
+ * Nothing here is pre-attached. `emptyAgentsState` stays a one-tool catalogue
+ * and `agents-store.ts` never names a kind, so a tool the wearer deleted is not
+ * resurrected merely by a reload (see tools/jev-spec-sim.mjs).
+ */
+interface SeedTool {
+  kind: ToolKind;
+  /** Words that mean this tool once a name lookup has already failed. */
+  words: RegExp;
+  /** Build the ToolDef on demand. */
+  make: () => ToolDef;
+}
 
-/** Forgiving tool lookup: id → exact name → substring → kind keyword. */
-function findTool(part: string, tools: ToolDef[]): ToolDef | null {
-  const t = part.trim().toLowerCase();
-  if (!t) return null;
-  return (
-    tools.find((x) => x.id.toLowerCase() === t) ??
-    tools.find((x) => x.name.toLowerCase() === t) ??
-    tools.find((x) => x.name.toLowerCase().includes(t) || x.id.toLowerCase().includes(t)) ??
-    (SEARCH_WORDS.test(t) ? tools.find((x) => x.kind === 'web') ?? null : null)
-  );
+const WEB_SEED: SeedTool = {
+  kind: 'web',
+  words: /(search|web|internet|online|tavily|brave|google)/i,
+  make: webSearchTool,
+};
+/** The relay's document gateway — the wearer reads the page on the Files tab. */
+const FILES_SEED: SeedTool = {
+  kind: 'files',
+  words: /(files?|docs?|documents?|stored|store|library|publish|reports?|briefing)/i,
+  make: filesTool,
+};
+/** The typed-decision tool, which is also the reranker Jarvis uses. */
+const JEV_SEED: SeedTool = {
+  kind: 'jev',
+  words: /(jev|decide|decision|judge|verdict|rerank|reranker|rank|score|probabilit|confidence)/i,
+  make: jevTool,
+};
+
+/** The wearer's own task list — the To-Do page. */
+const TODO_SEED: SeedTool = {
+  kind: 'todo',
+  words: /(to-?do|tasks?|checklist|chores?|reminders?)/i,
+  make: todoTool,
+};
+/**
+ * The wearer's own saved documents — the Docs page.
+ *
+ * These words are deliberately NOT the gateway's. FILES_SEED already claims the
+ * broad vocabulary (`docs?`, `documents?`, `store`, `library`, `reports`) for the
+ * external store, and it is offered FIRST only because its words are looser — so
+ * `docs?` is absent here on purpose: it matches inside "document", and a phrase
+ * like "the document store" must keep resolving to the gateway. What is left is
+ * vocabulary that can only mean the wearer's own library.
+ */
+const DOCS_SEED: SeedTool = {
+  kind: 'docs',
+  words: /(docs? tab|documents? tab|my (own )?(docs|documents)|(own|personal|saved) (docs|documents)|drafts?|journals?)/i,
+  make: docsTool,
+};
+/** The Notes scratchpad — one free-text blob, not a document. */
+const NOTES_SEED: SeedTool = {
+  kind: 'notes',
+  words: /(notes?|scratchpad|memo)/i,
+  make: notesTool,
+};
+
+/**
+ * Every kind an agent may be given, in the order they are offered.
+ *
+ * FILES_SEED sits after the hub seeds because `find` takes the FIRST match and
+ * its vocabulary is the loosest ("docs", "documents", "store", "library"): a
+ * phrase the wearer aimed at the Docs page ("my documents") would otherwise be
+ * swallowed by the gateway tool, which is the one confusing answer here — the
+ * report would be published where they are not looking.
+ */
+const SEED_TOOLS: readonly SeedTool[] = [
+  WEB_SEED,
+  TODO_SEED,
+  DOCS_SEED,
+  NOTES_SEED,
+  FILES_SEED,
+  JEV_SEED,
+];
+
+/**
+ * The catalogue's tool of `kind`, adding the seed to it if it is missing.
+ *
+ * Called ONLY from an explicit attach — the wearer naming the tool through
+ * agents.create/agents.update. Reads (agents.list, tools.list) never come here,
+ * so being TOLD a tool exists cannot resurrect one that was deleted.
+ */
+function ensureSeedTool(seed: SeedTool): ToolDef {
+  const found = getAgents().tools.find((t) => t.kind === seed.kind);
+  if (found) return found;
+  const tool = seed.make();
+  updateAgents((s) => ({ ...s, tools: [...s.tools, tool] }));
+  return tool;
 }
 
 /**
@@ -55,11 +155,28 @@ function findTool(part: string, tools: ToolDef[]): ToolDef | null {
  * spoken name, so "add web search" always works.
  */
 function toolsWithWebSearch(): ToolDef[] {
-  const st = getAgents();
-  if (st.tools.some((t) => t.kind === 'web')) return st.tools;
-  const tool = webSearchTool();
-  updateAgents((s) => ({ ...s, tools: [tool, ...s.tools] }));
-  return [tool, ...st.tools];
+  ensureSeedTool(WEB_SEED);
+  return getAgents().tools;
+}
+
+/**
+ * Forgiving tool lookup: id → exact name → substring → KIND keyword.
+ *
+ * The last step is what lets a wearer name a tool the catalogue does not hold
+ * yet by describing it ("the document store", "jev"). It resolves that kind's
+ * seed tool through `ensureSeedTool`, so one spoken phrase is enough to both
+ * create and attach it.
+ */
+function findTool(part: string, tools: ToolDef[]): ToolDef | null {
+  const t = part.trim().toLowerCase();
+  if (!t) return null;
+  const named =
+    tools.find((x) => x.id.toLowerCase() === t) ??
+    tools.find((x) => x.name.toLowerCase() === t) ??
+    tools.find((x) => x.name.toLowerCase().includes(t) || x.id.toLowerCase().includes(t));
+  if (named) return named;
+  const seed = SEED_TOOLS.find((s) => s.words.test(t));
+  return seed ? ensureSeedTool(seed) : null;
 }
 
 interface ToolParse {
@@ -525,8 +642,11 @@ export const agentsCapabilities: Capability[] = [
         name: 'tools',
         type: 'string',
         description:
-          'Comma-separated tool names to enable (e.g. "web search"). Defaults to web search. ' +
-          'Use "none" for no tools. See tools.list for names.',
+          'Comma-separated tools to enable: "web search" (live internet), "stored documents" ' +
+          '(publish an HTML report the wearer reads on the Files tab), "jev decision" (a typed ' +
+          'yes/no, pick-one or ranking answer — also the reranker Jarvis uses), or the name of a ' +
+          'REST tool. Defaults to web search. Use "none" for no tools. See tools.list for names: ' +
+          'a tool it marks (available) is created the first time an agent is given it.',
       },
       { name: 'model', type: 'string', description: 'Optional model override. Omit to use the global model.' },
     ],
@@ -576,9 +696,16 @@ export const agentsCapabilities: Capability[] = [
         name: 'tools',
         type: 'string',
         description:
-          'Replace the whole tool set with these comma-separated names. Use "none" to remove all tools.',
+          'Replace the whole tool set with these comma-separated names (e.g. "web search and stored ' +
+          'documents"). Use "none" to remove all tools.',
       },
-      { name: 'addTools', type: 'string', description: 'Comma-separated tools to ADD, keeping the others.' },
+      {
+        name: 'addTools',
+        type: 'string',
+        description:
+          'Comma-separated tools to ADD, keeping the others. A kind the catalog does not hold yet is ' +
+          'created by naming it ("stored documents", "jev decision").',
+      },
       { name: 'removeTools', type: 'string', description: 'Comma-separated tools to REMOVE, keeping the others.' },
       { name: 'model', type: 'string', description: 'New model override. Pass "none" or "default" to clear it.' },
     ],
@@ -696,27 +823,53 @@ export const agentsCapabilities: Capability[] = [
     page: 'agents',
     title: 'List tools',
     description:
-      'List every tool that can be attached to an agent, with the exact names agents.create and agents.update ' +
-      'accept. Call this before setting tools so the names are right.',
+      'List every tool that can be attached to an agent — including the ones not created yet — with the ' +
+      'exact names agents.create and agents.update accept. Call this before setting tools so the names are right.',
     params: [],
     run: () => {
       const tools = toolsWithWebSearch();
-      if (!tools.length) return { ok: true, summary: 'No tools available', data: { tools: [] } };
+      const jevNote = 'typed decision tool — also the reranker Jarvis uses to choose between tools';
+      // A kind the catalogue does not hold yet is still ATTACHABLE — naming it
+      // creates it (see findTool) — so it is listed here as `available: true`.
+      // This read must NOT create it: opt-in means the wearer's word, not a side
+      // effect of asking what is on offer. Before this the list was built from
+      // the catalogue alone, so an install with only web search answered
+      // "1 tool(s): web_search" and the document store and jev could not be
+      // reached by voice at all.
+      const available: Array<Record<string, unknown>> = SEED_TOOLS.filter(
+        (s) => !tools.some((t) => t.kind === s.kind),
+      ).map((s) => {
+        const seed = s.make();
+        return {
+          id: seed.id,
+          name: seed.name,
+          kind: seed.kind,
+          description: seed.description,
+          available: true,
+          ...(seed.kind === 'jev' ? { note: jevNote } : {}),
+        };
+      });
+      const rows: Array<Record<string, unknown>> = [
+        ...tools.map((t) => ({
+          id: t.id,
+          name: t.name,
+          kind: t.kind,
+          description: t.description,
+          ...(t.kind === 'http' ? { url: t.url ?? '', method: t.method ?? 'POST' } : {}),
+          ...(t.kind === 'web' ? { searchDepth: t.searchDepth ?? 'basic' } : {}),
+          ...(t.kind === 'jev' ? { note: jevNote } : {}),
+        })),
+        ...available,
+      ];
+      if (!rows.length) return { ok: true, summary: 'No tools available', data: { tools: [] } };
+      const label = (r: Record<string, unknown>) => `${String(r.name)}${r.available ? ' (available)' : ''}`;
       return {
         ok: true,
-        summary: `${tools.length} tool(s): ${tools.map((t) => t.name).join(', ')}`,
-        data: {
-          tools: tools.map((t) => ({
-            id: t.id,
-            name: t.name,
-            kind: t.kind,
-            description: t.description,
-            ...(t.kind === 'http' ? { url: t.url ?? '', method: t.method ?? 'POST' } : {}),
-            ...(t.kind === 'web' ? { searchDepth: t.searchDepth ?? 'basic' } : {}),
-            ...(t.kind === 'jev' ? { note: 'typed decision tool — no configuration' } : {}),
-          })),
-        },
-        hint: 'pass these names to agents.create "tools" or agents.update "tools"/"addTools"/"removeTools"',
+        summary: `${rows.length} tool(s): ${rows.map(label).join(', ')}`,
+        data: { tools: rows },
+        hint:
+          'pass these names to agents.create "tools" or agents.update "tools"/"addTools"/"removeTools" — ' +
+          'a tool marked (available) is created, then attached, the first time an agent is given it',
       };
     },
   },

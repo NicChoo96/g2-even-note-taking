@@ -17,13 +17,20 @@ import { getRuns, subscribeRuns } from '../agent-runs';
 import { startRun, stopRun } from '../stream';
 import { FREE_TOOL_MODELS } from '../models';
 import {
+  DOCS_TOOL_ID,
+  docsTool,
   emptyAgent,
   emptyLlmSettings,
   FILE_TOOL_ID,
   filesTool,
+  JEV_TOOL_ID,
   jevTool,
+  NOTES_TOOL_ID,
+  notesTool,
   orderedAgents,
   SEED_TOOL_ID,
+  TODO_TOOL_ID,
+  todoTool,
   uid,
   webSearchTool,
   type AgentDef,
@@ -88,70 +95,49 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         : [...agent.toolIds, id],
     });
 
-  /** Enable the seeded web-search tool (creating it if it was removed) and attach it. */
-  const addWebSearchToAgent = () =>
-    updateAgents((s) => {
-      const has = s.tools.some((t) => t.id === SEED_TOOL_ID);
-      return {
-        ...s,
-        tools: has ? s.tools : [...s.tools, webSearchTool()],
-        agents: s.agents.map((a) =>
-          a.id === agent.id
-            ? {
-                ...a,
-                toolIds: [...new Set([...a.toolIds, SEED_TOOL_ID])],
-                updatedAt: Date.now(),
-              }
-            : a,
-        ),
-      };
-    });
+  /**
+   * Opt this agent in to one of the seeded tool kinds, creating it if the
+   * catalogue does not hold it yet. The two steps are ONE action because to a
+   * wearer they are one decision — "give this agent the document store" — and
+   * splitting them is what produced a second, near-identical row of buttons.
+   *
+   * Nothing is pre-attached: a seed is only ever created by an explicit tap
+   * here (or a spoken request, which resolves to the same kinds server-side).
+   */
+  const attachSeed = (id: string, make: () => ToolDef) =>
+    updateAgents((s) => ({
+      ...s,
+      tools: s.tools.some((t) => t.id === id) ? s.tools : [...s.tools, make()],
+      agents: s.agents.map((a) =>
+        a.id === agent.id
+          ? { ...a, toolIds: [...new Set([...a.toolIds, id])], updatedAt: Date.now() }
+          : a,
+      ),
+    }));
 
   /**
-   * Enable the document-store tool (creating it if it was removed) and attach it.
-   * Like jev it needs no per-tool configuration — the credential lives on the
-   * relay, which is what lets an agent publish a page without ever holding one.
+   * The seed kinds, as chips. web, jev and the three hub stores need no
+   * configuration (the relay holds their credentials, and the hub stores ARE the
+   * relay's own state), which is why they can be created from here at all; files
+   * is the same. A kind the catalogue already holds is NOT listed twice — it is
+   * the toggle chip above, so there is exactly one chip per tool.
    */
-  const addFilesToAgent = () =>
-    updateAgents((s) => {
-      const has = s.tools.some((t) => t.id === FILE_TOOL_ID);
-      return {
-        ...s,
-        tools: has ? s.tools : [...s.tools, filesTool()],
-        agents: s.agents.map((a) =>
-          a.id === agent.id
-            ? {
-                ...a,
-                toolIds: [...new Set([...a.toolIds, FILE_TOOL_ID])],
-                updatedAt: Date.now(),
-              }
-            : a,
-        ),
-      };
-    });
+  const addWebSearchToAgent = () => attachSeed(SEED_TOOL_ID, webSearchTool);
+  const addJevToAgent = () => attachSeed(JEV_TOOL_ID, jevTool);
+  const addFilesToAgent = () => attachSeed(FILE_TOOL_ID, filesTool);
+  const addTodoToAgent = () => attachSeed(TODO_TOOL_ID, todoTool);
+  const addDocsToAgent = () => attachSeed(DOCS_TOOL_ID, docsTool);
+  const addNotesToAgent = () => attachSeed(NOTES_TOOL_ID, notesTool);
 
-  /**
-   * Enable the typed-decision tool (creating it if it was removed) and attach it.
-   * It needs no configuration of its own — it uses the relay's OpenRouter key,
-   * so there is nothing to save here.
-   */
-  const addJevToAgent = () =>
-    updateAgents((s) => {
-      const has = s.tools.some((t) => t.id === 'tool-jev');
-      return {
-        ...s,
-        tools: has ? s.tools : [...s.tools, jevTool()],
-        agents: s.agents.map((a) =>
-          a.id === agent.id
-            ? {
-                ...a,
-                toolIds: [...new Set([...a.toolIds, 'tool-jev'])],
-                updatedAt: Date.now(),
-              }
-            : a,
-        ),
-      };
-    });
+  const seedChips = [
+    { kind: 'web', label: 'Web search', add: addWebSearchToAgent },
+    { kind: 'jev', label: 'Jev decision', add: addJevToAgent },
+    { kind: 'files', label: 'Stored docs', add: addFilesToAgent },
+    { kind: 'todo', label: 'To-do list', add: addTodoToAgent },
+    { kind: 'docs', label: 'Docs', add: addDocsToAgent },
+    { kind: 'notes', label: 'Notes', add: addNotesToAgent },
+  ];
+  const missingSeeds = seedChips.filter((s) => !state.tools.some((t) => t.kind === s.kind));
 
   /** Create a new REST tool and attach it to this agent in one step. */
   const addRestToolToAgent = () => {
@@ -212,7 +198,10 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
       />
 
       <label className="field-label">Tools</label>
-      {state.tools.length === 0 && <p className="empty">No tools yet — add one below.</p>}
+      <p className="hint-line">
+        Tap to attach or detach. A chip marked <strong>+</strong> is a tool this install does not
+        hold yet — the first tap creates it.
+      </p>
       <div className="chip-row">
         {state.tools.map((t) => (
           <button
@@ -225,12 +214,23 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
             {t.name}
           </button>
         ))}
-      </div>
-      <div className="docs-actions">
-        <button onClick={addWebSearchToAgent}>+ Web search</button>
-        <button onClick={addJevToAgent}>+ Jev decision</button>
-        <button onClick={addFilesToAgent}>+ Stored docs</button>
-        <button onClick={addRestToolToAgent}>+ REST tool</button>
+        {missingSeeds.map((s) => (
+          <button
+            key={s.kind}
+            className="doc-chip"
+            onClick={s.add}
+            title={`Create the ${s.label} tool and attach it to this agent`}
+          >
+            + {s.label}
+          </button>
+        ))}
+        <button
+          className="doc-chip"
+          onClick={addRestToolToAgent}
+          title="Create a REST tool and attach it — then set its URL and request body under Tools"
+        >
+          + REST tool
+        </button>
       </div>
 
       <label className="field-label">Model override (blank = global)</label>
@@ -271,6 +271,30 @@ function ToolEditor({
       tools: s.tools.map((t) => (t.id === tool.id ? { ...t, ...p } : t)),
     }));
 
+  const method = tool.method ?? 'POST';
+  /** GET puts the template in the query string, POST in the body. */
+  const payloadLabel = method === 'GET' ? 'Query parameters (JSON)' : 'Request body (JSON)';
+  /**
+   * Read the authored template the same way the relay does (see
+   * `http-tool.mjs`), so what this field promises and what a run sends cannot
+   * disagree. The relay degrades an unparseable template to "no template"
+   * rather than failing a run, so the error is surfaced here, where it can be
+   * fixed, instead of being discovered by a model that got the wrong shape.
+   */
+  const template = (() => {
+    const raw = (tool.bodyTemplate ?? '').trim();
+    if (!raw) return { keys: [] as string[], error: null as string | null };
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { keys: [] as string[], error: 'must be a JSON object, e.g. {"query": ""}' };
+      }
+      return { keys: Object.keys(parsed as Record<string, unknown>), error: null as string | null };
+    } catch {
+      return { keys: [] as string[], error: 'is not valid JSON' };
+    }
+  })();
+
   const saveToken = async () => {
     if (!token.trim()) return;
     await saveSettings({ toolTokens: { [tool.id]: token.trim() } });
@@ -292,6 +316,13 @@ function ToolEditor({
           <option value="jev">Jev decision</option>
           <option value="http">REST API</option>
           <option value="files">Stored documents</option>
+          {/* The hub's own stores. Changing a tool's kind to one of these is
+              legitimate — it is how a wearer turns a REST tool they built into
+              "actually, just my notes" — and every one of them is server-held,
+              so there is nothing further to configure. */}
+          <option value="todo">To-do list</option>
+          <option value="docs">Docs (my documents)</option>
+          <option value="notes">Notes</option>
         </select>
         <button
           className="icon-btn danger"
@@ -365,13 +396,40 @@ function ToolEditor({
           <label className="inline-field">
             Method
             <select
-              value={tool.method ?? 'POST'}
+              value={method}
               onChange={(e) => patch({ method: e.target.value as 'GET' | 'POST' })}
             >
               <option value="POST">POST (JSON body)</option>
               <option value="GET">GET (query params)</option>
             </select>
           </label>
+          <textarea
+            className="doc-textarea"
+            rows={4}
+            value={tool.bodyTemplate ?? ''}
+            onChange={(e) => patch({ bodyTemplate: e.target.value })}
+            placeholder={'{"query": "", "limit": 5}'}
+          />
+          <p className={template.error ? 'warn-line' : 'hint-line'}>
+            {template.error ? (
+              <>
+                {payloadLabel}: {template.error}
+              </>
+            ) : template.keys.length ? (
+              <>
+                {payloadLabel}: the model is offered <strong>{template.keys.join(', ')}</strong>. An
+                empty value is <strong>required</strong> of the model; a filled one is the default it
+                may omit or override.
+              </>
+            ) : (
+              <>
+                {payloadLabel} is empty, so the model sends whatever JSON it decides — which is how a
+                REST tool becomes a guessing game. Write an object (e.g.{' '}
+                <code>{'{"query": ""}'}</code>) and its keys become the parameters the model is told
+                to send.
+              </>
+            )}
+          </p>
           <div className="token-row">
             <input
               type="password"
@@ -485,6 +543,32 @@ export function AgentsPanel() {
     }));
 
   /**
+   * Add one of the seeded kinds to the catalogue if it is not already there.
+   *
+   * Matched on `kind` rather than `id` so a worn-in install that somehow holds
+   * the tool under another id is not given a second, identical one — the same
+   * rule the per-agent chips use, and the reason the buttons below are keyed by
+   * kind instead of id.
+   */
+  const addSeed = (kind: ToolDef['kind'], make: () => ToolDef) =>
+    updateAgents((s) =>
+      s.tools.some((t) => t.kind === kind) ? s : { ...s, tools: [...s.tools, make()] },
+    );
+
+  const catalogueSeeds: Array<{ kind: ToolDef['kind']; label: string; make: () => ToolDef }> = [
+    { kind: 'web', label: 'Web search', make: webSearchTool },
+    { kind: 'jev', label: 'Jev decision', make: jevTool },
+    { kind: 'files', label: 'Stored docs', make: filesTool },
+    // The hub's own stores — the To-Do list, the Docs library and Notes. They
+    // are seeded from here for the same reason the others are: an agent cannot
+    // be given a tool the catalogue does not hold, and the wearer should not have
+    // to visit the to-do page first to make one exist.
+    { kind: 'todo', label: 'To-do list', make: todoTool },
+    { kind: 'docs', label: 'Docs', make: docsTool },
+    { kind: 'notes', label: 'Notes', make: notesTool },
+  ];
+
+  /**
    * Runs go to the RELAY, not this tab: the loop keeps executing if the phone
    * backgrounds, and both the glasses detail pane and this panel watch the same
    * transcript arrive over SSE.
@@ -577,28 +661,11 @@ export function AgentsPanel() {
           ))}
           <div className="docs-actions">
             <button onClick={addTool}>+ Custom REST tool</button>
-            <button
-              onClick={() =>
-                updateAgents((s) =>
-                  s.tools.some((t) => t.id === SEED_TOOL_ID)
-                    ? s
-                    : { ...s, tools: [...s.tools, webSearchTool()] },
-                )
-              }
-            >
-              + Web search
-            </button>
-            <button
-              onClick={() =>
-                updateAgents((s) =>
-                  s.tools.some((t) => t.id === FILE_TOOL_ID)
-                    ? s
-                    : { ...s, tools: [...s.tools, filesTool()] },
-                )
-              }
-            >
-              + Stored docs
-            </button>
+            {catalogueSeeds.map((seed) => (
+              <button key={seed.kind} onClick={() => addSeed(seed.kind, seed.make)}>
+                + {seed.label}
+              </button>
+            ))}
           </div>
 
           <div className="panel-label spaced">

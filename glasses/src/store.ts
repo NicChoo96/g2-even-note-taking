@@ -131,12 +131,39 @@ export function update(fn: (s: HubState) => HubState): void {
   emit();
 }
 
-/** Apply a state frame received from the relay (another device or our echo). */
+/**
+ * Apply a state frame received from the relay (another device or our echo).
+ *
+ * ⚠ A REMOTE FRAME MUST NEVER MOVE US BACKWARDS. The relay replays its cached
+ * snapshot on EVERY connect (`init`), and it caches whatever the last device
+ * sent — so a reconnect after a restart, a peer that was backgrounded, or a
+ * publish whose fire-and-forget disk write was lost all arrive as an OLDER copy
+ * of the same list. Adopting that unconditionally is the wipe: the newer local
+ * data is overwritten AND THEN PERSISTED, so the loss survives a reload and the
+ * list appears to have emptied itself with nobody having deleted anything.
+ *
+ * `updatedAt` is the tie-break the rest of the app already uses, so it is used
+ * here too: strictly-older loses. A refused frame is not dropped — the local
+ * copy is re-published, so the relay converges FORWARD. That cannot deadlock
+ * into a rollback loop, because the relay refuses backwards writes too (see the
+ * staleness guard in `POST /api/stream`).
+ *
+ * Deliberately NOT union-merged, unlike the append-only `sessions` list in
+ * `applyRemoteAgents`: deleting a task is a real edit and a later list is
+ * allowed to be shorter. Ordering, not union, is the correct policy here.
+ */
 export function applyRemote(next: HubState): void {
   if (!next?.sections) return;
   sawServerState = true;
-  if (next.updatedAt === lastPublishedAt) return; // our own echo — already applied
-  state = { ...next, updatedAt: next.updatedAt ?? Date.now() };
+  const stamp = Number.isFinite(next.updatedAt) ? next.updatedAt : 0;
+  if (stamp && stamp === lastPublishedAt) return; // our own echo — already applied
+  if (stamp && stamp < state.updatedAt) {
+    // Stale — the server (or a peer) is behind this device. Keep what we have
+    // and push it, so the newer list is restored to the relay rather than lost.
+    schedulePublish();
+    return;
+  }
+  state = { ...next, updatedAt: stamp || Date.now() };
   persist(state);
   emit();
 }

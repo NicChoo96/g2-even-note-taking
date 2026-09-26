@@ -138,6 +138,16 @@ import {
 // be asserted against a stub if it lived here.
 import { normalizeCatalogue, foldDrift } from './mcp-tools.mjs';
 import { describeRoute, routeTools } from './mcp-router.mjs';
+// Generic REST tools. The schema the model is offered and the body actually sent
+// are built together, so they cannot drift into the mismatch they once had (the
+// schema advertised `{ body: { ... } }` while the executor sent the args flat).
+import { httpRequestArgs, httpToolSchema } from './http-tool.mjs';
+// The hub's OWN stores (todo list, document library, notes). Until this existed
+// an agent could reach the web, the Jarvis gateway and jev — but not the state
+// the relay was already holding, so "add that to my list" had no route at all.
+// The schema and the reducer live together in hub-tools.mjs; `publishHubState`
+// below is the only part that needs a socket, and it stays here.
+import { hubToolSchema, isHubTool, runHubTool } from './hub-tools.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -733,10 +743,27 @@ async function runFilesTool(tool, args, signal) {
         await client.list({
           q: args?.q,
           agent: args?.agent,
+          tag: args?.tag,
+          order: args?.order,
+          // Carried through so "what did I delete" is answerable — a soft-deleted
+          // document is invisible to every other query, which is what made it
+          // unreachable rather than merely omitted.
+          includeDeleted: args?.include_deleted === true,
           limit: FILES_TOOL_LIST_LIMIT,
           signal,
         }),
       );
+    }
+    if (action === 'search') {
+      const term = String(args?.q ?? '').trim();
+      if (!term) return 'tool error: q is required to search';
+      return renderFilesResult(
+        'search_sessions',
+        await client.search({ q: term, limit: FILES_TOOL_LIST_LIMIT, signal }),
+      );
+    }
+    if (action === 'stats') {
+      return renderFilesResult('session_stats', await client.stats({ signal }));
     }
     if (action === 'publish') {
       const doc = await client.create({
@@ -746,6 +773,8 @@ async function runFilesTool(tool, args, signal) {
         tags: args?.tags,
         id: args?.id,
         overwrite: args?.overwrite,
+        slug: args?.slug,
+        contentType: args?.content_type ?? args?.contentType,
         signal,
       });
       return renderFilesResult('create_session', doc);
@@ -753,14 +782,88 @@ async function runFilesTool(tool, args, signal) {
     if (action === 'read') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to read a document';
+      // `include_html` is NOT forwarded. The schema accepts it because the
+      // gateway defines it and declaring the union is what keeps the drift check
+      // clean, but a body is never put in a tool message: see renderToolResult.
       return renderFilesResult('read_session', await client.read(id, { signal }));
+    }
+    if (action === 'update') {
+      const id = String(args?.id ?? '').trim();
+      if (!id) return 'tool error: id is required to update a document';
+      return renderFilesResult(
+        'update_session',
+        await client.update(id, {
+          html: args?.html ?? args?.document ?? args?.body,
+          title: args?.title,
+          tags: args?.tags,
+          agent: args?.agent,
+          contentType: args?.content_type ?? args?.contentType,
+          ifVersion: args?.if_version ?? args?.ifVersion,
+          signal,
+        }),
+      );
     }
     if (action === 'delete' || action === 'remove') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to delete a document';
-      return renderFilesResult('delete_session', await client.remove(id, { signal }));
+      // `hard` defaults to false HERE, so an unqualified delete stays the
+      // recoverable one. The hard form is the destructive path and the model has
+      // to name it (see the schema's description of `hard`).
+      return renderFilesResult(
+        'delete_session',
+        await client.remove(id, {
+          hard: args?.hard === true,
+          reason: args?.reason,
+          signal,
+        }),
+      );
     }
-    return 'tool error: action must be one of publish, list, read, delete';
+    if (action === 'history' || action === 'revisions') {
+      return renderFilesResult(
+        'list_revisions',
+        // No id is not an error: the gateway answers the WHOLE ARCHIVE's history
+        // in that case, which is how the model answers "what changed lately"
+        // without having to name a document first.
+        await client.revisions({
+          id: args?.id,
+          change: args?.change,
+          subject: args?.subject,
+          agent: args?.agent,
+          order: args?.order,
+          limit: args?.limit ?? FILES_TOOL_LIST_LIMIT,
+          offset: args?.offset,
+          signal,
+        }),
+      );
+    }
+    if (action === 'revision') {
+      const id = String(args?.id ?? '').trim();
+      if (!id) return 'tool error: id is required to read a revision';
+      return renderFilesResult(
+        'read_revision',
+        await client.revision(id, args?.revision, { signal }),
+      );
+    }
+    if (action === 'revert' || action === 'restore_revision') {
+      const id = String(args?.id ?? '').trim();
+      if (!id) return 'tool error: id is required to revert a document';
+      return renderFilesResult(
+        'restore_revision',
+        await client.restoreRevision(id, args?.revision, {
+          restoreMetadata: args?.restore_metadata !== false,
+          ifVersion: args?.if_version ?? args?.ifVersion,
+          subject: args?.subject,
+          signal,
+        }),
+      );
+    }
+    if (action === 'revision_stats') {
+      return renderFilesResult('revision_stats', await client.revisionStats(args?.id, { signal }));
+    }
+    return (
+      'tool error: action must be one of publish, list, search, stats, read, update, delete, '
+      + 'history, revision, revert, revision_stats'
+    );
   } catch (err) {
     const code = err?.code ? `${err.code}: ` : '';
     return `tool error: ${code}${err instanceof Error ? err.message : String(err)}`;
@@ -895,6 +998,49 @@ function broadcastRun(run) {
   for (const client of [...getChannel('agents').clients]) send(client, frame, 'agents');
 }
 
+/**
+ * What a hub tool reports when the relay holds no hub state at all.
+ *
+ * A tool must never AUTHOR the store it is editing. `runHubTool` is deliberately
+ * total, so a null hub normalizes to an EMPTY one — and every mutating action
+ * stamps its result `updatedAt: Date.now()`. That combination is a silent total
+ * wipe: the near-empty state is NEWER than the copy on the wearer's phone, so it
+ * gets cached, persisted, and adopted over the real list. (The worst case is a
+ * host with an ephemeral filesystem — a redeploy loses `.g2-hub-state.json`, and
+ * a tool call in that window would destroy the only copy that still existed.)
+ *
+ * The refusal lives here rather than in the reducer because only the relay knows
+ * whether its own copy is missing; the reducer must stay total so a harness can
+ * call it with anything.
+ */
+const NO_HUB_STATE_MSG =
+  'The server has no copy of your to-do list, docs or notes yet. Open the app once so it syncs, then try again.';
+
+/**
+ * Adopt a hub state produced by an AGENT TOOL and publish it.
+ *
+ * Deliberately the same steps the `POST /api/stream` publish does — cache
+ * `lastState`, mirror to disk, fan out to subscribers — because a change an
+ * agent makes has to be indistinguishable from one the wearer made by tapping.
+ * Skipping the broadcast would leave the glasses showing the old list until the
+ * next manual edit; skipping the disk write would lose it on the next restart.
+ *
+ * The cache write carries the SAME transient guard as every other one. `hub` is
+ * not transient, so the guard never fires here — it is here so that "no state is
+ * cached outside the transient check" stays true by reading the code, which is
+ * the rule the mirror harness pins. The broadcast stays OUTSIDE the guard: a
+ * transient channel is live, so it is still worth telling the clients about.
+ */
+function publishHubState(state) {
+  const channel = getChannel('hub');
+  if (!TRANSIENT_CHANNELS.has(channel.name)) {
+    channel.lastState = state;
+    void persistState(channel.name, state);
+  }
+  const frame = { type: 'state', state };
+  for (const client of [...channel.clients]) send(client, frame, channel.name);
+}
+
 /** OpenAI-style tool schema — mirrors the tool shapes in glasses/src/types.ts. */
 function toolSchemaFor(t) {
   if (isWebTool(t)) {
@@ -967,20 +1113,16 @@ function toolSchemaFor(t) {
       },
     };
   }
-  return {
-    type: 'function',
-    function: {
-      name: t?.name || 'http_tool',
-      description: t?.description || 'Call an external HTTP API.',
-      parameters: {
-        type: 'object',
-        properties: {
-          body: { type: 'object', description: 'JSON request body / query parameters.' },
-        },
-        required: [],
-      },
-    },
-  };
+  // The hub's own stores. One tool per area, each with an `action` enum, built
+  // in hub-tools.mjs beside the reducer that implements those actions — so the
+  // enum the model is offered and the switch that handles it cannot drift.
+  if (isHubTool(t)) {
+    const schema = hubToolSchema(t);
+    if (schema) return schema;
+  }
+  // Anything left is a generic REST tool: a tool with no body template offers a
+  // free-form `body`, one with a template offers exactly its authored keys.
+  return httpToolSchema(t);
 }
 
 /** One chat completion through the active LLM backend (OpenRouter or DeepSeek). */
@@ -1042,6 +1184,18 @@ async function runToolOnce(tool, rawArgs, signal) {
       return `tool error: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
+  if (isHubTool(tool)) {
+    // Read the LIVE hub channel, not a copy: two runs (or a run and a wearer's
+    // own edit) must not race on a stale snapshot. Only a call that actually
+    // changed something carries `state`, so a read can never rewrite the hub and
+    // a failed call can never half-apply.
+    const hub = getChannel('hub').lastState;
+    // Refuse rather than invent an empty list. See NO_HUB_STATE_MSG.
+    if (!hub) return NO_HUB_STATE_MSG;
+    const result = runHubTool(tool, args, hub);
+    if (result.state) publishHubState(result.state);
+    return result.text;
+  }
   if (isFilesTool(tool)) return runFilesTool(tool, args, signal);
   if (isWebTool(tool)) {
     const ws = webSearchConfig();
@@ -1074,13 +1228,16 @@ async function runToolOnce(tool, rawArgs, signal) {
   if (token) headers.Authorization = `Bearer ${token}`;
   let url = target;
   const init = { method, headers };
+  // The template's defaults under the model's arguments — see http-tool.mjs for
+  // why the schema and this merge must be built from the same description.
+  const payload = httpRequestArgs(tool, args);
   if (method === 'GET') {
     const qs = new URLSearchParams();
-    for (const [k, v] of Object.entries(args)) qs.set(k, String(v));
+    for (const [k, v] of Object.entries(payload)) qs.set(k, String(v));
     url = `${target}${target.includes('?') ? '&' : '?'}${qs.toString()}`;
   } else {
     headers['Content-Type'] = 'application/json';
-    init.body = JSON.stringify(args);
+    init.body = JSON.stringify(payload);
   }
   const r = await fetch(url, { ...init, signal });
   const text = await r.text().catch(() => '');
@@ -1633,6 +1790,35 @@ const server = createServer(async (req, res) => {
     } catch {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return;
+    }
+    // ⚠ THE RELAY MUST NOT MOVE BACKWARDS EITHER. `updatedAt` is the app's
+    // tie-break everywhere else, so honour it here too. A device that reconnects,
+    // was backgrounded, or published while this process was restarting can send
+    // an OLDER snapshot than the one already cached; accepting it caches,
+    // persists and fans out the rollback, and every other device then adopts it.
+    // That is how a to-do list empties itself with nobody having deleted
+    // anything — one stale publisher was enough to roll back the whole hub.
+    //
+    // Guarded only when BOTH sides carry a numeric stamp, so the transient
+    // channels and any future non-`updatedAt` payload keep the old behaviour.
+    const cachedStamp = Number.isFinite(channel.lastState?.updatedAt)
+      ? channel.lastState.updatedAt
+      : null;
+    const incomingStamp = Number.isFinite(state?.updatedAt) ? state.updatedAt : null;
+    if (
+      !TRANSIENT_CHANNELS.has(channel.name) &&
+      cachedStamp !== null &&
+      incomingStamp !== null &&
+      incomingStamp < cachedStamp
+    ) {
+      // Re-broadcast what we already hold. The stale publisher's own SSE socket
+      // is in `channel.clients` (its publish was a separate fetch), so it learns
+      // the current copy and catches up instead of diverging silently.
+      const current = { type: 'state', state: channel.lastState };
+      for (const client of [...channel.clients]) send(client, current, channel.name);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, stale: true, clients: channel.clients.size }));
       return;
     }
     // Transient channels broadcast and are then DROPPED — see
@@ -2331,6 +2517,23 @@ const server = createServer(async (req, res) => {
         json(res, 200, { ok: true, result });
         return;
       }
+      // The hub's own stores, over the same proxy. Routed through the same
+      // `publishHubState` as the agent executor rather than touching the channel
+      // here, so this route can never become a second, divergent way to write
+      // the hub (or a way to write it without telling the glasses).
+      if (isHubTool(body)) {
+        // Same refusal as the agent executor: a store this process does not hold
+        // is not one it may author. See NO_HUB_STATE_MSG.
+        const hub = getChannel('hub').lastState;
+        if (!hub) {
+          json(res, 200, { ok: false, result: NO_HUB_STATE_MSG });
+          return;
+        }
+        const result = runHubTool(body, args, hub);
+        if (result.state) publishHubState(result.state);
+        json(res, 200, { ok: result.ok, result: result.text });
+        return;
+      }
 
       // Generic REST tool: the model supplies the JSON body / query params.
       const target = String(body?.url || '').trim();
@@ -2344,10 +2547,12 @@ const server = createServer(async (req, res) => {
       const headers = { Accept: 'application/json' };
       if (token) headers.Authorization = `Bearer ${token}`;
       // Resolve relative dates in the model's own arguments too — a custom
-      // REST tool is just as date-sensitive as a web search.
+      // REST tool is just as date-sensitive as a web search. The tool's authored
+      // template is layered UNDER those arguments here, so this proxy sends the
+      // same object the agent executor does (see http-tool.mjs).
       const now = new Date();
       const resolvedArgs = Object.fromEntries(
-        Object.entries(args).map(([k, v]) => [
+        Object.entries(httpRequestArgs(body, args)).map(([k, v]) => [
           k,
           typeof v === 'string' ? preprocessText(v, now).text : v,
         ]),
@@ -2547,6 +2752,104 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ── Revision history ─────────────────────────────────────────────
+    //
+    // Three routes, because the gateway exposes three MCP tools here and NONE
+    // had any way through the relay before: the app could publish a new version,
+    // and could not see, read or return to an older one. The routes are ordered
+    // most-specific-first so `/…/revisions/3/restore` is never parsed as a read
+    // of revision 3.
+
+    // Make an old REVISION current. This is NOT the same operation as the
+    // `/restore` route above, and the two must not be merged: that one UNDOES a
+    // soft delete through the gateway's REST surface, while this one is a real
+    // MCP call that appends a `revert` revision. A revert therefore stays
+    // undoable, which is why it is served here rather than behind a warning.
+    const revertMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/revisions\/(\d{1,9})\/restore$/.exec(url.pathname);
+    if (req.method === 'POST' && revertMatch) {
+      let body = {};
+      try {
+        body = (await readJsonBody(req, 64 * 1024)) ?? {};
+      } catch {
+        json(res, 400, { ok: false, error: 'invalid JSON body' });
+        return;
+      }
+      try {
+        json(res, 200, {
+          ok: true,
+          document: await client.restoreRevision(revertMatch[1], Number(revertMatch[2]), {
+            // Absent means TRUE, matching the gateway's own default: a revert is
+            // normally a revert of the whole document, not just its pixels.
+            restoreMetadata: body.restoreMetadata !== false,
+            ifVersion: body.ifVersion,
+          }),
+        });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // One revision's metadata. The body is deliberately NOT returned even though
+    // the gateway can supply it: a stored document is code written by a model,
+    // and the relay serves that code in exactly one place — the sandboxed /html
+    // route above — never as a JSON field a client would then have to be careful
+    // with. The frame already shows the wearer any revision they want to see.
+    const oneRevMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/revisions\/(\d{1,9})$/.exec(url.pathname);
+    if (req.method === 'GET' && oneRevMatch) {
+      try {
+        json(res, 200, {
+          ok: true,
+          revision: await client.revision(oneRevMatch[1], Number(oneRevMatch[2])),
+        });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // A document's change log. `change` filters by kind, so "what did an agent
+    // DELETE" is one call rather than a scan the client would have to do.
+    const historyMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/revisions$/.exec(url.pathname);
+    if (req.method === 'GET' && historyMatch) {
+      try {
+        const q = url.searchParams;
+        const page = await client.revisions({
+          id: historyMatch[1],
+          change: q.get('change') || undefined,
+          subject: q.get('subject') || undefined,
+          order: q.get('order') || undefined,
+          limit: q.get('limit') ?? undefined,
+          offset: q.get('offset') ?? undefined,
+        });
+        json(res, 200, { ok: true, items: page.items, total: page.total, hasMore: page.hasMore });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // Library totals, or one document's revision totals.
+    //
+    // THIS BRANCH MUST STAY ABOVE THE `:id` MATCH BELOW. `stats` is a perfectly
+    // valid document id as far as that pattern is concerned, so putting this
+    // after it would silently turn every stats request into a read of a document
+    // called "stats" — a 404, not an error anyone would connect to route order.
+    //
+    // One route for two gateway tools, because they answer one question: with no
+    // id the archive's totals are wanted (only `session_stats` knows those), and
+    // with one, that document's revision totals (`revision_stats`). `revision_stats`
+    // also reports archive-wide numbers, so the two overlap rather than conflict.
+    if (req.method === 'GET' && url.pathname === '/api/files/stats') {
+      try {
+        const id = url.searchParams.get('id');
+        json(res, 200, { ok: true, ...(await (id ? client.revisionStats(id) : client.stats())) });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
     // One document's metadata.
     const oneMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})$/.exec(url.pathname);
     if (oneMatch && req.method === 'GET') {
@@ -2572,6 +2875,40 @@ const server = createServer(async (req, res) => {
           hard: removed.hard,
           deleted: removed.deleted,
         });
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // EDIT a stored document in place.
+    //
+    // A PATCH on the single-document route rather than another POST, so it
+    // cannot be confused with publish: publish mints a version from a
+    // REPLACEMENT body, while this one can change the title or the tags alone
+    // and leave the stored bytes exactly as they were. The gateway treats those
+    // as different tools for that reason, and so does this.
+    //
+    // `ifVersion` is forwarded when the caller sends it, so an editor that read
+    // a version can fail instead of clobbering a newer one.
+    if (oneMatch && req.method === 'PATCH') {
+      let body = null;
+      try {
+        body = await readJsonBody(req, FILES_MAX_BODY_BYTES);
+      } catch {
+        json(res, 400, { ok: false, error: 'invalid JSON body' });
+        return;
+      }
+      try {
+        const document = await client.update(oneMatch[1], {
+          html: body?.html,
+          title: body?.title,
+          tags: body?.tags,
+          agent: body?.agent,
+          contentType: body?.contentType,
+          ifVersion: body?.ifVersion,
+        });
+        json(res, 200, { ok: true, document });
       } catch (err) {
         fail(err);
       }
@@ -2859,20 +3196,33 @@ function startDocServer(port) {
 }
 
 /**
- * The four gateway operations the ONE `jarvis_files` tool folds into its
- * `action` enum, each mapped to the server tool that implements it.
+ * The gateway operations the ONE `jarvis_files` tool folds into its `action`
+ * enum, each mapped to the server tool that implements it.
  *
  * This map IS the contract between `filesToolSchema()` (what the model is told)
  * and the client that carries the call out — and it is exactly where the drift
  * lived: the schema offered `id` for delete while the client sent
  * `{ id, hard, reason }`, and the gateway accepted both. Nothing compared them,
  * because nothing had ever read the gateway's own catalogue.
+ *
+ * ALL ELEVEN, deliberately. The first version folded four, which left seven of
+ * the gateway's tools with no schema at all: editing a document, its version
+ * history, reading a past revision, reverting to one, searching, and both stats
+ * calls were capabilities the model could not express. `checkFilesSchemaDrift()`
+ * reports that as `unusedTools`, and it is now empty by construction.
  */
 const FILES_FOLD = {
   publish: 'create_session',
   list: 'list_sessions',
+  search: 'search_sessions',
+  stats: 'session_stats',
   read: 'read_session',
+  update: 'update_session',
   delete: 'delete_session',
+  history: 'list_revisions',
+  revision: 'read_revision',
+  revert: 'restore_revision',
+  revision_stats: 'revision_stats',
 };
 
 /**

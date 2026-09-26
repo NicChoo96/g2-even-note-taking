@@ -17,9 +17,15 @@ import type { FileRef } from '../../types';
 import type { Capability, CapabilityResult } from '../types';
 import {
   deleteFile,
+  fetchFileStats,
   listFiles,
+  listRevisions,
   publishFile,
+  readRevision,
+  restoreRevision,
   toFileRef,
+  updateFile,
+  type RevisionRef,
   type StoredDoc,
 } from '../../web/files-client';
 import { resolveFile, short } from './shared';
@@ -58,11 +64,24 @@ export const filesCapabilities: Capability[] = [
     params: [
       { name: 'query', type: 'string', description: 'Optional words to search titles and bodies for.' },
       { name: 'agent', type: 'string', description: 'Optional: only documents published by this agent name.' },
+      { name: 'tag', type: 'string', description: 'Optional: only documents carrying this tag.' },
+      { name: 'deleted', type: 'boolean', description: 'Set true to ALSO list deleted documents, so one can be restored.' },
     ],
     run: async (args): Promise<CapabilityResult> => {
       const query = String(args.query ?? '').trim();
       const agent = String(args.agent ?? '').trim();
-      const res = await listFiles({ limit: CAP, q: query || undefined, agent: agent || undefined });
+      const tag = String(args.tag ?? '').trim();
+      const deleted = args.deleted === true || args.deleted === 'true';
+      const res = await listFiles({
+        limit: CAP,
+        q: query || undefined,
+        agent: agent || undefined,
+        tag: tag || undefined,
+        // The gateway hides a soft-deleted document from EVERY other query, so
+        // without this there is no way to see one and therefore no way to know
+        // it is recoverable.
+        includeDeleted: deleted,
+      });
       if (!res.ok) {
         return {
           ok: false,
@@ -70,7 +89,11 @@ export const filesCapabilities: Capability[] = [
           hint: 'the relay serves these on /api/files; if it says not configured, the JARVIS_FILE_* env vars are unset',
         };
       }
-      syncRefs(res.items.map(toFileRef));
+      // Deleted documents must NOT enter the live list: the glasses page and
+      // "what do I have" both read those refs, and the reason to ask for them at
+      // all is to see what is recoverable.
+      const live = res.items.filter((d) => !d.deleted);
+      syncRefs(live.map(toFileRef));
       if (!res.items.length) {
         return {
           ok: true,
@@ -78,9 +101,12 @@ export const filesCapabilities: Capability[] = [
           data: { total: res.total, documents: [] },
         };
       }
+      const gone = res.items.length - live.length;
       return {
         ok: true,
-        summary: `${res.items.length} document(s): ${res.items.map((d) => short(d.title || 'Untitled', 18)).join(', ')}`,
+        summary:
+          `${live.length} document(s): ${live.map((d) => short(d.title || 'Untitled', 18)).join(', ')}`
+          + (gone ? ` — plus ${gone} deleted, restorable` : ''),
         data: {
           total: res.total,
           hasMore: res.hasMore,
@@ -92,9 +118,13 @@ export const filesCapabilities: Capability[] = [
             version: d.version,
             tags: d.tags,
             updatedAt: d.updatedAt,
+            deleted: d.deleted,
+            deletedReason: d.deletedReason,
           })),
         },
-        hint: 'the body of a stored page is HTML and is only rendered on the web Files tab — use files.read for its details',
+        hint: deleted
+          ? 'these include deleted documents; restore one from the Files tab on the web app'
+          : 'the body of a stored page is HTML and is only rendered on the web Files tab — use files.read for its details',
       };
     },
   },
@@ -171,7 +201,6 @@ export const filesCapabilities: Capability[] = [
     confirm: true,
     run: async (args): Promise<CapabilityResult> => {
       const html = String(args.html ?? '');
-      if (!html.trim()) return { ok: false, summary: 'No HTML given to publish' };
       const rawTitle = String(args.title ?? '').trim();
       const title = (rawTitle || 'Untitled').slice(0, 300);
       const tags = String(args.tags ?? '')
@@ -180,6 +209,42 @@ export const filesCapabilities: Capability[] = [
         .filter(Boolean)
         .slice(0, 12);
       const id = String(args.id ?? '').trim();
+      // A METADATA-ONLY EDIT: an existing document, no body.
+      //
+      // This is the gateway's `update_session`, not `create_session`, and the
+      // difference is the whole point: it changes the title or the tags and
+      // leaves the stored document alone. Routing it through `overwrite` instead
+      // is not possible from here — this app never holds a document's body, so
+      // there would be no replacement to send. Before this existed, renaming a
+      // stored page was the one edit the wearer simply could not do.
+      if (!html.trim() && id) {
+        if (!rawTitle && !tags.length) {
+          return {
+            ok: false,
+            summary: 'Nothing to change — give a new title or new tags, or the whole HTML document',
+          };
+        }
+        const patched = await updateFile(id, {
+          ...(rawTitle ? { title } : {}),
+          ...(tags.length ? { tags } : {}),
+        });
+        if (!patched.ok || !patched.document) {
+          return {
+            ok: false,
+            summary: oneLine(`Update failed: ${patched.error ?? 'unknown error'}`),
+            hint: 'the document must still exist and be live; re-run files.list, or restore it first if it was deleted',
+          };
+        }
+        const edited = patched.document;
+        syncRefs(files().map((f) => (f.id === edited.id ? toFileRef(edited) : f)));
+        return {
+          ok: true,
+          summary: oneLine(`Updated "${short(edited.title, 24)}"`),
+          data: { id: edited.id, title: edited.title, version: edited.version, tags: edited.tags },
+          hint: 'the page itself is unchanged; open the Files tab on the web app to see it',
+        };
+      }
+      if (!html.trim()) return { ok: false, summary: 'No HTML given to publish' };
       const res = await publishFile({
         html,
         title,
@@ -249,6 +314,200 @@ export const filesCapabilities: Capability[] = [
         // distinguishes a purged document from a restorable one.
         summary: oneLine(`Permanently deleted "${short(target.title, 24)}"`),
         data: { id: target.id, hard: res.hard === true, deleted: res.deleted === true },
+      };
+    },
+  },
+  {
+    name: 'files.history',
+    page: 'files',
+    effect: 'read',
+    title: 'Show what changed in a document, or how much is stored',
+    description:
+      'Show a stored document\'s change history — every version, what changed and when — or, with no ' +
+      'document named, how many documents the library holds. Use when asked what changed, when a page ' +
+      'was last updated, how much is stored, or to find the revision number to go back to.',
+    params: [
+      {
+        name: 'document',
+        type: 'string',
+        description: 'Document title, part of a title, or its number. Omit for library-wide totals.',
+      },
+      {
+        name: 'revision',
+        type: 'number',
+        description: 'One specific revision number to look at, as listed by this same action.',
+      },
+    ],
+    run: async (args): Promise<CapabilityResult> => {
+      const want = String(args.document ?? '').trim();
+
+      // No document named: the library's own totals. A different question, and
+      // the only one `session_stats` can answer — how many documents exist is
+      // not derivable from a page of them, which is why this is not simply
+      // "list everything and count".
+      if (!want) {
+        const stats = await fetchFileStats();
+        if (!stats.ok) {
+          return {
+            ok: false,
+            summary: oneLine(`Could not read the library totals: ${stats.error ?? 'unknown error'}`),
+          };
+        }
+        const live = Number(stats.live_sessions ?? stats.sessions) || 0;
+        const gone = Number(stats.deleted_sessions) || 0;
+        const stored = Number(stats.bytes) || 0;
+        return {
+          ok: true,
+          summary: oneLine(
+            `${live} document(s)${gone ? `, ${gone} deleted` : ''}, ${sizeLabel(stored)} stored`,
+          ),
+          data: {
+            documents: live,
+            deleted: gone,
+            agents: stats.agents,
+            tags: stats.tags,
+            bytes: stored,
+            revisions: stats.revisions,
+          },
+          hint: gone
+            ? 'the deleted ones are still stored — restore them from the Files tab on the web app'
+            : undefined,
+        };
+      }
+
+      const target = resolveFile(want, files());
+      if (!target) {
+        const list = files();
+        return {
+          ok: false,
+          summary: list.length ? 'No stored document matches that' : 'No documents are stored yet',
+          hint: list.length
+            ? `documents: ${list.map((f, i) => `${i + 1}. ${short(f.title, 20)}`).join(' | ')}`
+            : 'call files.list first',
+        };
+      }
+
+      // One named revision: its details. Not its body — the body is HTML and is
+      // only ever rendered in the web viewer, which is what keeps a document out
+      // of this app's state (and out of a model's context) entirely.
+      const rev = Number(args.revision);
+      if (Number.isFinite(rev) && rev >= 1) {
+        const res = await readRevision(target.id, rev);
+        if (!res.ok || !res.revision) {
+          return {
+            ok: false,
+            summary: oneLine(`"${short(target.title, 20)}" has no revision ${rev}`),
+            hint: 'call files.history without a revision to see which ones exist',
+          };
+        }
+        const r: RevisionRef = res.revision;
+        const day = new Date(r.createdAt || Date.now()).toISOString().slice(0, 10);
+        return {
+          ok: true,
+          summary: oneLine(
+            `Revision ${r.revision}: ${r.change} on ${day}, ${sizeLabel(r.size)}, v${r.version}`,
+          ),
+          data: {
+            id: r.id,
+            revision: r.revision,
+            version: r.version,
+            change: r.change,
+            changedContent: r.contentChanged,
+            size: r.size,
+            createdAt: r.createdAt,
+          },
+          hint: 'use files.revert to make this revision current again',
+        };
+      }
+
+      const list = await listRevisions(target.id, { limit: 12 });
+      if (!list.ok) {
+        return { ok: false, summary: oneLine(`Could not read the history: ${list.error ?? 'unknown error'}`) };
+      }
+      if (!list.items.length) {
+        return { ok: true, summary: oneLine(`"${short(target.title, 20)}" has no recorded changes yet`) };
+      }
+      const top = list.items[0];
+      // Only the last few are spoken; the whole set goes back as data. The
+      // glasses summary is what the wearer HEARS, so it has to stay a sentence.
+      const story = list.items
+        .slice(0, 4)
+        .map((r) => `${r.change} ${new Date(r.createdAt || Date.now()).toISOString().slice(0, 10)}`)
+        .join(', ');
+      return {
+        ok: true,
+        summary: oneLine(
+          `"${short(target.title, 20)}" v${top.version}, ${list.total} change(s): ${story}`,
+        ),
+        data: {
+          id: target.id,
+          version: top.version,
+          total: list.total,
+          hasMore: list.hasMore,
+          revisions: list.items.map((r) => ({
+            revision: r.revision,
+            version: r.version,
+            change: r.change,
+            changedContent: r.contentChanged,
+            createdAt: r.createdAt,
+          })),
+        },
+        hint: 'use files.revert with a revision number to go back to an earlier version',
+      };
+    },
+  },
+  {
+    name: 'files.revert',
+    page: 'files',
+    effect: 'write',
+    // Confirmed, like publish and for the same reason: this changes a document
+    // that other people read. It is classified `write` rather than
+    // `irreversible` because the gateway implements it by APPENDING a revert
+    // entry — the versions it replaces stay in the history, so a revert can
+    // itself be reverted. Calling that irreversible would be a lie in the other
+    // direction, and the wearer would be warned off an undo they can safely use.
+    title: 'Go back to an earlier version',
+    description:
+      'Restore an earlier revision of a stored document so it becomes the current version again. ' +
+      'Use when asked to undo a change to a stored page, or to go back to a previous version. The ' +
+      'versions it replaces are kept, so this can itself be undone.',
+    params: [
+      { name: 'document', type: 'string', description: 'Document title, part of a title, or its number.', required: true },
+      { name: 'revision', type: 'number', description: 'The revision number to go back to, from files.history.', required: true },
+    ],
+    confirm: true,
+    run: async (args): Promise<CapabilityResult> => {
+      const target = resolveFile(String(args.document ?? ''), files());
+      if (!target) {
+        return {
+          ok: false,
+          summary: files().length ? 'No stored document matches that' : 'No documents are stored yet',
+        };
+      }
+      const rev = Number(args.revision);
+      if (!Number.isFinite(rev) || rev < 1) {
+        return {
+          ok: false,
+          summary: 'Which revision? Give the number from files.history',
+        };
+      }
+      const res = await restoreRevision(target.id, rev, { restoreMetadata: true });
+      if (!res.ok || !res.document) {
+        return {
+          ok: false,
+          summary: oneLine(`Could not go back: ${res.error ?? 'unknown error'}`),
+          hint: 'the document must still be live; restore it first if it was deleted',
+        };
+      }
+      const doc = res.document;
+      syncRefs(files().map((f) => (f.id === doc.id ? toFileRef(doc) : f)));
+      return {
+        ok: true,
+        summary: oneLine(`"${short(doc.title, 22)}" is back to revision ${rev}, now v${doc.version}`),
+        data: { id: doc.id, revision: rev, version: doc.version, size: doc.size },
+        // Says so plainly, because it is the fact that makes the action safe to
+        // accept: nothing was thrown away, so no second confirmation is needed.
+        hint: 'the version this replaced is still in the history, so this can be undone the same way',
       };
     },
   },

@@ -975,7 +975,18 @@ console.log('\n§11  filesToolSchema');
   const s = filesToolSchema({});
   eq('the name defaults', s.function.name, FILES_TOOL_NAME);
   eq('it is an OpenAI-style function', s.type, 'function');
-  eq('the actions are the four the client implements', s.function.parameters.properties.action.enum, ['publish', 'list', 'read', 'delete']);
+  // ONE tool, eleven actions. Not eleven tools: the client budget is 12 tools a
+  // turn (MAX_TOOLS in agent.ts) and page navigation needs most of them, so a
+  // second document tool would evict a page. The cost is that this enum is
+  // hand-written, which is why §12 pins it to the fold.
+  eq(
+    'every action the gateway offers is offered here',
+    s.function.parameters.properties.action.enum,
+    [
+      'publish', 'list', 'search', 'stats', 'read', 'update',
+      'delete', 'history', 'revision', 'revert', 'revision_stats',
+    ],
+  );
   eq('only the action is required', s.function.parameters.required, ['action']);
   has('the description says the body is NOT returned', s.function.description, 'NOT returned');
   const custom = filesToolSchema({ name: 'my_files', description: 'custom' });
@@ -998,6 +1009,27 @@ console.log('\n§12  the relay is wired to this module');
   has('…extracting through the module that owns the document contract', relay, 'extractMedia(');
   has('…and status', relay, '/api/files/status');
   lacks('…with no gateway credential baked into the relay', relay, 'JARVIS_FILE_PWD=');
+
+  // THE TWO HAND-WRITTEN LISTS, PINNED TO EACH OTHER.
+  //
+  // The action enum lives in this module and the fold lives in the relay. Both
+  // are typed by hand, three files apart, and each is individually plausible —
+  // the fold merely lacking an entry means that action silently does nothing,
+  // which is the failure this whole exercise started from. Deriving both from
+  // the gateway would remove the class of bug; until then this is the assertion
+  // that notices, because no single-file test can: an entry added to one and not
+  // the other is only visible from outside both.
+  {
+    const at = relay.indexOf('const FILES_FOLD = {');
+    const body = at < 0 ? '' : relay.slice(at, relay.indexOf('};', at));
+    const folded = [...body.matchAll(/^\s*(\w+)\s*:/gm)].map((m) => m[1]);
+    eq(
+      'the fold and the offered actions are the same set',
+      [...folded].sort(),
+      [...filesToolSchema({}).function.parameters.properties.action.enum].sort(),
+      '(an action in the enum but not the fold is accepted by the model and then dropped)',
+    );
+  }
 
   // The panel is where the sandbox and the player meet, and the ONE way to
   // break video without breaking any server test is to sandbox the player too —
