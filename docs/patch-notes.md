@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.38
+
+v0.3.38 - Jarvis can use your lists, and they stop emptying themselves
+
+- Jarvis can now read and edit your to-do list, documents and notes, so
+ an agent can add a task or write a note. Each store is off until you
+ enable it for that agent.
+- Agents can also call a REST endpoint you name.
+- Fixed: your list could empty itself with nobody deleting anything. A
+ device that reconnected sent an older copy, and the app adopted it. An
+ older copy can no longer overwrite a newer one.
+
 ## 0.3.37
 
 v0.3.37 - Jarvis actions come from the server
