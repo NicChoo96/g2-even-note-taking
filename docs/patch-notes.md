@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.39
+
+v0.3.39 - Jarvis and agents can know where you are
+
+- A new location tool. Ask Jarvis where you are, or let an agent know
+ where a task started. It is off until you enable it for that agent,
+ like any other tool.
+- The position is read once, when the task starts, and its age is
+ always reported, so an old reading is never shown as where you are.
+- If no position can be read, Jarvis says so instead of guessing.
+- The app now asks for the location permission when you enable it.
+
 ## 0.3.38
 
 v0.3.38 - Jarvis can use your lists, and they stop emptying themselves
