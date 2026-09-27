@@ -8,6 +8,7 @@
 import { getAgents, updateAgents } from '../../agents-store';
 import { getRuns } from '../../agent-runs';
 import { fetchRuns, startRun, stopRun } from '../../stream';
+import { snapshotForRun } from '../../location/run';
 import {
   SEED_TOOL_ID,
   webSearchTool,
@@ -16,6 +17,7 @@ import {
   todoTool,
   docsTool,
   notesTool,
+  locationTool,
   uid,
   type AgentDef,
   type AgentMessage,
@@ -115,6 +117,23 @@ const NOTES_SEED: SeedTool = {
   words: /(notes?|scratchpad|memo)/i,
   make: notesTool,
 };
+/**
+ * Where the wearer is — the device itself, not a store.
+ *
+ * Every word here is checked against the seeds above and FILES_SEED below, and
+ * the boundary matters: the loose `locat` prefix is anchored (`\blocat`, so
+ * "allocated" is not a location), and nothing wide like "place" or "map" is
+ * included, because FILES_SEED's vocabulary is the loosest in this table and a
+ * bare "where" would swallow requests aimed at it. It sits AHEAD of FILES_SEED
+ * for the same reason the hub seeds do: `find` takes the first match, and these
+ * words can only mean a position.
+ */
+const LOCATION_SEED: SeedTool = {
+  kind: 'location',
+  words:
+    /(\blocat|whereabouts|where (am i|are we|i am|we are)|\bgps\b|\bcoords?\b|coordinates?|latitude|longitude|\bnear ?(me|by|us)\b|\bmy (position|coordinates)\b)/i,
+  make: locationTool,
+};
 
 /**
  * Every kind an agent may be given, in the order they are offered.
@@ -123,13 +142,15 @@ const NOTES_SEED: SeedTool = {
  * its vocabulary is the loosest ("docs", "documents", "store", "library"): a
  * phrase the wearer aimed at the Docs page ("my documents") would otherwise be
  * swallowed by the gateway tool, which is the one confusing answer here — the
- * report would be published where they are not looking.
+ * report would be published where they are not looking. LOCATION_SEED sits there
+ * too: "where am I" is not a document request.
  */
 const SEED_TOOLS: readonly SeedTool[] = [
   WEB_SEED,
   TODO_SEED,
   DOCS_SEED,
   NOTES_SEED,
+  LOCATION_SEED,
   FILES_SEED,
   JEV_SEED,
 ];
@@ -584,6 +605,9 @@ export const agentsCapabilities: Capability[] = [
         // before these fields existed.
         savedPrompt: savedPrompt || undefined,
         instructions: instructions || undefined,
+        // Same rule as the other two trigger sites (see src/location/run.ts):
+        // read the position only for an agent that has the location tool.
+        location: await snapshotForRun(tools),
         model: agent.model || st.llm.model,
       });
       if (!started.runId) return { ok: false, summary: `Could not start ${short(agent.name, 20)}`, hint: started.error };

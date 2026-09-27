@@ -148,6 +148,7 @@ import { httpRequestArgs, httpToolSchema } from './http-tool.mjs';
 // The schema and the reducer live together in hub-tools.mjs; `publishHubState`
 // below is the only part that needs a socket, and it stays here.
 import { hubToolSchema, isHubTool, runHubTool } from './hub-tools.mjs';
+import { isLocationTool, locationToolSchema, runLocationTool } from './location-tool.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -972,10 +973,26 @@ const RUN_MAX_BYTES = 256 * 1024;
 const runs = new Map(); // runId -> run
 const runAbort = new Map(); // runId -> AbortController
 
+/**
+ * The location snapshot a run was triggered with, keyed by run id.
+ *
+ * A SIDE TABLE rather than a field on the run, on purpose. `runSnapshot()` and
+ * `broadcastRun` hand the run object to clients verbatim, so a field there would
+ * put the wearer's coordinates on the wire — into the agents SSE feed, the
+ * stored session and durable storage — where they would outlive the one tool
+ * call that ever needed them. Beside the run, the default is that a position
+ * never leaves this process at all, and the peer tables are pruned together
+ * (see pruneRuns).
+ */
+const runLocations = new Map(); // runId -> snapshot
+
 function pruneRuns() {
   const now = Date.now();
   for (const [id, run] of runs) {
-    if (run.status !== 'running' && now - run.updatedAt > RUN_TTL_MS) runs.delete(id);
+    if (run.status !== 'running' && now - run.updatedAt > RUN_TTL_MS) {
+      runs.delete(id);
+      runLocations.delete(id);
+    }
   }
   while (runs.size > MAX_RUNS) {
     // Never evict an in-flight run.
@@ -984,6 +1001,7 @@ function pruneRuns() {
       .sort((a, b) => a.updatedAt - b.updatedAt)[0];
     if (!victim) break;
     runs.delete(victim.id);
+    runLocations.delete(victim.id);
   }
 }
 
@@ -1120,6 +1138,11 @@ function toolSchemaFor(t) {
     const schema = hubToolSchema(t);
     if (schema) return schema;
   }
+  // Where the wearer is. Unlike every other kind this one has nothing to
+  // configure and no arguments: the position is a SNAPSHOT taken on the device
+  // when the run started and sent with it, because the relay cannot reach the
+  // phone and a run has no way to ask mid-flight.
+  if (isLocationTool(t)) return locationToolSchema(t);
   // Anything left is a generic REST tool: a tool with no body template offers a
   // free-form `body`, one with a template offers exactly its authored keys.
   return httpToolSchema(t);
@@ -1148,8 +1171,17 @@ async function llmOnce(model, messages, tools, signal) {
   };
 }
 
-/** Execute one tool call server-side (web search, or a generic REST endpoint). */
-async function runToolOnce(tool, rawArgs, signal) {
+/**
+ * Execute one tool call server-side (web search, a hub store, or REST).
+ *
+ * `ctx` carries what a tool needs from beyond the relay's own reach, and today
+ * that is one thing: the location snapshot the client sent with the run. It
+ * arrives as an ARGUMENT rather than a module-level lookup because it belongs to
+ * the run being executed — two runs in flight must never see each other's
+ * position — and because a default keeps every caller that has nothing to pass
+ * (the /api/tool proxy, the harnesses) working unchanged.
+ */
+async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
   let args = {};
   try {
     args = JSON.parse(rawArgs || '{}');
@@ -1196,6 +1228,9 @@ async function runToolOnce(tool, rawArgs, signal) {
     if (result.state) publishHubState(result.state);
     return result.text;
   }
+  // No hub read needed and no key to check — but no second source either. A run
+  // that carried no snapshot gets a refusal that says so, never coordinates.
+  if (isLocationTool(tool)) return runLocationTool(tool, args, ctx.location).text;
   if (isFilesTool(tool)) return runFilesTool(tool, args, signal);
   if (isWebTool(tool)) {
     const ws = webSearchConfig();
@@ -1418,7 +1453,7 @@ async function executeRun(run) {
         // would send the model hunting for a typo instead of recovering. Naming
         // what is actually callable lets it retry in one step.
         const result = tool
-          ? await runToolOnce(tool, rawArgs, ac.signal)
+          ? await runToolOnce(tool, rawArgs, ac.signal, { location: runLocations.get(run.id) })
           : `tool error: ${name} is not available for this request. Call one of: `
             + `${schemas.map((s) => s.function.name).join(', ') || '(no tools)'}`;
         wire.push({ role: 'tool', content: result, tool_call_id: call.id });
@@ -2253,6 +2288,14 @@ const server = createServer(async (req, res) => {
       updatedAt: Date.now(),
     };
     runs.set(run.id, run);
+    // The wearer's position, captured on the device when the run was triggered —
+    // there is no route from here to the phone, and no client round trip mid-run
+    // to add one. Kept BESIDE the run and never ON it: a field would be
+    // serialized to every client by runSnapshot/broadcastRun, outliving the one
+    // tool call that needs it. Absent is a normal case, and a location tool that
+    // reads an absent snapshot REFUSES (see location-tool.mjs) rather than
+    // falling back to anything.
+    if (body?.location) runLocations.set(run.id, body.location);
     pruneRuns();
     json(res, 200, { ok: true, runId: run.id });
     broadcastRun(run);
@@ -2531,6 +2574,16 @@ const server = createServer(async (req, res) => {
         }
         const result = runHubTool(body, args, hub);
         if (result.state) publishHubState(result.state);
+        json(res, 200, { ok: result.ok, result: result.text });
+        return;
+      }
+
+      // Location, over the proxy. Without this branch a location tool would fall
+      // through to the generic REST path below and be told "tool url must be
+      // https://", which describes a tool it is not. The snapshot is whatever the
+      // caller sent — this route never reads a device either.
+      if (isLocationTool(body)) {
+        const result = runLocationTool(body, args, body?.location);
         json(res, 200, { ok: result.ok, result: result.text });
         return;
       }

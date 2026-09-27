@@ -376,13 +376,14 @@ assert(
   'the jev agent schema offers the rank intent',
   /enum: \['noul', 'choice', 'score', 'rank'\]/.test(relay),
 );
-// Adding a capability would shrink the page budget and evict a page action (the
-// bug fixed in 0.3.28), so the reserve must still hold exactly one entry.
-const agentSrc = readFileSync(resolve('src', 'ai', 'agent.ts'), 'utf8');
-assert(
-  'the always-available reserve still holds exactly one tool',
-  /const ALWAYS_AVAILABLE = \['jev\.decide'\];/.test(agentSrc),
-);
+// The reserve is no longer asserted here as a literal list. Reserve-membership
+// and the cap MOVE TOGETHER (see the MAX_TOOLS comment in agent.ts): adding a
+// global action that must be reserved — location.get did — raises MAX_TOOLS by
+// one and the per-page budget stands still. That change is correct, and a
+// "the reserve holds exactly these names" assertion fails on it while passing on
+// the change that actually breaks the wearer: a page losing its own action. So
+// the property is asserted against the live registry instead — the page budget
+// and the largest page — in section 11 below.
 
 // ── 10. the Agents tool side (source invariants) ────────────────────────────
 //
@@ -471,7 +472,7 @@ await build({
 // file that REGISTERS the catalog, registry.ts is where the helpers live.
 import './ai/pages.ts';
 export { capabilityByName, allCapabilities, capabilitiesForPage, listPages, toToolSchema, toWireName, callAction } from './ai/registry.ts';
-export { selectTools } from './ai/agent.ts';
+export { MAX_TOOLS, RESERVED, selectTools } from './ai/agent.ts';
 export { emptyAgentsState, jevTool } from './types.ts';
 export { GLOBAL_PAGE } from './ai/types.ts';
 `,
@@ -801,25 +802,58 @@ for (const [label, q, a] of [
   );
 }
 
-// The capability must expose the reader, and must NOT have grown the catalog:
-// extra global capabilities eat the per-page tool budget (see 0.3.28).
+// The capability must expose the reader, and must NOT have grown the catalog
+// beyond the one global that is genuinely app-wide and reserved. The count is 9,
+// not 8: location.get joined jev.decide. It was NOT a page action — "where am I?"
+// must not have to route the wearer somewhere to answer — and it could not live
+// in the unreserved remainder either, because a busy page fills all 9 remaining
+// slots before the remainder is reached (docs, files and agents each do) and it
+// would be dropped on exactly the runs most likely to ask. See ALWAYS_AVAILABLE
+// in agent.ts.
 assert('the jev capability offers an optional rank switch to Jarvis', /name: 'rank',\s*\n\s*type: 'boolean'/.test(capSrc));
 assert('the capability derives a ranking from the decision', /rankAnswers\(parsed\.value, reply\.answers\)/.test(capSrc));
 check(
-  'the reranker added no capability — the global count is unchanged',
+  'the app-wide catalog is jev.decide plus location.get and the seven nav/app actions',
   ui.allCapabilities().filter((c) => c.page === ui.GLOBAL_PAGE).length,
-  8,
+  9,
 );
 
 // The invariant behind the 0.3.28 bug, stated as a test rather than a comment:
-// the reserve is taken out BEFORE page actions, so every page must still be
+// the reserve is taken out BEFORE page actions, so what must hold still is the
+// page BUDGET, not the cap. Asserting the cap (or the reserve's size) tests the
+// symptom — it failed the moment location.get was reserved, while the property it
+// existed to protect was intact.
+const pageBudget = ui.MAX_TOOLS - ui.RESERVED.length;
+const ownCounts = ui.listPages().map((p) => [p.id, ui.capabilitiesForPage(p.id).length]);
+const biggest = ownCounts.reduce((a, b) => (b[1] > a[1] ? b : a));
+assert(
+  `the page budget (${pageBudget}) still fits the largest page's own actions (${biggest[0]}: ${biggest[1]})`,
+  pageBudget >= biggest[1],
+  `cap ${ui.MAX_TOOLS} - reserve ${ui.RESERVED.length} · own counts ${ownCounts
+    .map(([id, n]) => `${id}:${n}`)
+    .join(' ')}`,
+);
+// There is deliberately NO "the cap is no larger than it needs to be" assertion.
+// It read `pageBudget === biggest[1]`, which assumes a page declares exactly the
+// budget's worth of actions and that every spare slot would have been taken.
+// Neither is a property of anything: the size that matters is whether the reserve
+// can evict a page's OWN action, and that is the assertion above plus the loop
+// below. The equality also read as evidence that the largest page declared 9 —
+// this comment and agent.ts both said so — while the measurement says the largest
+// is docs with 7, which is simply what spare slots in this design look like.
+
+// And the same property against real selections: every page must still be
 // handed all of its own actions, and the list must still fit MAX_TOOLS.
 for (const pid of ui.listPages().map((p) => p.id)) {
   const handed = ui.selectTools(pid).map((s) => s.function.name);
   const own = ui.capabilitiesForPage(pid).map((c) => ui.toWireName(c.name));
   const missing = own.filter((n) => !handed.includes(n));
   assert(`no page loses its own action to the reserve on '${pid}'`, missing.length === 0, missing.join(', '));
-  assert(`the tool list stays within the cap on '${pid}'`, handed.length <= 12, String(handed.length));
+  assert(
+    `the tool list stays within the cap on '${pid}'`,
+    handed.length <= ui.MAX_TOOLS,
+    `${handed.length} of ${ui.MAX_TOOLS}`,
+  );
 }
 
 console.log(fail ? `\n${fail} FAILURE(S) of ${total}` : `\nALL PASS (${total} assertions)`);

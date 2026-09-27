@@ -10,6 +10,7 @@ import {
   type MenuContainerProperty,
 } from '@evenrealities/even_hub_sdk';
 import { connectAgentsStream, connectStream, startRun, stopRun, type AgentRun } from './stream';
+import { snapshotForRun } from './location/run';
 import { getRuns, isAgentRunning, latestRunFor, subscribeRuns } from './agent-runs';
 import {
   AGENT_LAYOUT,
@@ -1342,6 +1343,12 @@ async function main(): Promise<void> {
       },
       tools,
       prompt: agent.prompt.trim(),
+      // Read only when this agent actually has the location tool: the read can
+      // raise a permission prompt in a browser, so an agent that never asks
+      // where anyone is must not cause one. Resolved BEFORE the call because a
+      // run's snapshot is taken at trigger time by definition — the relay has no
+      // way to ask for one afterwards.
+      location: await snapshotForRun(tools),
       model: agent.model || st.llm.model,
     });
     if (!started.runId) {

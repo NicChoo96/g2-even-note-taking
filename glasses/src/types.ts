@@ -126,11 +126,17 @@ export function upsertDoc(
  * call returns. Note 'docs' is the wearer's own document LIBRARY (the Docs tab);
  * 'files' is the different, gateway-backed store.
  *
+ * 'location' is the odd one out, and the only kind whose data the RELAY cannot
+ * fetch. A fix lives in the phone, and a run executes server-side with no way to
+ * ask the page for one mid-run, so the client resolves it when the run is
+ * triggered and sends it ALONG WITH the run. The relay's tool reads that
+ * snapshot and says so when there is none. Same kind, two halves of the trip.
+ *
  * 'tavily' is the LEGACY kind for the same web tool. It is accepted on every read
  * path (see normalizeTool) because persisted agents, bridge snapshots and an
  * older client bundle can all still carry it, but nothing writes it any more.
  */
-export type ToolKind = 'web' | 'http' | 'jev' | 'files' | 'todo' | 'docs' | 'notes';
+export type ToolKind = 'web' | 'http' | 'jev' | 'files' | 'todo' | 'docs' | 'notes' | 'location';
 /** Legacy spelling, read-only — kept so normalizing old state type-checks. */
 export type LegacyToolKind = 'tavily';
 export type WebDepth = 'basic' | 'advanced';
@@ -370,6 +376,8 @@ export const TODO_TOOL_ID = 'tool-todo';
 export const DOCS_TOOL_ID = 'tool-docs';
 /** The seeded notes tool's id. */
 export const NOTES_TOOL_ID = 'tool-notes';
+/** The seeded location tool's id. */
+export const LOCATION_TOOL_ID = 'tool-location';
 
 /** Add, tick, rename, delete or list the wearer's tasks. */
 export function todoTool(): ToolDef {
@@ -415,6 +423,30 @@ export function notesTool(): ToolDef {
       'Read and change the wearer\u2019s Notes scratchpad on the glasses. Read the notes, add ' +
       'a line to them, or rewrite them. Notes is one free-text blob, unlike the Docs ' +
       'tab\u2019s separate documents.',
+    hasToken: false,
+  };
+}
+
+/**
+ * Where the wearer is.
+ *
+ * Unlike every other kind here, this one is only HALF a tool on the server: the
+ * relay cannot reach the phone's location, so the fix travels with the run and
+ * the tool reads the snapshot (see web/server/location-tool.mjs). The description
+ * says so, because a model that assumes the call is a live reading will report a
+ * fix captured before it set off as though the wearer were still standing there.
+ */
+export function locationTool(): ToolDef {
+  return {
+    id: LOCATION_TOOL_ID,
+    name: 'jarvis_location',
+    kind: 'location',
+    description:
+      'Read the wearer\u2019s location \u2014 latitude and longitude, and the accuracy of the reading, ' +
+      'plus altitude, speed and heading when the device supplies them. The position is captured when ' +
+      'the run starts (this tool cannot take a new reading while a run is in flight), so on a long run ' +
+      'treat it as where the wearer was when this started, and report the stated age if it matters. ' +
+      'If no position was available the tool says so rather than guessing.',
     hasToken: false,
   };
 }

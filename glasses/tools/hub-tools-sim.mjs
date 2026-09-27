@@ -18,6 +18,10 @@
 // Run: node tools/hub-tools-sim.mjs
 
 import { readFileSync } from 'node:fs';
+// The location tool is a relay tool like the hub ones, and this harness owns the
+// seed list, so the kind comes from the module that dispatches it rather than
+// being spelled 'location' here.
+import { LOCATION_KIND } from '../../web/server/location-tool.mjs';
 import {
   HUB_TOOL_KINDS,
   HUB_TOOL_NAMES,
@@ -353,9 +357,13 @@ has('publishHubState fans out to subscribers', publishFn, 'send(client, frame, c
 has('publishHubState publishes a state frame', publishFn, "{ type: 'state', state }");
 
 const runOnce = fnSource(relaySrc, 'runToolOnce');
+// Up to the declared parameters only. The executor gained a fourth (the run
+// context that carries the location snapshot), and pinning the whole signature
+// made this assertion fail over a change that was not about the slice at all.
+// What it checks is that the slice STARTS at the real function.
 has(
   'the slice really is the executor',
-  runOnce.startsWith('function runToolOnce(tool, rawArgs, signal)'),
+  runOnce.startsWith('function runToolOnce(tool, rawArgs, signal'),
   true,
 );
 has('runToolOnce dispatches hub tools', runOnce, 'if (isHubTool(tool))');
@@ -409,7 +417,18 @@ has('the voice path has a todo seed', capSrc, 'const TODO_SEED: SeedTool = {');
 has('the voice path has a docs seed', capSrc, 'const DOCS_SEED: SeedTool = {');
 has('the voice path has a notes seed', capSrc, 'const NOTES_SEED: SeedTool = {');
 const seedList = capSrc.slice(capSrc.indexOf('const SEED_TOOLS: readonly SeedTool[]'), capSrc.indexOf('/**', capSrc.indexOf('const SEED_TOOLS: readonly SeedTool[]')));
-eq('all six kinds are offered', seedList.split('_SEED,').length - 1, 6);
+// This check used to be a count with the number spelled out. The
+// literal went stale the moment `location` was seeded — and a harness that has to
+// be edited before it can notice a missing seed does not notice one. The expected
+// set is assembled from the same sources the relay uses: HUB_TOOL_KINDS owns
+// docs/notes/todo, and web, files, jev and the location kind are seeds of their
+// own. Derived here rather than typed, so the NEXT kind added is caught by this
+// assertion instead of requiring it to be updated.
+const SEED_KINDS = ['web', ...HUB_TOOL_KINDS, 'files', 'jev', LOCATION_KIND].sort();
+const offeredKinds = [
+  ...new Set([...seedList.matchAll(/([A-Z]+)_SEED\b/g)].map((m) => m[1].toLowerCase())),
+].sort();
+deepEq('every kind the relay can execute is offered as a seed', offeredKinds, SEED_KINDS);
 eq(
   'the gateway seed is resolved LAST, so "my documents" cannot mean it',
   seedList.indexOf('FILES_SEED') > seedList.indexOf('DOCS_SEED') &&

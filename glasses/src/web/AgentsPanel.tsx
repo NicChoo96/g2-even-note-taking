@@ -15,6 +15,7 @@ import {
 } from '../agents-store';
 import { getRuns, subscribeRuns } from '../agent-runs';
 import { startRun, stopRun } from '../stream';
+import { snapshotForRun } from '../location/run';
 import { FREE_TOOL_MODELS } from '../models';
 import {
   DOCS_TOOL_ID,
@@ -25,6 +26,8 @@ import {
   filesTool,
   JEV_TOOL_ID,
   jevTool,
+  LOCATION_TOOL_ID,
+  locationTool,
   NOTES_TOOL_ID,
   notesTool,
   orderedAgents,
@@ -128,6 +131,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   const addTodoToAgent = () => attachSeed(TODO_TOOL_ID, todoTool);
   const addDocsToAgent = () => attachSeed(DOCS_TOOL_ID, docsTool);
   const addNotesToAgent = () => attachSeed(NOTES_TOOL_ID, notesTool);
+  const addLocationToAgent = () => attachSeed(LOCATION_TOOL_ID, locationTool);
 
   const seedChips = [
     { kind: 'web', label: 'Web search', add: addWebSearchToAgent },
@@ -136,6 +140,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
     { kind: 'todo', label: 'To-do list', add: addTodoToAgent },
     { kind: 'docs', label: 'Docs', add: addDocsToAgent },
     { kind: 'notes', label: 'Notes', add: addNotesToAgent },
+    { kind: 'location', label: 'Location', add: addLocationToAgent },
   ];
   const missingSeeds = seedChips.filter((s) => !state.tools.some((t) => t.kind === s.kind));
 
@@ -323,6 +328,11 @@ function ToolEditor({
           <option value="todo">To-do list</option>
           <option value="docs">Docs (my documents)</option>
           <option value="notes">Notes</option>
+          {/* The one kind whose data is not the relay's. It takes no config
+              either — the position is read on the DEVICE and travels with the
+              run — but it only works if the wearer has granted location, so the
+              note below says where that happens. */}
+          <option value="location">Location</option>
         </select>
         <button
           className="icon-btn danger"
@@ -383,6 +393,16 @@ function ToolEditor({
           {filesReady
             ? 'Ready — publishes HTML pages the wearer reads on the Files tab. The document body is never returned to the model, so agents publish and stop.'
             : 'No document-store credential on the server yet. Set JARVIS_FILE_USER and JARVIS_FILE_PWD (or JARVIS_FILE_API_KEY) in the relay environment.'}
+        </p>
+      )}
+
+      {tool.kind === 'location' && (
+        <p className="empty">
+          Reports where the wearer is. The position is captured on the device when the run starts and
+          travels with it — a run cannot take a new reading while it is in flight — so this tool answers
+          with where the wearer was as the run began, and states the age. In the glasses app the Even Hub
+          app supplies it (grant location when it asks); in a browser the browser asks. If it is refused
+          or unavailable the tool says so instead of guessing.
         </p>
       )}
 
@@ -587,6 +607,10 @@ export function AgentsPanel() {
       },
       tools,
       prompt: body,
+      // Only an agent carrying the location tool pays for the read — it can
+      // raise the browser's permission prompt, so it must never be raised for a
+      // run that has no use for a position.
+      location: await snapshotForRun(tools),
       model: agent.model || state.llm.model,
     });
     if (!started.runId) {

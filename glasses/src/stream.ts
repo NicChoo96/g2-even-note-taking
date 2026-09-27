@@ -1,5 +1,6 @@
 import type { AgentsState, HubState } from './types';
 import { getStreamToken, notifyAuthRejected } from './auth-token';
+import type { LocationFix } from './location/spec';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
 // root, so /api/stream resolves to the live stream next to it. Local dev
@@ -493,6 +494,20 @@ export async function startRun(args: {
    * `prompt` REPLACES the saved task while this ADDS to it.
    */
   instructions?: string;
+  /**
+   * Where the wearer was when this run was triggered, for the `location` tool.
+   *
+   * The relay executes runs server-side and has no way to reach the phone, so a
+   * location tool there can only be read from a SNAPSHOT — this is the ride. The
+   * client resolves the fix (see src/location/source.ts) and sends it with the
+   * run, exactly as `savedPrompt` and `instructions` travel ahead of the prompt.
+   *
+   * Omitted whenever the agent has no location tool, or the device can supply no
+   * fix, which is what keeps an unchanged caller's wire bytes identical to what
+   * they were before this field existed. A run without a snapshot is not an
+   * error: the tool reports that it has no position rather than inventing one.
+   */
+  location?: LocationFix;
   model: string;
 }): Promise<RunStartResult> {
   try {

@@ -11,6 +11,7 @@ import { docsCapabilities } from './capabilities/docs';
 import { filesCapabilities } from './capabilities/files';
 import { globalCapabilities } from './capabilities/global';
 import { jevCapabilities } from './capabilities/jev';
+import { locationCapabilities } from './capabilities/location';
 import { notesCapabilities } from './capabilities/notes';
 import { settingsCapabilities } from './capabilities/settings';
 import { todoCapabilities } from './capabilities/todo';
@@ -19,6 +20,10 @@ import type { Capability } from './types';
 const CAPABILITIES: Capability[] = [
   ...globalCapabilities,
   ...jevCapabilities,
+  // Location belongs with the globals but lives in its own module: it is the one
+  // capability that reaches the DEVICE, which keeps it away from both the pure
+  // app introspection in capabilities/global.ts and jev's pure reasoning.
+  ...locationCapabilities,
   ...todoCapabilities,
   ...docsCapabilities,
   ...filesCapabilities,

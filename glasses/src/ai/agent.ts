@@ -37,8 +37,20 @@ import { conversePromptText, isConversational } from './converse';
 import { beginAiBatch, endAiBatch } from './undo';
 import { stripToolMarkup } from './tool-markup';
 
-/** DeepSeek tolerates more, but a tight tool set measurably improves selection. */
-const MAX_TOOLS = 12;
+/**
+ * DeepSeek tolerates more, but a tight tool set measurably improves selection.
+ *
+ * 13 rather than 12 because the RESERVE below gained one entry (location.get) and
+ * the PAGE BUDGET — this cap minus the reserve — is what the pages are sized
+ * against: 9, so that the busiest page still receives every one of its OWN
+ * actions (docs declares 7, the most of any page, and the reserve is 4). When the
+ * reserve grows against a fixed cap a page starts losing its own actions to it,
+ * and that eviction is the 0.3.28 bug. So the cap and the reserve move TOGETHER,
+ * and tools/jev-spec-sim.mjs measures their difference against the largest page
+ * rather than either number on its own. Exported for exactly that: a harness that
+ * hardcodes 12 stops testing anything the moment this changes.
+ */
+export const MAX_TOOLS = 13;
 
 /**
  * Provider-safe name for anything that crosses the wire. `prepare` accepts both
@@ -106,11 +118,19 @@ const MANDATORY = ['say.reply', 'nav.open_page'];
  * reached, and jev__decide disappeared from every Docs and Agents turn that
  * way. An advertised-but-absent tool is worse than an omitted one — the PAGES
  * block tells the model to call it, so it calls it and eats a provider error.
+ *
+ * location.get is reserved for that reason, and for one of its own: as a page
+ * action it would have to be ROUTED to, and "where am I?" must not change the
+ * page the wearer is looking at in order to answer a question about the world.
+ * It could not survive in `rest` either — a busy page consumes all 9 remaining
+ * budget slots before the remainder is reached (docs, files and agents each fill
+ * the 9), so a non-reserved global is handed on the quiet pages and dropped on
+ * the busy ones, which is the same as unreliable.
  */
-const ALWAYS_AVAILABLE = ['jev.decide'];
+const ALWAYS_AVAILABLE = ['jev.decide', 'location.get'];
 
 /** Everything taken out of the budget before page actions are considered. */
-const RESERVED = [...MANDATORY, ...ALWAYS_AVAILABLE];
+export const RESERVED: string[] = [...MANDATORY, ...ALWAYS_AVAILABLE];
 
 /**
  * Order for whatever budget is left, highest value first. Page actions sit above

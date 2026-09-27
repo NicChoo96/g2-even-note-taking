@@ -93,7 +93,7 @@ await build({
     // single module instance — duplicate module copies would give two stores.
     contents: `
 export * from './ai/index.ts';
-export { selectTools, shortJson } from './ai/agent.ts';
+export { selectTools, shortJson, MAX_TOOLS, RESERVED } from './ai/agent.ts';
 export * from './ai/store.ts';
 export * from './ai/sync.ts';
 export * from './ai/registry.ts';
@@ -127,6 +127,8 @@ const {
   registerPage,
   registerCapabilities,
   selectTools,
+  MAX_TOOLS,
+  RESERVED,
   shortJson,
   allCapabilities,
   capabilityByName,
@@ -232,7 +234,11 @@ check(
 // every docs and agents turn while the PAGES block called it "always callable".
 // An advertised-but-absent tool is worse than an omitted one — the model calls
 // it and reports a failure the wearer cannot act on.
-const RESERVED_WIRE = ['say.reply', 'nav.open_page', 'jev.decide'].map(toWireName);
+//
+// Read from agent.ts, not retyped: the reserve and the cap move TOGETHER (adding
+// one global spends one page slot), so a literal here would keep passing while
+// the thing it is meant to protect had already changed.
+const RESERVED_WIRE = RESERVED.map(toWireName);
 for (const p of pages) {
   const handed = selectTools(p.id).map((s) => s.function.name);
 
@@ -255,7 +261,7 @@ for (const p of pages) {
     `dropped: ${lostOwn.join(', ') || '-'}`,
   );
 
-  assert(`'${p.id}' stays inside the tool budget`, handed.length <= 12, `${handed.length}`);
+  assert(`'${p.id}' stays inside the tool budget`, handed.length <= MAX_TOOLS, `${handed.length}/${MAX_TOOLS}`);
 }
 // A page may promise MORE than is callable right now (an action gated off is
 // still one the model should plan for) but never less than nav.list_actions
@@ -759,7 +765,10 @@ assert('focused-page actions are exposed', sentTools.includes('todo__add'), sent
 assert('say.reply is always exposed', sentTools.includes('say__reply'));
 assert('nav.open_page is always exposed', sentTools.includes('nav__open_page'));
 assert('every name handed to the provider is pattern-safe', sentTools.every((n) => PROVIDER_NAME.test(n)), sentTools.join(','));
-assert('tool count respects the budget', sentTools.length <= 12, `${sentTools.length} tools`);
+// Read from agent.ts, never spelled out: the number that matters is the RULE
+// (page actions plus the reserve fit the budget), and a harness that hardcodes
+// the cap stops testing anything the moment the cap moves.
+assert('tool count respects the budget', sentTools.length <= MAX_TOOLS, `${sentTools.length} of ${MAX_TOOLS} tools`);
 check('no duplicate tool names', sentTools.length, new Set(sentTools).size);
 
 // --- 7b-iii. THE BUDGET CANNOT EVICT ROUTING OR SPEECH. Page actions are ranked
@@ -778,7 +787,7 @@ for (const page of pages.map((p) => p.id)) {
     names.includes('nav__open_page'),
     names.join(','),
   );
-  assert(`[${page}] stays within the tool budget`, names.length <= 12, `${names.length} tools`);
+  assert(`[${page}] stays within the tool budget`, names.length <= MAX_TOOLS, `${names.length} of ${MAX_TOOLS} tools`);
 }
 
 // --- 7b-iv. THE REPORTED DEFECT. Standing on To-Do, "add a line to my shopping
@@ -1768,13 +1777,20 @@ assert(
   JSON.stringify(toolCatalog.data).includes('jarvis_files'),
 );
 assert('tools.list advertises jev', JSON.stringify(toolCatalog.data).includes('jev_decide'));
+// Every kind a spoken phrase can CREATE has to be advertised here — that is what
+// makes it discoverable by a voice-only wearer, which is the whole reason the
+// list is built from the seeds rather than from the catalog. Spelled out on
+// purpose, and NOT derived from the same table it checks: a seed added without
+// appearing here is the failure this guards. It said ['files','jev'] and stayed
+// that way while todo, docs and notes were seeded; `location` is the newest of
+// them, and the literal had to be corrected to see it at all.
 check(
   '…and marks exactly the un-created kinds as available',
   toolCatalog.data.tools
     .filter((t) => t.available)
     .map((t) => t.kind)
     .sort(),
-  ['files', 'jev'],
+  ['docs', 'files', 'jev', 'location', 'notes', 'todo'],
 );
 // ASKING is not OPTING IN: a read must not create them, or a deleted tool would
 // come back the moment anything listed what was on offer.
@@ -1918,6 +1934,15 @@ assert('…with the unmatched phrase reported back', /no such tool/.test(bogus.h
 // ════════════════════════════════════════════════════════════════════════════
 console.log('\n── Sessions: full transcripts, not fragments ──');
 
+// Sessions are ordered by `updatedAt`, which `recordSession` stamps with
+// `Date.now()`, and the store sorts newest-first with a STABLE sort. Two fixtures
+// recorded back to back land in the SAME millisecond easily — everything between
+// them here is synchronous — and on a tie the EARLIER one keeps slot 1. The reads
+// below then answer with the previous fixture's transcript while the message
+// never names the session it actually got, which is how this surfaced: three
+// failures about line trimming that were really one about ordering.
+const tick = () => new Promise((r) => setTimeout(r, 5));
+
 // A tool result in the shape the relay now stores it: the whole thing, tail
 // included. This is the exact text that used to be cut to 600 characters.
 const TAIL_MARK = 'END-OF-TOOL-RESULT-MARKER';
@@ -1928,6 +1953,7 @@ assert(
   `${toolResult.length} chars`,
 );
 
+await tick();
 agents.recordSession({
   agentId: 'agent-session-fixture',
   title: 'Fixture run',
@@ -1969,6 +1995,9 @@ for (let i = 0; i < 40; i++) {
   oversized.push({ role: 'tool', content: `${'x'.repeat(3000)}-line-${i}`, tool: 't', at: i });
 }
 oversized.push({ role: 'assistant', content: `FINAL-ANSWER-${'y'.repeat(200)}`, at: 99 });
+// Strictly later than the fixture above, so "1 = newest" is a fact rather than a
+// coin flip (see `tick`), and the read names what it got.
+await tick();
 agents.recordSession({
   agentId: 'agent-session-fixture',
   title: 'Oversized run',
@@ -1976,6 +2005,11 @@ agents.recordSession({
   messages: oversized,
 });
 const big = await capOf('agents.sessions').run({ session: '1' });
+assert(
+  'the read resolves to the session just recorded',
+  big.data.session.title === 'Oversized run',
+  big.data.session.title,
+);
 const bt = big.data.transcript;
 assert('an oversized transcript IS trimmed', bt.includes('earlier line'), bt.slice(0, 60));
 assert('…and it stays near the budget', bt.length <= 88080, `${bt.length} chars`);
@@ -2001,6 +2035,7 @@ for (let i = 0; i < 5; i++) {
   fullRun.push({ role: 'tool', content: `${'r'.repeat(11839)}${TAIL_MARK}-${i}`, tool: 'tavily_search', at: i * 3 + 2 });
 }
 fullRun.push({ role: 'assistant', content: 'Markets moved on the rate decision.', at: 99 });
+await tick();
 agents.recordSession({
   agentId: 'agent-session-fixture',
   title: 'Full 5-step run',
@@ -2008,6 +2043,11 @@ agents.recordSession({
   messages: fullRun,
 });
 const worst = await capOf('agents.sessions').run({ session: '1' });
+assert(
+  'the read resolves to the session just recorded',
+  worst.data.session.title === 'Full 5-step run',
+  worst.data.session.title,
+);
 const wt = worst.data.transcript;
 assert('a full 5-step run reads WITHOUT a clip marker', !wt.includes('omitted'), wt.slice(0, 60));
 assert('…and its size matches the stored content', wt.length > 59000, `${wt.length} chars`);
