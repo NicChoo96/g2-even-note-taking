@@ -15,6 +15,8 @@
 import { useEffect, useState } from 'react';
 import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
 import { compactMemory, getMemoryView, resetMemory, subscribeMemory, type MemoryView } from '../ai';
+import { getDurableBridge } from '../durable-docs';
+import { PROBE_STATUS_LABELS, probeLocation, type ProbeReport, type ProbeStep } from '../location/probe';
 import { FREE_TOOL_MODELS, DEEPSEEK_MODELS } from '../models';
 import { DEFAULT_MODEL } from '../types';
 import { fetchAgentStatus, saveSettings, type AgentStatus, type SettingsPatch, type ValueSource } from './agents-client';
@@ -108,6 +110,69 @@ function MemoryPanel() {
           </button>
         )}
       </div>
+    </>
+  );
+}
+
+/** One route's outcome, in the settings readout's own words. */
+function probeStepText(step: ProbeStep): string {
+  if (step.status === 'ok' && step.coords) return step.coords;
+  const code = typeof step.code === 'number' ? ` (code ${step.code})` : '';
+  return `${PROBE_STATUS_LABELS[step.status]}${code}`;
+}
+
+/**
+ * Where the wearer is, asked directly — the ONE place both routes can be
+ * compared side by side.
+ *
+ * The app reads location itself (see ../location/source) and on the glasses that
+ * read is invisible: a refusal, a host with no location API, and a GPS that never
+ * answers all arrive downstream as the same sentence. This row exists so the
+ * question can be asked on demand and the ANSWER attributed to a route, with the
+ * W3C code that separates a denial from an absent positioner.
+ *
+ * It is a button here and NOT a menu item or a gesture: the glasses menu is full
+ * and its order is asserted by harnesses, and a new tap target would land in the
+ * middle of the input path dictation depends on. Nothing on this page is a fix —
+ * the probe deliberately writes no state, and `getCurrentFix` remains the only
+ * way a location reaches the app.
+ */
+function LocationProbePanel() {
+  const [report, setReport] = useState<ProbeReport | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    setBusy(true);
+    setReport(null);
+    try {
+      setReport(await probeLocation({ hub: getDurableBridge() }));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="panel-label">Location check</div>
+      <p className="hint-line">
+        Asks the Even Hub app's own location API <em>and</em> the WebView's{' '}
+        <code>navigator.geolocation</code>, once each, and reports what each one said. This is a
+        diagnostic only: it stores nothing, and a refusal is reported as a refusal — no coordinate
+        is ever invented to fill the gap.
+      </p>
+      <div className="docs-actions">
+        <button onClick={() => void run()} disabled={busy}>
+          {busy ? 'Asking both routes…' : 'Run location check'}
+        </button>
+      </div>
+      {report && (
+        <div className="status-grid">
+          <span className="pill">Even Hub app · {probeStepText(report.hub)}</span>
+          <span className="pill">WebView page · {probeStepText(report.browser)}</span>
+        </div>
+      )}
+      {report && <p className="hint-line">{report.hub.detail}</p>}
+      {report && <p className="hint-line">{report.browser.detail}</p>}
     </>
   );
 }
@@ -594,6 +659,8 @@ export function SettingsPanel() {
       </p>
 
       <MemoryPanel />
+
+      <LocationProbePanel />
 
       <DevicesPanel />
     </div>

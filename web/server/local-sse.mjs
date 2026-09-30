@@ -35,6 +35,7 @@
 //   GET  /api/files               -> list stored HTML documents (relay-proxied)
 //   POST /api/files               -> publish an HTML document
 //   GET  /api/files/:id           -> one document's metadata
+//   GET  /api/files/:id/text      -> the document BODY as plain text, in full
 //   GET  /api/files/:id/html      -> the document BODY (bearer only; see below)
 //   DELETE /api/files/:id         -> soft-delete a document
 //
@@ -103,8 +104,11 @@ import {
   filesConfig,
   filesToolSchema,
   htmlResponseHeaders,
+  htmlToText,
   isFilesTool,
+  bodyWindow,
   renderToolResult as renderFilesResult,
+  renderToolBody as renderFilesBody,
 } from './jarvis-files.mjs';
 // The DOCUMENT ORIGIN — where untrusted, agent-authored pages are framed from
 // when that must not be this app's own origin. See its header for why a sandbox
@@ -783,10 +787,20 @@ async function runFilesTool(tool, args, signal) {
     if (action === 'read') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to read a document';
-      // `include_html` is NOT forwarded. The schema accepts it because the
-      // gateway defines it and declaring the union is what keeps the drift check
-      // clean, but a body is never put in a tool message: see renderToolResult.
-      return renderFilesResult('read_session', await client.read(id, { signal }));
+      // THE BODY IS READABLE, AND ONLY WHEN ASKED FOR.
+      //
+      // `include_html` used to be declared in the schema and then dropped right
+      // here: the model could send a parameter that nothing acted on, so a
+      // stored report was metadata and nothing else — "it can only read
+      // metadata" was this line, one layer down. It is now forwarded, and what
+      // comes back is TEXT (htmlToText + bodyWindow) — the WHOLE document by
+      // default, so the model can quote it or rewrite it, and only a document
+      // past the module's ceiling arrives in a window. Never the markup, either
+      // way, and never more than that ceiling. See renderToolBody.
+      const wantBody = args?.include_html === true;
+      const doc = await client.read(id, { includeHtml: wantBody, signal });
+      if (!wantBody) return renderFilesResult('read_session', doc);
+      return renderFilesBody(doc, { offset: args?.offset, limit: args?.limit });
     }
     if (action === 'update') {
       const id = String(args?.id ?? '').trim();
@@ -840,10 +854,13 @@ async function runFilesTool(tool, args, signal) {
     if (action === 'revision') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to read a revision';
-      return renderFilesResult(
-        'read_revision',
-        await client.revision(id, args?.revision, { signal }),
-      );
+      // Same contract as read, for the same reason: a revision is how a wearer
+      // asks "what did it say BEFORE this edit", and metadata alone cannot
+      // answer that either.
+      const wantBody = args?.include_html === true;
+      const rev = await client.revision(id, args?.revision, { includeHtml: wantBody, signal });
+      if (!wantBody) return renderFilesResult('read_revision', rev);
+      return renderFilesBody(rev, { offset: args?.offset, limit: args?.limit });
     }
     if (action === 'revert' || action === 'restore_revision') {
       const id = String(args?.id ?? '').trim();
@@ -2733,6 +2750,35 @@ const server = createServer(async (req, res) => {
         // the frame is served under cannot drift from SANDBOX_CSP.
         res.writeHead(200, { ...htmlResponseHeaders(), 'Content-Type': doc.contentType });
         res.end(doc.text);
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    // The document BODY as TEXT — the readable view of a stored page.
+    //
+    // A route of its own beside /media, and for the same reason that one exists:
+    // the body is fetched by the RELAY with the credential the app does not have,
+    // and what goes back is a DERIVED value rather than the bytes, so the app's
+    // model can read what a page says without a 4 MiB HTML document ever
+    // entering a tool message. The raw body stays on /html, which is served
+    // under the sandbox policy and read by a frame, not by a model.
+    //
+    // Callers that pass no `limit` get the WHOLE text, which is the ordinary
+    // read: the app has to be able to hand its model a complete page to edit.
+    const textMatch = /^\/api\/files\/([A-Za-z0-9_-]{1,64})\/text$/.exec(url.pathname);
+    if (req.method === 'GET' && textMatch) {
+      try {
+        const doc = await client.body(textMatch[1]);
+        // Windowed EXACTLY as the tool path windows it, off the same helper, so
+        // the app's model and the relay's agent cannot disagree about what a
+        // given offset means or about which offset continues a split read.
+        const w = bodyWindow(htmlToText(doc.text), {
+          offset: url.searchParams.get('offset'),
+          limit: url.searchParams.get('limit'),
+        });
+        json(res, 200, { ok: true, text: w.text, offset: w.offset, total: w.total, next: w.next, more: w.more });
       } catch (err) {
         fail(err);
       }

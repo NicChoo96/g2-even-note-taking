@@ -64,6 +64,29 @@ export const MCP_PATH = '/mcp';
 export const MAX_HTML_BYTES = 4 * 1024 * 1024;
 /** Our own ceiling for a tool result, so one list cannot spend the byte budget. */
 export const RESULT_CHARS = 4000;
+/**
+ * The MOST document TEXT one read hands a model, in characters.
+ *
+ * A read returns the WHOLE body by default — see `windowSize`, where "no limit"
+ * means "all of it", so a caller that names no size is asking to read the page
+ * rather than to be shown a sample of it. A page has to come back whole for the
+ * reader to quote it or to CHANGE it, which is what this ceiling exists to bound
+ * and not to prevent. A document longer than it is still readable in full across
+ * a few calls, each carrying the offset that continues it.
+ *
+ * WHY 60 000 AND NOT MORE — MEASURED, NOT CHOSEN
+ *   The in-app agent clips a tool result at 120 000 characters
+ *   (MAX_RESULT_CHARS, src/ai/agent.ts), and clips it by shortening the longest
+ *   STRING LEAF — which is this text — appending "…(clipped)". An over-long
+ *   read would therefore lose the truncation marker that says how to continue
+ *   and leave the model holding a cut page it cannot finish. JSON escaping
+ *   decides the real ceiling, measured on three bodies: prose 1.00x,
+ *   blank-line-heavy 1.35x, and a body that is nothing but quotes 2.01x. At
+ *   60 000 characters even that worst case serialises to 110 335 — inside the
+ *   budget with room for the envelope around it — while 80 000 serialises to
+ *   130 335 and IS clipped.
+ */
+export const BODY_MAX_CHARS = 60_000;
 /** Renew this long before the access token actually expires. */
 export const RENEW_SKEW_MS = 120_000;
 /** A gateway call should not outlive this, whatever the run's own signal says. */
@@ -307,10 +330,19 @@ const dayOf = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : 'unknown d
 /**
  * The text a MODEL reads back.
  *
- * The invariant both transports must not break: the result is ALWAYS a short,
- * plain-text summary and NEVER the document body. A 4 MiB HTML page inside a
- * tool message would blow the run's byte budget and tells the model nothing it
- * can act on — it needs the ID and the title, and the wearer gets the pixels.
+ * The invariant both transports must not break: a result is ALWAYS plain text
+ * and NEVER markup. A 4 MiB HTML page inside a tool message would blow the run's
+ * byte budget and tells the model nothing it can act on — from a metadata call it
+ * needs the ID and the title, and the wearer gets the pixels.
+ *
+ * THE ONE EXCEPTION, AND ITS BOUNDS. `read_session` and `read_revision` with
+ * `include_html` DO put a body in a tool message, through renderToolBody — as
+ * TEXT (htmlToText), WHOLE unless the page is longer than BODY_MAX_CHARS.
+ * That is the whole point of this pair of functions: "read that report and tell
+ * me what it says" was unanswerable while every read stopped at the metadata,
+ * and a model asked to CHANGE a page needs its entire body rather than a sample
+ * of it. What stays true is the part that matters, and it is asserted: no HTML,
+ * and never more than one ceiling's worth of text.
  */
 export function renderToolResult(action, data) {
   const run = String(action || '');
@@ -419,6 +451,50 @@ export function renderToolResult(action, data) {
 }
 
 /**
+ * A document body rendered for a MODEL: the TEXT of the page, whole, and the
+ * offset to continue from only when it did not all fit.
+ *
+ * The only place a body is allowed into a tool message, and the shape is the one
+ * docs.read already proved with a local document: the reader gets the words, the
+ * exact character range it was given, and — when there is more — a marker naming
+ * the offset to ask for next. A model that reads to the end of such a document
+ * sees a read with NO marker, which is how it knows it has the whole thing.
+ *
+ * WHOLE BY DEFAULT, BECAUSE READING IS NOT SAMPLING. A caller that names no size
+ * is asking to read the page — summarise it, quote it, or rewrite it — and a
+ * page it cannot see the end of is a page it cannot edit. So the only things
+ * that produce a marker are a document genuinely longer than BODY_MAX_CHARS and
+ * a caller that asked for a narrower window on purpose.
+ *
+ * The two cases that would otherwise look like an answer are named in words
+ * instead of being returned as an empty body: a document whose text is empty
+ * (markup only), and an offset past the end. Both are the difference between "the
+ * page is blank" and "you asked for the wrong slice", and only one of those is
+ * true.
+ */
+export function renderToolBody(data, { offset = 0, limit } = {}) {
+  const d = data && data.id ? data : null;
+  if (!d) return clip('jarvis_files read: done.');
+  const head = `${d.title} [${d.agent || 'unknown'}] ${bytes(d.size)} · v${d.version}`;
+  // Defensive: a caller that forgets to fetch the body must be told so, rather
+  // than be handed "no readable text", which is a different and wrong claim.
+  if (d.html === undefined || d.html === null) {
+    return clip(`${head} (the body was not fetched — read it again with include_html true).`);
+  }
+  const w = bodyWindow(htmlToText(d.html), { offset, limit });
+  if (!w.total) {
+    return `${head}\n(no readable text: this document is markup only — a chart, an image or a script.)`;
+  }
+  if (!w.text) {
+    return `${head}\n(offset ${w.offset} is past the end: the readable text is ${w.total} characters.)`;
+  }
+  const more = w.more
+    ? `\n…(truncated at ${w.next} of ${w.total} chars — read again with the same id and offset ${w.next})`
+    : '';
+  return `${head}\n${w.text}${more}`;
+}
+
+/**
  * The headers the relay MUST send when it proxies a stored document's body.
  *
  * WHY THIS IS A CONSTANT AND NOT AN INLINE STRING
@@ -470,6 +546,182 @@ const HTML_RE = /<!doctype\s+html|<html[\s>]|<body[\s>]|<(?:div|p|h[1-6]|table|u
  */
 export function isHtmlish(text) {
   return HTML_RE.test(String(text ?? ''));
+}
+
+// ── A document body, as TEXT ─────────────────────────────────────────────────
+//
+// WHY STRIPPING TAGS IS NOT ENOUGH
+//   A body is the one input in this module that is both fully untrusted and
+//   large (up to MAX_HTML_BYTES). So:
+//
+//     • the parts that exist to be EXECUTED go first — <script>, <style>,
+//       <noscript>, <template>, <svg>, <canvas> and comment blocks. A stylesheet
+//       is not prose, and 40 kB of inline CSS would spend the whole window while
+//       telling the model nothing about the page;
+//     • block-level tags become a NEWLINE, never nothing. `<p>a</p><p>b</p>` must
+//       read as two paragraphs, and `<td>x</td><td>y</td>` must not weld into
+//       "xy" — a table silently run together as one word is worse than no table;
+//     • every other tag is deleted outright, so `<b>bold</b>` reads as `bold`.
+//
+//   Entities are decoded AFTER the tags are gone, so `&lt;script&gt;` written in
+//   the text stays text and can never be resurrected as markup on the way
+//   through. Decoding first is the version of this function that has a hole in
+//   it, and it is the obvious way to write it.
+//
+// WHAT IT DELIBERATELY LOSES
+//   Images, video, charts, layout and emphasis. A model reading this gets the
+//   WORDS of a document, not the document. Nothing about the frame the wearer
+//   reads is changed by any of it: this is a second, narrower view of the same
+//   bytes.
+
+/** Blocks removed with their contents, because nothing inside is prose. */
+const NON_TEXT_BLOCKS = /<(script|style|noscript|template|svg|canvas)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+const HTML_COMMENTS = /<!--[\s\S]*?-->/g;
+/**
+ * Tags that separate text, replaced by a newline rather than dropped.
+ *
+ * `code` is deliberately NOT here: it is inline most of the time, and treating
+ * it as a block would break a sentence across two lines mid-clause.
+ */
+const BLOCK_TAGS =
+  /<\/?(?:p|div|section|article|header|footer|main|nav|aside|h[1-6]|li|ul|ol|dl|dt|dd|tr|table|thead|tbody|tfoot|th|td|blockquote|pre|figure|figcaption|form|fieldset|hr|br|address|details|summary)\b[^>]*>/gi;
+const ANY_TAG = /<[^>]*>/g;
+/**
+ * `&#39;`, `&#x27;` and `&amp;` — bounded, so a stray ampersand in prose is left
+ * alone instead of swallowing the rest of the sentence as a "reference".
+ */
+const ENTITY_REF = /&(#x[0-9a-f]{1,6}|#\d{1,7}|[a-z][a-z0-9]{1,9});/gi;
+const NAMED_ENTITIES = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: ' ',
+  hellip: '…',
+  mdash: '—',
+  ndash: '–',
+  lsquo: '‘',
+  rsquo: '’',
+  ldquo: '“',
+  rdquo: '”',
+  laquo: '«',
+  raquo: '»',
+  middot: '·',
+  bull: '•',
+  dagger: '†',
+  deg: '°',
+  times: '×',
+  divide: '÷',
+  frac12: '½',
+  sup2: '²',
+  euro: '€',
+  pound: '£',
+  yen: '¥',
+  cent: '¢',
+  sect: '§',
+  para: '¶',
+  copy: '©',
+  reg: '®',
+  trade: '™',
+  prime: '′',
+  check: '✓',
+  cross: '✗',
+  larr: '←',
+  rarr: '→',
+};
+
+/**
+ * One entity, decoded — or left VERBATIM when it is not one.
+ *
+ * `&unknown;` in a document is text the author typed, so returning it unchanged
+ * is the only answer that cannot lose something the wearer wrote. Numeric
+ * references are range-checked for the same reason, plus one more: a lone
+ * surrogate or a C0 control character decodes into a string that is invalid or
+ * hostile in a tool message, so both are replaced by a space instead.
+ */
+const decodeEntity = (whole, body) => {
+  const named = NAMED_ENTITIES[body.toLowerCase()];
+  if (named !== undefined) return named;
+  if (body[0] !== '#') return whole;
+  const hex = body[1] === 'x' || body[1] === 'X';
+  const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+  if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole;
+  if (code < 0x20 && code !== 0x09 && code !== 0x0a) return ' ';
+  if ((code >= 0x7f && code <= 0x9f) || (code >= 0xd800 && code <= 0xdfff)) return ' ';
+  return String.fromCodePoint(code);
+};
+
+/**
+ * A stored document's body as plain text, for a model to read.
+ *
+ * Pure and total: any input, including '' and undefined, comes back as a string,
+ * so no caller has to guard it. The HTML is never echoed — see the header above
+ * for what is dropped and why.
+ */
+export function htmlToText(html) {
+  return String(html ?? '')
+    .replace(NON_TEXT_BLOCKS, '\n')
+    .replace(HTML_COMMENTS, ' ')
+    .replace(BLOCK_TAGS, '\n')
+    .replace(ANY_TAG, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(ENTITY_REF, decodeEntity)
+    // Whitespace LAST, so markup that became newlines and entities that became
+    // spaces are normalised together: runs of blanks collapse, a line never
+    // keeps trailing space, and no paragraph is separated by more than one
+    // empty line (which is the most a tool message should spend on air).
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
+ * How many characters a window may hold: 1 … BODY_MAX_CHARS.
+ *
+ * NO LIMIT MEANS ALL OF IT, and that is the point of this default. A caller that
+ * does not name a size is asking to read the document, not to be shown a sample
+ * of it, so "no size given" resolves to the ceiling rather than to something
+ * smaller. Every UNUSABLE value — `undefined`, `null`, `''`, 0, a negative,
+ * `NaN`, a word, an object — lands on that same answer, because a caller that
+ * asked badly did not ask for less.
+ */
+const windowSize = (raw) => {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return BODY_MAX_CHARS;
+  return Math.min(Math.floor(n), BODY_MAX_CHARS);
+};
+
+/**
+ * One window of document TEXT, plus where the next one starts.
+ *
+ * WITH NO `limit` THE WINDOW IS THE WHOLE TEXT, up to BODY_MAX_CHARS. So the
+ * ordinary read — the one that mentions no size — comes back complete and
+ * reports `more: false`; windowing is for the documents too long for one tool
+ * message, not the default way to read a page.
+ *
+ * The offset is clamped the same way docs.read clamps it, and for the same two
+ * measured reasons: `slice(-1)` is one character from the END of the string (so
+ * a negative offset would report a document as its own last character), and any
+ * offset at or past the end slices to '' — which reads to a model as "the page is
+ * blank", the one wrong answer that is indistinguishable from a successful read.
+ * The empty case is therefore REPORTED by renderToolBody rather than passed on as
+ * a body it must interpret.
+ */
+export function bodyWindow(text, { offset = 0, limit } = {}) {
+  const whole = String(text ?? '');
+  const total = whole.length;
+  const n = Number(offset);
+  const from = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), total) : 0;
+  const to = Math.min(total, from + windowSize(limit));
+  return {
+    text: whole.slice(from, to),
+    offset: from,
+    total,
+    next: to < total ? to : null,
+    more: to < total,
+  };
 }
 
 // ── Videos inside a document ─────────────────────────────────────────────────
@@ -1294,7 +1546,9 @@ export function filesToolSchema(t) {
         'Store HTML documents in the wearer documents library, and edit, search, delete or ' +
           'version them. Use it to publish a report, briefing, table or chart the wearer can open ' +
           'on the Files page, to change one that is already there, or to look at what changed. ' +
-          'The document body is NOT returned to you — the wearer reads it on screen.',
+          'A stored page comes back to you as TEXT, IN FULL, only when you ask for it with ' +
+          'include_html — read it, change it, then send the result back with update. The wearer ' +
+          'reads the rendered page on the Files page.',
       parameters: {
         type: 'object',
         properties: {
@@ -1315,7 +1569,8 @@ export function filesToolSchema(t) {
             ],
             description:
               'publish = create a document; list = what is stored; search = find one by title or ' +
-              'author; stats = library totals and disk use; read = one document metadata; ' +
+              'author; stats = library totals and disk use; read = one document’s metadata (and, ' +
+              'with include_html, its text); ' +
               'update = change a document in place; delete = remove a document; ' +
               'history = the change log (one document, or everything when id is omitted); ' +
               'revision = one entry of that history; revert = make an old revision current again; ' +
@@ -1408,9 +1663,13 @@ export function filesToolSchema(t) {
           include_html: {
             type: 'boolean',
             description:
-              'read/revision: ask for the document body too. Accepted because the document server ' +
-              'defines it, but this app never puts a body in a tool result — the wearer reads ' +
-              'documents on screen — so asking changes nothing. Leave it false.',
+              'read/revision: also return the document body, as PLAIN TEXT (its HTML stripped), ' +
+              'so you can read, summarise, quote or REWRITE the page itself. The WHOLE body comes ' +
+              'back, not a sample; only a page longer than 60000 characters arrives in slices, and ' +
+              'then the text ends with the offset to continue from, so call read again with the ' +
+              'same id and that offset — a read that comes back with no such marker is the end. ' +
+              'The markup is never sent, only the words it renders, so this is what to use for ' +
+              '"what does that report say".',
           },
           q: {
             type: 'string',
@@ -1430,9 +1689,17 @@ export function filesToolSchema(t) {
           },
           limit: {
             type: 'integer',
-            description: 'list/search/history: how many rows to return (1–200).',
+            description:
+              'list/search/history: how many rows to return (1–200). read/revision: with ' +
+              'include_html, how many characters of the body text to return (max 60000). Omit ' +
+              'it to read the whole body.',
           },
-          offset: { type: 'integer', description: 'list/history only: rows to skip.' },
+          offset: {
+            type: 'integer',
+            description:
+              'list/history: rows to skip. read/revision: with include_html, the character to ' +
+              'start the body text at — pass the offset a truncated read ended with.',
+          },
         },
         required: ['action'],
       },

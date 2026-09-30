@@ -7,6 +7,14 @@
 //   bodies are streamed into a sandboxed frame on the web page. Nothing here
 //   ever holds a document's HTML.
 //
+//   A body CAN now be read here — as TEXT, WHOLE by default, through the
+//   relay's `/api/files/:id/text` (files.read with content true); only a page
+//   longer than 60000 characters comes back windowed, with the offset to
+//   continue from. That is not a hole in the sentence above: the HTML still
+//   never enters this app or a tool message, only the words it renders. It is
+//   what makes "read me that report" answerable instead of metadata-only — and
+//   what lets the model CHANGE a page rather than only talk about it.
+//
 // WHY THE RELAY IS IN THE MIDDLE
 //   The store's CORS allow-list is empty and its credential is a server secret,
 //   so this module calls `/api/files/*` on the relay (see files-client.ts) and
@@ -21,6 +29,7 @@ import {
   listFiles,
   listRevisions,
   publishFile,
+  readFileText,
   readRevision,
   restoreRevision,
   toFileRef,
@@ -124,19 +133,37 @@ export const filesCapabilities: Capability[] = [
         },
         hint: deleted
           ? 'these include deleted documents; restore one from the Files tab on the web app'
-          : 'the body of a stored page is HTML and is only rendered on the web Files tab — use files.read for its details',
+          : 'the body of a stored page is HTML and is only rendered on the web Files tab — use files.read with content true to read its text',
       };
     },
   },
   {
     name: 'files.read',
     page: 'files',
-    title: 'Read stored document details',
+    title: 'Read a stored page',
     description:
-      'Get one stored document\'s details (title, publishing agent, size, version, tags, when it changed). ' +
-      'This does NOT return the page\'s HTML, which is only rendered in the web viewer.',
+      'Get one stored document. Its details (title, publishing agent, size, version, tags, when it ' +
+      'changed) always come back; set content true to also read the PAGE ITSELF, as text. The WHOLE ' +
+      'page comes back — that is what you need to summarise it, quote it, or rewrite it and send it ' +
+      'back with files.publish. Only a page longer than 60000 characters arrives in slices: the text ' +
+      'then ends with markers naming the offset to continue from, so keep calling with that offset ' +
+      'until a read comes back WITHOUT them — that is the end of the page.',
     params: [
       { name: 'document', type: 'string', description: 'Document title, part of a title, or its number.', required: true },
+      {
+        name: 'content',
+        type: 'boolean',
+        description:
+          'Set true to also return the page\'s text — the whole page, which is what you need to answer ' +
+          'a question about its contents or to rewrite them. Omit it when only the details were asked for.',
+      },
+      {
+        name: 'offset',
+        type: 'number',
+        description:
+          'Character to start the text from, for continuing a very long page. Omit to read the WHOLE ' +
+          'page; a truncated read reports the exact offset to pass next. Ignored unless content is true.',
+      },
     ],
     run: async (args): Promise<CapabilityResult> => {
       const target = resolveFile(String(args.document ?? ''), files());
@@ -163,20 +190,76 @@ export const filesCapabilities: Capability[] = [
       }
       const size = doc?.size ?? target.size;
       const when = new Date(doc?.updatedAt || target.updatedAt).toISOString().slice(0, 10);
+      const details = {
+        id: target.id,
+        title: doc?.title || target.title,
+        agent: doc?.agent || target.agent,
+        size,
+        version: doc?.version,
+        tags: doc?.tags,
+        updatedAt: doc?.updatedAt ?? target.updatedAt,
+        revisionAvailable: Boolean(doc?.version && doc.version > 1),
+      };
+
+      // ── The page itself, when it was asked for ────────────────────────────
+      //
+      // The window is sliced by the RELAY, not here, and that is deliberate:
+      // the body is fetched there (this app has no credential and nothing to
+      // fetch it with), so the same clamp decides one window for both models.
+      // Passing no limit is what asks for the WHOLE page — windowing is only
+      // what a page past the relay's ceiling gets, not the way a read works.
+      // A non-finite or negative offset is floored at 0 rather than passed on,
+      // because the relay would read a negative one from the END of the text.
+      if (args.content !== true) {
+        return {
+          ok: true,
+          summary: oneLine(`"${short(target.title, 24)}" · ${sizeLabel(size)} · updated ${when}`),
+          data: details,
+          hint: `to read what the page says, call again with content true${details.revisionAvailable ? ', or files.history for older versions' : ''}`,
+        };
+      }
+      const raw = Number(args.offset);
+      const from = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+      const win = await readFileText(target.id, { offset: from || undefined });
+      if (!win.ok || typeof win.text !== 'string') {
+        return {
+          ok: false,
+          summary: `Could not read "${short(target.title, 20)}"`,
+          hint: win.error || 'the relay could not fetch the page body',
+        };
+      }
+      const total = Number(win.total) || 0;
+      const at = Number(win.offset) || 0;
+      // The two cases that would otherwise read as "the page is blank", which is
+      // the one wrong answer indistinguishable from a successful read.
+      if (!win.text.length) {
+        return {
+          ok: true,
+          summary: total
+            ? `"${short(target.title, 20)}" is ${total} chars — offset ${at} is past the end`
+            : `"${short(target.title, 20)}" has no readable text`,
+          data: { ...details, content: '', offset: at, total, next: null, more: false },
+          hint: total
+            ? 'call again with an offset within the page, or with none to read from the start'
+            : 'this page is markup only: a chart, an image or a script with no prose',
+        };
+      }
+      const more = win.more === true;
+      const next = more ? Number(win.next) : null;
+      const slice = `${win.text}${
+        more ? `\n…(truncated at ${next} of ${total} chars — call files.read again with offset ${next})` : ''
+      }`;
       return {
         ok: true,
-        summary: oneLine(`"${short(target.title, 24)}" · ${sizeLabel(size)} · updated ${when}`),
-        data: {
-          id: target.id,
-          title: doc?.title || target.title,
-          agent: doc?.agent || target.agent,
-          size,
-          version: doc?.version,
-          tags: doc?.tags,
-          updatedAt: doc?.updatedAt ?? target.updatedAt,
-          revisionAvailable: Boolean(doc?.version && doc.version > 1),
-        },
-        hint: 'to show someone the page itself, tell them to open the Files tab on the web app',
+        summary: oneLine(
+          more
+            ? `Read "${short(target.title, 20)}" (${at}-${next} of ${total} chars)`
+            : `Read "${short(target.title, 20)}" (${total} chars)`,
+        ),
+        data: { ...details, content: slice, offset: at, next, total, more },
+        ...(more
+          ? { hint: `the page continues — call files.read again with offset ${next}` }
+          : { hint: 'that is the whole page' }),
       };
     },
   },

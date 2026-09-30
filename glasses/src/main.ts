@@ -11,6 +11,7 @@ import {
 } from '@evenrealities/even_hub_sdk';
 import { connectAgentsStream, connectStream, startRun, stopRun, type AgentRun } from './stream';
 import { snapshotForRun } from './location/run';
+import { probeLocation } from './location/probe';
 import { getRuns, isAgentRunning, latestRunFor, subscribeRuns } from './agent-runs';
 import {
   AGENT_LAYOUT,
@@ -50,7 +51,13 @@ import {
 } from './agents-store';
 import { getStreamToken, onStreamToken } from './auth-token';
 import { getPairCode, onPairCode } from './pair-code';
-import { loadDocsDurable, saveDocsDurable, setDurableBridge, setStartupReady } from './durable-docs';
+import {
+  getDurableBridge,
+  loadDocsDurable,
+  saveDocsDurable,
+  setDurableBridge,
+  setStartupReady,
+} from './durable-docs';
 import {
   activeDoc,
   emptyDoc,
@@ -184,6 +191,28 @@ async function main(): Promise<void> {
   } catch {
     bridge = null;
   }
+
+  // A one-shot location DIAGNOSTIC, reachable as `__hubGeoProbe()` from the
+  // phone app's dev console (Developer Mode) and by the Settings tab's "Run
+  // location check" button in the companion UI. It is installed BEFORE the
+  // early return below so it also exists in the web-UI-only case, which is
+  // exactly when the answer is most confusing.
+  //
+  // Deliberately NOT a contextual-menu item and NOT a gesture: the glasses menu
+  // is full, its order is asserted by harnesses (menu-sim / ai-agent-sim), and a
+  // new tap target would sit in the middle of the input path that dictation
+  // depends on. It reports the two routes and touches no app state, so it can
+  // never be mistaken for a real fix. Remove this block and probe.ts together.
+  (window as unknown as { __hubGeoProbe?: () => Promise<unknown> }).__hubGeoProbe = async () => {
+    const report = await probeLocation({ hub: getDurableBridge() });
+    console.log('[geo] sdk:', report.hub.detail);
+    console.log('[geo] web:', report.browser.detail);
+    // On the glasses the console is invisible, so the same answer goes on the
+    // lens through the existing one-off flash (it fades on its own).
+    if (getDurableBridge()) flashAi(report.summary);
+    return report;
+  };
+
   if (!bridge) {
     console.log('[hub] no EvenAppBridge — running as web UI only');
     return;

