@@ -8,10 +8,28 @@ import { FilesPanel } from './FilesPanel';
 import { ExportPanel } from './ExportPanel';
 import { SettingsPanel } from './SettingsPanel';
 import { consumeWebTab, getAi, subscribeAi } from '../ai';
-import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
+import {
+  addDoc,
+  addTask as storeAddTask,
+  appendDoc,
+  appendNote,
+  getConnStatus,
+  getState,
+  removeDoc,
+  removeTask as storeRemoveTask,
+  selectDoc as storeSelectDoc,
+  selectSection as storeSelectSection,
+  setDocContent,
+  setDocTitle,
+  setNotes as storeSetNotes,
+  setTaskDone,
+  setTaskText,
+  setTasks,
+  subscribe,
+  subscribeConn,
+} from '../store';
 import type { ConnStatus } from '../store';
-import type { HubState, SectionId, TodoItem } from '../types';
-import { activeDoc, emptyDoc, uid, upsertDoc } from '../types';
+import { activeDoc, type HubState, type SectionId } from '../types';
 
 const SECTION_LABELS: Record<SectionId, string> = {
   todo: 'To-Do',
@@ -81,146 +99,59 @@ export default function App() {
     if (!paste.trim()) return;
     const result = categorize(paste, state.sections.todo);
     setDetected(result.detected);
-    update((s) => {
-      const docText = result.docs;
-      let docs = s.sections.docs;
-      let activeDocId = s.activeDocId;
-      let activeSection = s.activeSection;
-      if (docText) {
-        const cur = activeDoc(s);
-        if (cur) {
-          // Append the pasted text to the currently-open doc.
-          docs = docs.map((d) =>
-            d.id === cur.id
-              ? {
-                  ...d,
-                  content: d.content ? `${d.content}\n${docText}` : docText,
-                  updatedAt: Date.now(),
-                }
-              : d,
-          );
-        } else {
-          // No doc yet — start one from the paste.
-          const firstLine = docText.split('\n')[0].trim().slice(0, 40) || 'Untitled';
-          const doc = emptyDoc(firstLine);
-          docs = [...docs, { ...doc, content: docText }];
-          activeDocId = doc.id;
-          activeSection = 'docs';
-        }
-      }
-      const notes = result.notes
-        ? s.sections.notes
-          ? `${s.sections.notes}\n${result.notes}`
-          : result.notes
-        : s.sections.notes;
-      return {
-        ...s,
-        activeSection,
-        activeDocId,
-        // `files` is passed through rather than rebuilt: categorising a paste
-        // must not touch the remote document cache, and this object REPLACES
-        // `sections` wholesale, so an omitted key would silently empty it.
-        sections: { todo: result.todo, docs, files: s.sections.files, notes },
-      };
-    });
+    // Each part is its own hub write, because the hub takes ONE collection per
+    // route — there is no "apply this whole state" endpoint any more. The doc
+    // append is a read-modify-write against the body the panel already holds.
+    if (result.docs) {
+      const cur = activeDoc(state);
+      if (cur) appendDoc(cur.id, result.docs);
+      else addDoc(result.docs.split('\n')[0].trim().slice(0, 40) || 'Untitled', result.docs);
+    }
+    if (result.notes) appendNote(result.notes);
+    setTasks(result.todo);
     setPaste('');
   };
 
   const addTask = () => {
     const text = newTask.trim();
     if (!text) return;
-    const item: TodoItem = { id: uid(), text, done: false };
-    update((s) => ({ ...s, sections: { ...s.sections, todo: [...s.sections.todo, item] } }));
+    storeAddTask(text);
     setNewTask('');
   };
 
   const toggleTask = (id: string) => {
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        todo: s.sections.todo.map((t) => (t.id === id ? { ...t, done: !t.done } : t)),
-      },
-    }));
+    const item = state.sections.todo.find((t) => t.id === id);
+    setTaskDone(id, !item?.done);
   };
 
-  const editTask = (id: string, text: string) => {
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        todo: s.sections.todo.map((t) => (t.id === id ? { ...t, text } : t)),
-      },
-    }));
-  };
+  const editTask = (id: string, text: string) => setTaskText(id, text);
 
-  const removeTask = (id: string) => {
-    update((s) => ({
-      ...s,
-      sections: { ...s.sections, todo: s.sections.todo.filter((t) => t.id !== id) },
-    }));
-  };
+  const removeTask = (id: string) => storeRemoveTask(id);
 
-  // ── Docs library (multiple named docs, auto-saved + synced across devices) ─
+  // ── Docs library (multiple named docs, auto-saved + synced through the hub) ─
   const docs = state.sections.docs;
   const active = activeDoc(state);
 
-  const selectDoc = (id: string) => {
-    update((s) => ({ ...s, activeDocId: id }));
-  };
+  const selectDoc = (id: string) => storeSelectDoc(id);
 
-  const createDoc = () => {
-    const doc = emptyDoc('Untitled');
-    update((s) => {
-      const { docs: ds, activeDocId } = upsertDoc(s, doc);
-      return { ...s, activeSection: 'docs', activeDocId, sections: { ...s.sections, docs: ds } };
-    });
-  };
+  const createDoc = () => addDoc('Untitled');
 
   const renameActiveDoc = (title: string) => {
     const id = active?.id;
-    if (!id) return;
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        docs: s.sections.docs.map((d) =>
-          d.id === id ? { ...d, title, updatedAt: Date.now() } : d,
-        ),
-      },
-    }));
+    if (id) setDocTitle(id, title);
   };
 
   const setActiveDocContent = (content: string) => {
     const id = active?.id;
-    if (!id) return;
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        docs: s.sections.docs.map((d) =>
-          d.id === id ? { ...d, content, updatedAt: Date.now() } : d,
-        ),
-      },
-    }));
+    if (id) setDocContent(id, content);
   };
 
   const deleteDoc = (id: string) => {
-    if (!window.confirm('Delete this doc? This syncs to all your devices.')) return;
-    update((s) => {
-      const remaining = s.sections.docs.filter((d) => d.id !== id);
-      return {
-        ...s,
-        sections: { ...s.sections, docs: remaining },
-        activeDocId:
-          remaining.length > 0 ? (s.activeDocId === id ? remaining[0].id : s.activeDocId) : null,
-      };
-    });
+    if (!window.confirm('Delete this doc? This removes it for every device.')) return;
+    removeDoc(id);
   };
 
-  const setNotes = (text: string) => {
-    update((s) => ({ ...s, sections: { ...s.sections, notes: text } }));
-  };
+  const setNotes = (text: string) => storeSetNotes(text);
 
   const appendPaste = (text: string) => {
     setPaste((p) => (p.trim() ? `${p.replace(/\s+$/, '')}\n${text}` : text));
@@ -232,33 +163,14 @@ export default function App() {
 
   const appendToActiveDoc = (text: string) => {
     const id = active?.id;
-    if (!id) return;
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        docs: s.sections.docs.map((d) =>
-          d.id === id
-            ? { ...d, content: d.content ? `${d.content.replace(/\s+$/, '')}\n${text}` : text, updatedAt: Date.now() }
-            : d,
-        ),
-      },
-    }));
+    if (id) appendDoc(id, text);
   };
 
-  const appendToNotes = (text: string) => {
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
-      },
-    }));
-  };
+  const appendToNotes = (text: string) => appendNote(text);
 
   const switchSection = (section: SectionId) => {
     setTab(null); // a real section clears the local Settings override
-    update((s) => ({ ...s, activeSection: section }));
+    storeSelectSection(section);
   };
 
   const pending = state.sections.todo.filter((t) => !t.done).length;

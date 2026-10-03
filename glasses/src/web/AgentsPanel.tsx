@@ -1,16 +1,27 @@
 // Agents panel (companion web UI).
 //
 // Mirrors the glasses experience but with a real keyboard: build agents, attach
-// tools, pick the model, run a prompt and browse the last 5 sessions. All state
-// lives in the shared `agents-store` (synced over the `agents` SSE channel and
-// dual-written to durable storage), so anything created here shows up on the
-// glasses instantly — and vice versa.
+// tools, pick the model, run a prompt and browse the last 5 sessions. Agents and
+// tools are HUB-OWNED — every edit here is a semantic op in `agents-store` that
+// issues one request to `/hub/agents` or `/hub/tools`, so the glasses, the
+// desktop and any other paired device converge on `rev` rather than on whichever
+// copy happened to be published last. Sessions still ride the `agents` SSE
+// channel and are dual-written to durable storage.
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import {
   clearSessionsFor,
+  createAgent,
+  createTool,
   getAgents,
+  getAgentsError,
   recordSession,
+  removeAgent as removeAgentFromStore,
+  removeTool,
+  saveAgent,
+  saveTool,
   subscribeAgents,
+  subscribeAgentsError,
+  toolBody,
   updateAgents,
 } from '../agents-store';
 import { getRuns, subscribeRuns } from '../agent-runs';
@@ -20,7 +31,6 @@ import { FREE_TOOL_MODELS } from '../models';
 import {
   DOCS_TOOL_ID,
   docsTool,
-  emptyAgent,
   emptyLlmSettings,
   FILE_TOOL_ID,
   filesTool,
@@ -34,7 +44,6 @@ import {
   SEED_TOOL_ID,
   TODO_TOOL_ID,
   todoTool,
-  uid,
   webSearchTool,
   type AgentDef,
   type AgentMessage,
@@ -83,13 +92,12 @@ function Transcript({ messages }: { messages: AgentMessage[] }) {
 
 function AgentEditor({ agent }: { agent: AgentDef }) {
   const state = useAgents();
-  const patch = (p: Partial<AgentDef>) =>
-    updateAgents((s) => ({
-      ...s,
-      agents: s.agents.map((a) =>
-        a.id === agent.id ? { ...a, ...p, updatedAt: Date.now() } : a,
-      ),
-    }));
+  /**
+   * Paint now, PUT once the typing stops. A keystroke is not a request — sending
+   * one `PUT` per character would turn a rename into a burst of `If-Match`
+   * refreshes against a record nobody else is touching.
+   */
+  const patch = (p: Partial<AgentDef>) => saveAgent(agent.id, p);
 
   const toggleTool = (id: string) =>
     patch({
@@ -104,19 +112,20 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
    * wearer they are one decision — "give this agent the document store" — and
    * splitting them is what produced a second, near-identical row of buttons.
    *
+   * Async now, and it has to be: the hub mints the tool's id, so the attach can
+   * only name it once the create has answered. Attaching the id the seed was
+   * authored with would reference a row that never existed.
+   *
    * Nothing is pre-attached: a seed is only ever created by an explicit tap
    * here (or a spoken request, which resolves to the same kinds server-side).
    */
-  const attachSeed = (id: string, make: () => ToolDef) =>
-    updateAgents((s) => ({
-      ...s,
-      tools: s.tools.some((t) => t.id === id) ? s.tools : [...s.tools, make()],
-      agents: s.agents.map((a) =>
-        a.id === agent.id
-          ? { ...a, toolIds: [...new Set([...a.toolIds, id])], updatedAt: Date.now() }
-          : a,
-      ),
-    }));
+  const attachSeed = async (id: string, make: () => ToolDef) => {
+    const toolId = getAgents().tools.some((t) => t.id === id) ? id : await createTool(toolBody(make()));
+    if (!toolId) return;
+    const live = getAgents().agents.find((a) => a.id === agent.id);
+    if (!live || live.toolIds.includes(toolId)) return;
+    saveAgent(agent.id, { toolIds: [...live.toolIds, toolId] });
+  };
 
   /**
    * The seed kinds, as chips. web, jev and the three hub stores need no
@@ -145,25 +154,18 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   const missingSeeds = seedChips.filter((s) => !state.tools.some((t) => t.kind === s.kind));
 
   /** Create a new REST tool and attach it to this agent in one step. */
-  const addRestToolToAgent = () => {
-    const id = uid();
-    updateAgents((s) => ({
-      ...s,
-      tools: [
-        ...s.tools,
-        {
-          id,
-          name: `tool_${s.tools.length + 1}`,
-          kind: 'http',
-          description: '',
-          url: '',
-          method: 'POST',
-        },
-      ],
-      agents: s.agents.map((a) =>
-        a.id === agent.id ? { ...a, toolIds: [...a.toolIds, id], updatedAt: Date.now() } : a,
-      ),
-    }));
+  const addRestToolToAgent = async () => {
+    const id = await createTool({
+      name: `tool_${getAgents().tools.length + 1}`,
+      kind: 'http',
+      description: '',
+      url: '',
+      method: 'POST',
+    });
+    if (!id) return;
+    const live = getAgents().agents.find((a) => a.id === agent.id);
+    if (!live || live.toolIds.includes(id)) return;
+    saveAgent(agent.id, { toolIds: [...live.toolIds, id] });
   };
 
   return (
@@ -270,11 +272,15 @@ function ToolEditor({
       ? 'Brave Search'
       : 'Tavily'
     : null;
-  const patch = (p: Partial<ToolDef>) =>
-    updateAgents((s) => ({
-      ...s,
-      tools: s.tools.map((t) => (t.id === tool.id ? { ...t, ...p } : t)),
-    }));
+  /**
+   * Paint now, PATCH once the typing stops.
+   *
+   * `hasToken` rides along locally only — it means "the RELAY holds a
+   * credential" in this app, which is a different mechanism from the hub's own
+   * tool-token store, and the hub has no column for `bodyTemplate` at all. Both
+   * are preserved across an adoption instead. See `agents-store`.
+   */
+  const patch = (p: Partial<ToolDef>) => saveTool(tool.id, p);
 
   const method = tool.method ?? 'POST';
   /** GET puts the template in the query string, POST in the body. */
@@ -337,16 +343,7 @@ function ToolEditor({
         <button
           className="icon-btn danger"
           aria-label="Remove tool"
-          onClick={() =>
-            updateAgents((s) => ({
-              ...s,
-              tools: s.tools.filter((t) => t.id !== tool.id),
-              agents: s.agents.map((a) => ({
-                ...a,
-                toolIds: a.toolIds.filter((id) => id !== tool.id),
-              })),
-            }))
-          }
+          onClick={() => removeTool(tool.id)}
         >
           ✕
         </button>
@@ -470,6 +467,8 @@ function ToolEditor({
 export function AgentsPanel() {
   const state = useAgents();
   const runs = useRuns();
+  /** A refused hub write must never be silent — it is the only signal there is. */
+  const hubError = useSyncExternalStore(subscribeAgentsError, getAgentsError);
   const [selected, setSelected] = useState<string | null>(null);
   const [prompt, setPrompt] = useState('');
   const [error, setError] = useState('');
@@ -531,36 +530,35 @@ export function AgentsPanel() {
     );
   }, [myRun, myRunId, agent?.id]);
 
-  const addAgent = () => {
-    const a = emptyAgent(`Agent ${state.agents.length + 1}`);
-    updateAgents((s) => ({ ...s, agents: [...s.agents, a] }));
-    setSelected(a.id);
+  /**
+   * The hub assigns the id, so the selection can only follow the create's
+   * answer. Nothing is painted optimistically here: a row with an invented id
+   * would be a row that never exists upstream, and the editor would be naming
+   * it in every subsequent write.
+   */
+  const addAgent = async () => {
+    const id = await createAgent(`Agent ${getAgents().agents.length + 1}`);
+    if (id) setSelected(id);
   };
 
   const removeAgent = (id: string) => {
-    // The agent's history goes with it, through the SAME tombstoned delete as
-    // the Clear-history button: filtering the array here would be undone by the
-    // next merged frame that still carried those sessions.
-    clearSessionsFor(id);
-    updateAgents((s) => ({ ...s, agents: s.agents.filter((a) => a.id !== id) }));
+    // One action, through the store: the agent is soft-deleted on the hub —
+    // irreversibly, there is no restore route — and its history is tombstoned by
+    // the same call. Filtering the array here would leave the hub holding a row
+    // this device simply stopped drawing, and the next read would bring it back.
+    removeAgentFromStore(id);
     if (selected === id) setSelected(null);
   };
 
-  const addTool = () =>
-    updateAgents((s) => ({
-      ...s,
-      tools: [
-        ...s.tools,
-        {
-          id: uid(),
-          name: `tool_${s.tools.length + 1}`,
-          kind: 'http',
-          description: '',
-          url: '',
-          method: 'POST',
-        },
-      ],
-    }));
+  const addTool = async () => {
+    await createTool({
+      name: `tool_${getAgents().tools.length + 1}`,
+      kind: 'http',
+      description: '',
+      url: '',
+      method: 'POST',
+    });
+  };
 
   /**
    * Add one of the seeded kinds to the catalogue if it is not already there.
@@ -570,10 +568,10 @@ export function AgentsPanel() {
    * rule the per-agent chips use, and the reason the buttons below are keyed by
    * kind instead of id.
    */
-  const addSeed = (kind: ToolDef['kind'], make: () => ToolDef) =>
-    updateAgents((s) =>
-      s.tools.some((t) => t.kind === kind) ? s : { ...s, tools: [...s.tools, make()] },
-    );
+  const addSeed = async (kind: ToolDef['kind'], make: () => ToolDef) => {
+    if (getAgents().tools.some((t) => t.kind === kind)) return;
+    await createTool(toolBody(make()));
+  };
 
   const catalogueSeeds: Array<{ kind: ToolDef['kind']; label: string; make: () => ToolDef }> = [
     { kind: 'web', label: 'Web search', make: webSearchTool },
@@ -645,6 +643,10 @@ export function AgentsPanel() {
           {statusInfo.source?.search?.key === 'env' ? ' (web search too)' : ''}.
         </p>
       )}
+      {/* Agents and tools live on the hub now, so a refused write is the whole
+          story of why an edit did not stick. Saying it here is the difference
+          between a stale screen and a visible failure. */}
+      {hubError && <p className="warn-line">⚠️ {hubError}</p>}
 
       <div className="agents-split">
         {/* ── master: agents + tools ─────────────────────────────────── */}

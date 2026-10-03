@@ -10,14 +10,35 @@
 // Size control is the point, not an afterthought. The log may grow to
 // MEMORY_MAX_WORDS; the first turn past that folds everything except the newest
 // KEEP_TURNS into ONE model-written summary of ~DIGEST_WORDS words and drops the
-// turns it covered. The store therefore stays bounded (and small enough to live
-// in localStorage through a Flutter WebView) while the model keeps a running
-// gist of everything that was ever said.
+// turns it covered. The store therefore stays bounded while the model keeps a
+// running gist of everything that was ever said.
+//
+// WHERE MEMORY LIVES NOW
+//   The HUB is the durable store: every turn is appended to it the moment it is
+//   recorded, the digest lives there, and a second device reading `/hub/memory`
+//   sees the same counts and gist. Its caps are the ones that count — the server
+//   reports `capWords` (4,000) and `digestWords` (400), and the panel renders
+//   THOSE rather than a number this file made up.
+//
+// ⚠ THE HUB NEVER GIVES THE TURNS BACK. `GET /hub/memory` answers counts and the
+//   digest and nothing else — `?limit`, `?turns` and `?includeTurns` are all
+//   ignored, and `/hub/memory/turns` is a 404 (it is POST-only). So the local
+//   blob below is not merely a cache: it is the ONLY readable copy of the recent
+//   turns, and it is what `memoryMessages()` replays into a prompt. What the hub
+//   settles is the DIGEST and the COUNTS — if it has folded more than this device
+//   has, its digest wins, because that is the half it actually owns.
 //
 // Pure data + one optional LLM call: no SSE, no app stores. `agent.ts` records
 // turns and reads the log back; `main.ts` hydrates it once at boot.
 import { loadMemoryRaw, saveMemoryRaw, clearMemoryRaw } from '../durable-docs';
 import { llmChat, type WireMessage } from '../web/agents-client';
+import {
+  appendMemoryTurn,
+  clearMemory as clearHubMemory,
+  compactMemory as compactHubMemory,
+  fetchMemory,
+  putMemory as putHubMemory,
+} from '../web/hub-client';
 import { aiModel } from './store';
 import { stripToolMarkup } from './tool-markup';
 
@@ -40,14 +61,16 @@ export interface JarvisMemory {
 }
 
 /**
- * Words allowed to accumulate before the log is compacted. "Words" is the unit
- * the wearer asked for (whitespace-separated tokens), not provider tokens: it is
- * the only unit a user can reason about. 100k words is roughly a 600 KB JSON
- * blob — well inside a localStorage quota, and far more than a voice assistant
- * will ever produce in one sitting.
+ * Words the log may hold before it is compacted.
+ *
+ * ⚠ THIS IS THE OFFLINE FALLBACK, NOT THE PROMISE. The hub is the store and it
+ * reports its own ceiling as `capWords` — 4,000, probed live — which is the
+ * number the panel shows. This constant is what the module holds itself to only
+ * while the hub has not answered, and it exists so a device that has never
+ * reached the relay still has SOME bound rather than none.
  */
 export const MEMORY_MAX_WORDS = 100_000;
-/** What a compaction leaves behind, in words. */
+/** What a compaction leaves behind, in words. The hub agrees: `digestWords` is 400. */
 export const MEMORY_DIGEST_WORDS = 400;
 /** Newest turns a compaction never folds away — the recent conversation. */
 const MEMORY_KEEP_TURNS = 20;
@@ -84,6 +107,68 @@ let hydrated = false;
 let compacting = false;
 let cachedView: MemoryView | null = null;
 const listeners = new Set<() => void>();
+
+/**
+ * What the hub last told us, or `null` if it never has.
+ *
+ * Held separately from `memory` on purpose. `memory.turns` is the readable
+ * working set this device owns; these are the SERVER's numbers, and they only
+ * ever overwrite the local ones when a hub read actually succeeded — a 404, an
+ * offline relay or a device with no session must leave the local log exactly as
+ * it was, never blank it.
+ */
+interface HubMemoryState {
+  /** The server's own cap. 0 until a read succeeds. */
+  capWords: number;
+  digestWords: number;
+  digest: string;
+  /** Turns the hub counts, folded ones included. */
+  turns: number;
+  words: number;
+  liveWords: number;
+  folded: number;
+}
+let hub: HubMemoryState | null = null;
+
+/** Adopt a successful hub read. Never called on a failure. */
+function adoptHub(m: {
+  capWords: number;
+  digestWords: number;
+  digest: string;
+  turns: number;
+  words: number;
+  liveWords: number;
+  folded: number;
+}): void {
+  hub = {
+    capWords: m.capWords,
+    digestWords: m.digestWords,
+    digest: m.digest,
+    turns: m.turns,
+    words: m.words,
+    liveWords: m.liveWords,
+    folded: m.folded,
+  };
+  cachedView = null;
+}
+
+/**
+ * Mirror one turn to the hub. Fire-and-forget, and never awaited by a caller.
+ *
+ * A turn that is spoken must not wait on a network round-trip, and a hub that is
+ * down must not cost the turn: the local blob has already taken it, and the next
+ * turn will carry the same history. Returns the promise only so the harness can
+ * settle it.
+ */
+function mirrorTurn(turn: MemoryTurn): Promise<void> {
+  return appendMemoryTurn({ role: turn.role, text: turn.text, at: turn.at })
+    .then((r) => {
+      if (r.ok) adoptHub(r.memory);
+    })
+    .catch(() => {
+      /* relay or hub unavailable — the local log is still the working set */
+    });
+}
 
 function emit(): void {
   cachedView = null;
@@ -136,16 +221,27 @@ function sanitize(raw: unknown): JarvisMemory | null {
   };
 }
 
-function persist(): void {
+/**
+ * Keep the readable log locally, and mirror the new turn to the hub.
+ *
+ * BOTH, and in this order: the local write is what `memoryMessages()` reads on
+ * the very next turn, so it must not be conditional on the hub being reachable.
+ * The hub write is the durable one and is the reason a second device can see
+ * this conversation at all.
+ *
+ * `.catch` and not just try/catch on the local half: the write is ASYNC, so a
+ * rejection would otherwise surface as an unhandled rejection in the WebView
+ * console.
+ */
+function persist(turn?: MemoryTurn): void {
   try {
-    // `.catch` and not just try/catch: the write is ASYNC, so a rejection would
-    // otherwise surface as an unhandled rejection in the WebView console.
     void saveMemoryRaw(JSON.stringify(memory)).catch(() => {
       /* storage full or unavailable — memory still works for this session */
     });
   } catch {
     /* JSON failed or storage unavailable — memory still works for this session */
   }
+  if (turn) void mirrorTurn(turn);
 }
 
 // ── Read side ────────────────────────────────────────────────────────────────
@@ -163,13 +259,17 @@ export interface MemoryView {
 
 export function getMemoryView(): MemoryView {
   if (!cachedView) {
+    // The hub's numbers win whenever the hub has answered, because the digest and
+    // the folded count are the half the SERVER owns. Its `capWords` is the cap
+    // the panel must show: this module's own constant is only the fallback for a
+    // device that has not reached the relay yet.
     cachedView = {
-      turns: memory.turns.length,
-      folded: memory.folded,
-      words: words(memory),
-      capWords: MEMORY_MAX_WORDS,
-      digestWords: MEMORY_DIGEST_WORDS,
-      digest: memory.digest,
+      turns: hub ? hub.turns : memory.turns.length,
+      folded: hub ? hub.folded : memory.folded,
+      words: hub ? hub.words : words(memory),
+      capWords: hub ? hub.capWords : MEMORY_MAX_WORDS,
+      digestWords: hub ? hub.digestWords : MEMORY_DIGEST_WORDS,
+      digest: hub && hub.digest ? hub.digest : memory.digest,
       updatedAt: memory.updatedAt,
     };
   }
@@ -251,13 +351,15 @@ export function memoryPromptText(): string {
 function rememberTurn(role: MemoryTurn['role'], text: string, at: number): void {
   const clean = text.replace(/\s+/g, ' ').trim();
   if (!clean) return;
-  memory.turns.push({ role, text: clean.slice(0, MEMORY_TURN_CHARS), at });
+  const turn: MemoryTurn = { role, text: clean.slice(0, MEMORY_TURN_CHARS), at };
+  memory.turns.push(turn);
   memory.updatedAt = at;
-  persist();
+  persist(turn);
   emit();
   // Over EITHER budget → fold the old end away. Fire-and-forget: a turn must
   // never wait on a summarisation call, and a failure just leaves the log long.
-  if (words(memory) >= MEMORY_MAX_WORDS || chars(memory) >= MEMORY_MAX_CHARS) {
+  const cap = hub ? hub.capWords : MEMORY_MAX_WORDS;
+  if (words(memory) >= cap || chars(memory) >= MEMORY_MAX_CHARS) {
     void compactMemory();
   }
 }
@@ -308,9 +410,37 @@ export function compactionPrompt(m: JarvisMemory, older: MemoryTurn[]): string {
  * Fold every turn except the newest KEEP_TURNS into the digest. Returns true
  * when the log actually shrank. Safe to call at any time — the harness drives
  * it directly with a stubbed `ask`.
+ *
+ * TWO FOLDERS, ONE DIGEST
+ *   With an explicit `ask` this folds HERE, with the caller's model call — the
+ *   harness path, and the path that still works when the hub cannot summarise.
+ *   Without one it asks the HUB to fold first (`POST /hub/memory/compact`), and
+ *   falls back to a local fold only if the hub declines. The hub declines for a
+ *   real reason and says which: probed live it answered `compacted: false` with
+ *   `compactSkipped: "provider down"`, because its own LLM credential is not
+ *   configured. A declined fold is a success carrying a reason, never a failure.
+ *
+ * Whichever side folded, the new digest is mirrored to the hub, so the other
+ * device sees the same gist.
  */
 export async function compactMemory(ask?: MemoryAsk): Promise<boolean> {
   if (compacting) return false;
+
+  if (!ask) {
+    const server = await compactHubMemory(false).catch(() => null);
+    if (server?.ok) {
+      adoptHub(server.memory);
+      if (server.memory.digest && server.memory.digest !== memory.digest) {
+        memory = { ...memory, digest: server.memory.digest, digestAt: Date.now() };
+        persist();
+        emit();
+        return true;
+      }
+      // The hub folded nothing. Fall through to the local fold rather than
+      // pretend the log is short.
+    }
+  }
+
   const older = memory.turns.slice(0, Math.max(0, memory.turns.length - MEMORY_KEEP_TURNS));
   if (!older.length) return false;
   compacting = true;
@@ -327,6 +457,16 @@ export async function compactMemory(ask?: MemoryAsk): Promise<boolean> {
       updatedAt: Date.now(),
     };
     persist();
+    // The digest is the half the hub owns, so hand it over. `PUT /hub/memory`
+    // ADDS rather than replaces (probed), which is exactly right here: the turns
+    // are already there and this only sets the new gist.
+    void putHubMemory({ digest })
+      .then((r) => {
+        if (r.ok) adoptHub(r.memory);
+      })
+      .catch(() => {
+        /* the digest still lives locally; the next fold will retry it */
+      });
     emit();
     return true;
   } catch {
@@ -337,30 +477,59 @@ export async function compactMemory(ask?: MemoryAsk): Promise<boolean> {
   }
 }
 
-/** Load the log from durable storage. Idempotent; call once per boot. */
+/**
+ * Load the log. Idempotent; call once per boot.
+ *
+ * The LOCAL blob goes first because it is the only copy of the turn text, then
+ * the hub is asked for its digest and counts. A hub read that fails changes
+ * nothing at all — the local log stands, which is what keeps a boot with no
+ * relay from looking like a wipe.
+ */
 export async function hydrateMemory(): Promise<void> {
   if (hydrated) return;
   hydrated = true;
   try {
     const raw = await loadMemoryRaw();
-    if (!raw) return;
-    const parsed = sanitize(JSON.parse(raw));
-    if (!parsed) return;
-    memory = parsed;
-    emit();
+    if (raw) {
+      const parsed = sanitize(JSON.parse(raw));
+      if (parsed) memory = parsed;
+    }
   } catch {
     /* corrupt or unavailable — start empty rather than refuse to run */
   }
+  try {
+    const remote = await fetchMemory();
+    if (remote.ok) adoptHub(remote.memory);
+  } catch {
+    /* no hub — the local log is the whole memory for now */
+  }
+  emit();
 }
 
-/** Forget everything, here and in durable storage. */
+/**
+ * Forget everything, here and on the hub.
+ *
+ * ⚠ The LOCAL half is synchronous and unconditional; the hub half is a tombstone
+ *   (`DELETE /hub/memory`) and is fired without being awaited, because clearing
+ *   must not depend on the network. A hub that is down leaves the server copy
+ *   intact — which is the safe direction: the wearer's local view is empty, and
+ *   the next successful fold or clear settles it.
+ */
 export function resetMemory(): void {
   memory = empty();
   hydrated = true; // a late hydrate must not refill what the wearer just cleared
+  hub = null; // the server's counts describe a store we just emptied
   emit();
   try {
     void clearMemoryRaw();
   } catch {
     /* ignore */
   }
+  void clearHubMemory()
+    .then((r) => {
+      if (r.ok) adoptHub(r.memory);
+    })
+    .catch(() => {
+      /* ignore */
+    });
 }

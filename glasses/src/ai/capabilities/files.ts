@@ -15,11 +15,24 @@
 //   what makes "read me that report" answerable instead of metadata-only — and
 //   what lets the model CHANGE a page rather than only talk about it.
 //
-// WHY THE RELAY IS IN THE MIDDLE
-//   The store's CORS allow-list is empty and its credential is a server secret,
-//   so this module calls `/api/files/*` on the relay (see files-client.ts) and
-//   the relay makes the authenticated call. That is what lets an in-app Jarvis
-//   publish a page without the credential, or the HTML, entering the bundle.
+// WHERE THE DATA LIVES
+//   The REFERENCES — which documents exist, their titles, sizes, tags and
+//   deleted state — are rows in the hub's `file_ref` table, served by
+//   `GET /hub/files` and written by `POST`/`DELETE /hub/files`. That is the
+//   registry, and it is what every list, read and stat below reads.
+//
+// WHY THE RELAY IS STILL IN THE MIDDLE
+//   Two different reasons, and neither is about the registry:
+//     • the store's CORS allow-list is empty, so the browser cannot call the
+//       hub directly at all — everything reaches it through the relay; and
+//     • four routes are DERIVATIONS the hub does not offer. `/text` runs the
+//       HTML through `htmlToText` and `bodyWindow` (the hub answers raw HTML and
+//       ignores `limit`); `/media` rebuilds player URLs from validated ids so a
+//       document cannot smuggle a `javascript:` URL into a tool result; `/html`
+//       and `/ticket` exist because the gateway sends `X-Frame-Options` and a
+//       frame cannot send an Authorization header; and `/revisions/:n` has no
+//       hub route at all. The credential also stays server-side, so no HTML and
+//       no password ever enters the bundle.
 import { getState, update } from '../../store';
 import type { FileRef } from '../../types';
 import type { Capability, CapabilityResult } from '../types';
@@ -95,7 +108,7 @@ export const filesCapabilities: Capability[] = [
         return {
           ok: false,
           summary: oneLine(`Could not reach the document store: ${res.error ?? 'unknown error'}`),
-          hint: 'the relay serves these on /api/files; if it says not configured, the JARVIS_FILE_* env vars are unset',
+          hint: 'the hub serves the registry on /api/hub/files, proxied by the relay; if the relay is not configured the JARVIS_FILE_* env vars are unset',
         };
       }
       // Deleted documents must NOT enter the live list: the glasses page and

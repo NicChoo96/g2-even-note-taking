@@ -5,12 +5,20 @@
 // manual Trigger button uses, so a run started by voice is indistinguishable
 // from one started by hand: it survives backgrounding and both the glasses
 // detail pane and the web panel watch the same transcript.
-import { getAgents, updateAgents } from '../../agents-store';
+import {
+  cloneAgent,
+  createAgent,
+  createTool,
+  getAgents,
+  getAgentsError,
+  removeAgent,
+  saveAgent,
+  toolBody,
+} from '../../agents-store';
 import { getRuns } from '../../agent-runs';
 import { fetchRuns, startRun, stopRun } from '../../stream';
 import { snapshotForRun } from '../../location/run';
 import {
-  SEED_TOOL_ID,
   webSearchTool,
   filesTool,
   jevTool,
@@ -18,7 +26,6 @@ import {
   docsTool,
   notesTool,
   locationTool,
-  uid,
   type AgentDef,
   type AgentMessage,
   type ToolDef,
@@ -161,13 +168,19 @@ const SEED_TOOLS: readonly SeedTool[] = [
  * Called ONLY from an explicit attach — the wearer naming the tool through
  * agents.create/agents.update. Reads (agents.list, tools.list) never come here,
  * so being TOLD a tool exists cannot resurrect one that was deleted.
+ *
+ * ASYNC because the hub mints the tool's id. The id a seed is authored with is
+ * its handle in `types.ts`, not a hub id, so the created row has to be read back
+ * out of the catalogue before anything can reference it — attaching the authored
+ * id would name a row that does not exist upstream, and the relay executes tools
+ * by looking them up in this same catalogue.
  */
-function ensureSeedTool(seed: SeedTool): ToolDef {
+async function ensureSeedTool(seed: SeedTool): Promise<ToolDef | null> {
   const found = getAgents().tools.find((t) => t.kind === seed.kind);
   if (found) return found;
-  const tool = seed.make();
-  updateAgents((s) => ({ ...s, tools: [...s.tools, tool] }));
-  return tool;
+  const id = await createTool(toolBody(seed.make()));
+  if (!id) return null;
+  return getAgents().tools.find((t) => t.id === id) ?? null;
 }
 
 /**
@@ -175,8 +188,8 @@ function ensureSeedTool(seed: SeedTool): ToolDef {
  * but a user can remove it from the catalog. Re-seed it before resolving a
  * spoken name, so "add web search" always works.
  */
-function toolsWithWebSearch(): ToolDef[] {
-  ensureSeedTool(WEB_SEED);
+async function toolsWithWebSearch(): Promise<ToolDef[]> {
+  await ensureSeedTool(WEB_SEED);
   return getAgents().tools;
 }
 
@@ -188,7 +201,7 @@ function toolsWithWebSearch(): ToolDef[] {
  * seed tool through `ensureSeedTool`, so one spoken phrase is enough to both
  * create and attach it.
  */
-function findTool(part: string, tools: ToolDef[]): ToolDef | null {
+async function findTool(part: string, tools: ToolDef[]): Promise<ToolDef | null> {
   const t = part.trim().toLowerCase();
   if (!t) return null;
   const named =
@@ -208,11 +221,11 @@ interface ToolParse {
 }
 
 /** Parse a spoken tool phrase into stored tool ids. */
-function parseTools(raw: unknown): ToolParse {
+async function parseTools(raw: unknown): Promise<ToolParse> {
   const text = String(raw ?? '').trim();
   if (!text) return { ids: [], unknown: [], cleared: false };
   if (NO_TOOLS.test(text)) return { ids: [], unknown: [], cleared: true };
-  const tools = toolsWithWebSearch();
+  const tools = await toolsWithWebSearch();
   const parts = text
     .split(/,|;|\n|\band\b|\bplus\b/gi)
     .map((p) => p.trim())
@@ -225,7 +238,7 @@ function parseTools(raw: unknown): ToolParse {
       cleared = true;
       continue;
     }
-    const tool = findTool(part, tools);
+    const tool = await findTool(part, tools);
     if (tool) {
       if (!ids.includes(tool.id)) ids.push(tool.id);
     } else {
@@ -674,31 +687,38 @@ export const agentsCapabilities: Capability[] = [
       },
       { name: 'model', type: 'string', description: 'Optional model override. Omit to use the global model.' },
     ],
-    run: (args): CapabilityResult => {
+    run: async (args): Promise<CapabilityResult> => {
       const name = String(args.name ?? '').trim();
       if (!name) return { ok: false, summary: 'The agent needs a name' };
       // No `tools` argument → web search on, matching the builder's new-agent
       // default. An explicit "none" → no tools.
-      const parsed = typeof args.tools === 'string' ? parseTools(args.tools) : null;
-      const toolIds = parsed ? parsed.ids : [SEED_TOOL_ID];
-      if (!parsed) toolsWithWebSearch();
+      const parsed = typeof args.tools === 'string' ? await parseTools(args.tools) : null;
+      // The default tool is the catalogue's ACTUAL web-search row, not the id it
+      // was authored with: the hub assigns ids, so a deleted-and-recreated web
+      // tool has a different one and naming the authored id would attach a row
+      // the relay cannot resolve.
+      const web = parsed ? null : await ensureSeedTool(WEB_SEED);
+      if (!parsed && !web) {
+        return { ok: false, summary: 'Could not create the web-search tool', hint: getAgentsError() };
+      }
+      const toolIds = parsed ? parsed.ids : [web!.id];
       const model = String(args.model ?? '').trim();
-      const agent: AgentDef = {
-        id: uid(),
-        name,
+      // One request: the hub mints the id, so the agent cannot be painted first.
+      // The model override rides along locally — the hub has no column for it.
+      const id = await createAgent(name, {
         systemPrompt: String(args.systemPrompt ?? '').trim(),
         prompt: String(args.prompt ?? '').trim(),
         toolIds,
         ...(model ? { model } : {}),
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      updateAgents((s) => ({ ...s, agents: [...s.agents, agent] }));
+      });
+      if (!id) {
+        return { ok: false, summary: `Could not create "${short(name, 20)}"`, hint: getAgentsError() };
+      }
       const unknown = parsed?.unknown ?? [];
       return {
         ok: true,
         summary: `Created "${short(name, 20)}" (${toolSummary(toolIds)})`,
-        data: { id: agent.id, tools: toolIds.map(nameOf) },
+        data: { id, tools: toolIds.map(nameOf) },
         ...(unknown.length ? { hint: `no such tool(s): ${unknown.join(', ')}` } : {}),
       };
     },
@@ -733,7 +753,7 @@ export const agentsCapabilities: Capability[] = [
       { name: 'removeTools', type: 'string', description: 'Comma-separated tools to REMOVE, keeping the others.' },
       { name: 'model', type: 'string', description: 'New model override. Pass "none" or "default" to clear it.' },
     ],
-    run: (args): CapabilityResult => {
+    run: async (args): Promise<CapabilityResult> => {
       const target = resolveAgent(String(args.agent ?? ''), agents());
       if (!target) {
         return { ok: false, summary: `No agent matches "${short(String(args.agent ?? ''), 20)}"`, hint: `agents: ${agentNames()}` };
@@ -753,7 +773,7 @@ export const agentsCapabilities: Capability[] = [
       const unknown: string[] = [];
       let toolIds = [...target.toolIds];
       if (typeof args.tools === 'string') {
-        const parsed = parseTools(args.tools);
+        const parsed = await parseTools(args.tools);
         // A replace that matched NOTHING (and was not an explicit "none") is far
         // more likely a misheard tool name than an intent to wipe every tool, so
         // leave the set alone and report the names back.
@@ -761,12 +781,12 @@ export const agentsCapabilities: Capability[] = [
         else unknown.push(...parsed.unknown);
       }
       if (typeof args.addTools === 'string') {
-        const parsed = parseTools(args.addTools);
+        const parsed = await parseTools(args.addTools);
         toolIds = [...new Set([...toolIds, ...parsed.ids])];
         unknown.push(...parsed.unknown);
       }
       if (typeof args.removeTools === 'string') {
-        const parsed = parseTools(args.removeTools);
+        const parsed = await parseTools(args.removeTools);
         const drop = new Set(parsed.ids);
         toolIds = toolIds.filter((id) => !drop.has(id));
         unknown.push(...parsed.unknown);
@@ -780,10 +800,9 @@ export const agentsCapabilities: Capability[] = [
           : `agents: ${agentNames()}`;
         return { ok: false, summary: 'Nothing to change', hint };
       }
-      updateAgents((s) => ({
-        ...s,
-        agents: s.agents.map((a) => (a.id === target.id ? { ...a, ...patch, updatedAt: Date.now() } : a)),
-      }));
+      // Paints at once and PUTs once the editing settles. `model` rides along
+      // locally; the four hub fields are what the request carries.
+      saveAgent(target.id, patch);
       const result: CapabilityResult = {
         ok: true,
         summary: `Updated "${short(patch.name ?? target.name, 20)}" (${fields.join(', ')})`,
@@ -805,25 +824,23 @@ export const agentsCapabilities: Capability[] = [
       { name: 'agent', type: 'string', description: 'Agent name or number to copy.', required: true },
       { name: 'name', type: 'string', description: 'Name for the copy. Defaults to "<original> copy".' },
     ],
-    run: (args): CapabilityResult => {
+    run: async (args): Promise<CapabilityResult> => {
       const src = resolveAgent(String(args.agent ?? ''), agents());
       if (!src) {
         return { ok: false, summary: `No agent matches "${short(String(args.agent ?? ''), 20)}"`, hint: `agents: ${agentNames()}` };
       }
       const name = (String(args.name ?? '').trim() || `${src.name} copy`).slice(0, 60);
-      const copy: AgentDef = {
-        ...src,
-        id: uid(),
-        name,
-        toolIds: [...src.toolIds],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      updateAgents((s) => ({ ...s, agents: [...s.agents, copy] }));
+      // The hub copies the agent AND its tools in their order; the model override
+      // has no hub column, so it is re-applied locally in the same write.
+      const id = await cloneAgent(src.id);
+      if (!id) {
+        return { ok: false, summary: `Could not clone ${short(src.name, 20)}`, hint: getAgentsError() };
+      }
+      saveAgent(id, { name, ...(src.model ? { model: src.model } : {}) });
       return {
         ok: true,
         summary: `Cloned to "${short(name, 20)}"`,
-        data: { id: copy.id, from: src.id, tools: copy.toolIds.map(nameOf) },
+        data: { id, from: src.id, tools: src.toolIds.map(nameOf) },
       };
     },
   },
@@ -832,13 +849,17 @@ export const agentsCapabilities: Capability[] = [
     page: 'agents',
     effect: 'irreversible',
     title: 'Delete agent',
-    description: 'Delete an agent permanently. Its saved sessions remain until they age out.',
+    description: 'Delete an agent permanently, with the runs it produced. There is no undo.',
     params: [{ name: 'agent', type: 'string', description: 'Agent name or number.', required: true }],
     confirm: true,
     run: (args) => {
       const target = resolveAgent(String(args.agent ?? ''), agents());
       if (!target) return { ok: false, summary: `No agent matches "${short(String(args.agent ?? ''), 20)}"` };
-      updateAgents((s) => ({ ...s, agents: s.agents.filter((a) => a.id !== target.id) }));
+      // One action, through the store: soft-deleted on the hub (irreversibly —
+      // there is no restore route) and its history tombstoned in the same call.
+      // The tombstone is not optional now: a session left behind names an agent
+      // that no longer exists, and it still counts against the 30-session cap.
+      removeAgent(target.id);
       return { ok: true, summary: `Deleted "${short(target.name, 20)}"`, data: { id: target.id } };
     },
   },
@@ -851,7 +872,10 @@ export const agentsCapabilities: Capability[] = [
       'exact names agents.create and agents.update accept. Call this before setting tools so the names are right.',
     params: [],
     run: () => {
-      const tools = toolsWithWebSearch();
+      // A READ, so it must not create anything: the catalogue as it stands. A
+      // kind that is missing is still attachable, and the `available` rows below
+      // are what say so — that is the whole point of listing them.
+      const tools = getAgents().tools;
       const jevNote = 'typed decision tool — also the reranker Jarvis uses to choose between tools';
       // A kind the catalogue does not hold yet is still ATTACHABLE — naming it
       // creates it (see findTool) — so it is listed here as `available: true`.

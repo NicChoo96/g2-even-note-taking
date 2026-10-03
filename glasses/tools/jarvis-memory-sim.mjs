@@ -97,12 +97,18 @@ globalThis.localStorage = {
     return mem.size;
   },
 };
-globalThis.fetch = async () => ({
-  ok: false,
-  status: 404,
-  json: async () => ({ ok: false, error: 'not stubbed' }),
-  text: async () => '{"ok":false}',
-});
+// A REAL `Response`, not a plain object with the same fields.
+//
+// `memory.ts` now mirrors every turn to the hub, so this stub is reached on
+// every write — and the client reads `res.headers.get('etag')` on the way out.
+// A plain object has no `headers`, so that line throws inside a floating promise
+// and the harness exits 1 while still printing ALL PASS. The 404 keeps the
+// behaviour identical: the hub is unreachable and the local log stands alone.
+globalThis.fetch = async () =>
+  new Response('{"ok":false,"error":"not stubbed"}', {
+    status: 404,
+    headers: { 'content-type': 'application/json' },
+  });
 
 // The storage key is a contract: the app writes it through the WebView bridge and
 // reads it back on the next boot, so pin the literal here.

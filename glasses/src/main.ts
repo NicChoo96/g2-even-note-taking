@@ -31,11 +31,21 @@ import {
   type SectionView,
 } from './sections';
 import {
+  addDoc,
+  addTask,
+  appendDoc,
+  appendNote,
   applyRemote,
   getState,
+  hubReady,
+  loadHub,
   noteServerHandshake,
+  removeDoc,
   seedIfEmpty,
+  selectDoc,
+  selectSection,
   setConnStatus,
+  setTaskDone,
   subscribe,
   update,
 } from './store';
@@ -43,9 +53,9 @@ import {
   applyRemoteAgents,
   getAgents,
   hydrateAgentsDurable,
-  noteAgentsHandshake,
+  hydrateHubSessions,
+  loadAgents,
   recordSession,
-  seedAgentsIfEmpty,
   setAgentsConn,
   subscribeAgents,
 } from './agents-store';
@@ -60,14 +70,10 @@ import {
 } from './durable-docs';
 import {
   activeDoc,
-  emptyDoc,
   orderedAgents,
-  uid,
-  upsertDoc,
   type AgentDef,
   type DocEntry,
   type SectionId,
-  type TodoItem,
 } from './types';
 import {
   cancelDictation,
@@ -103,6 +109,7 @@ import {
   undoLastAiBatch,
 } from './ai';
 import { isLiveStatus, requestRemoteConfirm, requestRemoteStop, startAiMirror } from './ai/sync';
+import { startLedgerMirror } from './ai/ledger-sync';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -161,11 +168,12 @@ async function main(): Promise<void> {
       onHandshake: (hasSnapshot) => noteServerHandshake(hasSnapshot),
     });
     // Agents ride a SEPARATE channel so agent/session payloads never bloat the
-    // HubState frame (and API keys never ride either).
+    // HubState frame (and API keys never ride either). It carries SESSIONS only
+    // now — the agent and tool catalogue is read from the hub like every other
+    // collection — and it is on the way out for the same reason.
     closeAgentsStream = connectAgentsStream({
       onState: (next) => applyRemoteAgents(next),
       onStatus: (s) => setAgentsConn(s),
-      onHandshake: (hasSnapshot) => noteAgentsHandshake(hasSnapshot),
     });
     // Jarvis runs mirror across surfaces on their own channel PAIR: the run
     // snapshot out, directed Stop/confirm frames back. Started before the bridge
@@ -175,9 +183,17 @@ async function main(): Promise<void> {
     // Live agent runs are TRANSIENT frames on the same channel: a run executes
     // in the relay, so the detail pane streams even if this page was
     // backgrounded mid-run. `subscribeRuns` (below) owns that connection.
+    //
+    // BOOT READS, once the credential exists — the relay refuses an
+    // unauthenticated principal, so these cannot run earlier. Each is ONE
+    // request and neither is ever polled: `GET /hub` inlines every document's
+    // complete body (~63 KB in this deployment) and `GET /hub/agents` carries
+    // the agents, the tools AND the llm block together. A second pairing
+    // re-enters here, which is what makes a re-credentialed device resync.
+    void loadHub();
+    void loadAgents();
     // Seed the relay from local data if the server has none yet.
     window.setTimeout(() => seedIfEmpty(), 1000);
-    window.setTimeout(() => seedAgentsIfEmpty(), 1200);
   });
 
   // 2) Glasses rendering only runs inside the Even App (bridge injected). In a
@@ -234,7 +250,11 @@ async function main(): Promise<void> {
   void (async () => {
     try {
       const saved = await loadDocsDurable();
-      if (saved && saved.length && getState().sections.docs.length === 0) {
+      // CACHE-RESTORE ONLY, and only before the hub has answered. Once it has,
+      // the hub is the authority: painting a device-local copy over it would
+      // resurrect docs deleted elsewhere — and since nothing writes this frame
+      // back to the hub, the resurrected list would silently never save.
+      if (!hubReady() && saved && saved.length && getState().sections.docs.length === 0) {
         update((s) => ({
           ...s,
           sections: { ...s.sections, docs: saved },
@@ -248,11 +268,21 @@ async function main(): Promise<void> {
   // Agent definitions/tools/settings + the last 5 sessions are also mirrored to
   // the host storage (the WebView can be torn down at any moment).
   void hydrateAgentsDurable();
+  // …and then the hub, which is the authority for WHICH sessions exist. It runs
+  // after the durable read so the local cache is already in place to merge into.
+  void hydrateHubSessions();
   // Jarvis conversation memory. Hydrated here, next to the bridge call, because
   // the prompt build reads it SYNCHRONOUSLY on the first turn — a later load
   // would make the wearer's first question of a session forget the last one,
   // which is exactly the bug this exists to fix.
   void hydrateMemory();
+  // The run ledger is the one thing here that is written BACK rather than read:
+  // it is transient in-memory state, so without this every run's record died
+  // with the tab. Not awaited — it mirrors on its own schedule, and a slow first
+  // flush must never delay the first frame. It also never throws, so there is
+  // nothing to catch, and it is started once for the lifetime of the app: the
+  // stop handle exists for tests, not for a boot path that has no counterpart.
+  startLedgerMirror();
 
   let started = false; // createStartUpPageContainer called exactly once
   let renderedText = '';
@@ -1059,18 +1089,11 @@ async function main(): Promise<void> {
   function commitSpeechToSection(text: string): void {
     const st = getState();
     if (st.activeSection === 'todo') {
-      const item: TodoItem = { id: uid(), text, done: false };
-      update((s) => ({ ...s, sections: { ...s.sections, todo: [...s.sections.todo, item] } }));
+      addTask(text);
       return;
     }
     if (st.activeSection === 'notes') {
-      update((s) => ({
-        ...s,
-        sections: {
-          ...s.sections,
-          notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
-        },
-      }));
+      appendNote(text);
       return;
     }
     if (st.activeSection === 'files') {
@@ -1079,42 +1102,18 @@ async function main(): Promise<void> {
       // quietly stuff the utterance into whichever Doc is open — a write to a
       // page the wearer is not looking at. Notes is the app's free-text
       // scratchpad, so that is where unsolicited speech is kept instead.
-      update((s) => ({
-        ...s,
-        sections: {
-          ...s.sections,
-          notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
-        },
-      }));
+      appendNote(text);
       console.log('[hub] dictation on Files kept in Notes (remote refs are not editable here)');
       return;
     }
     // Docs — append to the open doc, or create one titled from the first line.
     const cur = activeDoc(st);
     if (cur) {
-      update((s) => ({
-        ...s,
-        sections: {
-          ...s.sections,
-          docs: s.sections.docs.map((d) =>
-            d.id === cur.id
-              ? {
-                  ...d,
-                  content: d.content ? `${d.content.replace(/\s+$/, '')}\n${text}` : text,
-                  updatedAt: Date.now(),
-                }
-              : d,
-          ),
-        },
-      }));
+      appendDoc(cur.id, text);
       return;
     }
     const firstLine = text.split('\n')[0].trim().slice(0, 28) || 'Voice note';
-    const doc = emptyDoc(firstLine);
-    update((s) => {
-      const { docs, activeDocId } = upsertDoc(s, { ...doc, content: text });
-      return { ...s, activeSection: 'docs', activeDocId, sections: { ...s.sections, docs } };
-    });
+    addDoc(firstLine, text);
   }
 
   async function doRender(): Promise<void> {
@@ -1461,7 +1460,7 @@ async function main(): Promise<void> {
     agentSessionCursor = 0;
     agentDetailPage = 0;
     agentNotice = null;
-    update((s) => ({ ...s, activeSection: next }));
+    selectSection(next);
   }
 
   /** Menu → "Back": Docs returns to the previous tab, Agents to the first tab. */
@@ -1472,11 +1471,7 @@ async function main(): Promise<void> {
   }
 
   function newDoc(): void {
-    const doc = emptyDoc('Untitled');
-    update((s) => {
-      const { docs, activeDocId } = upsertDoc(s, doc);
-      return { ...s, activeSection: 'docs', activeDocId, sections: { ...s.sections, docs } };
-    });
+    addDoc('Untitled');
   }
 
   function onPickerSwipe(dir: -1 | 1): void {
@@ -1494,19 +1489,7 @@ async function main(): Promise<void> {
     if (!ds.length) return;
     const target: DocEntry = ds[Math.min(ds.length - 1, Math.max(0, pickerCursor))];
     if (pickerIntent === 'delete') {
-      update((s) => {
-        const remaining = s.sections.docs.filter((d) => d.id !== target.id);
-        return {
-          ...s,
-          sections: { ...s.sections, docs: remaining },
-          activeDocId:
-            remaining.length > 0
-              ? s.activeDocId === target.id
-                ? remaining[0].id
-                : s.activeDocId
-              : null,
-        };
-      });
+      removeDoc(target.id);
       // Stay in the picker so more docs can be removed; cursor clamps on render.
       pickerCursor = Math.min(pickerCursor, Math.max(0, ds.length - 2));
       return;
@@ -1514,7 +1497,10 @@ async function main(): Promise<void> {
     // Open the highlighted doc.
     pickerActive = false;
     pickerCursor = 0;
-    update((s) => ({ ...s, activeSection: 'docs', activeDocId: target.id }));
+    // Both control fields, so the pair collapses into ONE `PATCH /hub` under the
+    // store's shared control timer instead of two racy writes.
+    selectSection('docs');
+    selectDoc(target.id);
   }
 
   /**
@@ -1752,13 +1738,7 @@ async function main(): Promise<void> {
     const items = getState().sections.todo;
     if (!items.length || todoCursor >= items.length) return;
     const id = items[todoCursor].id;
-    update((s) => ({
-      ...s,
-      sections: {
-        ...s.sections,
-        todo: s.sections.todo.map((t) => (t.id === id ? { ...t, done: !t.done } : t)),
-      },
-    }));
+    setTaskDone(id, !items[todoCursor].done);
   }
 
   // Any state change (UI edit, remote frame, or a ring tap) re-renders and

@@ -1,11 +1,19 @@
 // To-Do page capabilities — layer 2.
 //
 // Mirrors every action the To-Do tab offers by hand: add, tick, edit, delete,
-// clear finished. Each one is a plain data description plus a `run` that
-// mutates the shared store, so the registry can expose, validate and undo it
-// without knowing anything about to-do lists.
-import { getState, update } from '../../store';
-import { uid, type TodoItem } from '../../types';
+// clear finished. Each one is a plain data description plus a `run` that calls a
+// store op, so the registry can expose, validate and undo it without knowing
+// anything about to-do lists — and, because the store ops write to the hub,
+// anything Jarvis does here persists and reaches the wearer's other devices.
+import {
+  addTask,
+  clearDoneTasks,
+  getState,
+  removeTask,
+  setTaskDone,
+  setTaskText,
+  setTasks,
+} from '../../store';
 import type { Capability } from '../types';
 import { resolveTodo, short } from './shared';
 
@@ -20,11 +28,6 @@ function splitItems(text: string): string[] {
   return [text.trim()].filter(Boolean);
 }
 
-function withTodo(fn: (todo: TodoItem[]) => TodoItem[]): TodoItem[] {
-  update((s) => ({ ...s, sections: { ...s.sections, todo: fn(s.sections.todo) } }));
-  return getState().sections.todo;
-}
-
 export const todoCapabilities: Capability[] = [
   {
     name: 'todo.add',
@@ -37,12 +40,14 @@ export const todoCapabilities: Capability[] = [
     run: (args) => {
       const items = splitItems(String(args.text ?? ''));
       if (!items.length) return { ok: false, summary: 'No task text given' };
-      const added = items.map((text) => ({ id: uid(), text, done: false }));
-      withTodo((todo) => [...todo, ...added]);
+      // One `POST /hub/todos` per item, NOT a wholesale replace of the list:
+      // replacing it would drop a task another device added in the meantime, and
+      // the hub has no multi-item create.
+      for (const text of items) addTask(text);
       return {
         ok: true,
-        summary: added.length === 1 ? `Added "${short(added[0].text)}"` : `Added ${added.length} tasks`,
-        data: { added: added.map((a) => a.text) },
+        summary: items.length === 1 ? `Added "${short(items[0])}"` : `Added ${items.length} tasks`,
+        data: { added: items },
       };
     },
   },
@@ -73,7 +78,7 @@ export const todoCapabilities: Capability[] = [
       if (item.done === done) {
         return { ok: true, summary: `"${short(item.text)}" is already ${done ? 'done' : 'open'}` };
       }
-      withTodo((list) => list.map((t, i) => (i === index ? { ...t, done } : t)));
+      setTaskDone(item.id, done);
       return { ok: true, summary: `${done ? 'Ticked' : 'Reopened'} "${short(item.text)}"`, data: { id: item.id, done } };
     },
   },
@@ -95,7 +100,7 @@ export const todoCapabilities: Capability[] = [
       }
       const text = String(args.text ?? '').trim();
       if (!text) return { ok: false, summary: 'No new text given' };
-      withTodo((list) => list.map((t, i) => (i === index ? { ...t, text } : t)));
+      setTaskText(item.id, text);
       return { ok: true, summary: `Edited task ${index + 1}`, data: { from: item.text, to: text } };
     },
   },
@@ -115,7 +120,7 @@ export const todoCapabilities: Capability[] = [
       if (!item || index < 0) {
         return { ok: false, summary: `No task matches "${short(String(args.target ?? ''), 24)}"` };
       }
-      withTodo((list) => list.filter((_, i) => i !== index));
+      removeTask(item.id);
       return { ok: true, summary: `Deleted "${short(item.text)}"` };
     },
   },
@@ -131,7 +136,7 @@ export const todoCapabilities: Capability[] = [
     run: () => {
       const before = getState().sections.todo;
       const removed = before.filter((t) => t.done).length;
-      withTodo((list) => list.filter((t) => !t.done));
+      clearDoneTasks();
       return { ok: true, summary: `Cleared ${removed} finished task(s)`, data: { removed } };
     },
   },
@@ -146,7 +151,7 @@ export const todoCapabilities: Capability[] = [
     available: () => getState().sections.todo.length > 0,
     run: () => {
       const removed = getState().sections.todo.length;
-      withTodo(() => []);
+      setTasks([]);
       return { ok: true, summary: `Cleared the whole list (${removed})`, data: { removed } };
     },
   },

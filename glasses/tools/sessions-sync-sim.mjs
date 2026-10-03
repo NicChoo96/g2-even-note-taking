@@ -338,7 +338,11 @@ function deliver(d, frame) {
   lacks('store: no path replaces sessions from a frame', store, 'sessions: pruneSessions(next.sessions ?? [])');
 
   has('panel: Clear history goes through the tombstone', panel, 'clearSessionsFor(agent.id)');
-  has('panel: deleting an agent tombstones its history', panel, 'clearSessionsFor(id)');
+  // Deleting an agent tombstones its history in the STORE, not the panel: the
+  // delete is one hub call now (`DELETE /hub/agents/{id}`), and the tombstone has
+  // to travel with it, so the store owns both. The panel only routes to it.
+  has('store: deleting an agent tombstones its history', body(store, 'removeAgent'), 'clearSessionsFor(id)');
+  has('panel: deleting an agent goes through the store', panel, 'removeAgentFromStore(id)');
   lacks('panel: no raw session filter on delete', panel, 'sessions: s.sessions.filter(');
 
   has('durable: the tombstone survives a WebView teardown', durable, 'JSON.stringify({ agents, tools, llm, sessionsClearedAt })');

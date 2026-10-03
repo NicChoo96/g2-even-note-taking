@@ -3,20 +3,21 @@
 // The Docs tab is a library of named documents with one "open" doc. These
 // capabilities mirror the manager UI: create, open, rename, append to, replace
 // and delete.
-import { getState, update } from '../../store';
-import { activeDoc, emptyDoc, upsertDoc, type DocEntry } from '../../types';
+import {
+  addDoc,
+  appendDoc,
+  getState,
+  removeDoc,
+  selectDoc,
+  setDocContent,
+  setDocTitle,
+} from '../../store';
+import { activeDoc, type DocEntry } from '../../types';
 import type { Capability } from '../types';
-import { READ_CHARS, appendText, readFrom, resolveDoc, short } from './shared';
+import { READ_CHARS, readFrom, resolveDoc, short } from './shared';
 
 function docs(): DocEntry[] {
   return getState().sections.docs;
-}
-
-function write(doc: DocEntry): void {
-  update((s) => {
-    const { docs: next, activeDocId } = upsertDoc(s, doc);
-    return { ...s, sections: { ...s.sections, docs: next }, activeDocId };
-  });
 }
 
 function titleOf(d: DocEntry): string {
@@ -37,13 +38,11 @@ export const docsCapabilities: Capability[] = [
     run: (args) => {
       const title = String(args.title ?? '').trim() || 'Untitled';
       const content = String(args.content ?? '').trim();
-      const doc = emptyDoc(title);
-      doc.content = content;
-      write(doc);
+      const id = addDoc(title, content);
       return {
         ok: true,
         summary: `Created "${short(title)}"`,
-        data: { id: doc.id, title, chars: content.length },
+        data: { id, title, chars: content.length },
       };
     },
   },
@@ -64,7 +63,7 @@ export const docsCapabilities: Capability[] = [
           hint: `documents: ${list.map((d, i) => `${i + 1}. ${titleOf(d)}`).join(' | ')}`,
         };
       }
-      update((s) => ({ ...s, activeDocId: found.id }));
+      selectDoc(found.id);
       return { ok: true, summary: `Opened "${short(titleOf(found))}"`, data: { id: found.id } };
     },
   },
@@ -87,12 +86,10 @@ export const docsCapabilities: Capability[] = [
       const target = resolveDoc(String(args.doc ?? ''), list, getState().activeDocId);
       if (!target) {
         // No document exists yet — creating one is clearly what the user meant.
-        const doc = emptyDoc('Untitled');
-        doc.content = text;
-        write(doc);
-        return { ok: true, summary: `Started a new doc with the text`, data: { id: doc.id, created: true } };
+        const id = addDoc('Untitled', text);
+        return { ok: true, summary: `Started a new doc with the text`, data: { id, created: true } };
       }
-      write({ ...target, content: appendText(target.content, text) });
+      appendDoc(target.id, text);
       return {
         ok: true,
         summary: `Appended to "${short(titleOf(target))}"`,
@@ -118,7 +115,7 @@ export const docsCapabilities: Capability[] = [
       const target = resolveDoc(String(args.doc ?? ''), list, getState().activeDocId);
       if (!target) return { ok: false, summary: 'There is no document to replace' };
       const text = String(args.text ?? '').trim();
-      write({ ...target, content: text });
+      setDocContent(target.id, text);
       return { ok: true, summary: `Rewrote "${short(titleOf(target))}"`, data: { id: target.id, chars: text.length } };
     },
   },
@@ -139,7 +136,7 @@ export const docsCapabilities: Capability[] = [
       const title = String(args.title ?? '').trim();
       if (!title) return { ok: false, summary: 'No new title given' };
       const from = titleOf(target);
-      write({ ...target, title });
+      setDocTitle(target.id, title);
       return { ok: true, summary: `Renamed to "${short(title)}"`, data: { from, id: target.id } };
     },
   },
@@ -157,12 +154,7 @@ export const docsCapabilities: Capability[] = [
       const list = docs();
       const target = resolveDoc(String(args.doc ?? ''), list, getState().activeDocId);
       if (!target) return { ok: false, summary: 'There is no document to delete' };
-      update((s) => {
-        const next = s.sections.docs.filter((d) => d.id !== target.id);
-        const nextActive =
-          s.activeDocId === target.id ? next[0]?.id ?? null : s.activeDocId;
-        return { ...s, sections: { ...s.sections, docs: next }, activeDocId: nextActive };
-      });
+      removeDoc(target.id);
       return { ok: true, summary: `Deleted "${short(titleOf(target))}"`, data: { id: target.id } };
     },
   },

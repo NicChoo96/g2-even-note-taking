@@ -101,9 +101,14 @@ globalThis.localStorage = {
 const relay = { runs: [], startId: 'run-triggered' };
 globalThis.fetch = async (url) => {
   const u = String(url);
+  // `headers.get` is REAL, not a plain object. `recordSession` mirrors the run to
+  // the hub, and the client reads `res.headers.get('etag')` on the way back — a
+  // hand-rolled reply without it throws inside that floating promise, which makes
+  // the process exit 1 while still printing every check as passing.
   const reply = (body, status = 200) => ({
     ok: status >= 200 && status < 300,
     status,
+    headers: { get: () => null },
     json: async () => body,
     text: async () => JSON.stringify(body),
   });

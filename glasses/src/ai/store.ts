@@ -180,10 +180,42 @@ let confirmResolver: ((ok: boolean) => void) | null = null;
  * cancelled run would repaint its HUD over whatever the user moved on to.
  */
 let cancelled = false;
-/** Disambiguates run ids created in the same millisecond. */
-let ledgerCounter = 0;
 /** The `seq` of the open gate entry, so its resolution can cite it. */
 let gateSeq: number | null = null;
+
+/**
+ * The run id — a canonical uuid v4, and deliberately NOT a short local string.
+ *
+ * This used to be `r<base36 time><counter>`, which nothing local objected to.
+ * The HUB objects: `POST /hub/ledger` validates an entry's `runId` as a uuid v4
+ * and refuses the ENTIRE batch with `400 VALIDATION_ERROR "runId must be a uuid
+ * v4"` — and it validates the whole batch before writing any of it, so one bad
+ * `runId` costs every entry. That rule appears in no published document; it was
+ * found by probing. Since the ledger keys on this id, a non-uuid here would have
+ * made the hub mirror fail on every entry, silently.
+ *
+ * Note the two surfaces do NOT agree: `POST /hub/sessions` accepts the relay's
+ * 16-hex agent run id as a `runId` (verified working). This one is written to
+ * the stricter rule, because a stricter rule can only cost a nicer id.
+ *
+ * Kept local rather than shared with `canonicalUuid` in `web/hub-client.ts`,
+ * for the same reason `ledger.ts` keeps its own `cleanText`: the ai layer is
+ * bundled by store-free harnesses, and `hub-client.ts` pulls in the SSE and
+ * auth modules. A uuid generator is ten lines; a broken bundle is not.
+ */
+function newRunId(): string {
+  const c = typeof crypto !== 'undefined' ? crypto : null;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  // A WebView without `randomUUID` still has `getRandomValues`. Build the v4
+  // shape by hand rather than fall back to something the hub would refuse.
+  const b = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === 'function') c.getRandomValues(b);
+  else for (let i = 0; i < 16; i += 1) b[i] = Math.floor(Math.random() * 256);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = Array.from(b, (p) => p.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 function loadSettings(): AiSettings {
   try {
@@ -273,8 +305,9 @@ export function aiBegin(utterance: string, focus: PageId): void {
   cancelled = false;
   // A run id is minted here because this is the one place that always knows a
   // run is starting. The ledger keys on it, which is what makes "everything
-  // that happened in that run" a filter rather than an inference.
-  const runId = `r${Date.now().toString(36)}${(ledgerCounter += 1).toString(36)}`;
+  // that happened in that run" a filter rather than an inference. It must be a
+  // uuid v4 — see `newRunId`, which is where the hub's rule is recorded.
+  const runId = newRunId();
   ledgerBegin(runId);
   ledgerAppend({ kind: 'ask', by: 'wearer', text: utterance, effect: 'pure', runId });
   set({

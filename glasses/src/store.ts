@@ -1,10 +1,46 @@
 // Shared HubState store — the single source of truth for BOTH the companion UI
-// (React, same page) and the glasses renderer. Persists to localStorage,
-// publishes edits to the relay, and applies remote frames (ignoring our own
-// echoes). This is what makes ONE app at ONE URL drive the web UI AND the
-// glasses at the same time.
-import { publishState } from './stream';
-import { emptyHubState, type DocEntry, type FileRef, type HubState } from './types';
+// (React, same page) and the glasses renderer.
+//
+// THE HUB IS THE AUTHORITY. Every read and every write goes to the backend
+// through `web/hub-client.ts`; local state is an optimistic copy plus a cache, so
+// a cold load paints instantly instead of flashing an empty list. Nothing here
+// may win a conflict against the server: `rev` decides, and this module
+// deliberately does NOT keep its own — `hub-client.ts` owns the single
+// forward-only counter, so two counters cannot drift apart.
+//
+// What this replaced: localStorage WAS the source of truth and the relay
+// live-synced whole state frames between devices, with a bespoke
+// "never move backwards by updatedAt" rule to stop an older frame from wiping a
+// newer list. That entire class of bug is gone — a real conflict is now a
+// `409 STALE_REV` and the client retries with the server's own rev.
+import {
+  appendNotes as hubAppendNotes,
+  clearDoneTodos as hubClearDone,
+  createDoc as hubCreateDoc,
+  createTodo as hubCreateTodo,
+  deleteDoc as hubDeleteDoc,
+  deleteTodo as hubDeleteTodo,
+  fetchDoc as hubFetchDoc,
+  fetchHub,
+  onStaleState,
+  patchHub,
+  patchTodo as hubPatchTodo,
+  putNotes as hubPutNotes,
+  putTodos as hubPutTodos,
+  renameDoc as hubRenameDoc,
+  reorderTodos as hubReorderTodos,
+  updateDocContent as hubUpdateDocContent,
+  type HubSnapshot,
+} from './web/hub-client';
+import {
+  emptyHubState,
+  uid,
+  type DocEntry,
+  type FileRef,
+  type HubState,
+  type SectionId,
+  type TodoItem,
+} from './types';
 
 const LS_KEY = 'hub:state';
 
@@ -12,16 +48,9 @@ export type ConnStatus = 'idle' | 'connecting' | 'open' | 'error';
 
 let state: HubState = loadLocal();
 const listeners = new Set<() => void>();
-let lastPublishedAt = 0;
-let pubTimer: number | null = null;
-// Set once the relay has answered the SSE handshake (or accepted a publish).
-// Seeding before this point is how a stale browser copy used to overwrite a
-// newer relay snapshot on a cold start — and how a client that could not reach
-// the relay at all would clobber it the moment connectivity came back.
-let sawServerState = false;
-let serverReportedEmpty = false;
-let seedArmed = false;
-let seeded = false;
+// Whether the hub has answered at least once. Until it has, the cached copy is
+// all there is to paint; after it has, the hub wins every disagreement.
+let hubLoaded = false;
 
 let conn: ConnStatus = 'idle';
 const connListeners = new Set<(s: ConnStatus) => void>();
@@ -100,15 +129,86 @@ function emit(): void {
   for (const l of [...listeners]) l();
 }
 
-function schedulePublish(): void {
-  if (pubTimer !== null) window.clearTimeout(pubTimer);
-  pubTimer = window.setTimeout(() => {
-    pubTimer = null;
-    lastPublishedAt = state.updatedAt;
-    void publishState(state).then((ok) => {
-      if (ok) sawServerState = true;
-    });
-  }, 250);
+// ── write status ────────────────────────────────────────────────────────────
+
+/**
+ * A plain, honest failure surface.
+ *
+ * This app is ONLINE-FIRST by decision and keeps no outbox, so a write that never
+ * reached the hub is REPORTED rather than queued. Swallowing it is the one thing
+ * that would make this strictly worse than the live-sync it replaced: the user
+ * would see their edit in the list and believe it had been saved.
+ */
+let hubError = '';
+const errorListeners = new Set<(message: string) => void>();
+
+export function getHubError(): string {
+  return hubError;
+}
+
+export function subscribeHubError(fn: (message: string) => void): () => void {
+  errorListeners.add(fn);
+  fn(hubError);
+  return () => {
+    errorListeners.delete(fn);
+  };
+}
+
+export function hubReady(): boolean {
+  return hubLoaded;
+}
+
+function reportError(message: string): void {
+  if (message === hubError) return;
+  hubError = message;
+  for (const l of [...errorListeners]) l(hubError);
+}
+
+/** Fold one hub result into the status chip and the error banner. */
+function settle(res: { ok: boolean; error?: string; status?: number }, onOk?: () => void): void {
+  if (res.ok) {
+    reportError('');
+    setConnStatus('open');
+    onOk?.();
+    return;
+  }
+  // `status 0` means no response at all — offline, or the relay is down. That is
+  // a different condition from the hub refusing a request, and it is what the
+  // "Offline" chip is for.
+  setConnStatus(res.status === 0 ? 'error' : 'open');
+  reportError(res.error || 'Could not reach the hub');
+}
+
+// One trailing-edge timer per target, so a burst of keystrokes collapses into a
+// single write of the FINAL text rather than one request per character.
+const writers = new Map<string, number>();
+const EDIT_DEBOUNCE_MS = 400;
+const CONTROL_DEBOUNCE_MS = 250;
+
+function debounce(key: string, ms: number, run: () => void): void {
+  const existing = writers.get(key);
+  if (existing !== undefined) window.clearTimeout(existing);
+  writers.set(
+    key,
+    window.setTimeout(() => {
+      writers.delete(key);
+      run();
+    }, ms),
+  );
+}
+
+// Per-document `ETag`. `PUT /hub/docs/{id}` is guarded by `If-Match`, and a write
+// without one is refused outright (`412 IF_MATCH_REQUIRED`) — so a body that was
+// read but whose etag was never kept could not be saved at all. Seeded by a read
+// and refreshed from EVERY write response. The value arrives quoted and the
+// quotes are part of it, like an `Idempotency-Key`'s hyphens.
+const docEtags = new Map<string, string>();
+
+/** Apply a local edit, cache it and repaint. Never touches the network. */
+function commit(fn: (s: HubState) => HubState): void {
+  state = { ...fn(state), updatedAt: Date.now() };
+  persist(state);
+  emit();
 }
 
 export function getState(): HubState {
@@ -123,89 +223,458 @@ export function subscribe(fn: () => void): () => void {
   };
 }
 
-/** Apply a local edit (from the companion UI) and broadcast it to all devices. */
+/**
+ * Apply a LOCAL edit and repaint.
+ *
+ * Kept for the callers that only move the frame the UI is painted from — the
+ * file cache, the AI's own focus. It does NOT write to the hub, so anything that
+ * must survive a reload has to go through one of the semantic ops below; those
+ * are the only places a route is chosen.
+ */
 export function update(fn: (s: HubState) => HubState): void {
-  state = { ...fn(state), updatedAt: Date.now() };
-  persist(state);
-  schedulePublish();
-  emit();
+  commit(fn);
 }
 
 /**
- * Apply a state frame received from the relay (another device or our echo).
+ * A whole-state frame from the relay's `hub` channel.
  *
- * ⚠ A REMOTE FRAME MUST NEVER MOVE US BACKWARDS. The relay replays its cached
- * snapshot on EVERY connect (`init`), and it caches whatever the last device
- * sent — so a reconnect after a restart, a peer that was backgrounded, or a
- * publish whose fire-and-forget disk write was lost all arrive as an OLDER copy
- * of the same list. Adopting that unconditionally is the wipe: the newer local
- * data is overwritten AND THEN PERSISTED, so the loss survives a reload and the
- * list appears to have emptied itself with nobody having deleted anything.
- *
- * `updatedAt` is the tie-break the rest of the app already uses, so it is used
- * here too: strictly-older loses. A refused frame is not dropped — the local
- * copy is re-published, so the relay converges FORWARD. That cannot deadlock
- * into a rollback loop, because the relay refuses backwards writes too (see the
- * staleness guard in `POST /api/stream`).
- *
- * Deliberately NOT union-merged, unlike the append-only `sessions` list in
- * `applyRemoteAgents`: deleting a task is a real edit and a later list is
- * allowed to be shorter. Ordering, not union, is the correct policy here.
+ * ⚠ SUBORDINATE, AND SCHEDULED FOR REMOVAL. The hub is the authority now, so a
+ * frame is only useful as BOOTSTRAP: it lets a device that has not yet reached
+ * the hub paint the last known list instead of nothing. Once `loadHub` has
+ * succeeded this is ignored outright — adopting a relay-cached copy over a
+ * hub-backed one is precisely the stale-frame wipe this migration exists to end,
+ * and no `updatedAt` tie-break can be trusted to tell the two apart.
  */
 export function applyRemote(next: HubState): void {
-  if (!next?.sections) return;
-  sawServerState = true;
-  const stamp = Number.isFinite(next.updatedAt) ? next.updatedAt : 0;
-  if (stamp && stamp === lastPublishedAt) return; // our own echo — already applied
-  if (stamp && stamp < state.updatedAt) {
-    // Stale — the server (or a peer) is behind this device. Keep what we have
-    // and push it, so the newer list is restored to the relay rather than lost.
-    schedulePublish();
-    return;
-  }
-  state = { ...next, updatedAt: stamp || Date.now() };
+  if (hubLoaded || !next?.sections) return;
+  state = { ...next, updatedAt: Number(next.updatedAt) || Date.now() };
   persist(state);
   emit();
 }
 
 /**
- * Arm a one-shot seed of the relay from local storage. The seed only actually
- * runs once the relay reports an EMPTY snapshot (`state: null`), so a client
- * that cannot reach the relay — or one that arrives after another device
- * already published — can never clobber newer server data.
+ * DEPRECATED NO-OP — kept only so the relay's SSE wiring in `main.ts` still
+ * compiles while the `hub` channel is retired.
+ *
+ * These two used to push the local copy to the relay when the server reported an
+ * empty snapshot. That is now exactly the wrong thing to do: the hub is the
+ * authority, and "my local list is the truth and the server is empty" is how one
+ * device overwrites another's data. Seeding is a hub-side import now.
  */
 export function seedIfEmpty(): void {
-  seedArmed = true;
-  maybeSeed();
+  /* the hub owns seeding */
 }
 
-function maybeSeed(): void {
-  if (!seedArmed || seeded || sawServerState || !serverReportedEmpty) return;
-  const local = getState();
-  const hasData =
-    local.sections.todo.length > 0 ||
-    local.sections.docs.length > 0 ||
-    (local.sections.notes ?? '').trim().length > 0;
-  if (!hasData) return;
-  seeded = true;
-  lastPublishedAt = Date.now();
-  void publishState({ ...local, updatedAt: lastPublishedAt }).then((ok) => {
-    if (ok) sawServerState = true;
+export function noteServerHandshake(_hasSnapshot: boolean): void {
+  /* the hub owns seeding */
+}
+
+// ── boot ────────────────────────────────────────────────────────────────────
+
+/**
+ * Load the whole state from the hub once and adopt it.
+ *
+ * `GET /hub` is a HEAVY read — it inlines every document's COMPLETE body (63 KB
+ * across the 19 documents in this deployment) — so this runs at boot and after a
+ * reconnect, never on a poll. It is also the only read that refreshes `rev` for
+ * collections this device has not touched.
+ */
+export async function loadHub(): Promise<boolean> {
+  wireStaleRefresh();
+  const res = await fetchHub();
+  if (!res.ok) {
+    settle(res);
+    return false;
+  }
+  hubLoaded = true;
+  adopt(res.hub);
+  settle(res);
+  return true;
+}
+
+/** Adopt a server snapshot wholesale. The hub wins by definition. */
+function adopt(snap: HubSnapshot): void {
+  state = {
+    activeSection: snap.activeSection,
+    sections: snap.sections,
+    activeDocId: snap.activeDocId,
+    updatedAt: snap.updatedAt || Date.now(),
+  };
+  persist(state);
+  emit();
+}
+
+let staleWired = false;
+
+/**
+ * A `409 STALE_REV` is not a dead end: the client already adopted the server's
+ * rev and retried, so the user's own edit lands. What may still be missing is
+ * another device's changes, so refresh the whole snapshot — but only AFTER the
+ * pending writes have flushed, otherwise a read issued mid-edit would repaint
+ * the list from under the user's cursor.
+ */
+function wireStaleRefresh(): void {
+  if (staleWired) return;
+  staleWired = true;
+  onStaleState(() => debounce('stale-refresh', EDIT_DEBOUNCE_MS + 400, () => void loadHub()));
+}
+
+// ── todos ───────────────────────────────────────────────────────────────────
+
+/**
+ * Add a task.
+ *
+ * Optimistic: the row appears immediately under a LOCAL id, so the list cannot
+ * lag behind a keystroke. The hub mints the real id, so the response swaps it in
+ * (see `swapTodoId`). A failed write leaves the row alone — the user asked for it
+ * and the failure is surfaced — and the next successful write converges the list.
+ */
+export function addTask(text: string): void {
+  const clean = text.trim();
+  if (!clean) return;
+  const localId = uid();
+  commit((s) => ({
+    ...s,
+    sections: { ...s.sections, todo: [...s.sections.todo, { id: localId, text: clean, done: false }] },
+  }));
+  void hubCreateTodo(clean).then((res) =>
+    settle(res, () => {
+      const item = res.item;
+      if (item?.id && item.id !== localId) swapTodoId(localId, item);
+    }),
+  );
+}
+
+/**
+ * Point the local row at the id the hub just minted — or RE-ADD it if a refresh
+ * took it away.
+ *
+ * A `409` on any write triggers a debounced `loadHub`, and that read adopts the
+ * hub's snapshot wholesale. If it lands between a create being issued and the
+ * create's response, the optimistic row is gone by the time the response
+ * arrives — so a rename alone would match nothing and the task would exist on
+ * the hub while being invisible here until the next boot.
+ */
+function swapTodoId(localId: string, item: TodoItem): void {
+  commit((s) => {
+    const rows = s.sections.todo;
+    if (rows.some((t) => t.id === localId)) {
+      return { ...s, sections: { ...s.sections, todo: rows.map((t) => (t.id === localId ? { ...item } : t)) } };
+    }
+    if (rows.some((t) => t.id === item.id)) return s;
+    return { ...s, sections: { ...s.sections, todo: [...rows, { ...item }] } };
+  });
+}
+
+function patchTask(id: string, patch: { text?: string; done?: boolean }): void {
+  commit((s) => ({
+    ...s,
+    sections: { ...s.sections, todo: s.sections.todo.map((t) => (t.id === id ? { ...t, ...patch } : t)) },
+  }));
+}
+
+export function setTaskDone(id: string, done: boolean): void {
+  patchTask(id, { done });
+  void hubPatchTodo(id, { done }).then((res) => settle(res));
+}
+
+/** Debounced: a task title is typed character by character. */
+export function setTaskText(id: string, text: string): void {
+  patchTask(id, { text });
+  debounce(`todo:${id}`, EDIT_DEBOUNCE_MS, () => void hubPatchTodo(id, { text }).then((res) => settle(res)));
+}
+
+export function removeTask(id: string): void {
+  commit((s) => ({ ...s, sections: { ...s.sections, todo: s.sections.todo.filter((t) => t.id !== id) } }));
+  void hubDeleteTodo(id).then((res) => settle(res));
+}
+
+/**
+ * Replace the whole list in one write.
+ *
+ * Used by the paste categoriser, which rewrites the entire to-do section at
+ * once: replaying that as individual creates would be N round trips and would
+ * lose the fact that it is a single intent.
+ */
+export function setTasks(items: TodoItem[]): void {
+  commit((s) => ({ ...s, sections: { ...s.sections, todo: items } }));
+  void hubPutTodos(items).then((res) => settle(res, () => adoptTodos(res.items)));
+}
+
+/** The list IS the order, so a reorder sends the ids in their new sequence. */
+export function reorderTasks(ids: string[]): void {
+  void hubReorderTodos(ids).then((res) => settle(res, () => adoptTodos(res.items)));
+}
+
+export function clearDoneTasks(): void {
+  commit((s) => ({ ...s, sections: { ...s.sections, todo: s.sections.todo.filter((t) => !t.done) } }));
+  void hubClearDone().then((res) => settle(res, () => adoptTodos(res.items)));
+}
+
+/** Trust the server's list over the optimistic one whenever it is offered. */
+function adoptTodos(items: TodoItem[]): void {
+  if (!items.length && !getState().sections.todo.length) return;
+  commit((s) => ({ ...s, sections: { ...s.sections, todo: items } }));
+}
+
+// ── docs ────────────────────────────────────────────────────────────────────
+
+/**
+ * Create a document and open it.
+ *
+ * Returns the OPTIMISTIC id straight away so a synchronous caller — an AI
+ * capability building its `data` — has something to name. The hub mints the
+ * real id, and `swapDocId` rewrites the row to it once the create lands, so the
+ * returned value is only meaningful for the lifetime of that request.
+ */
+export function addDoc(title = 'Untitled', content = ''): string {
+  const localId = uid();
+  commit((s) => ({
+    ...s,
+    activeSection: 'docs',
+    activeDocId: localId,
+    sections: {
+      ...s.sections,
+      docs: [...s.sections.docs, { id: localId, title, content, updatedAt: Date.now() }],
+    },
+  }));
+  void hubCreateDoc(title, content).then((res) =>
+    settle(res, () => {
+      const serverId = res.doc?.id;
+      if (!serverId) return;
+      if (serverId !== localId) swapDocId(localId, { id: serverId, title: res.doc?.title, content });
+      if (res.etag) docEtags.set(serverId, res.etag);
+    }),
+  );
+  return localId;
+}
+
+/**
+ * Point the local row (and the open doc) at the id the hub just minted.
+ *
+ * UPSERTS rather than renames, for the same reason `swapTodoId` does — see
+ * there. The row is rebuilt from the create's own request when the refresh won
+ * the race, so the only thing lost is the hub's ordering, which the hub owns
+ * anyway.
+ */
+function swapDocId(
+  localId: string,
+  created: { id: string; title?: string; content?: string; updatedAt?: number },
+): void {
+  const serverId = created.id;
+  const etag = docEtags.get(localId);
+  if (etag) {
+    docEtags.delete(localId);
+    docEtags.set(serverId, etag);
+  }
+  commit((s) => {
+    const rows = s.sections.docs;
+    const docs = rows.some((d) => d.id === localId)
+      ? rows.map((d) => (d.id === localId ? { ...d, id: serverId } : d))
+      : rows.some((d) => d.id === serverId)
+        ? rows
+        : [
+            ...rows,
+            {
+              id: serverId,
+              title: created.title ?? 'Untitled',
+              content: created.content ?? '',
+              updatedAt: created.updatedAt ?? Date.now(),
+            },
+          ];
+    return {
+      ...s,
+      activeDocId: s.activeDocId === localId ? serverId : s.activeDocId,
+      sections: { ...s.sections, docs },
+    };
+  });
+}
+
+/** Rename. METADATA ONLY on the wire, so it cannot clobber a body in flight. */
+export function setDocTitle(id: string, title: string): void {
+  patchDoc(id, { title, updatedAt: Date.now() });
+  void hubRenameDoc(id, title).then((res) =>
+    settle(res, () => {
+      if (res.etag) docEtags.set(id, res.etag);
+    }),
+  );
+}
+
+function patchDoc(id: string, patch: Partial<DocEntry>): void {
+  commit((s) => ({
+    ...s,
+    sections: {
+      ...s.sections,
+      docs: s.sections.docs.map((d) => (d.id === id ? { ...d, ...patch } : d)),
+    },
+  }));
+}
+
+/** Debounced: a document body is typed continuously. */
+export function setDocContent(id: string, content: string): void {
+  patchDoc(id, { content, updatedAt: Date.now() });
+  debounce(`doc:${id}`, EDIT_DEBOUNCE_MS, () => {
+    const live = getState().sections.docs.find((d) => d.id === id);
+    if (live) void pushDocContent(id, live.content);
   });
 }
 
 /**
- * Called when the relay's SSE handshake arrives. A snapshot means "don't seed";
- * a null snapshot means "server is empty", which is the only condition under
- * which a client may push its local copy.
+ * Replace a document's body, with the etag it needs.
+ *
+ * `GET /hub` does NOT carry per-document etags, so the first write after a boot
+ * read has none — and the hub refuses it (`412 IF_MATCH_REQUIRED`) rather than
+ * guessing. A moved etag means another device wrote. Both are recoverable the
+ * same way: read the current etag and write once more. The local text is the
+ * user's newest intent, so it wins; only a second refusal is reported.
  */
-export function noteServerHandshake(hasSnapshot: boolean): void {
-  if (hasSnapshot) {
-    sawServerState = true;
+async function pushDocContent(id: string, content: string, attempt = 0): Promise<void> {
+  const res = await hubUpdateDocContent(id, content, { etag: docEtags.get(id) });
+  if (res.ok) {
+    if (res.etag) docEtags.set(id, res.etag);
+    settle(res);
     return;
   }
-  serverReportedEmpty = true;
-  maybeSeed();
+  if ((res.code === 'IF_MATCH_REQUIRED' || res.code === 'IF_MATCH_FAILED') && attempt < 1) {
+    const read = await hubFetchDoc(id);
+    if (read.ok && read.etag) {
+      docEtags.set(id, read.etag);
+      return pushDocContent(id, content, attempt + 1);
+    }
+  }
+  settle(res);
+}
+
+/** Read one body and remember its etag, so the first save does not need a 412. */
+export async function loadDoc(id: string): Promise<DocEntry | null> {
+  const res = await hubFetchDoc(id);
+  if (!res.ok || !res.doc) {
+    settle(res);
+    return null;
+  }
+  if (res.etag) docEtags.set(id, res.etag);
+  const doc = res.doc;
+  patchDoc(id, {
+    title: doc.title,
+    ...(typeof doc.content === 'string' ? { content: doc.content } : {}),
+    updatedAt: doc.updatedAt || Date.now(),
+  });
+  return getState().sections.docs.find((d) => d.id === id) ?? null;
+}
+
+/** Append to a body. No hub route for this, so it is a read-modify-write. */
+export function appendDoc(id: string, text: string): void {
+  const cur = getState().sections.docs.find((d) => d.id === id);
+  if (!cur) return;
+  setDocContent(id, cur.content ? `${cur.content.replace(/\s+$/, '')}\n${text}` : text);
+}
+
+export function removeDoc(id: string): void {
+  commit((s) => {
+    const remaining = s.sections.docs.filter((d) => d.id !== id);
+    return {
+      ...s,
+      activeDocId: s.activeDocId === id ? remaining[0]?.id ?? null : s.activeDocId,
+      sections: { ...s.sections, docs: remaining },
+    };
+  });
+  docEtags.delete(id);
+  void hubDeleteDoc(id).then((res) => settle(res));
+}
+
+/**
+ * Push a whole captured state back to the hub — the revert half of an AI batch
+ * undo.
+ *
+ * The hub has ONE route per collection, so there is no "replace everything"
+ * call: this replays the snapshot as the writes that produce it, and only the
+ * differences, so an unchanged library costs nothing. A document that the
+ * snapshot restores is recreated rather than resurrected — the hub mints ids, so
+ * an id that was deleted cannot come back.
+ */
+export function restoreHub(snapshot: HubState): void {
+  const cur = getState();
+  const keep = new Set(snapshot.sections.docs.map((d) => d.id));
+  for (const d of cur.sections.docs) if (!keep.has(d.id)) removeDoc(d.id);
+  for (const d of snapshot.sections.docs) {
+    const was = cur.sections.docs.find((x) => x.id === d.id);
+    if (!was) addDoc(d.title, d.content);
+    else if (was.title !== d.title) setDocTitle(d.id, d.title);
+    if (was && was.content !== d.content) setDocContent(d.id, d.content);
+  }
+  setTasks(snapshot.sections.todo);
+  setNotes(snapshot.sections.notes);
+  selectSection(snapshot.activeSection);
+  selectDoc(snapshot.activeDocId);
+}
+
+// ── notes ───────────────────────────────────────────────────────────────────
+
+/** Debounced: the notes pane is typed into continuously. */
+export function setNotes(text: string): void {
+  commit((s) => ({ ...s, sections: { ...s.sections, notes: text } }));
+  debounce('notes', EDIT_DEBOUNCE_MS, () => void hubPutNotes(getState().sections.notes).then((res) => settle(res)));
+}
+
+/**
+ * Append one line.
+ *
+ * Preferred over `setNotes` for a dictated or streamed line: the SERVER does the
+ * joining, so two devices appending at once cannot each overwrite the other with
+ * their own idea of the old text.
+ */
+export function appendNote(text: string): void {
+  commit((s) => ({
+    ...s,
+    sections: {
+      ...s.sections,
+      notes: s.sections.notes ? `${s.sections.notes.replace(/\s+$/, '')}\n${text}` : text,
+    },
+  }));
+  void hubAppendNotes(text).then((res) =>
+    settle(res, () => {
+      const merged = res.content;
+      if (typeof merged === 'string') commit((s) => ({ ...s, sections: { ...s.sections, notes: merged } }));
+    }),
+  );
+}
+
+// ── control plane ───────────────────────────────────────────────────────────
+
+/** Which doc is open. Persisted so the glasses reopen where the wearer left off. */
+export function selectDoc(id: string | null): void {
+  commit((s) => ({ ...s, activeDocId: id }));
+  if (id) void loadDoc(id);
+  pushControl();
+}
+
+export function selectSection(section: SectionId): void {
+  commit((s) => ({ ...s, activeSection: section }));
+  pushControl();
+}
+
+/**
+ * `PATCH /hub` takes BOTH control fields and needs a rev. Both are sent from the
+ * current state under one shared timer, so a flurry of taps is a single write.
+ */
+function pushControl(): void {
+  debounce('control', CONTROL_DEBOUNCE_MS, () => {
+    const s = getState();
+    void patchHub({ activeDocId: s.activeDocId, activeSection: s.activeSection }).then((res) =>
+      settle(res, () => {
+        // Adopt only the two control fields: the response carries a whole
+        // snapshot, and repainting sections from it could undo a concurrent
+        // local edit that has not been written yet.
+        state = {
+          ...state,
+          activeSection: res.hub.activeSection,
+          activeDocId: res.hub.activeDocId,
+        };
+        persist(state);
+        emit();
+      }),
+    );
+  });
 }
 
 export function getConnStatus(): ConnStatus {

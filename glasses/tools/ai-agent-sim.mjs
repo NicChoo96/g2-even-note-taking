@@ -69,9 +69,17 @@ globalThis.localStorage = {
   removeItem: (k) => mem.delete(k),
   clear: () => mem.clear(),
 };
-// The app stores publish to the relay on every edit; there is no relay here, so
-// swallow it. Returning !ok also keeps store.ts from marking itself "in sync".
-globalThis.fetch = async () => ({ ok: false, status: 0, json: async () => ({}) });
+// NO NETWORK. The store now writes THROUGH to the hub — `todo.add` is a
+// `POST /hub/todos`, not a local edit — so this harness needs a fetch that
+// behaves like a dead network, and a dead network REJECTS. The previous stub
+// returned a fake `{ok:false,status:0}` object instead, which is not a
+// `Response`: the hub client reads response headers (for the document `ETag`),
+// so the moment a capability wrote through, the stub threw a TypeError in a
+// floating promise and the process died while the suite was still running. A
+// rejection instead takes the offline path the client has a real handler for.
+globalThis.fetch = async () => {
+  throw new TypeError('fetch failed');
+};
 
 // ── Bundle the real modules ─────────────────────────────────────────────────
 const out = mkdtempSync(join(tmpdir(), 'ai-agent-sim-'));

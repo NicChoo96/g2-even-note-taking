@@ -903,11 +903,24 @@ export function createFilesClient(opts = {}) {
 
   const hasCreds = Boolean(apiKey || (username && password));
 
-  async function request(path, { method = 'GET', body, token, signal, raw = false } = {}) {
+  async function request(path, { method = 'GET', body, token, signal, raw = false, headers: extraHeaders } = {}) {
     if (!baseUrl) throw new FilesError('bad_base_url', 'JARVIS_FILE_URL is not a valid http(s) URL');
     const headers = {};
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (token) headers.Authorization = `Bearer ${token}`;
+    // Caller-supplied headers, merged LAST so nothing here can be relied on to
+    // be unforgeable. The hub needs two this client never sets on its own:
+    //   Idempotency-Key — one UUID per user ACTION, replayed on retry so a
+    //                     dropped response cannot double-apply a write.
+    //   If-Match        — the agents/docs optimistic-concurrency guard; omitting
+    //                     it is a 412 IF_MATCH_REQUIRED, not a silent overwrite.
+    if (extraHeaders) {
+      for (const [k, v] of Object.entries(extraHeaders)) {
+        // Skip empties rather than sending `Idempotency-Key: undefined`, which
+        // the hub would reject as a malformed key instead of simply absent.
+        if (v !== undefined && v !== null && v !== '') headers[k] = String(v);
+      }
+    }
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     const onAbort = () => ctrl.abort();
@@ -1494,6 +1507,25 @@ export function createFilesClient(opts = {}) {
     },
     call,
     catalogue,
+    /**
+     * SHARED session primitives — what the hub client builds on.
+     *
+     * The hub is the SAME service as the gateway: one origin, one credential,
+     * one token family, reached under a different path prefix. So it must ride
+     * THIS session rather than opening its own. That is not a tidiness point —
+     * refresh tokens are SINGLE-USE and rotate, so two independent sessions on
+     * the one account would rotate against each other and the loser's next
+     * refresh would be answered `refresh_token_reuse`, revoking the WHOLE family
+     * and logging the app out. One session, shared.
+     *
+     * These are the low-level primitives, deliberately WITHOUT the retry policy:
+     * `request` neither renews nor retries, so a caller does
+     * `ensureToken()` → `request()` → on 401 `forget()` + ONE retry. That is the
+     * same shape `call()` uses, and it must stay the only auth logic.
+     */
+    request,
+    ensureToken,
+    forget,
     /** The SHARED sign-in, not the raw one: an outside caller cannot bypass it. */
     login: signIn,
     list,

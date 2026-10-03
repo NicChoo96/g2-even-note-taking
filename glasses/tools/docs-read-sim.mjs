@@ -107,9 +107,19 @@ globalThis.localStorage = {
   removeItem: (k) => mem.delete(k),
   clear: () => mem.clear(),
 };
-// The app stores publish to the relay on every edit; there is no relay here, so
-// swallow it. Returning !ok also keeps store.ts from marking itself "in sync".
-globalThis.fetch = async () => ({ ok: false, status: 0, json: async () => ({}) });
+// NO NETWORK. The store now writes THROUGH to the hub — creating a document is a
+// `POST /hub/docs`, not a local edit — so this harness needs a fetch that behaves
+// like a dead network, and a dead network REJECTS. The previous stub returned a
+// fake `{ok:false,status:0}` object instead, which is not a `Response`: the hub
+// client reads response headers (for the document `ETag`), so the moment a
+// capability tried to write through, the stub threw a TypeError in a floating
+// promise, the process exited 1 while still printing ALL PASS, and `sim-all.mjs`
+// — which judges on exit code precisely because a harness can pass its own
+// checks and still be broken — reported it as a regression. A rejection instead
+// takes the offline path the client has a real handler for.
+globalThis.fetch = async () => {
+  throw new TypeError('fetch failed');
+};
 
 const { prepare, capabilityByName, toToolSchema, READ_CHARS, hub } = await import(
   pathToFileURL(outfile).href

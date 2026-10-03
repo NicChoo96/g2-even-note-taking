@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.42
+
+v0.3.42 - Your data lives on the server now
+
+- Lists, docs, notes, files and agents are stored in the backend, not
+ only on this device, so every surface reads one copy and a second
+ device can no longer overwrite the first.
+- Jarvis can recall your memory and read past sessions from there.
+- Every Jarvis run is written to a server-side record you can read back.
+- Signing in still authorises the relay; there is nothing new to set up.
+
 ## 0.3.41
 
 v0.3.41 - Take your data out

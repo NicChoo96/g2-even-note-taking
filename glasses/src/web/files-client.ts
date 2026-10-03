@@ -10,11 +10,47 @@
 //        origin under a sandbox policy, which is the only arrangement that both
 //        displays the document AND keeps the document unable to reach this app.
 //
-// So this module is a thin, typed wrapper over `/api/files/*`. It holds NO
-// document bodies: the list carries references, and the body is fetched by the
-// browser straight into a frame (see `fileBodyUrl`), never through JS state.
+// WHERE THE DATA COMES FROM NOW
+//   The LIST, the METADATA, the TOTALS, the PUBLISH, the DELETE, the RESTORE
+//   and the revision LIST come from the HUB — `GET/POST /hub/files*` — reached
+//   through the relay's `/api/hub/*` proxy, the same way every other section of
+//   this app does. The hub is the authority for which references exist, so a
+//   page published by anything else (the `jarvis_files` MCP tool included) shows
+//   up here without a second copy to keep in step.
+//
+//   Four things CANNOT move, and each is a real derivation rather than a
+//   pass-through, so they stay on the relay's `/api/files/*`:
+//     • `/text` runs `htmlToText` + `bodyWindow`. The hub's own `/text` answers
+//       the RAW body and ignores `limit`/`offset` (probed), so moving this would
+//       hand Jarvis a page of HTML where it used to get readable prose.
+//     • `/media` runs `extractMedia`, which rebuilds every player URL from a
+//       validated id so agent-authored HTML cannot put a `javascript:` URL in an
+//       iframe. The hub returns raw, unresolved refs.
+//     • `/html` and `/ticket` exist because the gateway refuses to be framed
+//       from another origin (`X-Frame-Options: SAMEORIGIN`) — the relay re-serves
+//       the body through this origin under a sandbox policy, and mints the
+//       short-lived frame ticket. Neither has a hub equivalent.
+//     • `/revisions/:n` and its `/restore` have NO hub route at all: the hub
+//       exposes the revision LIST and nothing finer. `/status` is the relay's own
+//       config introspection and is a relay question by definition.
+//
+// So this module is a typed wrapper over BOTH: the hub for the registry, the
+// relay for anything that has to look INSIDE a body. It holds NO document
+// bodies — the list carries references, and the body is fetched by the browser
+// straight into a frame (see `fileBodyUrl`), never through JS state.
 import { getStreamToken } from '../auth-token';
 import { API_BASE } from '../stream';
+import {
+  createHubFile,
+  deleteHubFile,
+  fetchHubFile,
+  fetchHubFileRevisions,
+  fetchHubFileStats,
+  fetchHubFiles,
+  restoreHubFile,
+  type HubFile,
+  type HubFileRevision,
+} from './hub-client';
 import type { FileRef } from '../types';
 
 /** One stored document as the relay reports it (`compactDoc` on the server). */
@@ -34,6 +70,31 @@ export interface StoredDoc {
   deletedAt?: number | null;
   /** What removed it, e.g. `deleted by mcp client`. Empty while it is live. */
   deletedReason?: string;
+}
+
+/**
+ * A hub `file_ref` as this app's `StoredDoc`.
+ *
+ * THE ONE FIELD THAT NEEDS DERIVING IS `deleted`. A live `file_ref` has no
+ * `deletedAt` key at all — it is absent, not null — so the flag the panel splits
+ * on is `deletedAt !== undefined`. Reading a `deleted` off the wire would give
+ * `undefined` for every row and file a deleted document as live.
+ */
+function toStoredDoc(f: HubFile): StoredDoc {
+  return {
+    id: f.id,
+    title: f.title,
+    agent: f.agent,
+    slug: f.slug ?? '',
+    tags: f.tags,
+    version: f.version ?? 1,
+    size: f.size,
+    url: f.url,
+    updatedAt: f.updatedAt,
+    deleted: f.deletedAt !== undefined,
+    deletedAt: f.deletedAt ?? null,
+    deletedReason: f.deletedReason,
+  };
 }
 
 export interface FilesStatus {
@@ -165,10 +226,18 @@ export interface RestoreResult {
 /**
  * The stored documents, newest first by default (the gateway's own order).
  *
- * `includeDeleted` is what a restore list is built from. Without it the relay's
- * list carries only live documents, so a soft-deleted one is unreachable from
+ * `includeDeleted` is what a restore list is built from. Without it the hub's
+ * list carries only live references, so a soft-deleted one is unreachable from
  * this app entirely — not in the list, a 404 to a direct read — even though its
  * bytes are still on the gateway.
+ *
+ * TWO SHAPE DIFFERENCES FROM THE OLD RELAY LIST, both absorbed here:
+ *   • The hub pages with `more`/`next` and reports NO total for a filtered list.
+ *     `total` is therefore the page length, which is what every caller in this
+ *     app actually wanted (a mode label), and `hasMore` is the hub's `more`.
+ *   • `includeDeleted` becomes the hub's `includeDeleted`. The relay's spelling
+ *     was snake_case; sending the wrong one is not an error, it just returns the
+ *     live list — the Deleted tab would look empty with no hint why.
  */
 export async function listFiles(opts: {
   limit?: number;
@@ -178,27 +247,18 @@ export async function listFiles(opts: {
   tag?: string;
   includeDeleted?: boolean;
 } = {}): Promise<ListResult> {
-  const q = new URLSearchParams();
-  if (opts.limit) q.set('limit', String(opts.limit));
-  if (opts.offset) q.set('offset', String(opts.offset));
-  if (opts.q) q.set('q', opts.q);
-  if (opts.agent) q.set('agent', opts.agent);
-  if (opts.tag) q.set('tag', opts.tag);
-  if (opts.includeDeleted) q.set('include_deleted', 'true');
-  const suffix = q.toString() ? `?${q}` : '';
-  const res = await getJson<ListResult>(`/api/files${suffix}`);
-  return {
-    ok: res.ok === true,
-    items: Array.isArray(res.items) ? res.items : [],
-    total: Number(res.total) || 0,
-    hasMore: Boolean(res.hasMore),
-    error: res.error,
-  };
+  const res = await fetchHubFiles(opts);
+  if (!res.ok) return { ok: false, items: [], total: 0, hasMore: false, error: res.error };
+  const items = res.items.map(toStoredDoc);
+  return { ok: true, items, total: items.length, hasMore: res.more };
 }
 
 /** One document's metadata. Never the body — that is what the frame is for. */
-export function readFile(id: string): Promise<ReadResult> {
-  return getJson<ReadResult>(`/api/files/${encodeURIComponent(id)}`);
+export async function readFile(id: string): Promise<ReadResult> {
+  const res = await fetchHubFile(id);
+  if (!res.ok) return { ok: false, error: res.error };
+  if (!res.file) return { ok: false, error: 'the hub returned no file record' };
+  return { ok: true, document: toStoredDoc(res.file) };
 }
 
 /**
@@ -227,6 +287,11 @@ export interface TextResult {
  * which a sandboxed frame fetches and renders. This is the readable view, the
  * only form of a body a model is ever given, and it is windowed by the relay
  * for that reason.
+ *
+ * STAYS ON THE RELAY, and the window is why. The hub's `/files/{id}/text`
+ * answers the RAW body and IGNORES `limit`/`offset` (probed: a request for 7
+ * characters at offset 5 came back with `limit` equal to the whole length). Its
+ * route is the bytes; this route is the readable, resumable view of them.
  */
 export function readFileText(id: string, opts: { offset?: number; limit?: number } = {}): Promise<TextResult> {
   const q = new URLSearchParams();
@@ -236,9 +301,22 @@ export function readFileText(id: string, opts: { offset?: number; limit?: number
   return getJson<TextResult>(`/api/files/${encodeURIComponent(id)}/text${suffix}`);
 }
 
-/** Publish (or, with `overwrite`, replace) a document. */
-export function publishFile(input: PublishInput): Promise<ReadResult> {
-  return sendJson<ReadResult>('POST', '/api/files', { agent: SELF_AGENT, ...input });
+/**
+ * Publish (or, with `overwrite`, replace) a document.
+ *
+ * `POST /hub/files` publishes the body to the gateway AND records the reference,
+ * so one call still does both jobs — the split is server-side. The record comes
+ * back under `file`, which is what turns this into the id the caller selects.
+ *
+ * `contentType` has no hub column and is dropped: it only ever existed to force
+ * prose through as `text/plain`, and every caller in this app publishes HTML.
+ */
+export async function publishFile(input: PublishInput): Promise<ReadResult> {
+  const { contentType: _contentType, ...rest } = input;
+  const res = await createHubFile({ agent: SELF_AGENT, ...rest });
+  if (!res.ok) return { ok: false, error: res.error };
+  if (!res.file) return { ok: false, error: 'published, but the hub returned no record' };
+  return { ok: true, document: toStoredDoc(res.file) };
 }
 
 /**
@@ -247,24 +325,34 @@ export function publishFile(input: PublishInput): Promise<ReadResult> {
  * genuinely reversible. Pass `hard: true` to purge the stored bytes, which is
  * the only version of this that cannot be undone.
  *
- * The response is the FLAT relay payload `{ ok, id, hard, deleted }`: `deleted`
- * answers "is it gone from the live list?", not "did the request work?" (that is
- * `ok`).
+ * The hub answers `204`, so there is NO body to read and no rev to take. The
+ * flat shape below is built here rather than parsed: `deleted` answers "is it
+ * gone from the live list?", not "did the request work?" (that is `ok`).
  */
-export function deleteFile(id: string, hard = false): Promise<DeleteResult> {
-  const suffix = hard ? '?hard=true' : '';
-  return sendJson<DeleteResult>('DELETE', `/api/files/${encodeURIComponent(id)}${suffix}`);
+export async function deleteFile(id: string, hard = false): Promise<DeleteResult> {
+  const res = await deleteHubFile(id, hard);
+  if (!res.ok) return { ok: false, id, hard, deleted: false, error: res.error };
+  return { ok: true, id, hard, deleted: true };
 }
 
 /**
  * Undo a SOFT delete.
  *
- * The relay reaches the gateway's REST surface for this one, because the gateway
- * exposes no MCP restore tool. Restoring a document that is still live is
- * harmless upstream, so this can be called without knowing the current state.
+ * The hub owns this: a soft delete is a flag on the REFERENCE, so undoing it is
+ * a hub write and not a gateway one. The hub answers `200` — not `201`, because
+ * nothing was created. Restoring a document that is still live is harmless, so
+ * this can be called without knowing the current state.
  */
-export function restoreFile(id: string): Promise<RestoreResult> {
-  return sendJson<RestoreResult>('POST', `/api/files/${encodeURIComponent(id)}/restore`);
+export async function restoreFile(id: string): Promise<RestoreResult> {
+  const res = await restoreHubFile(id);
+  if (!res.ok) return { ok: false, error: res.error };
+  // The hub answers `200`, and whether it echoes the record back is not
+  // documented. A restore that WORKED must not be reported as a failure, so an
+  // absent record is filled by reading it — which now succeeds, because the row
+  // is live again.
+  if (res.file) return { ok: true, document: toStoredDoc(res.file) };
+  const back = await fetchHubFile(id);
+  return { ok: true, document: back.file ? toStoredDoc(back.file) : undefined };
 }
 
 /**
@@ -296,6 +384,12 @@ export interface UpdateInput {
  * the tags alone and leave the stored document untouched. Sending an empty
  * `html` is refused upstream rather than stored, because an edit that blanks a
  * document is always a mistake — deleting is the operation that means that.
+ *
+ * STAYS ON THE RELAY: the hub has no `PATCH /hub/files/{id}`. Its nine file
+ * routes are list, publish, stats, read, delete, media, restore, revisions and
+ * text — there is no way to change a title or a tag in place, so this keeps
+ * going to the gateway. Publishing over the same id with `overwrite` is the hub
+ * route that comes closest, and it rewrites the body, which is not a patch.
  */
 export function updateFile(id: string, input: UpdateInput): Promise<ReadResult> {
   return sendJson<ReadResult>('PATCH', `/api/files/${encodeURIComponent(id)}`, input);
@@ -323,6 +417,34 @@ export interface RevisionRef {
   contentChanged: boolean;
   createdAt: number;
   tags: string[];
+  /** Who caused it, e.g. `mcp`. Absent when nobody was recorded. */
+  subject?: string;
+}
+
+/**
+ * A hub revision entry as this app's `RevisionRef`.
+ *
+ * TWO DIFFERENCES, both absorbed here:
+ *   • `created_at` arrives as an ISO STRING, where every other timestamp in this
+ *     API is a ms epoch. It is parsed, so `createdAt` stays the number the rest
+ *     of this app and its `new Date(...)` callers already expect.
+ *   • The entry has no `id` of its own — its `id` is the FILE id — so the id is
+ *     passed in rather than read off the record.
+ */
+function toRevisionRef(h: HubFileRevision, id: string): RevisionRef {
+  return {
+    id,
+    revision: h.revision,
+    version: h.version ?? 1,
+    change: h.change,
+    title: h.title ?? '',
+    agent: h.agent ?? '',
+    size: h.size ?? 0,
+    contentChanged: h.contentChanged === true,
+    createdAt: h.createdAt ? Date.parse(h.createdAt) || 0 : 0,
+    tags: h.tags ?? [],
+    subject: h.subject,
+  };
 }
 
 export interface RevisionListResult {
@@ -343,32 +465,45 @@ export interface RevisionResult {
  * A document's change log, newest first.
  *
  * `change` filters by kind, which is what makes "what has anything deleted?"
- * one call. `order` is the gateway's own enum (`revision_desc` by default).
+ * one call.
+ *
+ * THE HUB KEEPS THE HISTORY; THE RELAY STILL KEEPS THE PAGING. `GET /hub/files/
+ * {id}/revisions` answers the whole list and accepts no filters at all, while
+ * the gateway answered one page and honoured `change`, `subject`, `order`,
+ * `limit` and `offset`. The filters are applied HERE instead, over the list the
+ * hub returns — the right call for a per-document history, which is a handful of
+ * entries, and the only one that keeps this signature working for its callers.
+ * A `limit`/`offset` is therefore a slice of a list already in memory.
  */
 export async function listRevisions(
   id: string,
   opts: { change?: string; subject?: string; order?: string; limit?: number; offset?: number } = {},
 ): Promise<RevisionListResult> {
-  const q = new URLSearchParams();
-  if (opts.change) q.set('change', opts.change);
-  if (opts.subject) q.set('subject', opts.subject);
-  if (opts.order) q.set('order', opts.order);
-  if (opts.limit) q.set('limit', String(opts.limit));
-  if (opts.offset) q.set('offset', String(opts.offset));
-  const suffix = q.toString() ? `?${q}` : '';
-  const res = await getJson<RevisionListResult>(
-    `/api/files/${encodeURIComponent(id)}/revisions${suffix}`,
-  );
+  const res = await fetchHubFileRevisions(id);
+  if (!res.ok) return { ok: false, items: [], total: 0, hasMore: false, error: res.error };
+  let items = res.items.map((h) => toRevisionRef(h, id));
+  if (opts.change) items = items.filter((r) => r.change === opts.change);
+  if (opts.subject) items = items.filter((r) => r.subject === opts.subject);
+  if (opts.order === 'revision_asc') items = items.slice().reverse();
+  const offset = opts.offset || 0;
+  const window = opts.limit ? items.slice(offset, offset + opts.limit) : items.slice(offset);
   return {
-    ok: res.ok === true,
-    items: Array.isArray(res.items) ? res.items : [],
-    total: Number(res.total) || 0,
-    hasMore: Boolean(res.hasMore),
-    error: res.error,
+    ok: true,
+    items: window,
+    total: items.length,
+    hasMore: offset + window.length < items.length,
   };
 }
 
-/** One past revision's metadata. Never its body — same rule as `readFile`. */
+/**
+ * One past revision's metadata. Never its body — same rule as `readFile`.
+ *
+ * STAYS ON THE RELAY. The hub publishes the revision LIST and nothing finer:
+ * there is no `/hub/files/{id}/revisions/{n}` and no restore-this-revision
+ * route, which §14.1 confirms by pointing a client at the gateway's
+ * `/sessions/{id}/revisions/...` family for exactly this. So the read and the
+ * revert below still go to the gateway, through the relay.
+ */
 export function readRevision(id: string, revision: number): Promise<RevisionResult> {
   return getJson<RevisionResult>(
     `/api/files/${encodeURIComponent(id)}/revisions/${encodeURIComponent(String(revision))}`,
@@ -398,9 +533,11 @@ export function restoreRevision(
 /**
  * Library totals — the archive's own answer to "how much is stored here?"
  *
- * Every field is optional because the gateway's two stats tools answer with
- * different, overlapping sets and neither is documented: a client that typed
- * them as required would be inventing keys. Render what is present.
+ * Every field is optional, and now for a second reason: the hub reports FIVE
+ * numbers and no more (`total`, `bytes`, `deleted` and a per-agent split), so
+ * the fields the old relay filled from the gateway's MCP stats tools — `tags`,
+ * `revisions`, `content_changes`, `database_bytes` — are left undefined rather
+ * than invented. Render what is present.
  */
 export interface FileStats {
   ok: boolean;
@@ -423,15 +560,33 @@ export interface FileStats {
 }
 
 /**
- * The archive's totals, or one document's revision totals when `id` is given.
+ * The archive's totals, or one document's revision count when `id` is given.
  *
- * The relay picks the gateway tool: `session_stats` for the archive, which is
- * the only one that knows how many documents exist, and `revision_stats` when a
- * document is named, which is the only one that can scope to it.
+ * The hub answers the archive question in one call. It has no per-document
+ * totals at all, so when an id is named this asks that document's REVISIONS
+ * route and reports how many there are — the same number the gateway's
+ * `revision_stats` tool was being used for.
+ *
+ * `sessions` keeps its old meaning (live + deleted) because a caller reads it as
+ * "how many documents are there", and `agents` is the count of agents that own
+ * at least one reference — which is exactly what the hub's `byAgent` map is.
  */
-export function fetchFileStats(id?: string): Promise<FileStats> {
-  const suffix = id ? `?id=${encodeURIComponent(id)}` : '';
-  return getJson<FileStats>(`/api/files/stats${suffix}`);
+export async function fetchFileStats(id?: string): Promise<FileStats> {
+  if (id) {
+    const revs = await fetchHubFileRevisions(id);
+    if (!revs.ok) return { ok: false, error: revs.error };
+    return { ok: true, sessions: 1, live_sessions: 1, revisions: revs.count };
+  }
+  const res = await fetchHubFileStats();
+  if (!res.ok) return { ok: false, error: res.error };
+  return {
+    ok: true,
+    sessions: res.total,
+    live_sessions: res.total - res.deleted,
+    deleted_sessions: res.deleted,
+    agents: Object.keys(res.byAgent).length,
+    bytes: res.bytes,
+  };
 }
 
 /**

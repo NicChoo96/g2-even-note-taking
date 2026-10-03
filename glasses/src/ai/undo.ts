@@ -6,8 +6,14 @@
 // exist when this file was written. An "inverse operation" design would need
 // every new capability to hand-write an undo and would silently break the day
 // one was forgotten. This is the adaptive choice.
-import { getAgents, updateAgents } from '../agents-store';
-import { getState, update } from '../store';
+//
+// The snapshot is captured and replayed THROUGH the stores' own semantic ops.
+// Both are hub-backed now, so "put the old object back" is not available: a
+// restore has to issue the requests that make the hub match the old object. See
+// `restoreHub` and `restoreAgents` — the latter replays the DIFF, because blind
+// re-insertion would resurrect rows deleted on another device.
+import { getAgents, restoreAgents } from '../agents-store';
+import { getState, restoreHub } from '../store';
 import type { AgentsState, HubState } from '../types';
 
 const MAX_BATCHES = 3;
@@ -74,8 +80,8 @@ export function undoLabel(): string {
 export function undoLastAiBatch(): string | null {
   const last = history.pop();
   if (!last) return null;
-  if (last.hubChanged) update(() => last.hub);
-  if (last.agentsChanged) updateAgents(() => last.agents);
+  if (last.hubChanged) restoreHub(last.hub);
+  if (last.agentsChanged) restoreAgents(last.agents);
   emit();
   return last.label;
 }

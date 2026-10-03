@@ -31,19 +31,41 @@
 //   POST /api/settings            -> owner sets model / keys (never echoed back)
 //   POST /api/llm                 -> OpenRouter/DeepSeek chat-completions proxy (tools ok)
 //   POST /api/tool                -> web search (Tavily or Brave) / generic REST proxy
-//   GET  /api/files/status        -> is the Jarvis document store configured?
-//   GET  /api/files               -> list stored HTML documents (relay-proxied)
-//   POST /api/files               -> publish an HTML document
-//   GET  /api/files/:id           -> one document's metadata
-//   GET  /api/files/:id/text      -> the document BODY as plain text, in full
+//   GET  /api/files/status        -> is the document store configured?
+//   GET  /api/files                -> list stored HTML documents  (SUPERSEDED)
+//   POST /api/files                -> publish an HTML document    (SUPERSEDED)
+//   GET  /api/files/:id            -> one document's metadata     (SUPERSEDED)
+//   DELETE /api/files/:id          -> soft-delete a document      (SUPERSEDED)
+//   GET  /api/files/:id/revisions  -> a document's history        (SUPERSEDED)
+//   GET  /api/files/:id/text      -> the document BODY as readable text, windowed
 //   GET  /api/files/:id/html      -> the document BODY (bearer only; see below)
-//   DELETE /api/files/:id         -> soft-delete a document
+//   PATCH /api/files/:id          -> rename / retag a document
+//   GET  /api/files/:id/media     -> the assets a document refers to, rebuilt
+//   POST /api/files/:id/ticket    -> a signed URL that frames the body
+//   GET  /api/files/:id/revisions/:n         -> one past revision
+//   POST /api/files/:id/revisions/:n/restore -> reinstate a past revision
+//
+// WHERE A DOCUMENT IS RECORDED NOW: the backend hub owns the REGISTRY, and the
+// app reaches it through the /api/hub/* prefix below (see hub-api.mjs). List,
+// metadata, totals, publish, delete, restore and the revision LIST all live
+// there -- write-serialised against `rev`, with an `Idempotency-Key`. The
+// /api/files routes marked SUPERSEDED are kept only as this process's own
+// fallback and are no longer the app's data path.
+//
+// WHAT COULD NOT MOVE, and why: the hub answers a document's RAW HTML and
+// ignores `limit`/`offset` on /text, so the readable prose Jarvis is given has
+// to be windowed here (htmlToText + bodyWindow). The hub's /media returns bare
+// references, so player URLs have to be rebuilt here from a validated id -- a
+// stored document is untrusted code and a `javascript:` URL must never reach an
+// embed. The hub has no PATCH for a file, and no per-revision read or restore.
+// And the gateway sends `X-Frame-Options: SAMEORIGIN`, so framing a body at all
+// needs a ticket and an origin of our own (doc-origin.mjs).
 //
 // THE DOCUMENT STORE (jarvis-files.mjs) holds its own credential and its own
-// session. The BROWSER NEVER TALKS TO IT: the gateway's CORS list is empty, so
-// a direct call from the SPA cannot even preflight. Every call therefore comes
-// through the /api/files routes above, which is also the only reason the
-// credential can stay in this process.
+// session. The BROWSER NEVER TALKS TO THE GATEWAY DIRECTLY: its CORS list is
+// empty, so a direct call from the SPA cannot even preflight. Every call comes
+// through the routes above, which is also the only reason the credential can
+// stay in this process.
 //
 // A stored document's body is served with `sandbox allow-scripts` and NO
 // `allow-same-origin`, so it runs with an opaque origin: it cannot read this
@@ -153,6 +175,16 @@ import { httpRequestArgs, httpToolSchema } from './http-tool.mjs';
 // below is the only part that needs a socket, and it stays here.
 import { hubToolSchema, isHubTool, runHubTool } from './hub-tools.mjs';
 import { isLocationTool, locationToolSchema, runLocationTool } from './location-tool.mjs';
+// The hub API (everything the app persists) rides the SAME session as the
+// document store, so this only needs the wrapper — never a second client.
+import { createHubClient, forwardedHeaders, HUB_MAX_BODY_BYTES } from './hub-api.mjs';
+import {
+  HUB_MCP_AGENT_NAMES,
+  HUB_MCP_AGENT_TOOLS,
+  hubMcpToolSchema,
+  isHubMcpTool,
+  runHubMcpTool,
+} from './hub-mcp-tools.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -729,6 +761,30 @@ function filesRuntime() {
   return { cfg, client: filesClientRef, error: '' };
 }
 
+// ── Hub API client (todo, docs, notes, files, agents, tools, sessions) ────────
+// ONE client for the process, and it is the SAME client the document store uses:
+// same origin, same credential, same rotating refresh family. `filesRuntime()`
+// already creates and caches that session, so wrapping it adds only prefix
+// resolution. Building a second client here would give the one account two
+// rotating refresh tokens — they would rotate against each other and the loser's
+// next refresh would be `refresh_token_reuse`, revoking the whole family and
+// signing every surface out. See the header of hub-api.mjs.
+let hubClientRef = null;
+let hubClientKey = '';
+
+function hubRuntime() {
+  const { cfg, client, error } = filesRuntime();
+  if (!client) return { client: null, error };
+  // Re-wrap whenever the underlying session is replaced, or the wrapper would
+  // keep calling into a discarded client whose token has stopped rotating.
+  const key = [cfg.url, cfg.apiKey, cfg.username, cfg.password].join('\u0000');
+  if (!hubClientRef || hubClientKey !== key) {
+    hubClientRef = createHubClient(client);
+    hubClientKey = key;
+  }
+  return { client: hubClientRef, error: '' };
+}
+
 /**
  * The document store as a TOOL, for the server-side agent loop.
  *
@@ -1155,6 +1211,15 @@ function toolSchemaFor(t) {
     const schema = hubToolSchema(t);
     if (schema) return schema;
   }
+  // Jarvis's own memory and session history, over the hub's MCP. Built in rather
+  // than stored, because the hub's tool kinds are a CLOSED vocabulary of nine
+  // and none of them is a memory kind — probed live, `kind:'memory'` is refused.
+  // Checking BEFORE the generic REST fallback, which would otherwise hand the
+  // model a free-form request body for a tool that has a real schema.
+  if (isHubMcpTool(t)) {
+    const schema = hubMcpToolSchema(t);
+    if (schema) return schema;
+  }
   // Where the wearer is. Unlike every other kind this one has nothing to
   // configure and no arguments: the position is a SNAPSHOT taken on the device
   // when the run started and sent with it, because the relay cannot reach the
@@ -1244,6 +1309,13 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
     const result = runHubTool(tool, args, hub);
     if (result.state) publishHubState(result.state);
     return result.text;
+  }
+  // Jarvis's faculties, over the hub's MCP rather than a store. It reads no hub
+  // channel, so it cannot race a wearer's own edit, and like every branch here
+  // it reports a refusal as text instead of throwing — a hub that is down must
+  // cost the model one tool call, not the whole run.
+  if (isHubMcpTool(tool)) {
+    return runHubMcpTool(tool, args, { mcp: hubRuntime().client, signal });
   }
   // No hub read needed and no key to check — but no second source either. A run
   // that carried no snapshot gets a refusal that says so, never coordinates.
@@ -1634,7 +1706,21 @@ function setCors(res) {
   //   "Request header field authorization is not allowed by
   //    Access-Control-Allow-Headers in preflight response."
   // — which surfaced in the UI as "relay refused the run".
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  //
+  // The hub adds two more, and both are REQUIRED rather than optional:
+  //   Idempotency-Key — every hub write carries one. Blocked at the preflight,
+  //                     a retry silently loses its dedupe and a dropped response
+  //                     can apply the same write twice.
+  //   If-Match        — the agents/docs concurrency guard. Losing it turns an
+  //                     optimistic write into a 412 the app cannot distinguish
+  //                     from a real conflict.
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, If-Match, Idempotency-Key');
+  // Response headers the app must READ. Neither is CORS-safelisted, so a
+  // cross-origin caller sees them as undefined unless they are exposed here:
+  //   ETag      — the value it has to send back as `If-Match` on the next write.
+  //   Duplicate — `true` when a replayed Idempotency-Key already landed. That is
+  //               a SUCCESS the caller has to be able to detect.
+  res.setHeader('Access-Control-Expose-Headers', 'ETag, Duplicate, Idempotency-Key');
   res.setHeader('Access-Control-Max-Age', '600');
 }
 
@@ -2280,9 +2366,18 @@ const server = createServer(async (req, res) => {
       json(res, 400, { ok: false, error: 'prompt is required' });
       return;
     }
-    const tools = Array.isArray(body?.tools)
-      ? body.tools.filter((t) => t && typeof t.name === 'string').slice(0, 10)
+    // Cap the wearer's own tools FIRST, then append Jarvis's own faculties after
+    // it, so a run that already sits at the cap cannot lose the memory tools.
+    // Deduped by name with the built-in winning: a stored row called
+    // `jarvis_memory` is a different tool wearing a name we own, and letting
+    // both through would hand the model two schemas for one name — whichever
+    // the router happened to keep would decide what that name meant.
+    const authored = Array.isArray(body?.tools)
+      ? body.tools
+          .filter((t) => t && typeof t.name === 'string' && !HUB_MCP_AGENT_NAMES.has(t.name))
+          .slice(0, 10)
       : [];
+    const tools = [...authored, ...HUB_MCP_AGENT_TOOLS];
     const run = {
       id: randomBytes(8).toString('hex'),
       agentId: String(agent.id ?? ''),
@@ -2595,6 +2690,19 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // Jarvis's faculties over the hub's MCP. Present here for the reason the
+      // comment above the hub branch gives: without it this route would be a
+      // second, DIVERGENT dispatcher, and a built-in arriving here would fall
+      // through to the generic REST path and be told "tool url must be https://"
+      // — a message describing a tool it is not. `runHubMcpTool` returns text
+      // rather than throwing, so `ok` is decided by whether that text is an
+      // error line, which is the only signal it emits.
+      if (isHubMcpTool(body)) {
+        const text = await runHubMcpTool(body, args, { mcp: hubRuntime().client });
+        json(res, 200, { ok: !String(text).startsWith('tool error:'), result: text });
+        return;
+      }
+
       // Location, over the proxy. Without this branch a location tool would fall
       // through to the generic REST path below and be told "tool url must be
       // https://", which describes a tool it is not. The snapshot is whatever the
@@ -2687,6 +2795,104 @@ const server = createServer(async (req, res) => {
   }
 
   // ── Jarvis document store (agent-authored HTML) ────────────────────────────
+  // ── Hub API — every collection the app persists ───────────────────────────
+  // One authenticated passthrough to `<base>/hub/*`. The browser cannot reach
+  // the hub itself (its CORS list is empty, verified live) and must never hold
+  // the credential, so every data path in the app comes through here.
+  //
+  // This adds exactly three things: the hub prefix from /config, the bearer, and
+  // ONE retry on a 401. It does NOT reinterpret the contract — `rev`, the
+  // `Idempotency-Key` replay, `If-Match`, the bodiless `204` and the
+  // `{ok:false,error,code}` envelope all belong to the browser client
+  // (glasses/src/web/hub-client.ts), where the user action that produced them
+  // lives. Doing it twice would let the two copies drift.
+  if (url.pathname === '/api/hub/config') {
+    const principal = requirePrincipal(req, url);
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    const { client, error } = hubRuntime();
+    if (!client) {
+      json(res, 501, { ok: false, error: `hub not configured — ${error}` });
+      return;
+    }
+    json(res, 200, { ok: true, hubPrefix: await client.prefix() });
+    return;
+  }
+
+  if (url.pathname === '/api/hub' || url.pathname.startsWith('/api/hub/')) {
+    const principal = requirePrincipal(req, url);
+    if (!principal) {
+      json(res, 401, { ok: false, error: 'sign-in or device pairing required' });
+      return;
+    }
+    const { client, error } = hubRuntime();
+    if (!client) {
+      json(res, 501, { ok: false, error: `hub not configured — ${error}` });
+      return;
+    }
+
+    // `/api/hub/todos/1?limit=5` -> `/todos/1?limit=5`. The QUERY is part of the
+    // path on purpose: the hub pages with `limit`/`cursor`, sequences with
+    // `since`/`sinceSeq`, and files filter with `include`/`hard`. Dropping it
+    // would silently return the unfiltered first page instead of an error.
+    const hubPath = `${url.pathname.slice('/api/hub'.length) || '/'}${url.search}`;
+
+    // A body only exists when the caller said so. A bodiless DELETE must stay
+    // bodiless: sending `{}` would add a Content-Type the hub does not expect.
+    let hubBody;
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const declared = Number(req.headers['content-length'] || 0);
+      if (declared > 0) {
+        try {
+          hubBody = await readJsonBody(req, HUB_MAX_BODY_BYTES);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'invalid request body';
+          const tooLarge = /too large/i.test(msg);
+          json(res, tooLarge ? 413 : 400, {
+            ok: false,
+            error: msg,
+            code: tooLarge ? 'TOO_LARGE' : 'VALIDATION_ERROR',
+          });
+          return;
+        }
+      }
+    }
+
+    // Only these two client headers mean anything to the hub, and they are the
+    // only two the app sets. Everything else is DROPPED rather than forwarded —
+    // `Authorization` above all, since the relay injects its own and a client
+    // that could supply one would bypass the credential boundary entirely.
+    const hubHeaders = {};
+    if (req.headers['idempotency-key']) hubHeaders['Idempotency-Key'] = String(req.headers['idempotency-key']);
+    if (req.headers['if-match']) hubHeaders['If-Match'] = String(req.headers['if-match']);
+
+    let upstream;
+    try {
+      upstream = await client.call(req.method, hubPath, { body: hubBody, headers: hubHeaders });
+    } catch (err) {
+      // A hub failure is a 502 the app can render, never a thrown error that
+      // would take the relay's request loop down with it.
+      json(res, 502, {
+        ok: false,
+        code: err?.code || 'gateway_error',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    // Byte-for-byte passthrough, INCLUDING the status and an empty body. A 204
+    // must stay bodiless — substituting `{}` would turn "no content" into a
+    // parseable object the client would mistake for a payload.
+    res.writeHead(upstream.status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...forwardedHeaders(upstream),
+    });
+    res.end(upstream.text ?? '');
+    return;
+  }
+
   // Four reasons every operation is proxied here rather than called from the
   // browser: the gateway's CORS list is empty (a direct call cannot preflight),
   // the credential must never reach a client, the gateway's

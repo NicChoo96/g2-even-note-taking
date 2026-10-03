@@ -495,9 +495,18 @@ assert(
   'the tool proxy answers a location tool as a location tool',
   toolRoute.includes('isLocationTool(body)'),
 );
+// The order check runs on COMMENT-STRIPPED source, and that matters. The subject
+// is where the location branch sits relative to the https guard, and a branch
+// ABOVE it may legitimately quote the guard's message in its own comment to
+// explain why it must not fall through (the hub-MCP branch does exactly that,
+// on one line). indexOf would find that quotation first and fail an assertion
+// whose subject — the branch order — is perfectly correct. A comment is not
+// behaviour; the guard is. The earlier location comment escaped this only by
+// luck, its quotation wrapping across two lines.
+const toolCode = toolRoute.replace(/^[ \t]*\/\/.*$/gm, '');
 assert(
   '  ...before the https guard that would describe a tool it is not',
-  toolRoute.indexOf('isLocationTool(body)') < toolRoute.indexOf('tool url must be https://'),
+  toolCode.indexOf('isLocationTool(body)') < toolCode.indexOf('tool url must be https://'),
 );
 
 // ── 7. the client wiring ────────────────────────────────────────────────────

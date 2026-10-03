@@ -163,11 +163,16 @@ export function FilesPanel() {
     async (q?: string) => {
       setBusy(true);
       setError(null);
-      // ONE request answers both questions. `include_deleted` returns the live
-      // documents AND the deleted ones, and each row says which it is, so the two
-      // lists are a partition of a single page rather than two pages that can
-      // disagree with each other (a delete landing between them would make the
-      // counts lie).
+      // ONE request answers both questions. The list comes back with the live
+      // documents AND the deleted ones when `includeDeleted` is set, and each
+      // row says which it is, so the two lists are a partition of a single page
+      // rather than two pages that can disagree with each other (a delete
+      // landing between them would make the counts lie).
+      //
+      // `deleted` is DERIVED in files-client from the hub's `deletedAt`, which
+      // is present only on a soft-deleted row — a live `file_ref` has no such
+      // key at all (`?deleted=true` is not a hub filter; the spelling there is
+      // `includeDeleted`, which this module translates).
       const res = await listFiles({
         limit: PAGE_LIMIT,
         q: q?.trim() || undefined,
@@ -203,6 +208,10 @@ export function FilesPanel() {
     void (async () => {
       const s = await fetchFilesStatus();
       setStatus(s);
+      // The status probe is still the right gate: it answers whether the RELAY
+      // holds the gateway credential, and the relay's `/api/hub/files` proxy
+      // authenticates with that same session — so an unconfigured relay cannot
+      // serve the hub either.
       if (s.ok && s.configured) await refresh();
     })();
     // Intentionally once, on mount: the relay caches its credential at boot, so

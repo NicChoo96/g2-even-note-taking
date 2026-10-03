@@ -2,16 +2,12 @@
 //
 // Notes is a single free-text scratchpad, so the actions are append / replace /
 // clear / read. It is the natural target for "note that down".
-import { getState, update } from '../../store';
+import { appendNote, getState, setNotes } from '../../store';
 import type { Capability } from '../types';
-import { READ_CHARS, appendText, readFrom, short } from './shared';
+import { READ_CHARS, readFrom, short } from './shared';
 
 function notes(): string {
   return getState().sections.notes ?? '';
-}
-
-function setNotes(next: string): void {
-  update((s) => ({ ...s, sections: { ...s.sections, notes: next } }));
 }
 
 export const notesCapabilities: Capability[] = [
@@ -27,8 +23,9 @@ export const notesCapabilities: Capability[] = [
     run: (args) => {
       const text = String(args.text ?? '').trim();
       if (!text) return { ok: false, summary: 'Nothing to add' };
-      const before = notes();
-      setNotes(appendText(before, text));
+      // The SERVER does the join, so two devices appending at once cannot each
+      // overwrite the other with their own idea of the old text.
+      appendNote(text);
       return { ok: true, summary: `Noted: "${short(text)}"`, data: { charsAdded: text.length } };
     },
   },
