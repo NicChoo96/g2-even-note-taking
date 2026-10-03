@@ -23,12 +23,17 @@ Browser (owner)          Phone Even App (glasses)
    │  Relay  web/server/local-sse.mjs          │
    │  /            → serve glasses/dist (SPA)  │
    │  /app.json    → Even Hub manifest         │
-   │  /api/stream  → SSE (GET) + state (POST)  │
+   │  /api/stream  → SSE (GET, multiplexed)    │
+   │                 + state (POST)            │
    │  /api/auth/*  → Google verify, /me, logout│
    │  /api/pair/*  → device pairing/approval   │
    │  /api/devices → owner device manager      │
    │  /api/stt(+ws)→ voice transcription proxy │
-   │  state/auth persisted to AUTH_FILE/STATE  │
+   │  /api/agent/* → run / stop / status / runs│
+   │  /api/files/* → Content Gateway proxy     │
+   │  /api/tool    → MCP tool dispatch         │
+   │  state/auth/secrets persisted to          │
+   │  STATE_FILE / AUTH_FILE / SECRETS_FILE    │
    └──────────────────────────────────────────┘
 ```
 
@@ -74,7 +79,9 @@ flowchart LR
    (`web/Dictate.tsx` → `dictate.ts`, which routes by target: glasses SDK mic vs
    browser `getUserMedia`/Web Speech).
 2. **Categorize** — `categorize.ts` heuristically splits content into **To-Do /
-   Docs / Notes**; Docs land in the open document (`activeDocId`).
+   Docs / Notes**; Docs land in the open document (`activeDocId`). Published
+   documents enter the **Files** section as `FileRef` rows (references only — the
+   body stays on the Content Gateway).
 3. **Persist + broadcast** — the local store (`store.ts`) updates `HubState` and
    POSTs it to `/api/stream`; the relay stores the last snapshot and pushes a
    `{ type: "state", state }` frame to every connected SSE client.
@@ -94,25 +101,40 @@ flowchart LR
 ### `HubState` (`glasses/src/types.ts`)
 
 ```ts
-type SectionId = 'todo' | 'docs' | 'notes';
+type SectionId = 'todo' | 'docs' | 'files' | 'notes' | 'agents';
+
+// Display order — mirrored by `SECTIONS` (glasses menu) and `TAB_ORDER` (web).
+const SECTION_IDS: SectionId[] = ['agents', 'todo', 'docs', 'files', 'notes'];
 
 interface TodoItem { id: string; text: string; done: boolean; }
 
 interface DocEntry { id: string; title: string; content: string; updatedAt: number; }
+
+interface FileRef {
+  id: string; title: string; agent: string;
+  url: string;              // the BODY on the Content Gateway — never a copy
+  size: number; updatedAt: number;
+}
 
 interface HubState {
   activeSection: SectionId;
   sections: {
     todo: TodoItem[];
     docs: DocEntry[];        // a library of named docs
+    files: FileRef[];        // references to the external store, never bodies
     notes: string;
   };
   activeDocId: string | null; // currently-open doc (Docs mode)
   updatedAt: number;
 }
 
-interface StreamFrame { type: 'init' | 'state'; state: HubState; }
+interface StreamFrame<T = HubState> { type: 'init' | 'state'; state: T; }
 ```
+
+> `SectionId` also includes `'agents'`, but there is no `sections.agents` — the
+> agent data lives in `AgentsState` (`agents-store.ts`) and is delivered on its own
+> channel. `FileRef` deliberately has **no body field and must never gain one**;
+> see `data-platform/01-inventory.md` and the `filesNoBody` invariant.
 
 ### SSE frames (JSON in `data:`)
 
@@ -123,6 +145,31 @@ interface StreamFrame { type: 'init' | 'state'; state: HubState; }
 
 The stream URL always carries the caller's credential:
 `/api/stream?channel=hub&token=<session-token-or-device-id>`.
+
+**Multiple channels share ONE socket.** A client opens a single `EventSource` per
+relay base and requests several channels at once:
+
+```
+GET /api/stream?channels=hub,agents,ai,ai-ctl&token=…
+```
+
+Each frame is tagged with its `channel`, so one connection carries hub state,
+agent state, the transient AI run state and the AI control channel. This is not
+an optimisation — Chrome allows ~6 concurrent HTTP/1.1 sockets per origin and an
+SSE response never releases its socket, so **one permanent `EventSource` per
+channel is a hard cap on the app.** Never open a second one.
+
+`ai` and `ai-ctl` are **transient**: they are skipped by `loadPersistedState()`,
+skipped by `persistState()`, and never written into a channel's `lastState`
+cache. All three skips are load-bearing — a cached `ai` frame is replayed as the
+next client's `init`, which made a client act on a stale run (the 0.3.24 "Jarvis
+killed itself" bug).
+
+### Where the data goes
+
+The full data model, database schema, REST surface, offline cache and the Jarvis
+session/MCP design are specified in [`data-platform/`](data-platform/README.md).
+This document describes the system as it runs today.
 
 ### Event routing in the glasses app
 
