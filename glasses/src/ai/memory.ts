@@ -176,6 +176,31 @@ export function getMemoryView(): MemoryView {
   return cachedView;
 }
 
+/**
+ * A full, DETACHED copy of the log, for EXPORT.
+ *
+ * Neither existing reader can be used to seed a database:
+ *   • `getMemoryView()` is the rendered summary — counts and the digest only,
+ *     no turns at all, and
+ *   • `memoryMessages()` is a PROMPT-SIZED window (capped by count AND by
+ *     MEMORY_PROMPT_CHARS), so it silently drops the older turns.
+ * This is the only reader that returns every turn.
+ *
+ * Deliberately NOT a `useSyncExternalStore` snapshot: it allocates a new object
+ * on every call, so a caller that passed it as `getSnapshot` would re-render
+ * forever. Call it from an event handler.
+ */
+export function snapshotMemory(): JarvisMemory {
+  return {
+    version: memory.version,
+    digest: memory.digest,
+    digestAt: memory.digestAt,
+    folded: memory.folded,
+    turns: memory.turns.map((t) => ({ role: t.role, text: t.text, at: t.at })),
+    updatedAt: memory.updatedAt,
+  };
+}
+
 export function subscribeMemory(fn: () => void): () => void {
   listeners.add(fn);
   return () => {

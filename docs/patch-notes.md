@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.41
+
+v0.3.41 - Take your data out
+
+- A new Export tab writes everything the app holds to one JSON file:
+ your lists, docs, notes, files, agents, history and Jarvis memory,
+ grouped by the table each one belongs to.
+- It writes no secret values. It lists which credentials exist and
+ where each comes from, so you can fill them in yourself.
+- The owner token and the ledger stay out unless you tick them.
+- The file explains every field, for whoever seeds the database.
+
 ## 0.3.40
 
 v0.3.40 - Jarvis can read what a stored page says

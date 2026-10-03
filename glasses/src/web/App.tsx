@@ -5,6 +5,7 @@ import { MicButton } from './Dictate';
 import { AgentsPanel } from './AgentsPanel';
 import { AiPanel } from './AiPanel';
 import { FilesPanel } from './FilesPanel';
+import { ExportPanel } from './ExportPanel';
 import { SettingsPanel } from './SettingsPanel';
 import { consumeWebTab, getAi, subscribeAi } from '../ai';
 import { getConnStatus, getState, subscribe, subscribeConn, update } from '../store';
@@ -20,18 +21,23 @@ const SECTION_LABELS: Record<SectionId, string> = {
   agents: 'Agents',
 };
 
-/** Local tabs — Settings is browser-only and never becomes the glasses section. */
-type Tab = SectionId | 'settings' | 'jarvis';
+/**
+ * Local tabs — Settings, Jarvis and Export are browser-only and never become the
+ * glasses section. There is no G2 page for any of them.
+ */
+type Tab = SectionId | 'settings' | 'jarvis' | 'export';
 
 // Agents leads: it is the page the switcher offers first on the glasses, so the
 // web tabs keep the same order. Jarvis sits just before Settings: it is an AI
 // surface over the whole app rather than a fifth glasses page, so it groups with
-// the "meta" tab.
-const TAB_ORDER: Tab[] = ['agents', 'todo', 'docs', 'files', 'notes', 'jarvis', 'settings'];
+// the "meta" tab. Export trails Settings: it is the one page that looks at the
+// data instead of changing it, so it does not sit among the working tabs.
+const TAB_ORDER: Tab[] = ['agents', 'todo', 'docs', 'files', 'notes', 'jarvis', 'settings', 'export'];
 
 function tabLabel(id: Tab): string {
   if (id === 'settings') return 'Settings';
   if (id === 'jarvis') return 'Jarvis';
+  if (id === 'export') return 'Export';
   return SECTION_LABELS[id];
 }
 
@@ -328,9 +334,11 @@ export default function App() {
             aria-selected={activeTab === id}
             className={activeTab === id ? 'tab active' : 'tab'}
             onClick={() =>
-              // Settings and Jarvis are companion-only tabs: they never change
-              // the glasses section, because neither is a G2 page.
-              id === 'settings' || id === 'jarvis' ? setTab(id) : switchSection(id)
+              // Settings, Jarvis and Export are companion-only tabs: they never
+              // change the glasses section, because none of them is a G2 page.
+              id === 'settings' || id === 'jarvis' || id === 'export'
+                ? setTab(id)
+                : switchSection(id)
             }
           >
             {tabLabel(id)}
@@ -346,6 +354,8 @@ export default function App() {
 
       <main className="content card">
         {activeTab === 'settings' && <SettingsPanel />}
+
+        {activeTab === 'export' && <ExportPanel />}
 
         {activeTab === 'jarvis' && <AiPanel />}
 
