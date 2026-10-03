@@ -155,7 +155,7 @@ npx evenhub pack app.json dist -o reality-hub.ehpk --sdk-ver 0.0.14
 
 - The pack step stamps the app version/SDK (`min_app_version 2.2.9` for SDK
   0.0.14) and validates `app.json`.
-- Keep `glasses/app.json` `version` in sync (currently `0.1.2`).
+- Keep `glasses/app.json` `version` in sync (currently `0.3.42`).
 - For personal use, load via QR / the Even Hub portal; submit the `.ehpk` to the
   Even Hub developer portal for wider distribution.
 

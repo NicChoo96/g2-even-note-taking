@@ -47,7 +47,7 @@ These also auto-load when the model detects the relevant task (their `descriptio
 - Max **12 containers/page** (max 8 text/list, max 4 image). Exactly **one** container with `isEventCapture: 1`.
 - Text container content limits: 1000 chars on create, 2000 chars via `textContainerUpgrade`.
 - List items: max 20, max 64 chars each; lists rebuild the whole page to update.
-- App manifest: `app.json` with `edition: "202601"`, `min_sdk_version: "0.0.12"`, `permissions` array.
+- App manifest: `app.json` with `edition: "202601"`, `min_sdk_version: "0.0.14"`, `permissions` array.
 - `network` permission requires a `whitelist` of allowed URLs — must include the SSE endpoint.
 
 ## Architecture & Data Flow
