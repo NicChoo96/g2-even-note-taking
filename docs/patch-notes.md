@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.50
+
+v0.3.50 - Jarvis now checks its work before saying it saved anything
+
+- When Jarvis or an agent saves a page or a document, the app reads it back and says plainly if it did not land.
+- Saving no longer asks first, so a run that finishes with your phone away can still keep its work. Deleting still asks.
+- Long pages save again - over about a page used to be dropped silently.
+- Going back to an earlier version no longer asks, since you can go forward again.
+
 ## 0.3.49
 
 v0.3.49 - One flat menu, the same on every page

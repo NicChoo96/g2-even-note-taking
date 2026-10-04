@@ -446,5 +446,148 @@ claimIntents(RUN, [toolMsg(proposal('run-7:8', 'say.reply', { text: 'again' }))]
 const after = await drain(false);
 eq('and the queue is not left deaf afterwards', [after.length, after[0].summary], [1, 'again']);
 
+// ═══════════════════════════════════════════════════════════════════════════
+section('F. a delegated WRITE is confirmed against the store, not assumed');
+
+// WHY THIS SECTION EXISTS. The report this came from was not a broken publish;
+// it was a publish that never happened and a run that said it had. Two things
+// made that sentence writable, and neither is visible from the relay alone:
+//
+//   • `files.publish` carried `confirm: true` on a `write`. The gate is the one
+//     step a DELEGATED run cannot pass — `aiAskConfirm` answers false when the
+//     phone is in a pocket — so the page was declined by default, and a decline
+//     the wearer never sees is indistinguishable from a success.
+//   • a publish was reported from the CREATE RESPONSE. A response is the hub
+//     answering; the store is what can be listed or opened a moment later.
+//     Nothing read the page back, so "published" described a reply.
+//
+// The checks below drive the REAL capability through the REAL drain over a
+// stubbed transport, because what is under test is the pair of statements the
+// device makes afterwards, and both are statements about the STORE.
+
+const realFetch = globalThis.fetch;
+const HEX = 'a'.repeat(32);
+/** Every request the store saw, in order, so a missing read-back is a failure. */
+const wire = [];
+/**
+ * A transport that behaves like the store for exactly one test.
+ * `created` answers the POST, `back` answers the read-back GET — `null` on
+ * either means that route 404s, which is how the bug's shape is reproduced.
+ */
+const storeStub = (created, back) => async (url, init) => {
+  const method = String(init?.method ?? 'GET').toUpperCase();
+  wire.push(`${method} ${String(url)}`);
+  const body = method === 'GET' ? back : created;
+  return {
+    ok: !!body,
+    status: body ? 200 : 404,
+    headers: { get: () => null },
+    text: async () => JSON.stringify(body ?? { error: 'not found' }),
+  };
+};
+/** One `file_ref` as the hub's wire spells it. */
+const record = (over = {}) => ({
+  rev: 1,
+  file: {
+    id: HEX,
+    title: 'Daily digest',
+    agent: 'Tracker',
+    slug: 'daily-digest',
+    tags: ['digest'],
+    version: 1,
+    size: 19_200,
+    url: `https://hub.test/f/${HEX}`,
+    updatedAt: 1_700_000_000_000,
+    ...over,
+  },
+});
+const PAGE = { html: '<!DOCTYPE html><html><body><h1>Digest</h1></body></html>', title: 'Daily digest' };
+const ask = (key, action, args, title) => toolMsg(proposal(key, action, args, 'because', title));
+
+// ⭐ THE GATE, ASSERTED RATHER THAN ASSUMED. A write an agent performs must not
+// ask the wearer, because there is no wearer to ask: a gate here does not add
+// friction, it deletes the write. The irreversible half of publishing is
+// `files.delete`, which stays gated — and section A's registry-wide invariant
+// is what keeps that true for every capability added later.
+eq('publish is a write', effectOf(byName('files.publish')), 'write');
+eq('and does NOT raise the gate a delegated run cannot pass', asksToConfirm(byName('files.publish')), false);
+eq('while destroying a page still does', asksToConfirm(byName('files.delete')), true);
+
+// ⭐ THE LINE IS "CAN THIS BE UNDONE?", NOT "IS THE EFFECT STRING THE SAME?".
+// `files.revert` is classed `write` because the gateway APPENDS a revert entry —
+// the versions it replaces stay in the history, so it can itself be reverted.
+// That is why it needs no gate. The two to-do deletes are ALSO classed `write`
+// and KEEP theirs, because they destroy the wearer's text outright with no
+// history behind it.
+//
+// Both halves are asserted. A check that only proved `files.revert` was
+// un-gated would let the next person un-gate `todo.remove` for symmetry and
+// still see this section pass — and the symmetry is exactly the mistake, since
+// these capabilities share an effect string while disagreeing about whether the
+// wearer can get their data back.
+eq('a revert can itself be reverted, so it needs no gate', asksToConfirm(byName('files.revert')), false);
+eq('but deleting a task keeps one — it destroys text with no history', asksToConfirm(byName('todo.remove')), true);
+eq('and so does clearing the finished ones', asksToConfirm(byName('todo.clear_done')), true);
+
+// ⭐ THE HAPPY PATH IS THE READ-BACK. The create is answered AND so is the read,
+// so the sentence kept is the one about the store.
+fresh();
+wire.length = 0;
+globalThis.fetch = storeStub(record(), record());
+claimIntents(RUN, [ask('run-8:1', 'files.publish', PAGE, 'Publish an HTML page')]);
+const [pub] = await drain(true);
+eq('a page-sized publish runs', [pub?.ok, pub?.action], [true, 'files.publish']);
+assert('and the summary says the STORE was read back', pub.summary.includes('read back from the store'), pub.summary);
+// 19_200 bytes through `sizeLabel` is `19 KB` — the number and the unit both
+// come from the stored record, so this is evidence the read-back happened.
+assert('naming the size only the stored record knows', pub.summary.includes('(19 KB)'), pub.summary);
+eq('the create was exactly one request', wire.filter((c) => c.startsWith('POST')).length, 1);
+assert('and the page was then READ BACK by its id', wire.some((c) => c.startsWith('GET') && c.includes(HEX)), wire.join(' | '));
+
+// ⭐ THE FAILURE THAT MATTERS, and the exact shape of the bug: the hub accepts
+// the create and no read can find the page. Before the read-back this was
+// reported as "Published"; now that word cannot be said at all.
+fresh();
+wire.length = 0;
+globalThis.fetch = storeStub(record(), null);
+claimIntents(RUN, [ask('run-8:2', 'files.publish', PAGE, 'Publish an HTML page')]);
+const [ghost] = await drain(true);
+eq('a publish no read can find is NOT a success', [ghost.ok, ghost.action], [false, 'files.publish']);
+assert('and says so in the word that cannot be mistaken for one', ghost.summary.includes('UNCONFIRMED'), ghost.summary);
+assert('naming the page it could not find', ghost.summary.includes('Daily digest'), ghost.summary);
+assert('with the read-back proven to have been attempted', wire.some((c) => c.startsWith('GET') && c.includes(HEX)), wire.join(' | '));
+assert('and the ledger holds a FAILURE, not a result', ledgerEntries('run-1').some((e) => e.kind === 'call' && e.status === 'failed'));
+
+// A store that answers with the page already marked DELETED is the same answer
+// as no answer: `deletedAt` present is how the wire spells it (see toStoredDoc).
+fresh();
+globalThis.fetch = storeStub(record(), record({ deletedAt: 1_700_000_001_000, deletedReason: 'deleted by mcp client' }));
+claimIntents(RUN, [ask('run-8:3', 'files.publish', PAGE, 'Publish an HTML page')]);
+const [buried] = await drain(true);
+eq('a page the store already holds as deleted is not published', buried.ok, false);
+// ⭐ AND IT HAS TO SURVIVE THE LINE. `oneLine` is 80 characters, and the reason
+// is what tells the wearer whether to RESTORE this page or publish it again —
+// so the check is that the distinguishing word is actually IN the summary, not
+// merely that some summary was produced.
+assert('and the summary says which of the two it was', buried.summary.includes('marked deleted'), buried.summary);
+assert('in full, not truncated past the distinguishing word', !buried.summary.includes('\u2026'), buried.summary);
+
+// ⭐ AND THE SAME RULE FOR A DOCUMENT. `docs.new` mints its own id, so its
+// read-back is a list lookup rather than a fetch — but the claim it supports is
+// identical, and the char count in the summary can only come from the record
+// the list actually holds.
+fresh();
+claimIntents(RUN, [ask('run-8:4', 'docs.new', { title: 'Standup notes', content: 'today' }, 'Create document')]);
+const [madeDoc] = await drain(true);
+eq('a new document runs', [madeDoc.ok, madeDoc.action], [true, 'docs.new']);
+assert('and its summary says the LIST was read back', madeDoc.summary.includes('read back from the list'), madeDoc.summary);
+assert(
+  'quoting a length only the stored document knows',
+  madeDoc.summary.includes('(5 chars)') && madeDoc.summary.includes('Standup notes'),
+  madeDoc.summary,
+);
+
+globalThis.fetch = realFetch;
+
 console.log(`\n${fail ? `${fail} FAILURE(S)` : 'ALL CHECKS PASSED'} — ${checks - fail} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

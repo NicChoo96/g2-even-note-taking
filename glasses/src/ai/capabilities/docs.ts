@@ -39,10 +39,28 @@ export const docsCapabilities: Capability[] = [
       const title = String(args.title ?? '').trim() || 'Untitled';
       const content = String(args.content ?? '').trim();
       const id = addDoc(title, content);
+      // ── THE READ-BACK ───────────────────────────────────────────────────────
+      //
+      // `addDoc` returns an id it just minted, and an id is not a document. The
+      // list is read back and the document found in it, so "Created X" is a
+      // statement about what is in the docs list rather than about what a
+      // function was asked to do.
+      //
+      // This is the same read-back `files.publish` makes against the store, for
+      // the same reason: the summary of a write is read by the wearer as proof,
+      // and an agent run has no other proof to offer.
+      const made = docs().find((d) => d.id === id);
+      if (!made) {
+        return {
+          ok: false,
+          summary: `Created nothing: "${short(title)}" is not in the document list`,
+          hint: 'the document was not added — do not tell the user it exists',
+        };
+      }
       return {
         ok: true,
-        summary: `Created "${short(title)}"`,
-        data: { id, title, chars: content.length },
+        summary: `Created "${short(titleOf(made))}" (${made.content.length} chars) — read back from the list`,
+        data: { id: made.id, title: titleOf(made), chars: made.content.length },
       };
     },
   },

@@ -32,6 +32,7 @@ import {
   INTENT_MAX_PER_RUN,
   INTENT_TOOL_KIND,
   INTENT_TOOL_NAME,
+  MAX_ARGS_CHARS,
   intentToolFor,
   intentToolSchema,
   isIntentTool,
@@ -94,6 +95,17 @@ const CATALOG = [
     description: 'Start a saved agent.',
     params: [{ name: 'agent', type: 'string', description: 'Which one.', required: false }],
   },
+  // In the catalogue because the false-success bug was reported against it: this
+  // is the action whose argument is a whole document, so it is the one the size
+  // ceiling was silently refusing.
+  {
+    name: 'files.publish',
+    title: 'Publish an HTML page',
+    page: 'files',
+    effect: 'write',
+    description: 'Publish a self-contained HTML document to the document store.',
+    params: [{ name: 'html', type: 'string', description: 'The complete HTML document.', required: true }],
+  },
 ];
 
 const TOOL = () => intentToolFor(CATALOG);
@@ -146,16 +158,37 @@ eq(
 );
 eq('the built-in carries the built-in marker and a stable id', [TOOL().kind, TOOL().id], [INTENT_TOOL_KIND, 'builtin:jarvis_app']);
 eq('name and toolId agree, as every built-in does', TOOL().toolId, TOOL().name);
-// The SCHEMA's description is what the model reads, so that is where the two
-// things it must know have to be: this proposes rather than performs, and the
-// result will not come back.
+// The SCHEMA's description is what the model reads, so that is where the three
+// things it cannot recover from being wrong about have to be.
+const SCHEMA_TEXT = intentToolSchema(TOOL()).function.description;
 assert(
   'the schema tells the model it will not see the result',
-  intentToolSchema(TOOL()).function.description.includes('will not see the result'),
+  SCHEMA_TEXT.includes('will not see the result'),
 );
 assert(
   'and that the device may ask the wearer first',
-  intentToolSchema(TOOL()).function.description.includes('confirm'),
+  SCHEMA_TEXT.includes('confirm'),
+);
+// ⭐ THE PROHIBITION, which is the fix for the reported bug.
+//
+// A run's transcript is read as evidence of what happened, and nothing
+// downstream can correct it: the relay hands the ask over and never learns the
+// outcome, and the wearer does not see the device's result either. So a model
+// that reports an ask as a completed change makes the transcript lie, and the
+// only place that can be prevented is here — in the words of the schema it is
+// holding. This was the missing half: the description said "you will not see
+// the result" and then, in the same breath, "say what you asked for and finish",
+// which licenses exactly the sentence the wearer then believed.
+assert(
+  'the schema forbids reporting the change as done',
+  SCHEMA_TEXT.includes('never report the change as done'),
+);
+// And the schema has to NAME the way work gets saved. A run asked for a report
+// reads the action list to find out how to store it, and a tool described only
+// as "change something of the wearer's" gives it nothing to find.
+assert(
+  'the schema names the action that saves an agent\'s own work',
+  SCHEMA_TEXT.includes('files.publish') && SCHEMA_TEXT.includes('SAVE'),
 );
 
 const crowded = intentToolFor(
@@ -235,7 +268,11 @@ eq('the title comes from the catalogue, not from the model', first.data.intent.t
 eq('so does the effect', first.data.intent.effect, 'write');
 eq('the arguments are what the model sent', first.data.intent.args, { text: 'milk' });
 eq('the why is what the prompt will show', first.data.intent.why, 'the wearer asked for milk');
-assert('the hint tells the model it is done', String(first.hint).includes('say what you asked for'));
+// The tool result IS the model's last sight of its own ask, and it is read again
+// whenever the transcript is replayed — so a hint that reads as "finished" is
+// what licenses the sentence the wearer then believes.
+assert('the hint forbids reporting the change as done', String(first.hint).includes('never that it is done'));
+assert('and the summary is past-tense ASKED, never a completion', String(first.summary).startsWith('asked the app to '));
 
 // ⭐ The exact field set, because the DEVICE reads this shape when it claims a
 // proposal (src/ai/intents.ts, `intentsFromMessages`). A rename here would
@@ -294,10 +331,42 @@ eq(
   {},
 );
 
+// ⭐ THE SIZE THE WHOLE BUG TURNED ON, and the reason the ceiling is asserted
+// from both sides.
+//
+// It was 1200 characters. `files.publish`'s required argument is a COMPLETE HTML
+// document, so 1200 is not a slightly narrow write path — it is the absence of
+// one: no page an agent could build was ever handed over, and a run refused at
+// this gate has one cheap sentence available to it, which is the sentence that
+// claimed a 19.2 kB digest had been published. So the reported size is the size
+// pinned here, and the ceiling is required to sit above the page a WEARER can
+// read back in one go (`BODY_MAX_CHARS = 60_000`), because otherwise the app
+// could show a page that no agent was allowed to write.
+assert('the ceiling is above the page the wearer can read back', MAX_ARGS_CHARS > 60_000, `${MAX_ARGS_CHARS}`);
+const PAGE = 'x'.repeat(19_200);
+const pageList = newList();
+const page = call(
+  TOOL(),
+  { action: 'files.publish', why: 'the daily digest', args: { html: PAGE, title: 'digest' } },
+  { list: pageList, runId: 'r' },
+);
+eq('a page-sized argument is accepted, not refused', page.ok, true);
+eq('and the whole page is what gets recorded', page.data.intent.args.html.length, PAGE.length);
+eq('which is one entry in the list', pageList.length, 1);
+
 const fatList = newList();
-const fat = call(TOOL(), { action: 'todo.add', why: 'w', args: { text: 'x'.repeat(1400) } }, { list: fatList, runId: 'r' });
+const fat = call(
+  TOOL(),
+  { action: 'todo.add', why: 'w', args: { text: 'x'.repeat(MAX_ARGS_CHARS + 1) } },
+  { list: fatList, runId: 'r' },
+);
 eq('arguments too large to hand the device are refused', fat.ok, false);
 assert('and the refusal says why', String(fat.summary).includes('too large'));
+// A refusal with no recovery path is what produces an invented outcome, so the
+// refusal has to name the limit, name the way out, and forbid the claim.
+assert('and it names the limit that was hit', String(fat.summary).includes(String(MAX_ARGS_CHARS)));
+assert('and points at the only real recovery', String(fat.hint).includes('send less'));
+assert('and forbids reporting the change as made', String(fat.hint).includes('was not'));
 eq('and nothing was recorded', fatList.length, 0);
 
 // The budget. A model that has learned it can post work will propose twelve things.
@@ -620,7 +689,27 @@ assert(
 );
 assert(
   '  ...which drains EVERY pending ask, including one whose run frame was missed',
-  handler.includes('if (done.length) console.log(\'[hub] agent intents settled\', done);'),
+  handler.includes('runPendingIntents().then((done) => {') && handler.includes('if (!done.length) return;'),
+);
+// ⭐ AND ITS OUTCOME IS REPORTED, which is the other half of the same failure.
+//
+// The device is the ONLY party that learns whether an agent's ask actually ran:
+// the relay forwards it and, by construction, never sees the result, and the
+// wearer does not see the device's execution either. So a drain that only writes
+// to the console left a failed publish indistinguishable from a landed one to
+// everyone except a developer with devtools open — which is exactly how a run
+// came to report a page that no read could find.
+assert(
+  '  ...and its OUTCOME becomes a step the wearer can see',
+  /aiStep\(it\.ok \? 'ok' : 'fail', line\)/.test(handler),
+);
+assert(
+  '  ...with a landed write recorded as landed',
+  handler.includes("console.log('[hub] agent intent landed', it)"),
+);
+assert(
+  '  ...and a failure logged as a WARNING, so it is loud',
+  handler.includes("console.warn('[hub] agent intent did NOT land', it)"),
 );
 unset(
   '  ...and the monitor queue is not used as a claim edge at all',

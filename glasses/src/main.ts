@@ -2134,7 +2134,30 @@ async function main(): Promise<void> {
       // whose own run frame was missed (the device was asleep) is still pending,
       // and the write the wearer asked for should still happen.
       void runPendingIntents().then((done) => {
-        if (done.length) console.log('[hub] agent intents settled', done);
+        if (!done.length) return;
+        console.log('[hub] agent intents settled', done);
+        // ── AND THEN SAID OUT LOUD ──────────────────────────────────────────
+        //
+        // This is the ONLY place the outcome of an agent's write can be
+        // noticed. The relay is a forwarder — it hands the ask over and, by
+        // construction, never learns whether the device ran it — so a run that
+        // claimed "published" has already answered by the time the page is
+        // actually written, or refused, or fails here.
+        //
+        // A `console.log` was the whole of this reporting, which made a failed
+        // publish indistinguishable from a landed one to everyone except a
+        // developer with devtools open — and the run's own transcript, the thing
+        // the wearer reads as evidence, says only what the relay told it to say.
+        // So each outcome becomes a step: the HUD shows it, and the ledger keeps
+        // it under `by:'agent'` beside the call it answers. A failure is logged
+        // as a warning rather than a line, so it is loud in the one place a
+        // developer would look for it.
+        for (const it of done) {
+          const line = it.ok ? `${it.title}: ${it.summary}` : `${it.title} did NOT run — ${it.summary}`;
+          if (getAi().status !== 'idle') aiStep(it.ok ? 'ok' : 'fail', line);
+          if (it.ok) console.log('[hub] agent intent landed', it);
+          else console.warn('[hub] agent intent did NOT land', it);
+        }
       });
     }
     void renderGlasses();

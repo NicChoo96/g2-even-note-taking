@@ -63,8 +63,30 @@ export const INTENT_MAX_PER_RUN = 4;
  */
 export const INTENT_MAX_CATALOG = 48;
 
-/** Bound on an intent's arguments as they cross the wire and land in the ledger. */
-const MAX_ARGS_CHARS = 1200;
+/**
+ * Bound on an intent's arguments as they cross the wire and land in the ledger.
+ *
+ * THE NUMBER HAS TO COME FROM THE LARGEST BODY AN ACTION TAKES, not from a guess
+ * at what a model usually sends. `files.publish`'s required argument is the
+ * COMPLETE HTML document, and `docs.append`'s is a passage, so this ceiling IS
+ * the largest page an agent can put in the wearer's store. It was 1200 — which
+ * is 1/50th of the app's own read window and 1/3333rd of what the store accepts —
+ * and the consequence was not a small page but NO page: an agent asked to build a
+ * 19 kB digest was refused with "those arguments are too large to hand the
+ * device", and a refusal the model cannot act on is what it answers with a
+ * plausible sentence instead. A write path that cannot carry a document is not a
+ * slightly narrow write path; it is the absence of one.
+ *
+ * 200_000 because the floor is the page the WEARER CAN READ BACK in one go
+ * (`BODY_MAX_CHARS = 60_000` in ./jarvis-files.mjs), and this sits above three
+ * times that, so any page that arrives whole on a read can also be published
+ * whole by an agent. It is deliberately NOT the store's own `MAX_HTML_BYTES`
+ * (4 MB): an intent is carried in the run's transcript, which is broadcast to
+ * every client and replayed on every reconnect, so a megabyte body per intent is
+ * a cost the store does not pay. That bound is therefore stated rather than
+ * hidden — the web Files tab can publish up to 4 MB, an agent up to this.
+ */
+export const MAX_ARGS_CHARS = 200_000;
 /** Bound on a catalogue entry's description, which is prompt text. */
 const MAX_DESC_CHARS = 240;
 
@@ -153,12 +175,32 @@ export function intentToolSchema(tool) {
     type: 'function',
     function: {
       name: INTENT_TOOL_NAME,
+      // WHAT THE MODEL MUST KNOW, in the order it needs it.
+      //
+      // It has to know this is how its own work gets SAVED, or it builds a report
+      // and has nowhere to put it: an agent asked for a digest page has to be
+      // told, in the tool it is holding, that `files.publish` is the way that page
+      // reaches the wearer. "Change something of the wearer's" described the tool
+      // to a reader who already knew what it was and to nobody else.
+      //
+      // And it has to know the request is ANSWERED LATER, because that is the
+      // fact it cannot recover from being wrong about. A run that calls this and
+      // then says "published, 19.2 kB" has recorded a claim the relay is in no
+      // position to check and the wearer is in no position to doubt — and if the
+      // ask had been refused earlier in the turn, that sentence is simply false.
+      // SO THE PROHIBITION IS THE LOAD-BEARING PART: the transcript of a run is
+      // read as evidence of what happened, and the only way it stays evidence is
+      // if the model is told, here, never to report this as a completed change.
       description:
-        'Ask the glasses app to change something of the wearer\'s: ' +
-        'their to-do list, their documents, their scratchpad, their published files, ' +
-        'or another agent. This PROPOSES the change; the device runs it and will ask ' +
-        'the wearer to confirm anything it cannot undo. It returns immediately and you ' +
-        'will not see the result, so say what you asked for and finish.',
+        'Ask the glasses app to change something of the wearer\'s: their to-do list, ' +
+        'their documents, their scratchpad, their published files, or another agent. ' +
+        'This is also how you SAVE work of your own — files.publish puts a page you have ' +
+        'built into the store the wearer reads, and docs.new starts a document for them. ' +
+        'It RECORDS A REQUEST: the device runs it afterwards and will ask the wearer to ' +
+        'confirm anything it cannot undo. You will not see the result, so never report the ' +
+        'change as done, published, saved or created — say that you asked for it and that ' +
+        'it is pending. If the action you need is not in the list below, say so plainly ' +
+        'rather than describing the change as made.',
       parameters: {
         type: 'object',
         properties: {
@@ -238,11 +280,21 @@ export function runIntentTool(tool, rawArgs, ctx = {}) {
   }
 
   const payload = coerceArgs(args.args);
-  if (JSON.stringify(payload).length > MAX_ARGS_CHARS) {
+  const size = JSON.stringify(payload).length;
+  if (size > MAX_ARGS_CHARS) {
+    // A REFUSAL HAS TO BE ACTIONABLE, or it is worse than silence: the model
+    // holds a request it cannot place and a run it must narrate, and the
+    // cheapest sentence available is the one that claims success. So this names
+    // the ceiling, the size that was sent, and the only real recovery — asking
+    // for less — and it forbids the invented outcome in the same breath.
     return JSON.stringify({
       ok: false,
-      summary: 'those arguments are too large to hand the device',
-      hint: 'send only what the action needs',
+      summary:
+        `those arguments are too large to hand the device: ${size} characters, ` +
+        `and the limit is ${MAX_ARGS_CHARS}`,
+      hint:
+        'send less: publish or write a shorter body, or split it into several documents. ' +
+        'Do NOT tell the user the change was made — it was not.',
     });
   }
 
@@ -282,6 +334,13 @@ export function runIntentTool(tool, rawArgs, ctx = {}) {
     ok: true,
     summary: `asked the app to ${found.title}${why ? ` (${clip(why, 60)})` : ''}`,
     data: { intent },
-    hint: 'the device runs this on its own; say what you asked for and finish',
+    // "pending" is the word that has to be here. The tool result IS the model's
+    // last sight of its own ask, and it is read again whenever the transcript is
+    // replayed — so a hint that reads as "you are finished" is what licenses the
+    // sentence the wearer then believes. This says the opposite, in the two words
+    // the model would otherwise reach for: asked, not done.
+    hint:
+      `the device runs this afterwards and you will not see the result — ` +
+      `say you asked for "${found.title}", never that it is done`,
   });
 }

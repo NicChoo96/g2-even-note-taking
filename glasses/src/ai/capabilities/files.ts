@@ -42,6 +42,7 @@ import {
   listFiles,
   listRevisions,
   publishFile,
+  readFile,
   readFileText,
   readRevision,
   restoreRevision,
@@ -291,10 +292,19 @@ export const filesCapabilities: Capability[] = [
       { name: 'tags', type: 'string', description: 'Optional comma-separated tags.' },
       { name: 'id', type: 'string', description: 'Existing 32-hex document id to overwrite instead of creating a new page.' },
     ],
-    // Writing to a store that serves other people is outward-facing, so it is
-    // gated like the other destructive actions even though it is classified
-    // `write` (the relay can delete it again).
-    confirm: true,
+    // NO GATE, AND IT USED TO HAVE ONE. `confirm: true` here contradicted the
+    // `effect: 'write'` three lines above it, and the contradiction cost more
+    // than friction — it cost the write. The gate is the one step an AGENT run
+    // cannot pass: a delegated publish is run after the wearer has put the
+    // phone down, and `aiAskConfirm` with nobody there answers `false`, so the
+    // page the run had just built was declined by default and never written.
+    //
+    // The old comment's reasoning ("a store that serves other people") does not
+    // hold: this store serves the wearer and nobody else. And the irreversible
+    // half of publishing is `files.delete`, which stays gated — destroying is
+    // the act that cannot be taken back. Adding a page is not, and an agent that
+    // has just spent a run composing a report is exactly the hand it is safe to
+    // let do this.
     run: async (args): Promise<CapabilityResult> => {
       const html = String(args.html ?? '');
       const rawTitle = String(args.title ?? '').trim();
@@ -355,16 +365,56 @@ export const filesCapabilities: Capability[] = [
         };
       }
       const doc = res.document;
+      // ── THE READ-BACK ───────────────────────────────────────────────────────
+      //
+      // The create call returning a document is the hub's ANSWER. What the
+      // wearer needs, and what an agent run has no other way to get, is the
+      // hub's STATE — so the page is read straight back by id before anything is
+      // called published.
+      //
+      // Without this, "published" was a claim about a response. With it, it is a
+      // claim about the store, which is the only thing that can be listed, opened
+      // or linked to a moment later. The failure it catches is not hypothetical:
+      // it is the entire shape of the bug this came from, where a run reported a
+      // page that no read could find.
+      //
+      // A read-back that cannot be MADE is reported as unconfirmed rather than
+      // as fine — there is no third answer here, and inventing one is what made
+      // the original report possible.
+      const back = await readFile(doc.id);
+      if (!back.ok || !back.document || back.document.deleted) {
+        const why = back.ok
+          ? back.document?.deleted
+            ? 'the store has it marked deleted'
+            : 'the store has no record of it'
+          : String(back.error ?? 'the store could not be read');
+        // THE REASON COMES FIRST, and the sentence does not say "read-back
+        // failed" — `UNCONFIRMED` already says it. That is not brevity for its
+        // own sake: `oneLine` is 80 characters, and the first draft read
+        //   Publish UNCONFIRMED: read-back of "Daily digest" failed — the
+        //   store has it mark…
+        // The one word that tells the wearer whether to RESTORE the page or
+        // re-publish it was the word pushed off the end, and a summary cut
+        // before its distinguishing fact is one the wearer has to guess at.
+        return {
+          ok: false,
+          summary: oneLine(`Publish UNCONFIRMED: "${short(title, 20)}" — ${why}`),
+          hint: 'the page could not be found in the store after publishing; check the Files tab before saying it exists',
+        };
+      }
+      const stored = back.document;
       // Show the new page immediately rather than at the next poll.
-      const already = files().some((f) => f.id === doc.id);
+      const already = files().some((f) => f.id === stored.id);
       const next = already
-        ? files().map((f) => (f.id === doc.id ? toFileRef(doc) : f))
-        : [toFileRef(doc), ...files()].slice(0, CAP);
+        ? files().map((f) => (f.id === stored.id ? toFileRef(stored) : f))
+        : [toFileRef(stored), ...files()].slice(0, CAP);
       syncRefs(next);
       return {
         ok: true,
-        summary: oneLine(`${already ? 'Updated' : 'Published'} "${short(title, 24)}" (${sizeLabel(doc.size)})`),
-        data: { id: doc.id, title: doc.title, size: doc.size, version: doc.version, tags: doc.tags },
+        summary: oneLine(
+          `${already ? 'Updated' : 'Published'} "${short(title, 24)}" (${sizeLabel(stored.size)}) — read back from the store`,
+        ),
+        data: { id: stored.id, title: stored.title, size: stored.size, version: stored.version, tags: stored.tags },
         hint: 'open the Files tab on the web app to view it',
       };
     },
@@ -556,12 +606,24 @@ export const filesCapabilities: Capability[] = [
     name: 'files.revert',
     page: 'files',
     effect: 'write',
-    // Confirmed, like publish and for the same reason: this changes a document
-    // that other people read. It is classified `write` rather than
-    // `irreversible` because the gateway implements it by APPENDING a revert
-    // entry — the versions it replaces stay in the history, so a revert can
-    // itself be reverted. Calling that irreversible would be a lie in the other
-    // direction, and the wearer would be warned off an undo they can safely use.
+    // NOT CONFIRMED — and it is the only destruction-shaped action that is not.
+    //
+    // It is classed `write` rather than `irreversible` because the gateway
+    // implements a revert by APPENDING a revert entry: the versions it replaces
+    // stay in the history, so a revert can itself be reverted. That is what
+    // earns it the gate's absence, and the reasoning is the same one that freed
+    // `files.publish`, which also carried a `confirm: true` it could not
+    // justify. A gate is unpassable for a DELEGATED run — `aiAskConfirm`
+    // answers false with the phone in a pocket — so a gate on something that
+    // CAN be undone protects nothing; it only makes the action fail silently.
+    //
+    // THE DELETES ARE DELIBERATELY NOT LIKE THIS. `todo.remove` and
+    // `todo.clear_done` are also classed `write` and also keep the gate, and
+    // that is a decision rather than an oversight: they destroy the wearer's
+    // text outright and there is no history to revert to. Un-gating either of
+    // them because this one was un-gated would be reading a rule where there is
+    // only a judgement. The line is "can this be undone?", NOT "is the effect
+    // string the same?".
     title: 'Go back to an earlier version',
     description:
       'Restore an earlier revision of a stored document so it becomes the current version again. ' +
@@ -571,7 +633,6 @@ export const filesCapabilities: Capability[] = [
       { name: 'document', type: 'string', description: 'Document title, part of a title, or its number.', required: true },
       { name: 'revision', type: 'number', description: 'The revision number to go back to, from files.history.', required: true },
     ],
-    confirm: true,
     run: async (args): Promise<CapabilityResult> => {
       const target = resolveFile(String(args.document ?? ''), files());
       if (!target) {
