@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.51
+
+v0.3.51 - Your to-do list now proves a change landed, and Brave is the search default
+
+- Adding, ticking, editing, deleting or clearing a to-do is read back, so the app no longer says it saved when it did not.
+- If the hub is unreachable your list still shows your change, and you are told plainly that it did not land.
+- Web search now uses Brave Search unless you pick Tavily in Settings.
+
 ## 0.3.50
 
 v0.3.50 - Jarvis now checks its work before saying it saved anything
