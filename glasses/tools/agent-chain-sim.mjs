@@ -101,6 +101,8 @@ const startFn = fnSource(relaySrc, 'startAgentRun');
 const runRouteSrc = read('../../web/server/local-sse.mjs').slice(
   read('../../web/server/local-sse.mjs').indexOf("url.pathname === '/api/agent/run'"),
 );
+/** The builder's seed table — the vocabulary that decides which kind a phrase IS. */
+const capSrc = read('../src/ai/capabilities/agents.ts');
 
 // ── 1. the module's contract ────────────────────────────────────────────────
 console.log('\n§1  the kind, the name and the brakes');
@@ -390,6 +392,94 @@ unset('the run object carries no depth field', startFn, 'depth:');
 unset('the run object carries no children field', startFn, 'children:');
 has('both side tables are pruned with the runs', fnSource(relaySrc, 'pruneRuns'), 'runDepths.delete');
 has('  ...in both the TTL and the eviction loops', fnSource(relaySrc, 'pruneRuns'), 'runChildren.delete');
+
+// ── 10. the seed table cannot steal a phrase ───────────────────────────────
+console.log('\n§10  the seed vocabulary, in table order');
+// This kind's seed sits FIRST and `find` takes the FIRST match, so every word
+// AGENT_SEED gains is a word taken off whichever seed sits behind it — and the
+// symptom is not an error, it is a phrase quietly attaching the wrong tool. The
+// table is read out of the real source instead of restated here, so a loose word
+// added to any seed shows up as a phrase resolving to the wrong kind.
+const seedNames =
+  capSrc
+    .slice(
+      capSrc.indexOf('export const SEED_TOOLS'),
+      capSrc.indexOf('];', capSrc.indexOf('export const SEED_TOOLS')),
+    )
+    .match(/[A-Z]+_SEED/g) ?? [];
+const seeds = seedNames.map((name) => {
+  const at = capSrc.indexOf(`const ${name}: SeedTool = {`);
+  const body = at < 0 ? '' : capSrc.slice(at, capSrc.indexOf('\n};', at));
+  const raw = /words:\s*\/((?:\\[\s\S]|[^\\/])*)\/([a-z]*)/.exec(body);
+  return {
+    kind: /kind:\s*'([a-z]+)'/.exec(body)?.[1] ?? name,
+    ...(raw ? { re: new RegExp(raw[1], raw[2]) } : {}),
+  };
+});
+const seedFind = (phrase) => seeds.find((s) => s.re?.test(phrase.toLowerCase()))?.kind ?? null;
+/** A resolution that is wrong, phrased so the failure names the phrase and both ends. */
+const misread = (cases) =>
+  cases
+    .filter(([phrase, kind]) => seedFind(phrase) !== kind)
+    .map(([phrase, kind]) => `${clip40(phrase)} -> ${seedFind(phrase)} (want ${kind})`);
+
+has('the lookup consults the table in the declared order', capSrc, 'SEED_TOOLS.find((s) => s.words.test(t))');
+eq('the table has one seed per kind', seeds.length, 8);
+deepEq(
+  '  ...and the agent kind is FIRST, because find takes the first match',
+  seeds.map((s) => s.kind),
+  ['agent', 'web', 'todo', 'docs', 'notes', 'location', 'files', 'jev'],
+);
+
+// Every way an orchestrator is asked for by voice.
+const ORCHESTRATOR = misread(
+  [
+    'the agents',
+    'the daily digest agent',
+    'run the agents',
+    'run the six daily agents',
+    'ask the other agents',
+    'gather the agents',
+    'multi-agent',
+    'the orchestrator',
+    'summarize the six agents',
+    'my daily digest',
+    'the digest',
+    'trigger the daily agents',
+    'compile the other agents',
+    'run all six agents',
+    'call the agents',
+    'all six agents',
+  ].map((p) => [p, 'agent']),
+);
+assert('every way the wearer names it resolves to it', ORCHESTRATOR.length === 0, ORCHESTRATOR.join('; '));
+// The phrases the seeds BEHIND it own. Sitting first is only safe while this
+// holds: the day a word here belongs to a store, the store stops being reachable.
+const NEIGHBOURS = misread([
+  ['web search', 'web'],
+  ['the internet', 'web'],
+  ['my to-do list', 'todo'],
+  ['the reminders', 'todo'],
+  ['docs tab', 'docs'],
+  ['my own documents', 'docs'],
+  ['my journals', 'docs'],
+  ['the notes', 'notes'],
+  ['scratchpad', 'notes'],
+  ['where am i', 'location'],
+  ['near me', 'location'],
+  ['the document store', 'files'],
+  ['publish', 'files'],
+  ['the reports', 'files'],
+  ['jev', 'jev'],
+  ['score the options', 'jev'],
+].map(([p, k]) => [p, k]));
+assert('and it takes nothing that belongs to another kind', NEIGHBOURS.length === 0, NEIGHBOURS.join('; '));
+// And the verbs that must drag nothing: the seed comment says so in prose, and
+// "run" alone is the one word most likely to be added to it next.
+const UNCLAIMED = misread(
+  ['run', 'start', 'stop', 'the weather', 'my photos', 'the music'].map((p) => [p, null]),
+);
+assert('a bare verb, or anything no kind owns, is still not a tool', UNCLAIMED.length === 0, UNCLAIMED.join('; '));
 
 console.log(
   fail
