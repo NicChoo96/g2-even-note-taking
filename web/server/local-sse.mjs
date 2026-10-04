@@ -89,7 +89,7 @@
 // DeepSeek with LLM_PROVIDER=deepseek + DEEPSEEK_API_KEY (+ optional
 // DEEPSEEK_MODEL). Agents web search: TAVILY_API_KEY or BRAVE_SEARCH_API_KEY,
 // with SEARCH_PROVIDER=tavily|brave to choose (default: whichever key is set,
-// Tavily winning when both are), plus an optional WEB_SEARCH_DEPTH (basic or
+// Brave winning when both are), plus an optional WEB_SEARCH_DEPTH (basic or
 // advanced; the legacy TAVILY_SEARCH_DEPTH still works). Agents document store:
 // JARVIS_FILE_USER + JARVIS_FILE_PWD (password login, the default path) or
 // JARVIS_FILE_API_KEY (a pre-minted `jvk_…` key, which needs no session at all),
@@ -694,10 +694,10 @@ async function jevDecide(request) {
  *
  *   1. `searchProvider` in .g2-hub-secrets.json  (the Settings toggle)
  *   2. SEARCH_PROVIDER in the environment  (a host's default)
- *   3. AUTO — Tavily if a Tavily key exists, else Brave if a Brave key exists.
- *      Tavily wins when both are present, so an install with no explicit choice
- *      does not switch provider behind the wearer's back the moment a Brave key
- *      is added.
+ *   3. AUTO — Brave if a Brave key exists, else Tavily if a Tavily key exists.
+ *      Brave is the house default, so an install that has never pinned a
+ *      provider answers with Brave as soon as it holds a Brave key; Tavily is
+ *      the fallback for an install that only ever configured Tavily.
  *
  * A selected provider with NO key resolves to an empty key on purpose. Falling
  * back to the other provider's key would answer the question that was asked with
@@ -717,7 +717,10 @@ function webSearchConfig() {
   const tavilyKey = tavilyFile || tavilyEnv || '';
   const braveKey = braveFile || braveEnv || '';
 
-  const provider = chosen || (tavilyKey ? 'tavily' : braveKey ? 'brave' : 'tavily');
+  // AUTO is Brave-first. The final fallback is Brave too, so a keyless install
+  // names BRAVE_SEARCH_API_KEY in its error rather than pointing the wearer at
+  // the vendor this default is moving away from.
+  const provider = chosen || (braveKey ? 'brave' : tavilyKey ? 'tavily' : 'brave');
   const isBrave = provider === 'brave';
   const envKey = isBrave ? braveEnv : tavilyEnv;
   const fileKey = isBrave ? braveFile : tavilyFile;

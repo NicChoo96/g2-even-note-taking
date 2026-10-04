@@ -381,7 +381,7 @@ has('TAVILY_API_KEY is read', relaySrc, 'process.env.TAVILY_API_KEY');
 has('the legacy depth env still works', relaySrc, 'process.env.TAVILY_SEARCH_DEPTH');
 has('and the new depth env wins over it', relaySrc, 'process.env.WEB_SEARCH_DEPTH || process.env.TAVILY_SEARCH_DEPTH');
 has("only 'tavily' | 'brave' are honoured", relaySrc, "(v === 'tavily' || v === 'brave' ? v : '')");
-has('auto prefers Tavily when both keys exist', relaySrc, "tavilyKey ? 'tavily' : braveKey ? 'brave' : 'tavily'");
+has('auto prefers Brave when both keys exist', relaySrc, "braveKey ? 'brave' : tavilyKey ? 'tavily' : 'brave'");
 has('the key is selected FOR the provider, not merged', relaySrc, 'const envKey = isBrave ? braveEnv : tavilyEnv;');
 has('a missing key names the exact env var', relaySrc, 'envVar: isBrave ? \'BRAVE_SEARCH_API_KEY\' : \'TAVILY_API_KEY\'');
 has('and the error is actionable', relaySrc, 'not configured — set ${ws.envVar}');

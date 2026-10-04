@@ -313,6 +313,9 @@ export function SettingsPanel() {
   // only the flat `tavily` mirror. Fall back so either layout renders correctly.
   const searchSrc = src?.search;
   const search = info?.search;
+  // This default stays TAVILY on purpose, unlike the relay's resolver. It only
+  // applies to a relay too old to report a provider at all — one that cannot run
+  // Brave — so naming Brave here would describe a backend that relay lacks.
   const liveProvider = (search?.provider ?? 'tavily') === 'brave' ? 'brave' : 'tavily';
   const liveLabel = liveProvider === 'brave' ? 'Brave Search' : 'Tavily';
   /**
@@ -493,23 +496,6 @@ export function SettingsPanel() {
       )}
 
       <label className="field-label">
-        Tavily API key <SourceBadge source={searchSrc?.tavilyKey ?? src?.tavily?.key} />
-      </label>
-      <input
-        type="password"
-        value={tavilyKey}
-        onChange={(e) => setTavilyKey(e.target.value)}
-        placeholder={info?.search?.keys?.tavily ? '••••••• (saved — type to replace)' : 'tvly-dev-…'}
-      />
-      <FieldNote source={searchSrc?.tavilyKey ?? src?.tavily?.key} envVar="TAVILY_API_KEY" />
-      {(searchSrc?.tavilyKey ?? src?.tavily?.key) === 'settings' && (
-        <ClearToggle
-          pending={clearFields.includes('tavilyKey')}
-          onToggle={() => toggleClear('tavilyKey')}
-        />
-      )}
-
-      <label className="field-label">
         Brave Search API key <SourceBadge source={searchSrc?.braveKey} />
       </label>
       <input
@@ -527,6 +513,23 @@ export function SettingsPanel() {
       )}
 
       <label className="field-label">
+        Tavily API key <SourceBadge source={searchSrc?.tavilyKey ?? src?.tavily?.key} />
+      </label>
+      <input
+        type="password"
+        value={tavilyKey}
+        onChange={(e) => setTavilyKey(e.target.value)}
+        placeholder={info?.search?.keys?.tavily ? '••••••• (saved — type to replace)' : 'tvly-dev-…'}
+      />
+      <FieldNote source={searchSrc?.tavilyKey ?? src?.tavily?.key} envVar="TAVILY_API_KEY" />
+      {(searchSrc?.tavilyKey ?? src?.tavily?.key) === 'settings' && (
+        <ClearToggle
+          pending={clearFields.includes('tavilyKey')}
+          onToggle={() => toggleClear('tavilyKey')}
+        />
+      )}
+
+      <label className="field-label">
         Web-search provider <SourceBadge source={searchSrc?.provider} />
       </label>
       <select
@@ -534,9 +537,9 @@ export function SettingsPanel() {
         onChange={(e) => setSearchProvider(e.target.value as '' | 'tavily' | 'brave')}
         disabled={!relaySupportsProvider}
       >
-        <option value="">Auto — whichever key is set (Tavily first)</option>
-        <option value="tavily">Tavily</option>
+        <option value="">Auto — whichever key is set (Brave first)</option>
         <option value="brave">Brave Search</option>
+        <option value="tavily">Tavily</option>
       </select>
       {!relaySupportsProvider && (
         <p className="warn-line">

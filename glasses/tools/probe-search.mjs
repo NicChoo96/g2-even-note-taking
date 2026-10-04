@@ -54,7 +54,7 @@ const fileTavily = String(secrets.tavilyKey || '');
 const fileBrave = String(secrets.braveKey || '');
 const fileProvider = String(secrets.searchProvider || '').toLowerCase();
 
-// Mirror the relay's precedence EXACTLY: settings page -> env -> auto (Tavily
+// Mirror the relay's precedence EXACTLY: settings page -> env -> auto (Brave
 // first). Settings-first is the whole point of the page: a value saved there
 // overrides the host environment, and the env is only the fallback for a field
 // nobody has saved. Keep this in step with `webSearchConfig()` in
@@ -65,7 +65,7 @@ const braveKey = fileBrave || envBrave;
 const declared = (fileProvider === 'tavily' || fileProvider === 'brave' ? fileProvider : '') ||
   (envProvider === 'tavily' || envProvider === 'brave' ? envProvider : '');
 
-const provider = declared || (tavilyKey ? 'tavily' : braveKey ? 'brave' : 'tavily');
+const provider = declared || (braveKey ? 'brave' : tavilyKey ? 'tavily' : 'brave');
 const key = provider === 'brave' ? braveKey : tavilyKey;
 
 out.push('── keys ──');

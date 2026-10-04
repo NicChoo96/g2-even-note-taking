@@ -421,7 +421,7 @@ Two lessons from building that sweep, both recorded because they cost time:
 
 The agent never chose a vendor and should not start now. The model always calls
 `web_search`; the relay resolves a provider from `SEARCH_PROVIDER` (or
-`secrets.searchProvider`, or whichever key is present, Tavily first) and
+`secrets.searchProvider`, or whichever key is present, Brave first) and
 delegates to `web/server/web-search.mjs`. That module owns both request shapes
 — Brave is a `GET` with `X-Subscription-Token`, Tavily a `POST` with
 `Authorization: Bearer` — because two `fetch` shapes in one file is how a wrong
