@@ -30,9 +30,8 @@ await build({
   },
 });
 
-const { sectionMenu, MENU, SECTIONS, agentsMasterDetailView, sectionView } = await import(
-  pathToFileURL(outfile).href
-);
+const { sectionMenu, MENU, SECTIONS, agentsMasterDetailView, docsPanelView, PANEL_LAYOUT, sectionView } =
+  await import(pathToFileURL(outfile).href);
 
 // The per-agent run lookup lives in the run store, and it is the actual fix for
 // the master-list/detail-pane desync (see §Master–detail below), so it is built
@@ -431,7 +430,7 @@ const view = agentsMasterDetailView(
     agents: [mkAgent('a1', 'Alpha', ['tool-web']), mkAgent('a2', 'Beta')],
     sessions: [mkSession('s1', 'a1', 'Newest answer'), mkSession('s2', 'a1', 'Older answer')],
     cursor: 0,
-    focus: 'master',
+    level: 1,
     sessionCursor: 0,
     status: '',
   },
@@ -451,7 +450,7 @@ const ordered = agentsMasterDetailView({
   ],
   sessions: [],
   cursor: 0,
-  focus: 'master',
+  level: 1,
   status: '',
 });
 assert('the newest-updated agent is listed first', /▶1\.Newer/.test(ordered.master), ordered.master);
@@ -461,7 +460,7 @@ const browsed = agentsMasterDetailView({
   agents: [mkAgent('a1', 'Alpha')],
   sessions: [mkSession('s1', 'a1', 'Newest answer'), mkSession('s2', 'a1', 'Older answer')],
   cursor: 0,
-  focus: 'detail',
+  level: 2,
   sessionCursor: 1,
   status: '',
 });
@@ -522,7 +521,7 @@ const leaked = agentsMasterDetailView({
   agents: [mkAgent('a1', 'Alpha'), mkAgent('a2', 'Beta')],
   sessions: [],
   cursor: 1,
-  focus: 'detail',
+  level: 2,
   status: '',
   run: alphaLive,
 });
@@ -535,7 +534,7 @@ const own = agentsMasterDetailView({
   agents: [mkAgent('a1', 'Alpha'), mkAgent('a2', 'Beta')],
   sessions: [],
   cursor: 0,
-  focus: 'detail',
+  level: 2,
   status: '',
   run: alphaLive,
 });
@@ -547,7 +546,7 @@ const parked = agentsMasterDetailView({
   agents: [mkAgent('a1', 'Alpha'), mkAgent('a2', 'Beta')],
   sessions: [],
   cursor: 1,
-  focus: 'master',
+  level: 1,
   status: '',
   run: null,
   runningAgentIds: ['a1'],
@@ -560,7 +559,7 @@ assert(
   view.master,
 );
 
-const emptyView = agentsMasterDetailView({ agents: [], sessions: [], cursor: 5, focus: 'master' });
+const emptyView = agentsMasterDetailView({ agents: [], sessions: [], cursor: 5, level: 1 });
 assert('empty state clamps cursor to 0', emptyView.cursor === 0);
 assert('empty state hints', emptyView.master.includes('no agents'), emptyView.master);
 
@@ -591,7 +590,7 @@ const paged = agentsMasterDetailView({
     },
   ],
   cursor: 0,
-  focus: 'detail',
+  level: 2,
   sessionCursor: 0,
   detailPage: 0,
   status: '',
@@ -616,7 +615,7 @@ const lastPage = agentsMasterDetailView({
     },
   ],
   cursor: 0,
-  focus: 'detail',
+  level: 2,
   sessionCursor: 0,
   detailPage: 999,
   status: '',
@@ -645,7 +644,7 @@ for (let p = 0; p < paged.detailPages; p++) {
     agents: [mkAgent('a1', 'Alpha', ['tool-web'])],
     sessions: [session],
     cursor: 0,
-    focus: 'detail',
+    level: 2,
     sessionCursor: 0,
     detailPage: p,
     status: '',
@@ -666,7 +665,7 @@ assert(
     agents: [mkAgent('a1', 'Alpha')],
     sessions: [mkSession('s1', 'a1', 'Short answer')],
     cursor: 0,
-    focus: 'detail',
+    level: 2,
     detailPage: 0,
     status: '',
   }).detailPages === 1,
@@ -710,7 +709,7 @@ const emojiView = agentsMasterDetailView({
   agents: [mkAgent('a9', 'Emoji')],
   sessions: [emojiSession],
   cursor: 0,
-  focus: 'detail',
+  level: 2,
   detailPage: 0,
   status: '',
 }).detail;
@@ -718,6 +717,195 @@ assert(
   'emoji from model output is stripped',
   !/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(emojiView) && emojiView.includes('Tools & AI news'),
   emojiView,
+);
+
+// ── The three-level panel: Agents and Docs share one model ───────────────────
+// Reported (docs/issue_0_3_43/Glasses_Agent_Docs_Enhancement.md): the master /
+// detail flow reads well, but there was no way to give the CONTENT the whole
+// canvas. Level 1 is the list alone, level 2 the list plus the detail pane, and
+// level 3 the detail alone — one tap advances a level, one double tap steps
+// back. Both panels use the same levels so they cannot drift apart, and the
+// pane that captures the ring is DERIVED from the level.
+//
+// The geometry is asserted here because it is what makes level 3 worth having:
+// the level-1/3 pane IS the canvas, and the level-2 split must not overlap.
+assert(
+  'levels 1 and 3 draw into the whole canvas',
+  PANEL_LAYOUT.fullX === 0 && PANEL_LAYOUT.fullW === 576,
+  JSON.stringify(PANEL_LAYOUT),
+);
+assert(
+  'the level-2 panes sit side by side with a gutter and stay inside the canvas',
+  PANEL_LAYOUT.splitMasterX + PANEL_LAYOUT.splitMasterW <= PANEL_LAYOUT.splitDetailX &&
+    PANEL_LAYOUT.splitDetailX + PANEL_LAYOUT.splitDetailW <= PANEL_LAYOUT.fullW,
+  JSON.stringify(PANEL_LAYOUT),
+);
+
+const longName = 'Alpha Research Agent With A Very Long Name';
+const agentAt = (level) =>
+  agentsMasterDetailView({
+    agents: [mkAgent('a1', longName)],
+    sessions: [],
+    cursor: 0,
+    level,
+    status: '',
+  });
+
+assert(
+  'level 1 footer offers the tap that steps in',
+  agentAt(1).master.includes('▲▼ move · tap open'),
+  agentAt(1).master,
+);
+assert(
+  'level 2 footer promises the full screen the next tap gives',
+  agentAt(2).master.includes('▲▼ move · tap full'),
+  agentAt(2).master,
+);
+assert(
+  'level 2 marks the list as the pane that owns the ring',
+  agentAt(2).master.startsWith('Agents 1 ◀'),
+  agentAt(2).master,
+);
+assert(
+  'level 1 does not claim to own a ring it shares with nothing',
+  !agentAt(1).master.includes('◀'),
+  agentAt(1).master,
+);
+// The row budget follows the width the pane is actually drawn at: a name that
+// fits across 568px would wrap to two rendered lines in the 200px pane and blow
+// the ten-line canvas budget.
+assert(
+  'level 1 rows use the wide pane, so the name is not truncated early',
+  agentAt(1).master.includes('Alpha Research Agent With A Very L'),
+  agentAt(1).master,
+);
+assert(
+  'level 2 rows truncate to the 200px pane',
+  !agentAt(2).master.includes('Alpha Research Agent With A Very L'),
+  agentAt(2).master,
+);
+
+// Level 3 is the SAME transcript re-wrapped to the full canvas. Proving the
+// width actually changed is the point: a level 3 that re-used the split width
+// would look identical to level 2 and waste the screen it was given.
+const level3 = agentsMasterDetailView({
+  agents: [mkAgent('a1', 'Alpha', ['tool-web'])],
+  sessions: [session],
+  cursor: 0,
+  level: 3,
+  sessionCursor: 0,
+  detailPage: 0,
+  status: '',
+});
+assert(
+  'level 3 re-wraps the transcript to the full canvas (fewer, longer pages)',
+  level3.detailPages < paged.detailPages,
+  `full=${level3.detailPages} split=${paged.detailPages}`,
+);
+assert(
+  'level 3 keeps the byte cap',
+  Buffer.byteLength(level3.detail, 'utf8') <= 999,
+  `${Buffer.byteLength(level3.detail, 'utf8')} bytes`,
+);
+assert(
+  'level 3 keeps the ten rendered lines',
+  level3.detail.split('\n').length <= 10,
+  `${level3.detail.split('\n').length} lines`,
+);
+assert(
+  'level 3 shows the same newest turn as level 2',
+  level3.detail.includes('Here is the full answer'),
+  level3.detail,
+);
+
+// ── The Docs panel ──────────────────────────────────────────────────────────
+const mkDoc = (id, title, content) => ({ id, title, content, updatedAt: 0 });
+const docMetas = [
+  mkDoc('d1', 'Alpha notes', 'alpha body'),
+  mkDoc('d2', 'Beta notes', 'beta body'),
+];
+const docsState = emptyState({ activeSection: 'docs', sections: { docs: docMetas } });
+
+const docList = docsPanelView(docsState, 0, 0, 1);
+assert(
+  'docs level 1 lists every document',
+  docList.master.includes('Alpha notes') && docList.master.includes('Beta notes'),
+  docList.master,
+);
+assert('docs level 1 marks the cursor', docList.master.includes('▶1.'), docList.master);
+assert(
+  'docs level 1 offers the tap that steps in',
+  docList.master.includes('▲▼ move · tap open'),
+  docList.master,
+);
+// The panel is built before the paint decision, so level 1 already carries the
+// body it will show one tap later — that is what makes level 2 instant.
+assert('docs level 1 already carries the body it will show', docList.detail.includes('alpha body'));
+assert('docs level 1 reports the library is not empty', docList.hasDoc === true);
+
+const docSplit = docsPanelView(docsState, 0, 0, 2);
+assert(
+  'docs level 2 marks the list as the pane that owns the ring',
+  docSplit.master.startsWith('Docs 2 ◀'),
+  docSplit.master,
+);
+assert(
+  'docs level 2 footer promises the full screen',
+  docSplit.master.includes('▲▼ move · tap full'),
+  docSplit.master,
+);
+
+// The CURSOR drives the body, not some other notion of "open": the ring moves
+// the highlight and the body follows in the same render, so the two panes can
+// never describe different documents.
+const docThird = docsPanelView(docsState, 1, 0, 3);
+assert(
+  'docs level 3 shows the document the ring is on',
+  docThird.detail.includes('beta body') && !docThird.detail.includes('alpha body'),
+  docThird.detail,
+);
+assert('docs level 3 clamps a cursor past the end', docThird.cursor === 1);
+
+// A long document must PAGE at the level-3 width, and the paging state the
+// panel reports is the one the swipe handler uses as its bound.
+const longDocState = emptyState({
+  activeSection: 'docs',
+  sections: { docs: [mkDoc('d9', 'Long', 'paragraph '.repeat(400))] },
+});
+const longTop = docsPanelView(longDocState, 0, 0, 3);
+assert('a long document pages at the full width', longTop.pages > 1, `pages=${longTop.pages}`);
+assert(
+  'page 0 has nothing before it and something after',
+  longTop.page === 0 && longTop.canPrev === false && longTop.canNext === true,
+);
+const longEnd = docsPanelView(longDocState, 0, 999, 3);
+assert(
+  'a page past the end clamps to the last page',
+  longEnd.page === longEnd.pages - 1 && longEnd.canNext === false,
+  `${longEnd.page + 1}/${longEnd.pages}`,
+);
+assert(
+  'every page of a long document stays inside the byte cap',
+  Buffer.byteLength(longTop.detail, 'utf8') <= 999 && longTop.detail.split('\n').length <= 10,
+);
+
+// An empty library must not leave the ring on a pane that does not exist, and
+// must say how to fill it — the picker is still the only way to make one.
+const docEmpty = docsPanelView(emptyState({ activeSection: 'docs' }), 3, 2, 2);
+assert(
+  'an empty library clamps the cursor and page to 0',
+  docEmpty.cursor === 0 && docEmpty.page === 0,
+  `cursor=${docEmpty.cursor} page=${docEmpty.page}`,
+);
+assert('an empty library reports it has no document', docEmpty.hasDoc === false);
+assert('an empty library says how to make one', docEmpty.master.includes('no docs yet'), docEmpty.master);
+
+// One gesture language: the two panels must word their footers identically, or
+// the same ring tap means two different things depending on the tab.
+assert(
+  'both panels share their level-1 footer wording',
+  agentAt(1).master.split('\n').pop() === docList.master.split('\n').pop(),
+  `${agentAt(1).master.split('\n').pop()} vs ${docList.master.split('\n').pop()}`,
 );
 
 console.log(fail === 0 ? '\nALL PASS' : `\n${fail} FAILURE(S)`);

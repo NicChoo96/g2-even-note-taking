@@ -15,20 +15,21 @@ import { snapshotForRun } from './location/run';
 import { probeLocation } from './location/probe';
 import { getRuns, isAgentRunning, latestRunFor, subscribeRuns } from './agent-runs';
 import {
-  AGENT_LAYOUT,
   agentsMasterDetailView,
   agentsStatusLine,
   aiView,
   clipBytes,
+  docsPanelView,
   docPickerView,
   listenView,
   MAX_CONTENT_BYTES,
   MENU,
+  PANEL_LAYOUT,
   sectionByMenuId,
   sectionMenu,
   sectionView,
   signInView,
-  type AgentFocus,
+  type PanelLevel,
   type SectionView,
 } from './sections';
 import {
@@ -175,6 +176,21 @@ async function main(): Promise<void> {
   // Catch up whenever this page comes back to the foreground: a nudge can only
   // arrive while the stream is open, and the relay replays nothing. Idempotent.
   startHubLiveSync();
+  // The app opens on the AGENT page: one redirect, fired once the hub's first
+  // load has settled.
+  //
+  // It cannot be a default in `emptyHubState()` — the hub snapshot is
+  // authoritative for `activeSection` (`adopt()` replaces local state
+  // wholesale), so a default would be overwritten by the very first snapshot and
+  // would also fight the web companion, which legitimately writes the document
+  // it is reading into that same field. A one-shot redirect after the load is
+  // authoritative regardless of what the server stored.
+  let bootRedirected = false;
+  function bootRedirect(): void {
+    if (bootRedirected) return;
+    bootRedirected = true;
+    if (getState().activeSection !== 'agents') switchSection('agents');
+  }
   let closeStream: (() => void) | null = null;
   let closeAgentsStream: (() => void) | null = null;
   let closeAiMirror: (() => void) | null = null;
@@ -225,6 +241,9 @@ async function main(): Promise<void> {
     // re-enters here, which is what makes a re-credentialed device resync.
     void loadHub();
     void loadAgents();
+    // …plus a fallback, so an unreachable relay still opens on Agents instead of
+    // stranding the wearer on whatever section the local cache happened to hold.
+    window.setTimeout(() => bootRedirect(), 2500);
     // Seed the relay from local data if the server has none yet.
     window.setTimeout(() => seedIfEmpty(), 1000);
   });
@@ -324,12 +343,29 @@ async function main(): Promise<void> {
   // this changes (entering/leaving Docs, or docs count crossing 0) — ordinary
   // content updates still use flicker-free textContainerUpgrade.
   let appliedMenuSig = '';
-  /** 'single' = one full-canvas text container; 'dual' = the Agents panes. */
-  let appliedLayout: 'single' | 'dual' = 'single';
-  /** Focus+cursor+border signature of the dual pane layout. */
-  let appliedAgentSig = '';
+  /**
+   * Signature of the pane layout currently installed on the page.
+   *
+   *   'single'  one container, a plain page (todo / notes / sign-in / HUD)
+   *   'dual'    the level-2 split of a panel — list + detail
+   *   'pane'    a panel showing ONE of its panes full-canvas (levels 1 and 3)
+   *
+   * The three are distinct because the container COUNT differs, and a page's
+   * container count can only change through rebuildPageContainer.
+   */
+  let appliedLayout: 'single' | 'dual' | 'pane' = 'single';
+  /** Focus+cursor+border signature of the panel pane layout. */
+  let appliedPanelSig = '';
   let todoCursor = 0; // selected todo row
-  let docPage = 0; // current docs/notes page
+  let docPage = 0; // current page of the docs/notes body
+  // Docs tab — the same three-level panel as Agents (see PanelLevel). The list
+  // cursor IS the open document: the ring highlights a title and `selectDoc`
+  // makes it the hub's activeDocId, so the level-2 preview and the level-3 body
+  // always describe the document the wearer is actually looking at.
+  let docLevel: PanelLevel = 1;
+  let docCursor = 0;
+  /** Pages the last docs render produced — bounds the level-3 paging swipes. */
+  let docPages = 1;
   // Ring position on the Files page. Separate from docPage because Files is a
   // cursor window over a list, not a page-flip body — and it is reset on every
   // section change, since the list is refreshed from outside and an index from
@@ -356,11 +392,12 @@ async function main(): Promise<void> {
   let pickerIntent: 'open' | 'delete' = 'open';
   let pickerCursor = 0;
 
-  // Agents tab — master–detail. The contextual menu moves R1 control between
-  // the left agent list (focus 'master') and the right output pane ('detail'):
-  // "Select Agents" → master, picking an agent → detail. Only ONE container may
-  // be isEventCapture:1, so the ring is routed by this flag, not by the event.
-  let agentFocus: AgentFocus = 'master';
+  // Agents tab — the same three-level panel as Docs (see PanelLevel): a list,
+  // the list plus the selected agent's output, then that output alone. ONE ring
+  // tap steps in, one double tap steps back, and at level 1 a double tap has
+  // nowhere left to go so it exits. Only ONE container may be isEventCapture:1,
+  // so the ring is routed by the LEVEL, never by which container got the event.
+  let agentLevel: PanelLevel = 1;
   let agentCursor = 0;
   /**
    * A LOCAL note about the LAST trigger, for one agent only:
@@ -705,12 +742,60 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Master–detail panes for the Agents tab. Two containers, 4px gutters:
-   *   • left  x0   w200 — the agent list (event-capturing while focus='master')
-   *   • right x208 w368 — the selected agent's output (event-capturing otherwise)
-   * Exactly one container may be isEventCapture:1, so R1 input is routed by
-   * `agentFocus` rather than by which container was touched. The focused pane
-   * gets a 2px border as the documented selection highlight.
+   * One pane of a panel. `focused` gives it the 2px selection frame AND the
+   * event capture — exactly one container on a page may be isEventCapture:1, so
+   * these two facts are never allowed to drift apart.
+   *
+   * `framed` is false for the levels where the pane is the whole canvas: a frame
+   * there would only take width from the text inside it, and there is no second
+   * pane left to be told apart from.
+   */
+  function pane(
+    id: number,
+    name: string,
+    x: number,
+    width: number,
+    content: string,
+    focused: boolean,
+    framed: boolean,
+  ): TextContainerProperty {
+    return new TextContainerProperty({
+      xPosition: x,
+      yPosition: 0,
+      width,
+      height: PANEL_LAYOUT.height,
+      borderWidth: framed && focused ? 2 : 0,
+      borderColor: 5,
+      borderRadius: 0,
+      paddingLength: 4,
+      containerID: id,
+      containerName: name,
+      isEventCapture: focused ? 1 : 0,
+      content: clipBytes(content, MAX_CONTENT_BYTES),
+    });
+  }
+
+  /**
+   * Pane for one side of the level-2 split: left x0 w200, right x208 w368, a 4px
+   * gutter either side of the right pane.
+   */
+  function splitPanes(master: string, detail: string): TextContainerProperty[] {
+    return [
+      pane(1, 'master', PANEL_LAYOUT.splitMasterX, PANEL_LAYOUT.splitMasterW, master, true, true),
+      pane(2, 'detail', PANEL_LAYOUT.splitDetailX, PANEL_LAYOUT.splitDetailW, detail, false, true),
+    ];
+  }
+
+  /**
+   * The panes the Agents panel shows at `agentLevel`:
+   *   1  the agent list ALONE, full canvas
+   *   2  list + output pane side by side
+   *   3  the output ALONE, full canvas
+   *
+   * The ring is on the list at levels 1–2 and on the output at level 3, so the
+   * event-capturing pane follows the level. Levels 1 and 3 are a single
+   * container: the layout is rebuilt whenever the level changes, because a
+   * page's container count is only settable through rebuildPageContainer.
    */
   function agentContainers(): TextContainerProperty[] {
     const a = getAgents();
@@ -734,7 +819,7 @@ async function main(): Promise<void> {
         agents: list,
         sessions: a.sessions,
         cursor: agentCursor,
-        focus: agentFocus,
+        level: agentLevel,
         sessionCursor: agentSessionCursor,
         detailPage: agentDetailPage,
         // Precedence: a local note (the gap before the relay's first frame, or a
@@ -758,37 +843,50 @@ async function main(): Promise<void> {
     agentSessionCursor = view.sessionCursor;
     agentDetailPage = view.detailPage;
     agentDetailPages = view.detailPages;
-    const masterFocus = agentFocus === 'master';
-    return [
-      new TextContainerProperty({
-        xPosition: AGENT_LAYOUT.masterX,
-        yPosition: 0,
-        width: AGENT_LAYOUT.masterW,
-        height: AGENT_LAYOUT.height,
-        borderWidth: masterFocus ? 2 : 0,
-        borderColor: 5,
-        borderRadius: 0,
-        paddingLength: 4,
-        containerID: 1,
-        containerName: 'master',
-        isEventCapture: masterFocus ? 1 : 0,
-        content: clipBytes(view.master, MAX_CONTENT_BYTES),
-      }),
-      new TextContainerProperty({
-        xPosition: AGENT_LAYOUT.detailX,
-        yPosition: 0,
-        width: AGENT_LAYOUT.detailW,
-        height: AGENT_LAYOUT.height,
-        borderWidth: masterFocus ? 0 : 2,
-        borderColor: 5,
-        borderRadius: 0,
-        paddingLength: 4,
-        containerID: 2,
-        containerName: 'detail',
-        isEventCapture: masterFocus ? 0 : 1,
-        content: clipBytes(view.detail, MAX_CONTENT_BYTES),
-      }),
-    ];
+    if (agentLevel === 3) {
+      return [pane(1, 'detail', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.detail, true, false)];
+    }
+    if (agentLevel === 1) {
+      return [pane(1, 'master', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.master, true, false)];
+    }
+    return splitPanes(view.master, view.detail);
+  }
+
+  /**
+   * The panes the Docs panel shows at `docLevel` — the same three states as the
+   * Agents panel: the document list alone, list + body, then the body alone.
+   *
+   * The list cursor IS the open document (`selectDoc` commits it), so the body
+   * this pane shows is always the one the highlighted title names. An empty
+   * bookshelf has nothing to split, so it stays one pane however deep the level
+   * says we are.
+   */
+  function docContainers(): TextContainerProperty[] {
+    const view = docsPanelView(getState(), docCursor, docPage, docLevel);
+    docCursor = view.cursor;
+    docPage = view.page;
+    docPages = view.pages;
+    const list = pane(1, 'master', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.master, true, false);
+    if (!view.hasDoc || docLevel === 1) return [list];
+    if (docLevel === 3) {
+      return [pane(1, 'detail', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.detail, true, false)];
+    }
+    return splitPanes(view.master, view.detail);
+  }
+
+  /**
+   * The panes to paint for the section on screen, or null when it is an
+   * ordinary single-container page. Calling this is what clamps and stores the
+   * panel cursors, so the render path only ever gets them from here.
+   *
+   * An overlay (HUD, dictation, picker, diagnostics) owns the whole canvas, so
+   * it never goes through this — and its panes are not built, because building
+   * them would move a cursor that is not on screen.
+   */
+  function panelPanes(section: SectionId): TextContainerProperty[] | null {
+    if (section === 'agents') return agentContainers();
+    if (section === 'docs') return docContainers();
+    return null;
   }
 
   /** Contextual menu for the current state (docs/agents actions in their tabs). */
@@ -833,23 +931,36 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Identity of the dual-pane layout: geometry + which pane captures events +
-   * the rendered text. A change means the page must be rebuilt (the border that
-   * highlights the focused pane is only settable on create/rebuild).
+   * Identity of a panel layout: each pane's name, geometry, capture flag and
+   * rendered text. A change means the page must be rebuilt — the border that
+   * marks the focused pane, the pane COUNT and the container names are all only
+   * settable on create/rebuild.
    */
-  function agentSignature(containers: TextContainerProperty[]): string {
+  function panelSignature(containers: TextContainerProperty[]): string {
     return containers
       .map(
         (c) =>
-          `${c.containerID}:${c.xPosition}:${c.width}:${c.borderWidth}:${c.isEventCapture}:${c.content ?? ''}`,
+          `${c.containerID}:${c.containerName}:${c.xPosition}:${c.width}:${c.borderWidth}:${c.isEventCapture}:${c.content ?? ''}`,
       )
       .join('|');
   }
 
-  async function createPage(content: string): Promise<StartUpPageCreateResult> {
+  /** Which level the panel on screen is showing (both panels share one model). */
+  function panelLevel(): PanelLevel {
+    return getState().activeSection === 'docs' ? docLevel : agentLevel;
+  }
+
+  /**
+   * First frame only. `panes` are the panel's containers when the tab that is
+   * showing is a panel, and null for every ordinary single-container page — the
+   * caller has already built them, so this must not build them a second time.
+   */
+  async function createPage(
+    content: string,
+    panes: TextContainerProperty[] | null = null,
+  ): Promise<StartUpPageCreateResult> {
     const menu = currentSectionMenu();
-    const agents = getState().activeSection === 'agents';
-    const containers = agents ? agentContainers() : [textContainer(content)];
+    const containers = panes ?? [textContainer(content)];
     const res = await b.createStartUpPageContainer(
       new CreateStartUpPageContainer({
         containerTotalNum: containers.length,
@@ -860,8 +971,8 @@ async function main(): Promise<void> {
     );
     if (res === StartUpPageCreateResult.success) {
       appliedMenuSig = menuSignature(menu);
-      appliedLayout = agents ? 'dual' : 'single';
-      appliedAgentSig = agents ? agentSignature(containers) : '';
+      appliedLayout = panes ? (panes.length === 2 ? 'dual' : 'pane') : 'single';
+      appliedPanelSig = panes ? panelSignature(containers) : '';
     }
     return res;
   }
@@ -1176,12 +1287,18 @@ async function main(): Promise<void> {
     }
 
     // Switching to a different doc (web UI or the glasses picker) restarts its
-    // pagination at page 1.
+    // pagination at page 1 and moves the panel highlight onto it.
     if (!pickerActive) {
       const curDocId = getState().activeSection === 'docs' ? getState().activeDocId : null;
       if (curDocId !== lastActiveDocId) {
         lastActiveDocId = curDocId;
         docPage = 0;
+        // The list cursor IS the open document on this panel, so a doc opened
+        // from anywhere else (web companion, long-press picker, or dictation
+        // creating one) has to move the highlight with it — otherwise the ring's
+        // next step would re-open the document that is already on screen.
+        const idx = getState().sections.docs.findIndex((d) => d.id === curDocId);
+        if (idx >= 0) docCursor = idx;
       }
     }
 
@@ -1201,6 +1318,12 @@ async function main(): Promise<void> {
     // and a sticky diagnostic outranks everything.
     const overlayActive =
       pickerActive || dictationActive || !!dictationDiagText || foreignActive || aiActive;
+    // Docs and Agents paint their own panes. Built here, once per render, so the
+    // cursors they clamp are stored exactly once and the same containers are
+    // reused for the startup page and for every rebuild below. Null while an
+    // overlay is up: an overlay is one container, and moving a panel cursor
+    // behind it would move the ring on a screen that is not showing.
+    const panes = overlayActive ? null : panelPanes(getState().activeSection);
     const view = pickerActive
       ? docPickerView(getState().sections.docs, pickerCursor, pickerIntent)
       : dictationActive
@@ -1228,7 +1351,7 @@ async function main(): Promise<void> {
       // that actually owns it — otherwise walking the file list would drag the
       // To-Do selection along with it.
       if (getState().activeSection === 'files') filesCursor = view.todoCursor;
-      else todoCursor = view.todoCursor;
+      else if (!panes) todoCursor = view.todoCursor;
     }
     // The HUD clamps its own scroll, so its answer wins: a transcript that grew
     // a page (or a queue that drained a row) would otherwise leave the stored
@@ -1244,7 +1367,7 @@ async function main(): Promise<void> {
     });
 
     if (!started) {
-      const res = await createPage(text);
+      const res = await createPage(text, panes);
       console.log('[hub] createStartUpPageContainer ->', res);
       setStatus(
         `🖼 createStartUpPageContainer -> ${res}${res === StartUpPageCreateResult.success ? '' : ' (REJECTED — nothing will draw on glasses)'}`,
@@ -1261,29 +1384,35 @@ async function main(): Promise<void> {
 
     const menu = currentSectionMenu();
     const sig = menuSignature(menu);
-    const agentsTab = getState().activeSection === 'agents' && !overlayActive;
 
-    // Agents tab: two panes whose BORDERS encode the focused pane, so any focus
-    // or cursor change needs a rebuild. The master list and the output pane are
-    // independent containers; the menu is replaced at the same time.
-    // Skipped while an overlay is up — those render as a single container.
-    if (agentsTab) {
-      const containers = agentContainers();
-      const asig = agentSignature(containers);
-      if (appliedLayout !== 'dual' || asig !== appliedAgentSig || sig !== appliedMenuSig) {
+    // A panel tab (Docs or Agents) paints its own panes. The pane BORDERS encode
+    // which pane owns the ring, and a border — like the pane COUNT, which differs
+    // between levels 1/3 (one full-canvas container) and level 2 (two) — is only
+    // settable through rebuildPageContainer, so any level or cursor change is a
+    // rebuild. Skipped while an overlay is up: those render as one container.
+    if (panes) {
+      const psig = panelSignature(panes);
+      const want = panes.length === 2 ? 'dual' : 'pane';
+      if (appliedLayout !== want || psig !== appliedPanelSig || sig !== appliedMenuSig) {
         const ok = await b.rebuildPageContainer(
           new RebuildPageContainer({
-            containerTotalNum: 2,
-            textObject: containers,
+            containerTotalNum: panes.length,
+            textObject: panes,
             menuObject: menu,
           }),
         );
-        // The signature carries both pane contents (master | detail) — log enough
-        // of it to see what the panes actually show when debugging.
-        console.log('[hub] rebuildPageContainer (agents) ->', ok, agentFocus, asig.slice(0, 240));
+        // The signature carries every pane's content — log enough of it to see
+        // what the panes actually show, and the level, when debugging.
+        console.log(
+          '[hub] rebuildPageContainer (panel) ->',
+          ok,
+          getState().activeSection,
+          panelLevel(),
+          psig.slice(0, 240),
+        );
         if (ok) {
-          appliedLayout = 'dual';
-          appliedAgentSig = asig;
+          appliedLayout = want;
+          appliedPanelSig = psig;
           appliedMenuSig = sig;
           renderedText = text;
         }
@@ -1291,8 +1420,10 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Left the Agents tab (or a non-agents view is showing) — the page must go
-    // back to ONE container before the single-container update path can run.
+    // Left the panel tab (or a non-panel view is showing) — the page must go
+    // back to ONE container named 'main' before the single-container update path
+    // can run, both because the count differs and because that path addresses the
+    // container by name.
     if (appliedLayout !== 'single') {
       const ok = await b.rebuildPageContainer(
         new RebuildPageContainer({
@@ -1304,7 +1435,7 @@ async function main(): Promise<void> {
       console.log('[hub] rebuildPageContainer (single) ->', ok);
       if (ok) {
         appliedLayout = 'single';
-        appliedAgentSig = '';
+        appliedPanelSig = '';
         appliedMenuSig = sig;
         renderedText = text;
       }
@@ -1383,7 +1514,7 @@ async function main(): Promise<void> {
     if (isAgentRunning(agent.id)) return;
     if (!agent.prompt.trim()) {
       agentNotice = { agentId: agent.id, error: 'no saved prompt' };
-      agentFocus = 'detail';
+      agentLevel = 3;
       void renderGlasses();
       return;
     }
@@ -1391,7 +1522,9 @@ async function main(): Promise<void> {
     const tools = st.tools.filter((t) => agent.toolIds.includes(t.id));
     // Optimistic: the relay's first run frame replaces this within a round trip.
     agentNotice = { agentId: agent.id, status: 'Thinking…' };
-    agentFocus = 'detail';
+    // Go straight to level 3: the wearer asked for a run, and the run's output is
+    // what they asked to see. The list is one double-tap back.
+    agentLevel = 3;
     agentSessionCursor = 0;
     agentDetailPage = 0;
     void renderGlasses();
@@ -1484,15 +1617,25 @@ async function main(): Promise<void> {
     todoCursor = 0;
     docPage = 0;
     lastView = null;
-    // Agents pane navigation is per-visit; reset so each entry starts clean.
-    // Only NAVIGATION lives here: a run in flight is not this page's to reset,
-    // and clearing it (as the old global status flags did) is how a live run
-    // lost its status line the moment the wearer switched tabs and back.
-    agentFocus = 'master';
+    // Panel navigation is per-visit; reset so each entry starts at the list, the
+    // outermost level, with a clean cursor. That matters for Docs specifically:
+    // the wearer arrives from another tab expecting to CHOOSE a document, and the
+    // list is the only screen that can do it. Only NAVIGATION is reset here — a
+    // run in flight is not this page's to drop, and clearing it (as the old
+    // global status flags did) is how a live run lost its status line the moment
+    // the wearer switched tabs and back.
+    agentLevel = 1;
     agentCursor = 0;
     agentSessionCursor = 0;
     agentDetailPage = 0;
     agentNotice = null;
+    docLevel = 1;
+    // Highlight the document that is actually open, so entering Docs does not
+    // silently re-target the next open at whatever happens to be first.
+    docCursor = Math.max(
+      0,
+      getState().sections.docs.findIndex((d) => d.id === getState().activeDocId),
+    );
     selectSection(next);
   }
 
@@ -1612,9 +1755,10 @@ async function main(): Promise<void> {
       }
       return;
     }
-    // Agents — master cursor moves the selection; detail browses stored sessions.
+    // Agents — the ring walks the list at levels 1–2 and pages the output at 3,
+    // which is exactly where each one is drawn.
     if (getState().activeSection === 'agents') {
-      if (agentFocus === 'master') {
+      if (agentLevel !== 3) {
         const n = getAgents().agents.length;
         if (!n) return;
         // Wrap around: ▲ at the top cycles to the bottom and ▼ at the bottom
@@ -1668,7 +1812,37 @@ async function main(): Promise<void> {
       }
       return;
     }
-    // docs / notes — flip pages.
+    // Docs — the ring walks the document list at levels 1–2 and pages the open
+    // body at 3, the same split as Agents.
+    if (getState().activeSection === 'docs') {
+      if (docLevel !== 3) {
+        const docs = getState().sections.docs;
+        if (!docs.length) return;
+        const next = Math.min(docs.length - 1, Math.max(0, docCursor + dir));
+        if (next === docCursor) return;
+        docCursor = next;
+        docPage = 0;
+        // Moving the ring OPENS the highlighted document. The level-2 preview and
+        // the level-3 body must describe the document the ring is on, and this is
+        // the same `activeDocId` the web companion follows, so the two surfaces
+        // never disagree about which document is open.
+        selectDoc(docs[next].id);
+        void renderGlasses();
+        return;
+      }
+      // Level 3 is the body alone: the swipe pages it. `docPages` is the paging
+      // state the panel itself produced, so the bound is the pane's, not a guess
+      // derived from a differently-paged view.
+      if (dir === -1 && docPage > 0) {
+        docPage -= 1;
+        void renderGlasses();
+      } else if (dir === 1 && docPage < docPages - 1) {
+        docPage += 1;
+        void renderGlasses();
+      }
+      return;
+    }
+    // notes — flip pages.
     if (!lastView) return;
     if (dir === -1 && lastView.canPrev) {
       docPage = Math.max(0, docPage - 1);
@@ -1757,12 +1931,30 @@ async function main(): Promise<void> {
       onPickerTap();
       return;
     }
-    // Agents: tapping the master list moves control to the detail pane.
+    // Agents: a tap steps IN one level — list → list + output → output alone.
     if (getState().activeSection === 'agents') {
-      if (agentFocus === 'master' && agentSelected()) {
-        agentFocus = 'detail';
-        agentSessionCursor = 0;
-        agentDetailPage = 0;
+      if (agentLevel < 3 && agentSelected()) {
+        // Entering the output pane starts at its newest page and newest session,
+        // the same as opening it from the menu.
+        if (agentLevel === 1) {
+          agentSessionCursor = 0;
+          agentDetailPage = 0;
+        }
+        agentLevel = (agentLevel + 1) as PanelLevel;
+        void renderGlasses();
+      }
+      return;
+    }
+    // Docs: the same step, and the level-2 step OPENS the highlighted document so
+    // the preview and the body cannot describe two different documents.
+    if (getState().activeSection === 'docs') {
+      if (docLevel < 3 && getState().sections.docs.length) {
+        if (docLevel === 1) {
+          docPage = 0;
+          const doc = getState().sections.docs[docCursor];
+          if (doc) selectDoc(doc.id);
+        }
+        docLevel = (docLevel + 1) as PanelLevel;
         void renderGlasses();
       }
       return;
@@ -1777,6 +1969,9 @@ async function main(): Promise<void> {
   // Any state change (UI edit, remote frame, or a ring tap) re-renders and
   // mirrors the docs library into durable storage (debounced).
   subscribe(() => {
+    // The first hub snapshot names its own section; override it ONCE so the app
+    // opens on Agents (see bootRedirect).
+    if (hubReady()) bootRedirect();
     void renderGlasses();
     if (saveDocsTimer !== null) window.clearTimeout(saveDocsTimer);
     saveDocsTimer = window.setTimeout(() => {
@@ -1952,12 +2147,16 @@ async function main(): Promise<void> {
         dismissAi();
         return;
       }
-      // Double-tap is a BACK gesture first: while the Agents detail pane holds
-      // the ring, return to the master list so the agent selection is
-      // reachable again. Only when there is nowhere to go back to (master pane,
-      // or any non-agents tab) does it shut the page down.
-      if (getState().activeSection === 'agents' && agentFocus === 'detail') {
-        agentFocus = 'master';
+      // Double-tap is a BACK gesture first: it pops the panel one level — body
+      // (3) → list + body (2) → list alone (1). Only at the root, where there is
+      // nowhere left to go back to, does it shut the page down.
+      if (getState().activeSection === 'agents' && agentLevel > 1) {
+        agentLevel = (agentLevel - 1) as PanelLevel;
+        void renderGlasses();
+        return;
+      }
+      if (getState().activeSection === 'docs' && docLevel > 1) {
+        docLevel = (docLevel - 1) as PanelLevel;
         void renderGlasses();
         return;
       }
@@ -2002,6 +2201,10 @@ async function main(): Promise<void> {
     pickerCursor = 0;
     todoCursor = 0;
     docPage = 0;
+    // The Docs panel starts at its list again — a re-credentialed device should
+    // not land mid-document in a panel it did not choose.
+    docLevel = 1;
+    docCursor = 0;
     lastView = null;
     void renderGlasses();
   });

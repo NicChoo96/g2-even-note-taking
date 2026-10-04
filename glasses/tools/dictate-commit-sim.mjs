@@ -350,11 +350,20 @@ console.log('\n── 6. consumers commit from idle only (source) ──');
 console.log('\n── 7. the overlay actually reaches the screen (source) ──');
 {
   const main = readFileSync('src/main.ts', 'utf8');
-  // The Agents tab has its own dual-pane renderer that RETURNS early. Without
-  // this guard the dictation overlay was computed but never drawn there.
+  // The panel tabs (Agents AND Docs) paint their own panes and RETURN early, so
+  // the panes must be dropped — not merely ignored — while an overlay is up,
+  // otherwise the dictation overlay was computed but never drawn there.
   assert(
-    'Agents dual-pane branch is skipped while an overlay is up',
-    /activeSection === 'agents' && !overlayActive/.test(main),
+    'the panel tabs render as ONE container while an overlay is up',
+    /const panes = overlayActive \? null : panelPanes\(getState\(\)\.activeSection\);/.test(main),
+  );
+  assert(
+    'the panel branch is gated on `panes`, so an overlay never reaches it',
+    /if \(panes\) \{[\s\S]{0,400}?rebuildPageContainer\(/.test(main),
+  );
+  assert(
+    'the single-container fallback clears the panel signature',
+    /appliedPanelSig = ''/.test(main),
   );
   assert(
     'overlayActive covers picker + dictation + diagnostics + foreign mirror + AI',

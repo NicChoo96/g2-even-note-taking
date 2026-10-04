@@ -429,10 +429,10 @@ function paginateLines(rawLines: readonly string[], budget: PageBudget): string[
   return pages.length ? pages : [''];
 }
 
-/** Split long text into pages that each fit the screen (line- and byte-aware). */
-function pageText(text: string): string[] {
+/** Split long text into pages that each fit a pane of `width` (line- and byte-aware). */
+function pageText(text: string, width: number = INNER_W): string[] {
   return paginateLines(text.split('\n'), {
-    width: INNER_W,
+    width,
     lines: PAGE_BODY_LINES,
     bytes: PAGE_BYTES,
   });
@@ -550,20 +550,55 @@ function todoView(items: TodoItem[], cursor: number): SectionView {
   };
 }
 
-function bodyView(title: string, raw: string, page: number): SectionView {
+/**
+ * A body page plus the pagination state that produced it.
+ *
+ * `SectionView` only exposes canPrev/canNext, which is enough to turn a page but
+ * not enough to clamp a cursor or to tell a panel how many pages it is holding.
+ * The panels need the numbers, so the numbers are what this returns.
+ */
+interface BodyRender {
+  text: string;
+  page: number;
+  pages: number;
+}
+
+/**
+ * Page a body of text at the width it will actually be DRAWN at.
+ *
+ * One document renders in three places — the 360px level-2 detail pane, the
+ * 568px level-3 canvas, and the plain note/todo views — and each wraps
+ * differently. Paging at the wrong width is how a 47-column line ends up inside
+ * a 200px pane and eats two of the ten rendered lines the canvas holds.
+ */
+function bodyPage(title: string, raw: string, page: number, width: number): BodyRender {
   // `stripUnsupported` drops emoji the firmware font cannot draw; they would
   // otherwise show as tofu boxes and still consume the byte budget.
   const body = stripUnsupported(raw || '').trim() || '(empty)';
-  const pages = pageText(body);
+  const pages = pageText(body, width);
   const idx = Math.min(pages.length - 1, Math.max(0, page));
   const head = truncate(title, 24);
   // Compact 1-line header (no divider/footer) so the measured body page fits.
   const header = pages.length > 1 ? `${head} ${idx + 1}/${pages.length}` : head;
   return {
     text: clipBytes(`${header}\n${pages[idx]}`, MAX_CONTENT_BYTES),
+    page: idx,
+    pages: pages.length,
+  };
+}
+
+function bodyView(
+  title: string,
+  raw: string,
+  page: number,
+  width: number = INNER_W,
+): SectionView {
+  const r = bodyPage(title, raw, page, width);
+  return {
+    text: r.text,
     todoCursor: 0,
-    canPrev: idx > 0,
-    canNext: idx < pages.length - 1,
+    canPrev: r.page > 0,
+    canNext: r.page < r.pages - 1,
   };
 }
 
@@ -668,7 +703,15 @@ function filesView(refs: FileRef[], cursor: number): SectionView {
   };
 }
 
-/** Render the active section (todo cursor window, active-doc page, or notes). */
+/**
+ * Render the active section into ONE glasses container.
+ *
+ * The Docs and Agents tabs are three-level panels and paint through their own
+ * pane builders (`docsPanelView`, `agentsMasterDetailView`) when they are on
+ * screen. This is the single-container path everything else takes, and for docs
+ * it produces that panel's level-3 state — the body of the open document — which
+ * is what the Docs tab has always shown.
+ */
 export function sectionView(
   state: HubState,
   todoCursor: number,
@@ -1152,24 +1195,52 @@ export function docPickerView(
   };
 }
 
-// ── Agents: master–detail ────────────────────────────────────────────────────
-// Two text containers on the 576×288 canvas: a narrow master list on the left
-// and the detail/output pane on the right. Exactly ONE container may be
-// isEventCapture:1, so the R1 ring is routed by an app-level focus flag rather
-// than by which container received the event (see main.ts).
-export type AgentFocus = 'master' | 'detail';
+// ── Panels: master → detail → full screen ───────────────────────────────────
+// The Docs and Agents tabs are the same widget — a list of things on the left,
+// the selected thing on the right — and both grow and shrink the same way:
+//
+//   level 1   the list alone, filling the 576×288 canvas
+//   level 2   list + detail side by side (how both tabs shipped)
+//   level 3   the detail alone, filling the canvas
+//
+// ONE RING TAP ADVANCES A LEVEL, ONE DOUBLE TAP STEPS BACK. That is the whole
+// gesture grammar, and it is why the level is the only focus state there is:
+// the ring is on the list at levels 1–2 and on the detail at level 3, so the
+// pane that captures events is DERIVED from the level rather than tracked next
+// to it (two states that can disagree are two states that will). A double tap at
+// level 1 has nowhere left to go, so it shuts the page down — the same gesture
+// that exits the app from a plain tab.
+//
+// Levels 1 and 3 are ONE full-canvas container; level 2 is the pair. Exactly one
+// container on a page may carry isEventCapture:1, so the R1 ring is routed by
+// this level rather than by which container was touched.
+//
+// The pane border is the only focus cue the firmware gives us, and at levels 1
+// and 3 the pane IS the screen, so those draw unframed: a 2px frame around the
+// whole canvas would only steal width from the text it contains.
+export type PanelLevel = 1 | 2 | 3;
 
-/** Panel geometry — the master list is narrow, the output pane takes the rest. */
-export const AGENT_LAYOUT = {
-  masterX: 0,
-  masterW: 200,
-  detailX: 208,
-  detailW: 368,
+/** Panel geometry: the full-canvas rectangle, and the level-2 split of it. */
+export const PANEL_LAYOUT = {
+  /** Levels 1 and 3 — the pane that is the whole screen. */
+  fullX: 0,
+  fullW: 576,
+  /** Left pane of the level-2 split. */
+  splitMasterX: 0,
+  splitMasterW: 200,
+  /** Right pane of the level-2 split — a 4px gutter sits either side of it. */
+  splitDetailX: 208,
+  splitDetailW: 368,
   height: 288,
 } as const;
 
-const AGENT_ITEM_TEXT = 15; // chars per master row (200px panel)
-const AGENT_ROWS = 7; // visible master rows
+// List row budgets, measured per pane width so a row never wraps (a wrapped row
+// costs two of the ten lines the canvas holds AND makes the cursor window lie
+// about how many things are on screen).
+const ROW_TEXT_SPLIT = 15; // chars per row in the 200px pane
+const ROW_TEXT_FULL = 38; // chars per row in the 576px pane (see TODO_ITEM_TEXT)
+const ROW_COUNT_SPLIT = 7; // rows in the cursor window, 200px pane
+const ROW_COUNT_FULL = 8; // rows in the cursor window, 576px pane
 
 export interface AgentsView {
   /** Left panel: the agent list. */
@@ -1207,7 +1278,8 @@ export interface AgentsViewInput {
   agents: AgentDef[];
   sessions: AgentSession[];
   cursor: number;
-  focus: AgentFocus;
+  /** Which of the three panel states to render (see PanelLevel). */
+  level: PanelLevel;
   /** Index of the session shown in the detail pane (0 = newest). */
   sessionCursor?: number;
   /** Page of that session's transcript (0 = newest). */
@@ -1225,8 +1297,14 @@ export interface AgentsViewInput {
   runningAgentIds?: readonly string[];
 }
 
-/** Inner width of the 368px detail panel (paddingLength 4 each side). */
+/** Inner width of the level-2 detail pane (368px container, paddingLength 4). */
 const DETAIL_W = 360;
+/**
+ * Inner width of the level-3 detail pane — the whole canvas. Text re-wraps to
+ * this, so a transcript page holds FEWER lines than at level 2 but each line
+ * holds more words; the ten rendered lines the canvas allows do not change.
+ */
+const DETAIL_W_FULL = INNER_W;
 /** Body lines a live (streaming) run shows under the 3-line header. */
 const DETAIL_LINES = 7;
 
@@ -1288,13 +1366,16 @@ function stripUnsupported(s: string): string {
  * model or a search result embedded: the firmware font has no glyph for them,
  * so they would draw as tofu boxes and waste the byte budget.
  */
-function transcriptLines(messages: readonly { role: string; content: string; tool?: string }[]) {
+function transcriptLines(
+  messages: readonly { role: string; content: string; tool?: string }[],
+  width: number = DETAIL_W,
+) {
   const out: string[] = [];
   for (const m of [...messages].reverse()) {
     const label = m.role === 'user' ? 'You: ' : m.role === 'tool' ? `[${m.tool ?? 'tool'}] ` : '';
     const text = stripUnsupported(`${label}${m.content}`).replace(/\s+/g, ' ').trim();
     if (!text) continue;
-    out.push(...wrapToWidth(text, DETAIL_W));
+    out.push(...wrapToWidth(text, width));
   }
   return out;
 }
@@ -1304,32 +1385,41 @@ function transcriptLines(messages: readonly { role: string; content: string; too
  *   ▶  the highlighted agent,   ●  a backgrounded run,   (blank) idle.
  * The cursor glyph wins the gutter, so a highlighted agent's own run is not
  * double-marked: the right pane is already showing that run live.
+ *
+ * Only drawn at levels 1 and 2, and the row budget follows the width the caller
+ * will give this pane: 48 columns at level 1 would wrap to two rendered lines in
+ * the 200px pane at level 2 and blow the ten-line canvas budget.
  */
 function agentListView(
   agents: AgentDef[],
   cursor: number,
-  focus: AgentFocus,
+  level: PanelLevel,
   running: ReadonlySet<string>,
 ): string {
-  const head = `Agents ${agents.length}${focus === 'master' ? ' ◀' : ''}`;
+  const head = `Agents ${agents.length}${level === 2 ? ' ◀' : ''}`;
   if (agents.length === 0) {
     return clipBytes(
       `${head}\n------------------\n(no agents yet — build one\nin the web app)`,
       MAX_CONTENT_BYTES,
     );
   }
+  const cols = level === 1 ? ROW_TEXT_FULL : ROW_TEXT_SPLIT;
+  const rows = level === 1 ? ROW_COUNT_FULL : ROW_COUNT_SPLIT;
   const clamped = Math.min(agents.length - 1, Math.max(0, cursor));
-  const half = Math.floor(AGENT_ROWS / 2);
+  const half = Math.floor(rows / 2);
   let start = Math.max(0, clamped - half);
-  const end = Math.min(agents.length, start + AGENT_ROWS);
-  start = Math.max(0, end - AGENT_ROWS);
+  const end = Math.min(agents.length, start + rows);
+  start = Math.max(0, end - rows);
 
   const lines: string[] = [head];
   for (let i = start; i < end; i++) {
     const sel = i === clamped ? '▶' : running.has(agents[i].id) ? '●' : ' ';
-    lines.push(`${sel}${i + 1}.${truncate(agents[i].name || '(unnamed)', AGENT_ITEM_TEXT)}`);
+    lines.push(`${sel}${i + 1}.${truncate(agents[i].name || '(unnamed)', cols)}`);
   }
-  lines.push(focus === 'master' ? '▲▼ move · tap open' : 'double-tap = back');
+  // The footer is a hint for the CURRENT level, and it has to fit the pane this
+  // list is in — the 200px one holds about 19 characters, so it gets the short
+  // wording whether or not the wide one could afford more.
+  lines.push(level === 1 ? '▲▼ move · tap open' : '▲▼ move · tap full');
   return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
 }
 
@@ -1351,7 +1441,10 @@ const DETAIL_COMPACT_BODY_LINES = DETAIL_MAX_LINES - 2;
 /** Body byte budget per page (999 OS cap − header, name and tools line). */
 const DETAIL_PAGE_BYTES = 820;
 
-/** Right panel: the selected agent's setup + live run output or chosen session. */
+/**
+ * Right panel: the selected agent's setup + live run output or chosen session.
+ * At level 3 this is the whole screen, so it re-wraps to the full canvas width.
+ */
 function agentDetailView(
   agent: AgentDef | null,
   sessions: AgentSession[],
@@ -1359,7 +1452,8 @@ function agentDetailView(
   sessionCursor: number,
   detailPage: number,
   status: string,
-  run?: LiveRun | null,
+  run: LiveRun | null | undefined,
+  level: PanelLevel,
 ): DetailRender {
   if (!agent) {
     return {
@@ -1375,6 +1469,7 @@ function agentDetailView(
   const idx = mine.length ? Math.min(mine.length - 1, Math.max(0, sessionCursor)) : 0;
   const latest = mine[idx] ?? null;
   const tools = toolNames.length ? toolNames.join(', ') : 'none';
+  const width = level === 3 ? DETAIL_W_FULL : DETAIL_W;
   const head = [
     truncate(agent.name || '(unnamed)', 26),
     `tools: ${truncate(tools, 30)}`,
@@ -1406,16 +1501,16 @@ function agentDetailView(
   // A live run owns the pane while it is in flight — newest turn on page 0.
   if (run && run.status === 'running') {
     return render(
-      [run.statusText || status || 'Thinking…', ...transcriptLines(run.messages)],
+      [run.statusText || status || 'Thinking…', ...transcriptLines(run.messages, width)],
       '',
-      { width: DETAIL_W, lines: DETAIL_LINES, bytes: 860 },
+      { width, lines: DETAIL_LINES, bytes: 860 },
     );
   }
   if (run && run.status === 'error' && !latest) {
     return render(
-      [`! ${truncate(run.error ?? 'run failed', 40)}`, ...transcriptLines(run.messages)],
+      [`! ${truncate(run.error ?? 'run failed', 40)}`, ...transcriptLines(run.messages, width)],
       '',
-      { width: DETAIL_W, lines: DETAIL_LINES, bytes: 860 },
+      { width, lines: DETAIL_LINES, bytes: 860 },
     );
   }
 
@@ -1439,10 +1534,10 @@ function agentDetailView(
     40,
   );
   return render(
-    transcriptLines(latest.messages),
+    transcriptLines(latest.messages, width),
     footer,
     {
-      width: DETAIL_W,
+      width,
       lines: footer ? DETAIL_BODY_LINES : DETAIL_COMPACT_BODY_LINES,
       bytes: DETAIL_PAGE_BYTES,
     },
@@ -1450,9 +1545,11 @@ function agentDetailView(
 }
 
 /**
- * Render the Agents master–detail panes. The contextual menu is how the user
- * moves control between them: "Select Agents" puts the ring on the master list,
- * picking an agent moves it to the detail pane.
+ * Render the Agents panel at `level`.
+ *
+ * The contextual menu and the ring both drive the level: "Select Agents" returns
+ * to the list (level 1), a tap steps in, a double tap steps back. The pane that
+ * captures events is DERIVED from the level, never stored beside it.
  *
  * `nameOf` resolves a tool id to its display name — injected so this module
  * stays free of store imports.
@@ -1461,7 +1558,7 @@ export function agentsMasterDetailView(
   input: AgentsViewInput,
   nameOf: (id: string) => string = (id) => id,
 ): AgentsView {
-  const { sessions, focus } = input;
+  const { sessions, level } = input;
   // The list is ALWAYS shown newest-updated-first. The master cursor indexes
   // THIS order, so main.ts selects from the same ordered list (see
   // agentSelected / agentContainers).
@@ -1487,9 +1584,10 @@ export function agentsMasterDetailView(
     input.detailPage ?? 0,
     input.status ?? '',
     liveRun,
+    level,
   );
   return {
-    master: agentListView(agents, clamped, focus, running),
+    master: agentListView(agents, clamped, level, running),
     detail: detail.text,
     cursor: clamped,
     sessionCursor,
@@ -1504,4 +1602,103 @@ export function agentsMasterDetailView(
 export function agentsStatusLine(running: boolean, error?: string): string {
   if (error) return `! ${truncate(error, 30)}`;
   return running ? 'Thinking…' : '';
+}
+
+// ── Docs: the same panel, three levels ──────────────────────────────────────
+/**
+ * The Docs panel renders the document list on the left and the highlighted
+ * document's body on the right, at the same three levels as the Agents panel
+ * (see PanelLevel). Level 1 lists titles, level 2 puts the body beside them, and
+ * level 3 fills the canvas with the body.
+ *
+ * The list is in STORE order — the same order the long-press document picker
+ * shows. A second list of the same documents in a different order is exactly how
+ * a wearer becomes convinced the app has lost one.
+ */
+export interface DocsView {
+  /** Levels 1 and 2: the numbered document list. */
+  master: string;
+  /** Levels 2 and 3: the highlighted document's body page. */
+  detail: string;
+  /** Clamped index into the document list; the caller stores it back. */
+  cursor: number;
+  /** Clamped page of the highlighted document's body. */
+  page: number;
+  /** Pages the highlighted document has at the width `detail` was drawn at. */
+  pages: number;
+  canPrev: boolean;
+  canNext: boolean;
+  /** False when there are no documents at all. */
+  hasDoc: boolean;
+}
+
+/** Inner width of the level-2 detail pane (368px container, paddingLength 4). */
+const DOC_DETAIL_W = 360;
+
+function docListView(docs: readonly DocEntry[], cursor: number, level: PanelLevel): string {
+  const head = `Docs ${docs.length}${level === 2 ? ' ◀' : ''}`;
+  if (docs.length === 0) {
+    return clipBytes(
+      `${head}\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)`,
+      MAX_CONTENT_BYTES,
+    );
+  }
+  // Row budget follows the width this pane is drawn at, never the other level's.
+  const cols = level === 1 ? ROW_TEXT_FULL : ROW_TEXT_SPLIT;
+  const rows = level === 1 ? ROW_COUNT_FULL : ROW_COUNT_SPLIT;
+  const clamped = Math.min(docs.length - 1, Math.max(0, cursor));
+  const half = Math.floor(rows / 2);
+  let start = Math.max(0, clamped - half);
+  const end = Math.min(docs.length, start + rows);
+  start = Math.max(0, end - rows);
+
+  const lines: string[] = [head];
+  for (let i = start; i < end; i++) {
+    const sel = i === clamped ? '▶' : ' ';
+    lines.push(`${sel}${i + 1}.${truncate(docs[i].title || '(untitled)', cols)}`);
+  }
+  lines.push(level === 1 ? '▲▼ move · tap open' : '▲▼ move · tap full');
+  return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
+}
+
+/**
+ * Render the Docs panel at `level`. The list cursor and the body page are the
+ * caller's to keep — both come back clamped so a shrinking document list can
+ * never strand the ring on an empty pane.
+ */
+export function docsPanelView(
+  state: HubState,
+  cursor: number,
+  page: number,
+  level: PanelLevel,
+): DocsView {
+  const docs = state.sections.docs;
+  const master = docListView(docs, cursor, level);
+  const width = level === 3 ? INNER_W : DOC_DETAIL_W;
+  if (docs.length === 0) {
+    const empty = bodyPage('Docs', '', page, width);
+    return {
+      master,
+      detail: empty.text,
+      cursor: 0,
+      page: 0,
+      pages: 1,
+      canPrev: false,
+      canNext: false,
+      hasDoc: false,
+    };
+  }
+  const clamped = Math.min(docs.length - 1, Math.max(0, cursor));
+  const doc = docs[clamped];
+  const body = bodyPage(doc.title, doc.content, page, width);
+  return {
+    master,
+    detail: body.text,
+    cursor: clamped,
+    page: body.page,
+    pages: body.pages,
+    canPrev: body.page > 0,
+    canNext: body.page < body.pages - 1,
+    hasDoc: true,
+  };
 }
