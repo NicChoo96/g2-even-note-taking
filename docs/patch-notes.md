@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.45
+
+v0.3.45 - Agents and Docs open full screen
+
+- Both tabs now step through three views with the ring: the list, then the
+ list with its detail beside it, then that detail filling the page.
+- One tap moves to the next view, a double tap steps back one, and at the
+ list a double tap closes the page as before.
+- The Agent tab is now the page the glasses open on.
+
 ## 0.3.44
 
 v0.3.44 - Jarvis's to-do and doc edits really save now
