@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.49
+
+v0.3.49 - One flat menu, the same on every page
+
+- All five pages are now on every menu, so moving tabs is the same gesture wherever you are - the Back row is gone.
+- A page's own action sits on top: Delete Docs on Docs, Trigger or Stop on Agents.
+- New docs is gone: make a document in the web app or ask Jarvis, and swiping the list opens one.
+- Delete Docs starts on the document you are reading, not the first one.
+
 ## 0.3.48
 
 v0.3.48 - Agents and Docs open with the list and its detail side by side

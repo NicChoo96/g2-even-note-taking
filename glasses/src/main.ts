@@ -1339,7 +1339,9 @@ async function main(): Promise<void> {
     }
 
     // Remember the last non-Docs tab we actually showed, whichever path put us
-    // here (menu switcher, web UI tab, new doc, picker) — "Back" restores it.
+    // here (menu switcher, web UI tab, new doc, picker) — so that leaving Docs
+    // knows where to return to. The menu has no "Back" row any more (0.3.49),
+    // but Jarvis still means "go back" by voice (`goBack`, the app bridge).
     if (getState().activeSection !== 'docs') lastNonDocsSection = getState().activeSection;
 
     // In-app doc picker, the R1-ring dictation overlay, a sticky diagnostics
@@ -1515,9 +1517,16 @@ async function main(): Promise<void> {
   }
 
   function enterPicker(intent: 'open' | 'delete'): void {
-    if (getState().sections.docs.length === 0) return;
+    const docs = getState().sections.docs;
+    if (docs.length === 0) return;
     pickerIntent = intent;
-    pickerCursor = 0;
+    // Start the picker on the document that is ON SCREEN, not on the first one.
+    // `docCursor` is the list cursor and the list cursor IS the open document on
+    // this panel (see the activeDocId sync in renderGlasses), so seeding 0 here
+    // made the picker disagree with the detail pane the wearer had just been
+    // reading — swipe to doc #4, long-press Delete Docs, tap, and doc #1 was the
+    // one removed.
+    pickerCursor = Math.min(docs.length - 1, Math.max(0, docCursor));
     pickerActive = true;
     void renderGlasses();
   }
@@ -1681,7 +1690,13 @@ async function main(): Promise<void> {
     selectSection(next);
   }
 
-  /** Menu → "Back": Docs returns to the previous tab, Agents to the first tab. */
+  /**
+   * Jarvis' "go back" (exposed as `goBack` on the app bridge), and still the
+   * handler for the retired MENU.BACK id so a page whose menu was built by an
+   * older bundle maps its old Back row here instead of to nothing. There is no
+   * Back row any more (0.3.49): every tab carries the switchers. Docs returns to
+   * the previous tab, Agents to To-Do — the same place the Back row used to go.
+   */
   function goBack(): void {
     const cur = getState().activeSection;
     if (cur === 'agents') switchSection('todo');
@@ -1708,8 +1723,20 @@ async function main(): Promise<void> {
     const target: DocEntry = ds[Math.min(ds.length - 1, Math.max(0, pickerCursor))];
     if (pickerIntent === 'delete') {
       removeDoc(target.id);
+      // Removing the LAST document would leave the picker as a dead screen: its
+      // list is empty, so the ring and a tap both return early, and `Delete Docs`
+      // has already gone from the menu — leaving a switcher (i.e. the next tab)
+      // as the only way off it. Close it instead and let the empty library say
+      // why it is empty.
+      const left = getState().sections.docs;
+      if (left.length === 0) {
+        pickerActive = false;
+        pickerCursor = 0;
+        void renderGlasses();
+        return;
+      }
       // Stay in the picker so more docs can be removed; cursor clamps on render.
-      pickerCursor = Math.min(pickerCursor, Math.max(0, ds.length - 2));
+      pickerCursor = Math.min(pickerCursor, left.length - 1);
       return;
     }
     // Open the highlighted doc.
@@ -2168,6 +2195,12 @@ async function main(): Promise<void> {
         flashAi(label ? `Undid: ${label}` : 'Nothing to undo');
         return;
       }
+      // ── Retired menu ids ──────────────────────────────────────────────────
+      // `sectionMenu` no longer emits these (0.3.49): creating a document belongs
+      // to the web app and to Jarvis, and the always-present switchers replaced
+      // Back. They are still handled so that a page whose menu was built by an
+      // older bundle — the OS never re-renders a label, so a stale menu is a real
+      // possibility — maps the old row to the same action instead of to nothing.
       if (itemID === MENU.DOC_NEW) {
         pickerActive = false;
         newDoc();

@@ -30,13 +30,20 @@ Simulator facts this harness is built around
 * The console endpoint lags the render loop by ~1s, so every assertion drains the
   console with a single `snapshot()` call after settling.
 
-Menu layouts (sections.ts sectionMenu) -- the ROW INDEX is the ring `down` count
-  * Plain tab  : Jarvis(30) [Undo AI] To-Do(1) Docs(2) Notes(3) Agents(4) Dictate(20)
-  * Agents tab : Jarvis(30) [Undo AI] Back(21) [Trigger(34)|Stop(35)] Dictate(20)
-  * Docs tab   : Jarvis(30) [Undo AI] Back(21) New Docs(10) [Select/Delete] Dictate(20)
+Menu layouts (sections.ts sectionMenu) -- the ROW INDEX is the ring `down` count.
+The menu is FLAT since 0.3.49: no `Back` row, the five section switchers on EVERY
+tab, and the tab's own action (if it has one) ABOVE them:
+
+  Jarvis(30) [Undo AI] [own action] Agents(4) To-Do(1) Docs(2) Notes(3) Files(5) Dictate(20)
+
+  * Plain tab  : no own action, so the switchers start at row 1
+  * Agents tab : own action is Trigger(34), or Stop(35) while a run is in flight
+  * Docs tab   : own action is Delete Docs(12), and only when a document exists
+
 `Undo AI` appears only when there is something to revert, so read the delivered id
-back out of `[hub] menu item N` instead of trusting a fixed row index. The section
-switchers are HIDDEN on the Agents/Docs tabs, so Back is the only way off them.
+back out of `[hub] menu item N` instead of trusting a fixed row index -- the row
+numbers below assume no Undo AI. The switchers are absent ONLY inside a
+conversation, where the menu is `Stop AI [Undo AI] Dictate`.
 
 The app BOOTS onto the Agents page (main.ts `bootRedirect`), whatever section the
 hub snapshot happens to carry, so every run starts there.
@@ -288,16 +295,18 @@ time.sleep(0.8)
 msgs, restored = snapshot()
 check("menu closes and the page restores", abs(restored - base) < base * 0.15, f"{dimmed} -> {restored} (base {base})")
 
-# ── 3. Back leaves the panel; `down`/`up` then arrive as scroll events ──────
-# The section switchers are HIDDEN on the Agents/Docs tabs, so Back is the only
-# way off the panel. The cursor checks need a plain tab: the render log's
-# `cursor` reports the To-Do cursor, which the panel does not own.
-ids, msgs = pick(1)
-check("agents menu row 1 delivered Back (21)", bool(ids) and ids[-1] == 21, str(ids))
+# ── 3. A switcher leaves the panel; `down`/`up` then arrive as scroll events ─
+# This is the flattened menu's core promise: the way off the Agents tab is one of
+# the switchers, not a Back row, and To-Do is row 3 (0 Jarvis, 1 Trigger, 2 the
+# own-tab Agents row, 3 To-Do -- see the layout above). The cursor checks need a
+# plain tab: the render log's `cursor` reports the To-Do cursor, which the panel
+# does not own.
+ids, msgs = pick(3)
+check("agents menu row 3 delivered the To-Do switcher (1)", bool(ids) and ids[-1] == 1, str(ids))
 r = renders(msgs)
 check(
-    "Back leaves the panel for a plain tab",
-    any(x.get("section") in ("todo", "docs", "notes") for x in r),
+    "a switcher leaves the panel for a plain tab",
+    any(x.get("section") == "todo" for x in r),
     json.dumps(r[-1]) if r else "",
 )
 msgs, plain = snapshot()
@@ -314,15 +323,16 @@ msgs, _ = snapshot()
 r = renders(msgs)
 check("up moves the cursor back", any(x.get("cursor") == 0 for x in r), json.dumps(r[-1]) if r else "")
 
-# ── 4. Switcher -> Agents section (menu item 4) ─────────────────────────────
-ids, msgs = pick(4)
+# ── 4. Switcher -> Agents section ──────────────────────────────────────────
+# On a plain tab Agents is the FIRST switcher, so it is row 1: row 0 is Jarvis.
+ids, msgs = pick(1)
 check("switcher delivered Agents (4)", 4 in ids, str(ids))
 r = renders(msgs)
 check("menu switched to the agents section", any(x.get("section") == "agents" for x in r), json.dumps(r[-1]) if r else "")
 
 # ── 5. The panel draws L1 (list AND detail, the list lit) with the seeded data ─
 # The rebuild fires as part of the section switch, so it is already in the
-# messages drained by pick(4) -- keep them and top up.
+# messages drained by pick(1) -- keep them and top up.
 msgs = msgs + drain(1.5)
 lit_master = lit_pixels(shot("agents-L1.png"))
 check("agents page draws", lit_master > 400, f"{lit_master} lit px")
@@ -411,13 +421,13 @@ check(
 # No dictation: the run is POSTed to the relay (server-side), which streams the
 # transcript back as `run` frames the detail pane renders turn by turn. Trigger
 # from L2 so the detail pane (which shows the transcript) is on the page.
-# Agents-tab menu: Jarvis(30), [Undo AI], Back(21), [Trigger(34)|Stop(35)], Dictate(20)
-# -- the section switchers are hidden, so the run control is row 2.
+# Agents-tab menu: Jarvis(30), [Undo AI], [Trigger(34)|Stop(35)], then the five
+# switchers -- the run control is this tab's own action, so it sits at row 1.
 send("click")  # L1 -> L2
 msgs = drain(1.2)
 runs_before = {r.get("id") for r in relay_runs()}
-ids, msgs = pick(2)
-check("agents menu row 2 delivered Trigger (34)", 34 in ids, str(ids))
+ids, msgs = pick(1)
+check("agents menu row 1 delivered Trigger (34)", 34 in ids, str(ids))
 check(
     "Trigger does NOT open dictation",
     not any("[dictate]" in m for m in msgs),

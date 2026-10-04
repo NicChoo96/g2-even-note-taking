@@ -64,13 +64,28 @@ export const MENU = {
    * a page cannot renumber an installed page's menu.
    */
   FILES: 5,
+  /**
+   * RETIRED from the menu — creating a document belongs to the web app and to
+   * Jarvis (which writes a real title), not to an "Untitled" made in the dark.
+   * The id is still handled so a page whose menu has not been rebuilt yet maps
+   * it to the same action instead of to nothing.
+   */
   DOC_NEW: 10,
+  /** RETIRED with DOC_NEW — the L1 list already opens a document as you swipe. */
   DOC_SELECT: 11,
+  /** This tab's own action: the delete picker (the list itself only opens). */
   DOC_DELETE: 12,
   /** R1 → long-press menu → Dictate: start glasses-mic speech-to-text. */
   DICTATE: 20,
-  /** Return to the last non-special tab (switchers are hidden there). */
-  BACK: 21,  // Agents-tab actions. Select / New / Delete live in the WEB app now, so the
+  /**
+   * RETIRED from the menu — the five switchers are now on every tab, so a
+   * separate "Back" row was exactly the part that made the menu confusing: it
+   * appeared on some tabs and not others. Kept as a wire id, and it is still
+   * what Jarvis means by "go back" (`goBack` on the app bridge), so the click is
+   * handled as before.
+   */
+  BACK: 21,
+  // Agents-tab actions. Select / New / Delete live in the WEB app now, so the
   // glasses menu only carries the run controls; ids 30–33 stay reserved so an
   // installed page with the previous menu still maps to something sensible.
   /** Run the selected agent's SAVED prompt (no dictation needed). */
@@ -104,9 +119,9 @@ export const MENU = {
 export interface MenuState {
   /** The active section (section actions only show while that tab is active). */
   section: SectionId;
-  /** Whether the docs library has any docs (Select/Delete need at least one). */
+  /** Whether the docs library has any docs (Delete needs at least one). */
   hasDocs: boolean;
-  /** Whether any agents exist (Select/Delete/Trigger need at least one). */
+  /** Whether any agents exist (Trigger needs at least one). */
   hasAgents?: boolean;
   /** True while a server-side agent run is in flight → show Stop instead. */
   agentRunning?: boolean;
@@ -126,18 +141,22 @@ export interface MenuState {
 
 /**
  * Build the OS contextual menu for the current state — reusable and
- * state-aware. The order is fixed and deliberate:
+ * state-aware. The menu is FLAT: the same rows in the same order on every tab,
+ * so it stops re-shaping itself as the wearer moves around.
  *
  *   1. **Jarvis** (→ "Stop AI" while a run is live or a conversation is open)
  *      — the flagship action, so a long-press reaches it first.
  *   2. **Undo AI** — only while a revertible batch exists and nothing is
  *      running; the recovery for a wrong AI action, kept next to the way in.
- *   3. **Back** — wherever it applies (docs, agents). The escape hatch sits
- *      above the page's own actions so it is never the item you scroll past.
- *   4. **The page's own actions**, in this tab's order:
- *      • Docs → New Docs · Select Docs · Delete Docs
+ *   3. **This tab's own action**, when it has one:
+ *      • Docs → Delete Docs (only while a document exists)
  *      • Agents → Trigger (becomes Stop while a run is in flight)
- *      • Any other tab → the Agents · To-Do · Docs · Notes switchers
+ *      It sits ABOVE the core rows because it is the only row that ever
+ *      changes, so everything else stays where a learnt menu is expected.
+ *   4. **The core items** — the Agents · To-Do · Docs · Notes · Files
+ *      switchers, on EVERY tab. This is what replaces "Back": one flat set of
+ *      five rows means the way to another page is the same everywhere, and no
+ *      state can leave a tab with no way off it.
  *   5. **Dictate** — always LAST. Same trigger, same speech engine as Jarvis;
  *      the difference is that the sentence is typed into the page instead of
  *      being routed through the agent. Keeping it last means the raw,
@@ -145,13 +164,13 @@ export interface MenuState {
  *
  * ONE EXCEPTION to 3 and 4: while a Jarvis conversation is open (a turn is in
  * flight or the mic is armed between turns) the menu is the AI group ALONE —
- * Stop AI · Undo AI? · Back? · Dictate. See `inConversation` below for why.
+ * Stop AI · Undo AI? · Dictate. See `inConversation` below for why.
  *
  * The menu is applied on the startup page and REPLACED wholesale on every
  * `rebuildPageContainer`, so call this with the current state whenever the
  * active section (or collection count) changes. Items sit between the system
  * slots (Display off / Brightness on top, "Close Reality Hub" at the bottom).
- * Max 10 items.
+ * Max 10 items — this layout peaks at 9.
  */
 export function sectionMenu(state: MenuState): MenuContainerProperty {
   const items: MenuItemProperty[] = [
@@ -180,52 +199,57 @@ export function sectionMenu(state: MenuState): MenuContainerProperty {
    * wearer is talking to Jarvis or commanding the page. Removing them makes the
    * long-press answer one question.
    *
-   * This trims only things that are reachable another way, which is the rule
-   * that matters here (0.3.10: never trim a menu item that is the ONLY escape
-   * from a tab):
-   *   • Stop AI  → ends the conversation, and is always item 1.
-   *   • Back     → KEPT for the tabs that need it; on docs/agents the switchers
-   *                are hidden anyway, so this is still the way off.
-   *   • Double-tap → ends the conversation without opening the menu at all.
-   *   • Dictate  → never trimmed, so the raw page path stays one press away.
-   * What goes away is only this tab's own actions (New Docs, Trigger, the
-   * switchers), and those come straight back the moment the conversation ends.
+   * The switchers go with them. That is a deliberate trade, so it is written
+   * down rather than left to look like an oversight: while a conversation is
+   * open there is no menu shortcut to another tab. The cost is ONE step —
+   * `Stop AI` (always item 1) or a double-tap ends the conversation, and the
+   * five switchers are back the instant it does — so it is a step, never a
+   * dead end.
+   *
+   * What the trim removes is therefore only what the modal HUD covers: this
+   * tab's own action and the core switchers. Stop AI, Undo AI and Dictate are
+   * never trimmed, so the entry into the page, the recovery from a wrong action
+   * and the way out of the conversation all survive it.
    */
   const inConversation = Boolean(state.aiRunning || state.aiListening);
-  if (inConversation) {
-    // Back is the escape hatch from docs/agents, and the ONLY one on agents
-    // (its switchers are hidden), so it survives the trim on exactly those tabs.
-    if (state.section === 'docs' || state.section === 'agents') {
-      items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
+  if (!inConversation) {
+    // 3. This tab's own action, when it has one. It sits ABOVE the core rows
+    // because it is the row that comes and goes, and a row that appears at the
+    // top of a settled block is easier to skip over than one inserted into the
+    // middle of it. It does mean the switchers sit one row lower on Docs and
+    // Agents than on the plain tabs (and one lower again while `Undo AI` is
+    // offered). Accepted: the five names and their order never change, and the
+    // alternative — a placeholder row that does nothing — is a worse lie than a
+    // shifted index.
+    if (state.section === 'docs') {
+      // Only Docs has a menu action left. "New Docs" and "Select Docs" are gone
+      // (0.3.49): a document is created in the web app or by asking Jarvis, and
+      // the L1 list already opens a document as you swipe it — so all they did
+      // was make this tab's menu a different length from every other tab's.
+      if (state.hasDocs) {
+        items.push(new MenuItemProperty({ itemName: 'Delete Docs', itemID: MENU.DOC_DELETE }));
+      }
+    } else if (state.section === 'agents') {
+      // Trigger fires the highlighted agent's SAVED prompt server-side (so it
+      // keeps running if the glasses page is backgrounded) and streams the
+      // transcript back into the detail panel. The master↔detail move is a
+      // gesture now (tap in, double-tap back), so Select/New/Delete Agents are
+      // gone and the menu stays short.
+      if (state.hasAgents) {
+        items.push(
+          state.agentRunning
+            ? new MenuItemProperty({ itemName: 'Stop', itemID: MENU.AGENT_STOP })
+            : new MenuItemProperty({ itemName: 'Trigger', itemID: MENU.AGENT_TRIGGER }),
+        );
+      }
     }
-  } else if (state.section === 'docs') {
-    // 3. Escape hatch first, then this tab's actions — Back returns to the last
-    // non-special tab.
-    items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
-    items.push(new MenuItemProperty({ itemName: 'New Docs', itemID: MENU.DOC_NEW }));
-    if (state.hasDocs) {
-      items.push(new MenuItemProperty({ itemName: 'Select Docs', itemID: MENU.DOC_SELECT }));
-      items.push(new MenuItemProperty({ itemName: 'Delete Docs', itemID: MENU.DOC_DELETE }));
-    }
-  } else if (state.section === 'agents') {
-    // Back is the ONLY way off this tab (the switchers are hidden here), so it
-    // stays — and per the fixed menu order it sits directly after the AI group,
-    // above the run control. Then the run control: Trigger fires the highlighted
-    // agent's SAVED prompt server-side (so it keeps running if the glasses page
-    // is backgrounded) and streams the transcript back into the detail panel.
-    // The master↔detail move is a gesture now (tap in, double-tap back), so
-    // Select/New/Delete Agents are gone and the menu stays short.
-    items.push(new MenuItemProperty({ itemName: 'Back', itemID: MENU.BACK }));
-    if (state.hasAgents) {
-      items.push(
-        state.agentRunning
-          ? new MenuItemProperty({ itemName: 'Stop', itemID: MENU.AGENT_STOP })
-          : new MenuItemProperty({ itemName: 'Trigger', itemID: MENU.AGENT_TRIGGER }),
-      );
-    }
-  } else {
-    // Section switchers — the page core for the plain tabs, after Back (there
-    // is nothing to go back to from here, so Back is absent by design).
+    // 4. The core items: the section switchers, on EVERY tab. This is what
+    // replaces "Back" — one flat set of five rows means the way to another page
+    // is the same everywhere, and no state can strand a tab with no way off it.
+    // The row for the tab you are already on is drawn too, and is inert
+    // (`switchSection` early-returns on the active section): keeping all five
+    // rows beats four rows plus a highlight that moves with the page, and a
+    // stray press on your own tab costs nothing.
     for (const s of SECTIONS) {
       items.push(new MenuItemProperty({ itemName: s.title, itemID: s.menuId }));
     }
@@ -607,7 +631,7 @@ function docView(state: HubState, page: number): SectionView {
   if (!doc) {
     return {
       text: clipBytes(
-        'Docs\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)',
+        'Docs\n------------------\n(no docs yet — create one\nin the web app, or ask\nJarvis to add it)',
         MAX_CONTENT_BYTES,
       ),
       todoCursor: 0,
@@ -1167,7 +1191,7 @@ export function docPickerView(
   if (docs.length === 0) {
     return {
       text: clipBytes(
-        `${label}\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)`,
+        `${label}\n------------------\n(no docs yet — create one\nin the web app, or ask\nJarvis to add it)`,
         MAX_CONTENT_BYTES,
       ),
       todoCursor: 0,
@@ -1656,7 +1680,7 @@ function docListView(docs: readonly DocEntry[], cursor: number, focused: boolean
   const head = `Docs ${docs.length}${focused && docs.length > 0 ? ' ◀' : ''}`;
   if (docs.length === 0) {
     return clipBytes(
-      `${head}\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)`,
+      `${head}\n------------------\n(no docs yet — create one\nin the web app, or ask\nJarvis to add it)`,
       MAX_CONTENT_BYTES,
     );
   }

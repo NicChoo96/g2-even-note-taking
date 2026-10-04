@@ -65,64 +65,94 @@ const assert = (label, cond, detail = '') => {
 };
 
 // ── Docs tab ────────────────────────────────────────────────────────────────
-// FIXED ORDER, every section: Jarvis → Undo AI (when offered) → Back → that
-// page's own actions → Dictate LAST.
+// FIXED ORDER, every section: Jarvis → Undo AI (when offered) → this tab's own
+// action → the core switchers → Dictate LAST.
 //   • The agent sits at the top because it is the entry point that can reach
 //     everything else; a menu is read top-down, so the most powerful item first.
+//   • The tab's own action sits above the core rows because it is the only row
+//     that ever changes, so a menu that has been learnt still finds every other
+//     row exactly where it was left.
 //   • Voice entry for raw dictation sits at the bottom: it is the most familiar
 //     gesture, so it is the easiest to find by thumb without reading.
+/** The core items: the section switchers, in SECTIONS order, on EVERY tab. */
+const core = ['Agents', 'To-Do', 'Docs', 'Notes', 'Files'];
+const coreIds = [MENU.AGENTS, MENU.TODO, MENU.DOCS, MENU.NOTES, MENU.FILES];
+const allSections = ['agents', 'todo', 'docs', 'notes', 'files'];
+
 const docs = sectionMenu({ section: 'docs', hasDocs: true });
-check('docs (has docs)', names(docs), [
-  'Jarvis',
-  'Back',
-  'New Docs',
-  'Select Docs',
-  'Delete Docs',
-  'Dictate',
-]);
-check('docs ids', ids(docs), [
-  MENU.JARVIS,
-  MENU.BACK,
-  MENU.DOC_NEW,
-  MENU.DOC_SELECT,
-  MENU.DOC_DELETE,
-  MENU.DICTATE,
-]);
+check('docs (has docs)', names(docs), ['Jarvis', 'Delete Docs', ...core, 'Dictate']);
+check('docs ids', ids(docs), [MENU.JARVIS, MENU.DOC_DELETE, ...coreIds, MENU.DICTATE]);
 
 check('docs (empty)', names(sectionMenu({ section: 'docs', hasDocs: false })), [
   'Jarvis',
-  'Back',
-  'New Docs',
+  ...core,
   'Dictate',
 ]);
 
 // ── Agents tab ──────────────────────────────────────────────────────────────
-// The Agents menu carries Back + the run control: agent CRUD lives in the web
-// app and the master↔detail move is a gesture (tap in, double-tap back). Back
-// stays because it is the only way off this tab.
+// The Agents menu carries the run control and the core switchers: agent CRUD
+// lives in the web app and the master↔detail move is a gesture (tap in,
+// double-tap back).
 const agents = sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true });
-check('agents (has agents)', names(agents), ['Jarvis', 'Back', 'Trigger', 'Dictate']);
-check('agents ids', ids(agents), [MENU.JARVIS, MENU.BACK, MENU.AGENT_TRIGGER, MENU.DICTATE]);
+check('agents (has agents)', names(agents), ['Jarvis', 'Trigger', ...core, 'Dictate']);
+check('agents ids', ids(agents), [MENU.JARVIS, MENU.AGENT_TRIGGER, ...coreIds, MENU.DICTATE]);
 check(
   'agents (running) shows Stop',
   names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true, agentRunning: true })),
-  ['Jarvis', 'Back', 'Stop', 'Dictate'],
+  ['Jarvis', 'Stop', ...core, 'Dictate'],
 );
 check('agents (empty)', names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: false })), [
   'Jarvis',
-  'Back',
+  ...core,
   'Dictate',
 ]);
-assert(
-  'agents menu keeps Back (only way off the tab)',
-  names(agents).includes('Back'),
-  names(agents).join(','),
-);
 assert(
   'agents menu drops Select/New/Delete',
   !names(agents).some((n) => /Select|New|Delete/.test(n)),
   names(agents).join(','),
 );
+
+// ── The flattening (0.3.49) ─────────────────────────────────────────────────
+// The promise the flattening makes is exactly two things, so assert both on
+// EVERY tab rather than on the two tabs that used to be special: the five
+// switchers are always listed in SECTIONS order, and there is never a Back.
+for (const s of allSections) {
+  const list = names(sectionMenu({ section: s, hasDocs: true, hasAgents: true }));
+  const idList = ids(sectionMenu({ section: s, hasDocs: true, hasAgents: true }));
+  assert(`${s}: every core row is present`, core.every((n) => list.includes(n)), list.join(','));
+  check(`${s}: the core rows keep the SECTIONS order`, list.filter((n) => core.includes(n)), core);
+  check(`${s}: …and their ids`, idList.filter((v) => coreIds.includes(v)), coreIds);
+  assert(`${s}: no Back item`, !list.includes('Back'), list.join(','));
+}
+assert(
+  'docs: the own action sits ABOVE the core rows',
+  names(docs).indexOf('Delete Docs') < names(docs).indexOf('Agents'),
+  names(docs).join(','),
+);
+assert(
+  'agents: the own action sits above the core rows',
+  names(agents).indexOf('Trigger') < names(agents).indexOf('Agents'),
+  names(agents).join(','),
+);
+check(
+  'a plain tab has no own action to place, so the core rows start at row 1',
+  names(sectionMenu({ section: 'todo', hasDocs: true, hasAgents: true }))[1],
+  'Agents',
+);
+
+// The retired ids must never come back through the menu: their absence IS the
+// change, so pin the ids and not only the labels.
+const retired = [
+  ['Back', MENU.BACK],
+  ['New Docs', MENU.DOC_NEW],
+  ['Select Docs', MENU.DOC_SELECT],
+];
+for (const [label, id] of retired) {
+  const reachable = allSections.filter((s) =>
+    ids(sectionMenu({ section: s, hasDocs: true, hasAgents: true, aiUndo: true })).includes(id),
+  );
+  check(`no tab's menu can reach a retired "${label}" row`, reachable, []);
+}
 
 // ── Plain tabs ──────────────────────────────────────────────────────────────
 // The switcher order comes straight from SECTIONS: Agents leads.
@@ -140,7 +170,7 @@ for (const s of ['agents', 'todo', 'docs', 'notes', 'files']) {
   check(`${s}: Dictate appears exactly once`, list.filter((n) => n === 'Dictate').length, 1);
 }
 // Undo AI sits directly under Jarvis — the two agent controls stay adjacent, and
-// the page's own actions keep their relative order below the Back item.
+// the tab's own action keeps its place above the core rows.
 const withUndo = names(sectionMenu({ section: 'todo', hasDocs: true, aiUndo: true }));
 check('todo gains Undo AI when a batch exists', withUndo[1], 'Undo AI');
 check('Undo AI sits directly under Jarvis', withUndo[0], 'Jarvis');
@@ -186,18 +216,17 @@ check(
 // ── An OPEN conversation trims the menu (the collapse) ─────────────────────
 // While a Jarvis conversation is open the menu is the AI group ALONE, because a
 // long-press has to answer one question instead of mixing a half-finished
-// sentence with "Delete Docs". The trim is only allowed because everything
-// removed is reachable another way, so this block pins BOTH halves of that
-// bargain: the menu really is small, and nothing that was the only way out got
-// removed with it.
-const convSections = ['agents', 'todo', 'docs', 'notes', 'files'];
-for (const s of convSections) {
+// sentence with "Delete Docs". What it removes — this tab's own action and the
+// core switchers — comes straight back the moment the conversation ends, so this
+// block pins BOTH halves of that bargain: the menu really is small, and the rows
+// that end the conversation are still there.
+for (const s of allSections) {
   for (const flag of [{ aiListening: true }, { aiRunning: true }]) {
     const st = { section: s, hasDocs: true, hasAgents: true, aiUndo: true, ...flag };
     const which = flag.aiRunning ? 'running' : 'listening';
     const list = names(sectionMenu(st));
     const tag = `${s} in-conversation (${which})`;
-    assert(`${tag}: at most 4 items`, list.length <= 4, `${list.length}: ${list.join(', ')}`);
+    assert(`${tag}: at most 3 items`, list.length <= 3, `${list.length}: ${list.join(', ')}`);
     assert(`${tag}: well under the 10-item OS cap`, list.length <= 10);
     check(`${tag}: Stop AI is the way out`, list[0], 'Stop AI');
     check(`${tag}: …and it is the stop ID`, ids(sectionMenu(st))[0], MENU.JARVIS_STOP);
@@ -210,8 +239,8 @@ for (const s of convSections) {
 // this tab's own actions. Nothing else.
 const convDocsNames = names(sectionMenu({ section: 'docs', hasDocs: true, aiListening: true }));
 assert(
-  'docs in-conversation: New/Select/Delete Docs are trimmed',
-  !convDocsNames.some((n) => /New Docs|Select Docs|Delete Docs/.test(n)),
+  'docs in-conversation: Delete Docs is trimmed',
+  !convDocsNames.includes('Delete Docs'),
   convDocsNames.join(','),
 );
 const convAgentsNames = names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true, aiListening: true }));
@@ -221,25 +250,30 @@ assert(
   convAgentsNames.join(','),
 );
 const convTodoNames = names(sectionMenu({ section: 'todo', hasDocs: true, aiListening: true }));
-assert(
-  'a plain tab in-conversation: the switchers are trimmed',
-  !['Agents', 'To-Do', 'Docs', 'Notes', 'Files'].some((n) => convTodoNames.includes(n)),
-  convTodoNames.join(','),
-);
 
-// The rule that must survive the trim (0.3.10): never remove the ONLY way off a
-// tab. Back is that way on docs and agents — their switchers are hidden — so it
-// is kept there and only there.
-for (const s of ['docs', 'agents']) {
+// No tab keeps its switchers mid-conversation, so the trim is uniform: the
+// number of rows does not depend on which page is under the transcript.
+for (const s of allSections) {
+  const conv = names(sectionMenu({ section: s, hasDocs: true, hasAgents: true, aiListening: true }));
   assert(
-    `${s} in-conversation: Back survives (it is the only way off the tab)`,
-    names(sectionMenu({ section: s, hasDocs: true, hasAgents: true, aiListening: true })).includes('Back'),
+    `${s} in-conversation: the core switchers are trimmed`,
+    !core.some((n) => conv.includes(n)),
+    conv.join(','),
   );
+  assert(`${s} in-conversation: no Back either`, !conv.includes('Back'), conv.join(','));
 }
-for (const s of ['todo', 'notes', 'files']) {
-  assert(
-    `${s} in-conversation: no Back (there is nothing to go back to)`,
-    !names(sectionMenu({ section: s, hasDocs: true, aiListening: true })).includes('Back'),
+
+// That uniform trim spends the exit it used to keep: mid-conversation there is
+// no menu shortcut to another tab. Pin the two things that keep it a step rather
+// than a dead end — item 1 always ends the conversation, and the switchers come
+// back with it.
+for (const s of allSections) {
+  const st = { section: s, hasDocs: true, hasAgents: true, aiListening: true };
+  check(`${s} in-conversation: item 1 is the way out`, ids(sectionMenu(st))[0], MENU.JARVIS_STOP);
+  check(
+    `${s} in-conversation: …and the switchers return when it ends`,
+    names(sectionMenu({ ...st, aiListening: false })).filter((n) => core.includes(n)),
+    core,
   );
 }
 
@@ -251,7 +285,7 @@ check(
     names(sectionMenu({ section: 'docs', hasDocs: true })).length,
     convDocsNames.length,
   ],
-  [6, 3],
+  [8, 2],
 );
 check(
   '…including agents',
@@ -259,7 +293,7 @@ check(
     names(sectionMenu({ section: 'agents', hasDocs: true, hasAgents: true })).length,
     convAgentsNames.length,
   ],
-  [4, 3],
+  [8, 2],
 );
 check('…and the plain tabs', [
   names(sectionMenu({ section: 'todo', hasDocs: true })).length,
@@ -282,17 +316,29 @@ check(
 );
 
 // ── Global invariants ───────────────────────────────────────────────────────
-const allSections = ['agents', 'todo', 'docs', 'notes', 'files'];
 for (const s of allSections) {
   for (const hasAgents of [false, true]) {
-    const list = ids(sectionMenu({ section: s, hasDocs: true, hasAgents }));
-    const label = `${s}/hasAgents=${hasAgents}`;
-    check(`${label}: Dictate last`, list[list.length - 1], MENU.DICTATE);
-    check(`${label}: Jarvis first`, list[0], MENU.JARVIS);
-    check(`${label}: unique ids`, new Set(list).size, list.length);
-    assert(`${label}: <= 10 items`, list.length <= 10, `(${list.length})`);
+    // `aiUndo` is included because it is what produces the 9-item worst case:
+    // without it this loop only ever builds the 7- and 8-item menus and the real
+    // peak against the firmware's 10-row cap would go unmeasured.
+    for (const aiUndo of [false, true]) {
+      const list = ids(sectionMenu({ section: s, hasDocs: true, hasAgents, aiUndo }));
+      const label = `${s}/hasAgents=${hasAgents}/aiUndo=${aiUndo}`;
+      check(`${label}: Dictate last`, list[list.length - 1], MENU.DICTATE);
+      check(`${label}: Jarvis first`, list[0], MENU.JARVIS);
+      check(`${label}: unique ids`, new Set(list).size, list.length);
+      assert(`${label}: <= 10 items`, list.length <= 10, `(${list.length})`);
+    }
   }
 }
+
+// Pin the worst case by VALUE, not only by the bound: Docs with a document to
+// delete and a revertible batch waiting is the widest menu the app can build.
+check(
+  'the widest menu the app can build',
+  ids(sectionMenu({ section: 'docs', hasDocs: true, hasAgents: true, aiUndo: true })),
+  [MENU.JARVIS, MENU.UNDO_AI, MENU.DOC_DELETE, ...coreIds, MENU.DICTATE],
+);
 
 // Section switcher ids must match SECTIONS and stay unique across the app.
 // MENU.TODO/DOCS/NOTES/AGENTS/FILES intentionally mirror SECTIONS[].menuId, and
