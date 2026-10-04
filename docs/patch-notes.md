@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.52
+
+v0.3.52 - An agent can now run the other agents and read what they said
+
+- An agent that asks for another agent gets that agent's own final answer back, so a digest is built from real reports instead of the same page a second time.
+- One level deep only, eight agents per run, four minutes each.
+- If an agent was never set up, or does not answer, you are told plainly instead of getting a made-up report.
+
 ## 0.3.51
 
 v0.3.51 - Your to-do list now proves a change landed, and Brave is the search default

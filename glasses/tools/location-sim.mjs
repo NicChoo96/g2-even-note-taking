@@ -481,13 +481,21 @@ const pruneFn = fnSource(relaySrc, 'pruneRuns');
 has('a finished run drops its snapshot', pruneFn, 'runLocations.delete(id)');
 has('  ...and so does an evicted one', pruneFn, 'runLocations.delete(victim.id)');
 const runRoute = routeSource(relaySrc, "url.pathname === '/api/agent/run'");
-has('the run route stores the snapshot', runRoute, 'runLocations.set(run.id, body.location)');
-unset(
-  '  ...BESIDE the run, never on it (runSnapshot/broadcastRun would serialise it)',
-  runRoute,
-  'location: body?.location,',
+// The route no longer stores the snapshot itself — the run it starts does. The
+// subject is unchanged: the position is stored BESIDE the run and never ON it,
+// because runSnapshot/broadcastRun serialise every field, so a position field
+// would be handed to every client and would outlive the one tool call that needs
+// it. Only the OWNER moved, and it moved because there is now exactly one place a
+// run comes into existence; the route's job is to hand the spec over.
+has('the run route hands the snapshot to the run it starts', runRoute, 'location: body?.location,');
+assert('  ...and stores nothing itself', !/runLocations\.set/.test(runRoute));
+const runCtorFn = fnSource(relaySrc, 'startAgentRun');
+has('the run constructor stores it BESIDE the run', runCtorFn, 'runLocations.set(run.id, spec.location)');
+assert(
+  '  ...and never ON it (runSnapshot/broadcastRun would serialise it)',
+  !/^\s*location:/m.test(runCtorFn),
+  'a field here reaches every client, and a child run is given none on purpose',
 );
-assert('  ...and never as a run field at all', !/^\s*location:/m.test(runRoute));
 const execFn = fnSource(relaySrc, 'executeRun');
 // The snapshot is read BY RUN ID. The assertion is on the LOOKUP, not on the
 // whole context literal: that same context also carries the run id and the run's
@@ -523,10 +531,10 @@ assert(
 
 // ── 7. the client wiring ────────────────────────────────────────────────────
 console.log('\n§7  the client wiring');
-const kinds = (/export type ToolKind = ([^;]+);/.exec(typesSrc)?.[1] ?? '')
+const kinds = (/export type ToolKind =([^;]+);/.exec(typesSrc)?.[1] ?? '')
   .match(/'[a-z]+'/g)
   ?.map((s) => s.slice(1, -1));
-// Derived from the relay, not typed twice: two kinds come from modules that
+// Derived from the relay, not typed twice: three kinds come from modules that
 // declare them, two from branches written out in local-sse.mjs, and the last two
 // ride the generic REST path.
 const sourceKinds = [
@@ -534,7 +542,28 @@ const sourceKinds = [
   /kind === 'jev'/.test(relaySrc) ? 'jev' : null,
 ].filter(Boolean);
 deepEq('the relay branches on files and jev by name', sourceKinds, ['files', 'jev']);
-const relayKinds = [...HUB_TOOL_KINDS, RELAY_LOCATION_KIND, ...sourceKinds, 'web', 'http'].sort();
+// A third kind is branched on by name as well, but it arrives through a MODULE the
+// relay imports — agent-tool.mjs, the way `location` arrives through
+// location-tool.mjs — rather than as a literal written inline. Both halves are
+// required, and that is the point: a schema branch with no dispatch is a function
+// the model can call and nothing can ever answer, and a dispatch with no schema
+// branch is code the model can never reach. Either one alone looks like the
+// feature is present, which is exactly how a kind gets shipped and then reported
+// as "the agent says it ran something".
+const agentKind =
+  /\bisAgentTool\(t\)\) return agentToolSchema\(t\)/.test(relaySrc) &&
+  /\bisAgentTool\(tool\)\) return runAgentTool\(tool, args, ctx\)/.test(relaySrc)
+    ? 'agent'
+    : null;
+assert('the agent kind is both described and executed by the relay', Boolean(agentKind));
+const relayKinds = [
+  ...HUB_TOOL_KINDS,
+  RELAY_LOCATION_KIND,
+  ...sourceKinds,
+  ...(agentKind ? [agentKind] : []),
+  'web',
+  'http',
+].sort();
 // Parity in BOTH directions: a kind the client can author but the relay cannot
 // execute is an agent tool that fails at the worst possible moment, and one the
 // relay can execute but the client cannot author is dead code.

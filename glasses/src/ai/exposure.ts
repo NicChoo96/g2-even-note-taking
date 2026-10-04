@@ -121,7 +121,7 @@ const COMMIT = /\b(?:use[sd]?|using|call(?:s|ed|ing)?|invoke[sd]?|run(?:s|ning)?
 const TOOLLESS = /\b(?:no|without|zero|none of the)\s+(?:any\s+)?(?:external\s+|other\s+)?tools?\b/i;
 
 /**
- * The two kinds whose promise reading is NOT their voice reading.
+ * The kinds whose promise reading is NOT their voice reading.
  *
  * Deliberately a short, explicit list rather than a general mechanism: an
  * override is a claim that speech and prose disagree here, and each one has to
@@ -171,6 +171,37 @@ const OVERRIDES: Partial<Record<ToolKind, RuleOverride>> = {
     names:
       /(?:\blocat|whereabouts|where (?:am i|are we|i am|we are)|\bgps\b|\bcoords?\b|coordinates?|latitude|longitude|\bnear ?(?:me|by|us)\b|\bmy (?:position|coordinates|location)\b|geolocation|\bwearer'?s (?:position|location|coordinates)\b|near a location|places near)/i,
     why: 'a run prompt describes the wearer in the third person, so the first-person voice vocabulary alone never fires',
+  },
+  // Speech: naming an agent is unambiguous — nothing else in the seed table
+  // claims the word — so the seed keeps it loose, including "digest".
+  //
+  // Prose: "digest" is the thing THIS KIND OF PROMPT PRODUCES. The Daily Run
+  // Digest's own instructions say "send the digest", and `send` is a commitment
+  // verb, so the seed's `\bdigest\b` would read an orchestrator's description of
+  // its own OUTPUT as a request for the tool that runs other agents — the exact
+  // false positive that would make the wearer decline a proposal and then not
+  // believe the next one. It is dropped here and "agents" carries the promise.
+  //
+  // That word is worth keeping narrow rather than trusting to the withdrawal
+  // guard, because this rule is what RECOMMENDS attaching the tool: read too
+  // loose it proposes to every agent that talks about agents in the abstract,
+  // read too tight and the orchestrator whose prompt says "ask each of the six
+  // daily agents" never gets it — which is the bug, not the fix.
+  agent: {
+    names: /\bagents?\b|\bmulti-?agent\b|\borchestrat(?:e|es|ed|ing|ions?)?\b/i,
+    // The commitment verbs differ too, and that is the half a names-only override
+    // would hide. The base list is built for tools whose instructions say "use"
+    // and "save"; an orchestrator's instructions say "ask each of the six daily
+    // agents" and "gather what they return", and neither ASK nor GATHER is in it.
+    // Borrowing the store vocabulary would leave the single phrase this rule
+    // exists for — the one in the bug report — reading as a bare mention, so the
+    // detector would report "no gaps" on the exact prompt it was written for.
+    //
+    // The possession form is kept. "You have the other agents" is a claim about
+    // the run's capability, and the file's rule is that possession is commitment.
+    commit:
+      /\b(?:ask(?:s|ed|ing)?|gather(?:s|ed|ing)?|collect(?:s|ed|ing)?|compil(?:e|es|ed|ing)|combine[sd]?|orchestrat(?:e|es|ed|ing)|delegat(?:e|es|ed|ing)|trigger(?:s|ed|ing)?|start(?:s|ed|ing)?|publish(?:es|ed|ing)?|writ(?:e|es|ten|ing)|send(?:s|t)?|give[s]?|provide[sd]?|summari[sz](?:e|es|ed|ing)|run(?:s|ning)?|call(?:s|ed|ing)?|invoke[sd]?|use[sd]?|using|read(?:s|ing)?|fetch(?:es|ed|ing)?|pull(?:s|ed|ing)?|find(?:s|ing)?|check(?:s|ed|ing)?|have|has|had|can|access|availabl(?:e|ility)|get(?:s)?)\b/i,
+    why: 'prose uses "digest" for this kind of run\u2019s own OUTPUT, so the one seed word that names a product rather than a capability is dropped, and its instructions commit with "ask" and "gather", which the store vocabulary does not carry',
   },
 };
 
@@ -408,6 +439,7 @@ const KIND_LABEL: Partial<Record<ToolKind, string>> = {
   docs: 'saved docs',
   notes: 'notes',
   location: 'location',
+  agent: 'another agent',
 };
 
 export function kindLabel(kind: ToolKind): string {

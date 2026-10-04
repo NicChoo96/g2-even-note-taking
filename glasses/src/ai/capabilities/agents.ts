@@ -26,6 +26,7 @@ import {
   docsTool,
   notesTool,
   locationTool,
+  agentTool,
   type AgentDef,
   type AgentMessage,
   type ToolDef,
@@ -146,7 +147,37 @@ const LOCATION_SEED: SeedTool = {
 };
 
 /**
+ * The tool that runs ANOTHER agent and reads its answer back.
+ *
+ * The only seed whose subject is the app's own agents rather than a store, and
+ * the only one that must sit FIRST in the table. `find` takes the first match, so
+ * a phrase that names another agent — "the daily digest agent", "run the agents"
+ * — would otherwise be claimed by whatever seed happens to hold a generic word in
+ * it. Nothing else claims "agent", and no other seed's vocabulary is meaningful
+ * here, so first is both safe and correct.
+ *
+ * The words are kept NARROW on purpose. `\bagents?\b` is included because it can
+ * only mean this tool (there is no other agent-shaped thing to attach), and the
+ * rest are the phrasings an orchestrator actually gets asked for by voice — a
+ * multi-agent run, a digest assembled FROM the other agents, or simply being told
+ * to gather what they found. Nothing as loose as "run" alone: the To-Do and
+ * document seeds both live near that word and losing a phrase to the wrong seed
+ * is the failure this table's ordering exists to prevent.
+ */
+const AGENT_SEED: SeedTool = {
+  kind: 'agent',
+  words:
+    /(\bagents?\b|\borchestrat|multi-?agent|\bdigest\b|(run|start|trigger|call|ask|gather|collect|compile|summari[sz]e) (the |my |all )?(other |six |daily )?(agents?|digests?))/i,
+  make: agentTool,
+};
+
+/**
  * Every kind an agent may be given, in the order they are offered.
+ *
+ * AGENT_SEED sits FIRST: it is the only seed whose subject is the app's own
+ * agents, nothing else claims the word, and `find` takes the FIRST match — so a
+ * phrase naming another agent must not be reachable by whatever generic word
+ * happens to sit ahead of it.
  *
  * FILES_SEED sits after the hub seeds because `find` takes the FIRST match and
  * its vocabulary is the loosest ("docs", "documents", "store", "library"): a
@@ -165,6 +196,7 @@ const LOCATION_SEED: SeedTool = {
  * failing if any rule's vocabulary stops being the seed's.
  */
 export const SEED_TOOLS: readonly SeedTool[] = [
+  AGENT_SEED,
   WEB_SEED,
   TODO_SEED,
   DOCS_SEED,

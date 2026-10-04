@@ -135,8 +135,23 @@ export function upsertDoc(
  * 'tavily' is the LEGACY kind for the same web tool. It is accepted on every read
  * path (see normalizeTool) because persisted agents, bridge snapshots and an
  * older client bundle can all still carry it, but nothing writes it any more.
+ *
+ * 'agent' is the newest, and the only one that reaches BACK: the relay runs the
+ * named agent to completion and hands its final answer to the caller as the tool
+ * result. Every other kind here returns something the relay could fetch or
+ * compute on its own; this one returns another run's output, which is why it is
+ * the only kind that can be refused for being too deep in a chain.
  */
-export type ToolKind = 'web' | 'http' | 'jev' | 'files' | 'todo' | 'docs' | 'notes' | 'location';
+export type ToolKind =
+  | 'web'
+  | 'http'
+  | 'jev'
+  | 'files'
+  | 'todo'
+  | 'docs'
+  | 'notes'
+  | 'location'
+  | 'agent';
 /** Legacy spelling, read-only — kept so normalizing old state type-checks. */
 export type LegacyToolKind = 'tavily';
 export type WebDepth = 'basic' | 'advanced';
@@ -400,6 +415,8 @@ export const DOCS_TOOL_ID = 'tool-docs';
 export const NOTES_TOOL_ID = 'tool-notes';
 /** The seeded location tool's id. */
 export const LOCATION_TOOL_ID = 'tool-location';
+/** The seeded agent-running tool's id. */
+export const AGENT_TOOL_ID = 'tool-agent';
 
 /** Add, tick, rename, delete or list the wearer's tasks. */
 export function todoTool(): ToolDef {
@@ -469,6 +486,38 @@ export function locationTool(): ToolDef {
       'the run starts (this tool cannot take a new reading while a run is in flight), so on a long run ' +
       'treat it as where the wearer was when this started, and report the stated age if it matters. ' +
       'If no position was available the tool says so rather than guessing.',
+    hasToken: false,
+  };
+}
+
+/**
+ * Run one of the wearer's other agents, and read what it said.
+ *
+ * The one tool whose result is another run's. Attaching it to an agent makes that
+ * agent an ORCHESTRATOR, which is why the description spends its words on the two
+ * properties that keep a chain honest rather than on the arguments:
+ *
+ *   • It WAITS. The agent it names is run to completion and its final answer comes
+ *     back here, so the caller is compiling text that exists rather than describing
+ *     a run it merely started. This is the whole difference between this tool and
+ *     the device's own "run an agent" capability, which is fire-and-forget.
+ *   • It REFUSES in words. An unknown name, a chain one link too deep, a run that
+ *     outlives its time limit — each comes back as a sentence naming what happened,
+ *     never as an empty success. A caller that cannot finish must say so, because
+ *     the wearer is reading a digest that looks exactly like a real one either way.
+ */
+export function agentTool(): ToolDef {
+  return {
+    id: AGENT_TOOL_ID,
+    name: 'jarvis_agent',
+    kind: 'agent',
+    description:
+      'Run one of the wearer\u2019s other saved agents and get its answer back, to gather or compile ' +
+      'work that several agents do. The named agent is run to completion and its own final answer is ' +
+      'returned to you \u2014 use that text, and do not add anything it did not say. Call it with no name ' +
+      'to list the agents that exist. Omit "ask" to run the agent on the task it was saved with, or pass ' +
+      '"ask" to add a one-off direction on top of that task. Only one link deep: an agent started this ' +
+      'way cannot start another, and there is a time limit on each.',
     hasToken: false,
   };
 }

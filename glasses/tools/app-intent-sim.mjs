@@ -486,16 +486,27 @@ has('  ...read from the run own side table', execFn, 'const intentState = runInt
 has('  ...and the dispatcher is given the same context', execFn, 'intents: runIntents.get(run.id)');
 
 const runRoute = routeSource(relaySrc, "url.pathname === '/api/agent/run'");
+// The ONE constructor every run in this process comes from — the wearer's run here
+// and a child started by the `agent` tool. The refusals and the intent side table
+// live in it now rather than in the route, because inlining them is how there came
+// to be two homes for one tool in the first place. What is asserted below is that
+// the constructor does each of them, and that the route does not also try.
+const runCtorFn = fnSource(relaySrc, 'startAgentRun');
 has(
   'the run route builds the tool from the catalogue the device sent',
   runRoute,
   'const intentTool = intentToolFor(body?.capabilities);',
 );
-has('  ...and installs the side table for this run', runRoute, 'runIntents.set(run.id, { tool: intentTool, list: [] })');
+has('  ...and the run constructor installs the side table for this run', runCtorFn, 'runIntents.set(run.id, { tool: intentTool, list: [] })');
 assert(
   '  ...only when the device delegates something',
-  runRoute.includes('if (intentTool) runIntents.set('),
+  runCtorFn.includes('if (intentTool) runIntents.set('),
   'an older client keeps its old toolset instead of an empty enum',
+);
+assert(
+  '  ...and the route keeps no second copy of it',
+  !/runIntents\.set/.test(runRoute),
+  'one owner, so the queue cannot be installed twice — or missed by one of them',
 );
 has(
   '  ...and gives up the name only when the built-in is there to take it',
@@ -580,10 +591,15 @@ assert(
 has('  ...and every failure records itself through one path', execFn, 'failRun(run, err)');
 has(
   'a toolset that would collide is refused before the run exists',
-  runRoute,
+  runCtorFn,
   'const fault = toolSetFault(intentTool ? [...tools, intentTool] : tools);',
 );
-has('  ...in words the caller can act on', runRoute, 'cannot start this run');
+has('  ...in words the caller can act on', runCtorFn, 'cannot start this run');
+assert(
+  '  ...from ONE place, so the route cannot refuse a different way',
+  !/toolSetFault|modelProviderFault/.test(runRoute),
+  'two refusals for one fault is how the route and the constructor drift apart',
+);
 has(
   '  ...and the launch keeps a net under the loop own guard',
   runRoute,
@@ -600,7 +616,7 @@ has('  ...and never the caller own mirror of it', runRoute, 'const modelSource =
 unset('  ...however loudly the caller asks', runRoute, 'agentModel || callerModel ||');
 has(
   '  ...and a model the backend cannot serve is refused before the run exists',
-  runRoute,
+  runCtorFn,
   'const modelFault = modelProviderFault(runModel, cfg.provider);',
 );
 has(

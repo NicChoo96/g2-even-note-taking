@@ -22,6 +22,9 @@ import { readFileSync } from 'node:fs';
 // seed list, so the kind comes from the module that dispatches it rather than
 // being spelled 'location' here.
 import { LOCATION_KIND } from '../../web/server/location-tool.mjs';
+// Same reasoning for the agent tool: it is a relay tool with a seed of its own,
+// and the kind belongs to the module that dispatches it.
+import { AGENT_KIND } from '../../web/server/agent-tool.mjs';
 import {
   HUB_TOOL_KINDS,
   HUB_TOOL_NAMES,
@@ -442,10 +445,10 @@ const seedList = capSrc.slice(capSrc.indexOf('const SEED_TOOLS: readonly SeedToo
 // literal went stale the moment `location` was seeded — and a harness that has to
 // be edited before it can notice a missing seed does not notice one. The expected
 // set is assembled from the same sources the relay uses: HUB_TOOL_KINDS owns
-// docs/notes/todo, and web, files, jev and the location kind are seeds of their
-// own. Derived here rather than typed, so the NEXT kind added is caught by this
-// assertion instead of requiring it to be updated.
-const SEED_KINDS = ['web', ...HUB_TOOL_KINDS, 'files', 'jev', LOCATION_KIND].sort();
+// docs/notes/todo, and web, files, jev and the location and agent kinds are
+// seeds of their own. Derived here rather than typed, so the NEXT kind added is
+// caught by this assertion instead of requiring it to be updated.
+const SEED_KINDS = ['web', ...HUB_TOOL_KINDS, 'files', 'jev', LOCATION_KIND, AGENT_KIND].sort();
 const offeredKinds = [
   ...new Set([...seedList.matchAll(/([A-Z]+)_SEED\b/g)].map((m) => m[1].toLowerCase())),
 ].sort();

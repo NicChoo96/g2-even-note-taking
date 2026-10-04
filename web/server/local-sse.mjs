@@ -177,6 +177,22 @@ import { hubToolSchema, isHubTool } from './hub-tools.mjs';
 // the hub state is a BOOTSTRAP and never an authority (see hub-write.mjs).
 import { applyHubTool, HUB_TOOL_COLLECTION } from './hub-write.mjs';
 import { isLocationTool, locationToolSchema, runLocationTool } from './location-tool.mjs';
+import {
+  CHILD_TIMEOUT_MS,
+  MAX_AGENT_DEPTH,
+  MAX_CHILDREN_PER_RUN,
+  agentToolSchema,
+  budgetRefusalText,
+  depthRefusalText,
+  findAgent,
+  formatChildResult,
+  formatRoster,
+  isAgentTool,
+  parseAgents,
+  readChildResult,
+  timedOutText,
+  unknownAgentText,
+} from './agent-tool.mjs';
 // The hub API (everything the app persists) rides the SAME session as the
 // document store, so this only needs the wrapper — never a second client.
 import { createHubClient, forwardedHeaders, HUB_MAX_BODY_BYTES } from './hub-api.mjs';
@@ -1155,6 +1171,29 @@ const runLocations = new Map(); // runId -> snapshot
  */
 const runIntents = new Map(); // runId -> { tool, list }
 
+/**
+ * How deep in a chain a run sits, and which children it started. Both SIDE
+ * TABLES, for the same reason `runLocations` is one: `runSnapshot()` and
+ * `broadcastRun` hand the run object to clients verbatim, so a field for either
+ * would ride into every stored session — a child's ancestry living on in a
+ * transcript forever, for a fact that only matters while the chain is in flight.
+ *
+ * `runDepths` is 0 for a run the wearer started and parent+1 for a child. It is
+ * carried rather than inferred, because the call being refused is the GRANDCHILD,
+ * and the only moment at which refusing it is cheap and explainable is before it
+ * exists.
+ *
+ * `runChildren` is the fan-out ledger. It exists so a parent that asks for the
+ * same agent six times in a loop is stopped by a number rather than by a timeout
+ * thirty minutes later, and so the refusal can say how many it already started.
+ *
+ * ⚠ MAX_RUNS is 8. A parent plus its children must therefore not be assumed to
+ * fit: the code that reads a finished child holds the run OBJECT, never a second
+ * lookup by id, so an eviction can never turn a real answer into "not found".
+ */
+const runDepths = new Map(); // runId -> depth
+const runChildren = new Map(); // parent runId -> [child runId]
+
 function pruneRuns() {
   const now = Date.now();
   for (const [id, run] of runs) {
@@ -1162,6 +1201,8 @@ function pruneRuns() {
       runs.delete(id);
       runLocations.delete(id);
       runIntents.delete(id);
+      runDepths.delete(id);
+      runChildren.delete(id);
     }
   }
   while (runs.size > MAX_RUNS) {
@@ -1173,6 +1214,8 @@ function pruneRuns() {
     runs.delete(victim.id);
     runLocations.delete(victim.id);
     runIntents.delete(victim.id);
+    runDepths.delete(victim.id);
+    runChildren.delete(victim.id);
   }
 }
 
@@ -1383,6 +1426,11 @@ function toolSchemaFor(t) {
   // when the run started and sent with it, because the relay cannot reach the
   // phone and a run has no way to ask mid-flight.
   if (isLocationTool(t)) return locationToolSchema(t);
+  // Another agent, run to completion by THIS process so its answer can be read
+  // back. Placed before the REST fallback for the reason the two above are: a
+  // generic free-form body is not what this tool takes, and handing the model one
+  // would make the call shape a guess.
+  if (isAgentTool(t)) return agentToolSchema(t);
   // Anything left is a generic REST tool: a tool with no body template offers a
   // free-form `body`, one with a template offers exactly its authored keys.
   return httpToolSchema(t);
@@ -1477,6 +1525,17 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
   // No hub read needed and no key to check — but no second source either. A run
   // that carried no snapshot gets a refusal that says so, never coordinates.
   if (isLocationTool(tool)) return runLocationTool(tool, args, ctx.location).text;
+  // Another agent, run to completion by THIS process so its answer can be handed
+  // back to the caller. The only branch that starts a run of its own, and the
+  // whole reason the `agent` kind exists: `agents.trigger` can already start an
+  // agent, but its executor lives on the device and a relay run still in flight
+  // cannot be returned to from there (see agent-tool.mjs). Everything about the
+  // child — the roster read, the depth brake, the fan-out ledger, the timeout —
+  // lives in `runAgentTool`, which reports every refusal as TEXT like its
+  // neighbours here, so a hub that is down costs the model one step and not the
+  // run. `ctx` is forwarded wholesale because the child's ancestry (its depth and
+  // the parent's abort signal) is the only thing this branch needs from it.
+  if (isAgentTool(tool)) return runAgentTool(tool, args, ctx);
   if (isFilesTool(tool)) return runFilesTool(tool, args, signal);
   if (isWebTool(tool)) {
     const ws = webSearchConfig();
@@ -1688,6 +1747,306 @@ function failRun(run, err) {
 }
 
 /**
+ * THE ONE PLACE A RUN COMES INTO EXISTENCE.
+ *
+ * Extracted from POST /api/agent/run so that the `agent` tool can start a child
+ * through exactly the same construction. Two constructors would be two answers to
+ * "what is a run", and the second one would be the one nobody reviews: the child
+ * would quietly miss the tool cap, the name dedupe, the duplicate-name fault, the
+ * model fault and both side tables, and the difference would only ever show up as
+ * a child that behaves unlike every other run in the app.
+ *
+ * Returns `{ ok: true, run }` or `{ ok: false, error }` — it does NOT broadcast
+ * and does NOT launch. The route answers the caller and then launches; the
+ * `agent` tool waits for the loop to finish. Only the caller knows which.
+ *
+ * The MODEL resolution lives here for the reason the route spelled out before it
+ * moved:
+ *
+ *   The AGENT's own model wins. An agent is a SAVED configuration, so a run of
+ *   that agent is expected to use the model it was saved with.
+ *
+ *   The CALLER's model does NOT, and that was one of the ways these runs died.
+ *   `body.model` is the DEVICE's session model — by default an OpenRouter id
+ *   (`emptyLlmSettings`) until a visit to Settings syncs it from this relay — so
+ *   an agent with no model of its own could be launched on a model this relay's
+ *   backend does not serve, and the provider killed the request before the first
+ *   prompt landed. The relay's OWN configured model is the right fallback: it is
+ *   the model this relay was told to use, provider-correct by construction, and a
+ *   model set in Settings is written to the RELAY, so the caller's copy is a
+ *   mirror that can only go stale. The route still reads that field and reports it
+ *   when it disagrees, because an older client goes on sending it — silence about a
+ *   difference the caller cannot see is how a mirror becomes a belief.
+ */
+function startAgentRun(spec) {
+  const tools = Array.isArray(spec.tools) ? spec.tools : [];
+  const intentTool = spec.intentTool ?? null;
+  // Refused HERE, while the caller still exists to be told, and before the run
+  // exists to be abandoned. See toolSetFault and modelProviderFault: both are
+  // faults the provider answers by rejecting the whole request, which reaches the
+  // wearer as a run that never arrived rather than one that failed.
+  const fault = toolSetFault(intentTool ? [...tools, intentTool] : tools);
+  if (fault) return { ok: false, error: `cannot start this run — ${fault}` };
+  const cfg = llmConfig();
+  const runModel = String(spec.model ?? '').trim() || cfg.model;
+  const modelFault = modelProviderFault(runModel, cfg.provider);
+  if (modelFault) return { ok: false, error: `cannot start this run — ${modelFault}` };
+  const prompt = String(spec.prompt ?? '').trim();
+  const agent = spec.agent ?? {};
+  const run = {
+    id: randomBytes(8).toString('hex'),
+    agentId: String(agent.id ?? ''),
+    agentName: String(agent.name ?? 'Agent'),
+    systemPrompt: String(agent.systemPrompt ?? ''),
+    // Optional, and absent from older clients. Both are layered INTO the wire
+    // rather than replacing anything (see executeRun), and when neither is
+    // present the assembled messages are byte-for-byte what they were before
+    // these fields existed — which is the property the delta plan rests on.
+    savedPrompt: String(spec.savedPrompt ?? ''),
+    instructions: String(spec.instructions ?? ''),
+    model: runModel,
+    prompt,
+    title: prompt.slice(0, 48),
+    tools,
+    messages: [{ role: 'user', content: prompt, at: Date.now() }],
+    status: 'running',
+    statusText: 'Thinking…',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  runs.set(run.id, run);
+  // Recorded on creation, not on first tool call, so a chain's depth is a fact
+  // about where the run CAME FROM and cannot be lost if its first call throws.
+  runDepths.set(run.id, Number.isFinite(spec.depth) ? Number(spec.depth) : 0);
+  // Installed AFTER the run exists, because the key is the run's own id, and
+  // BEFORE pruneRuns so an eviction in this same tick can still see and clear
+  // it. Absent is the normal case for a client that delegates nothing.
+  if (intentTool) runIntents.set(run.id, { tool: intentTool, list: [] });
+  // The wearer's position, captured on the device when the run was triggered —
+  // there is no route from here to the phone, and no client round trip mid-run
+  // to add one. Kept BESIDE the run and never ON it: a field would be
+  // serialized to every client by runSnapshot/broadcastRun, outliving the one
+  // tool call that needs it. Absent is a normal case — and so is a CHILD run,
+  // which is never given one on purpose: see runAgentTool.
+  if (spec.location) runLocations.set(run.id, spec.location);
+  pruneRuns();
+  return { ok: true, run };
+}
+
+/** The hub's own tool rows, taken to the fields a run can execute. */
+function parseHubTools(payload) {
+  const raw = Array.isArray(payload) ? payload : payload?.tools;
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue;
+    const name = typeof row.name === 'string' ? row.name.trim() : '';
+    const kind = typeof row.kind === 'string' ? row.kind.trim() : '';
+    if (!name || !kind) continue;
+    out.push({
+      id: typeof row.id === 'string' ? row.id : '',
+      name,
+      kind,
+      description: typeof row.description === 'string' ? row.description : '',
+      ...(typeof row.url === 'string' ? { url: row.url } : {}),
+      ...(typeof row.method === 'string' ? { method: row.method } : {}),
+      ...(typeof row.searchDepth === 'string' ? { searchDepth: row.searchDepth } : {}),
+      hasToken: Boolean(row.hasToken),
+    });
+  }
+  return out;
+}
+
+/**
+ * The hub's agents and its tool rows, read through the ONE hub client.
+ *
+ * Both together because they are useless apart: a name is only worth resolving
+ * because its tool rows turn it into a run. `hubRuntime()` reuses the document
+ * store's session on purpose — see its header — because a second client would
+ * rotate the same refresh family against itself and sign every surface out.
+ *
+ * NEVER throws, and every unhappy outcome is a VALUE. This is called from inside
+ * a tool call, so a hub that is down has to cost the model one honest refusal
+ * rather than the run that asked.
+ *
+ * `/agents` is asked for both collections because it is documented to carry both,
+ * and `/tools` is only reached when the first answer had no `tools` key at all —
+ * so a hub that grows or drops that field costs a round trip, never a wrong
+ * answer.
+ */
+async function hubAgentRoster(signal) {
+  let client = null;
+  try {
+    const hub = hubRuntime();
+    client = hub.client;
+    if (!client) return { agents: [], tools: [], error: hub.error || 'the hub is not configured' };
+  } catch (err) {
+    return { agents: [], tools: [], error: err instanceof Error ? err.message : String(err) };
+  }
+  const read = async (path) => {
+    try {
+      const res = await client.call('GET', path, { signal });
+      if (!res?.ok) return { error: `the hub answered ${res?.status ?? 'nothing'} for ${path}` };
+      return { body: JSON.parse(res.text) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+  const first = await read('/agents');
+  if (first.error) return { agents: [], tools: [], error: first.error };
+  const agents = parseAgents(first.body);
+  if (Array.isArray(first.body?.tools)) {
+    return { agents, tools: parseHubTools(first.body.tools), error: '' };
+  }
+  const second = await read('/tools');
+  if (second.error) return { agents: [], tools: [], error: second.error };
+  return { agents, tools: parseHubTools(second.body), error: '' };
+}
+
+/** A short, ASCII, single-line name for a log line or a refusal. */
+function clipName(name) {
+  const one = String(name ?? '').replace(/[^\x20-\x7E]+/g, ' ').trim();
+  return one.length > 60 ? `${one.slice(0, 57)}...` : one;
+}
+
+/**
+ * Run another agent and hand its answer back to the run that asked.
+ *
+ * THE SHAPE OF THIS FUNCTION IS THE GUARANTEE. Read the roster, resolve the
+ * agent, check the two brakes, start the child through `startAgentRun`, AWAIT the
+ * child's loop, then read the child's OWN final answer off its transcript. There
+ * is no branch anywhere in here that returns a result the child did not produce;
+ * every other outcome is a refusal that names which one it was, so a model cannot
+ * mistake a failure for a finding. That is the whole point of the tool (see
+ * agent-tool.mjs) — an honest "it did not answer" is worth more than a fluent
+ * sentence about what it probably found.
+ *
+ * AWAITING is what makes this different from the intent path. `agents.trigger`
+ * already exists and is delegable, but it is fire-and-forget by necessity: its
+ * executor is on the device and there is no route back into a relay run that is
+ * still in flight. A result can only be handed to the model that asked for it by
+ * something that waited, and this process is the only thing that can.
+ */
+async function runAgentTool(tool, args, ctx) {
+  const parent = ctx?.run ?? null;
+  const asked = String(args?.name ?? args?.agent ?? '').trim();
+  const roster = await hubAgentRoster(ctx?.signal);
+  if (roster.error) {
+    return (
+      `tool error: the agent list could not be read (${roster.error}), so no agent was run and ` +
+      'no result exists for any of them. Do not write down a result for an agent you could not start.'
+    );
+  }
+  // The roster call. This is what lets the model use the names that EXIST instead
+  // of the names it expects, which is the cheapest possible fix for an invented
+  // one — one extra step, against a whole compiled page built on nothing.
+  if (!asked) return formatRoster(roster.agents);
+  const agent = findAgent(roster.agents, asked);
+  if (!agent) return unknownAgentText(asked, roster.agents);
+
+  // ── The two brakes, both BEFORE the child exists ──────────────────────────
+  // Refusing here is a sentence the model can work around. Refusing later — or
+  // letting the child start and cutting it off — is a run the model cannot see
+  // the end of, and a model staring at a half-run will write the rest itself.
+  const depth = parent ? runDepths.get(parent.id) ?? 0 : 0;
+  if (depth >= MAX_AGENT_DEPTH) return depthRefusalText(agent.name, depth);
+  const used = parent ? runChildren.get(parent.id)?.length ?? 0 : 0;
+  if (used >= MAX_CHILDREN_PER_RUN) return budgetRefusalText(agent.name, used);
+
+  // The tools the agent was SAVED with, resolved against the hub's own catalogue.
+  // Never re-chosen here: a child holding a different toolset than the wearer
+  // sees on the Agents page is an agent that behaves unlike itself, and the
+  // wearer would have no way to tell which of the two answers they read.
+  const tools = roster.tools.filter((t) => agent.toolIds.includes(t.id));
+  const ask = String(args?.ask ?? '').trim();
+  const savedTask = String(agent.prompt ?? '').trim();
+  const prompt = (savedTask || ask).trim();
+  if (!prompt) {
+    return (
+      `tool error: "${clipName(agent.name)}" has no saved task to run, so nothing was started and ` +
+      'no result exists for it. Pass an "ask" argument to give it one.'
+    );
+  }
+  const started = startAgentRun({
+    agent: { id: agent.id, name: agent.name, systemPrompt: agent.systemPrompt },
+    prompt,
+    // `ask` is LAYERED, never substituted: it arrives as `instructions`, which the
+    // wire appends to the saved task. Replacing the task instead would run a
+    // different agent than the one that was named.
+    instructions: ask && savedTask ? ask : '',
+    tools,
+    // '' rather than the agent's own model: an agent on the hub carries no model
+    // key (see the agents-store notes), and the relay's own configured model is
+    // provider-correct by construction. `startAgentRun` resolves it.
+    model: '',
+    depth: depth + 1,
+  });
+  if (!started.ok) return `tool error: ${started.error}`;
+  const child = started.run;
+  // No location snapshot, deliberately. The parent's fix is the WEARER'S position
+  // at the moment the parent started, and a child run inherits the ambiguity of
+  // that age without inheriting the context that explained it. A child that needs
+  // a position gets the location tool's own refusal, which is the honest answer.
+  if (parent) {
+    const list = runChildren.get(parent.id) ?? [];
+    list.push(child.id);
+    runChildren.set(parent.id, list);
+    parent.statusText = `Running ${clipName(agent.name)}…`;
+    broadcastRun(parent);
+  }
+  broadcastRun(child);
+  console.log(
+    `[g2-hub] agent run ${child.id}: "${clipName(agent.name)}" started by run ${parent?.id ?? '(direct)'}`,
+  );
+
+  // The child's loop, and the two ways it can be cut short.
+  //
+  // It is started WITHOUT `await` so the controller it installs for itself can be
+  // read straight back — `executeRun` sets `runAbort` before its first `await` —
+  // and then awaited. Passed in instead, the signature would change for every
+  // other caller to serve this one.
+  const loop = executeRun(child);
+  const childCtl = runAbort.get(child.id);
+  // The wearer pressing Stop on the PARENT must not leave the child running
+  // behind it: a stopped run that is still spending tokens and still writing to
+  // the hub is exactly the kind of invisible cost this app has been bitten by.
+  const parentCtl = parent ? runAbort.get(parent.id) : null;
+  const stopChild = () => {
+    if (child.status === 'running') {
+      child.status = 'stopped';
+      child.statusText = '';
+      broadcastRun(child);
+    }
+    childCtl?.abort();
+  };
+  let timedOut = false;
+  const onParentStop = () => stopChild();
+  parentCtl?.signal?.addEventListener?.('abort', onParentStop, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stopChild();
+  }, CHILD_TIMEOUT_MS);
+  try {
+    await loop;
+  } catch (err) {
+    failRun(child, err);
+  } finally {
+    clearTimeout(timer);
+    parentCtl?.signal?.removeEventListener?.('abort', onParentStop);
+    if (parent && parent.status === 'running') {
+      parent.statusText = 'Reasoning…';
+      broadcastRun(parent);
+    }
+  }
+  const elapsed = Date.now() - child.startedAt;
+  // The child is read from the OBJECT, never a second lookup by id: MAX_RUNS is
+  // 8, so a parent that started several children can have pushed one out of the
+  // map, and a lookup that missed would turn a real answer into "not found".
+  if (timedOut) return timedOutText(agent.name, CHILD_TIMEOUT_MS);
+  return formatChildResult(agent.name, child.id, readChildResult(child), elapsed);
+}
+
+/**
  * Run the agent loop and stream every turn to both clients. Never throws: the
  * failure is recorded on the run so the glasses and the browser both show it.
  */
@@ -1813,6 +2172,13 @@ async function executeRun(run) {
               location: runLocations.get(run.id),
               runId: run.id,
               intents: runIntents.get(run.id),
+              // The run itself, so a tool that starts ANOTHER run can see where
+              // it sits in a chain and how many children it already has. Beside
+              // the two above rather than read from `runs`, because the answer it
+              // needs is about THIS run's own frame and cannot be derived from a
+              // registry that evicts.
+              run,
+              signal: ac.signal,
             })
           : `tool error: ${name} is not available for this request. Call one of: `
             + `${schemas.map((s) => s.function.name).join(', ') || '(no tools)'}`;
@@ -2698,15 +3064,11 @@ const server = createServer(async (req, res) => {
     // never arrived. Two homes for one tool was the whole fault; the side table is
     // now the only one.
     const tools = [...authored, ...HUB_MCP_AGENT_TOOLS];
-    // A toolset that cannot reach the model is refused HERE, while the caller is
-    // still listening and before the run exists, so the answer can name the fault.
-    // The alternative is what the duplicate above produced: a run that was
-    // accepted, broadcast, and then quietly died with nothing on it to say why.
-    const fault = toolSetFault(intentTool ? [...tools, intentTool] : tools);
-    if (fault) {
-      json(res, 400, { ok: false, error: `cannot start this run — ${fault}` });
-      return;
-    }
+    // The toolset fault is checked by startAgentRun, below, together with the model
+    // fault — both are refused while the caller is still listening and before the
+    // run exists, so the answer can name the fault. The alternative is what the
+    // duplicate above produced: a run that was accepted, broadcast, and then
+    // quietly died with nothing on it to say why.
     // Which model this run will use, resolved once, out loud.
     //
     // The AGENT's own model wins: an agent is a SAVED configuration, so a run of
@@ -2726,46 +3088,25 @@ const server = createServer(async (req, res) => {
     const callerModel = String(body?.model ?? '').trim();
     const runModel = String(agentModel || cfg.model);
     const modelSource = agentModel ? 'agent' : 'relay';
-    const modelFault = modelProviderFault(runModel, cfg.provider);
-    if (modelFault) {
-      json(res, 400, { ok: false, error: `cannot start this run — ${modelFault}` });
+    // ONE constructor for every run in this process — the wearer's run here and a
+    // child started by the `agent` tool. See startAgentRun for what it owns and
+    // why it is not inlined a second time.
+    const started = startAgentRun({
+      agent,
+      prompt,
+      tools,
+      intentTool,
+      model: runModel,
+      savedPrompt: body?.savedPrompt,
+      instructions: body?.instructions,
+      location: body?.location,
+      depth: 0,
+    });
+    if (!started.ok) {
+      json(res, 400, { ok: false, error: started.error });
       return;
     }
-    const run = {
-      id: randomBytes(8).toString('hex'),
-      agentId: String(agent.id ?? ''),
-      agentName: String(agent.name ?? 'Agent'),
-      systemPrompt: String(agent.systemPrompt ?? ''),
-      // Optional, and absent from older clients. Both are layered INTO the wire
-      // rather than replacing anything (see executeRun), and when neither is
-      // present the assembled messages are byte-for-byte what they were before
-      // these fields existed — which is the property the delta plan rests on.
-      savedPrompt: String(body?.savedPrompt ?? ''),
-      instructions: String(body?.instructions ?? ''),
-      model: runModel,
-      prompt,
-      title: prompt.slice(0, 48),
-      tools,
-      messages: [{ role: 'user', content: prompt, at: Date.now() }],
-      status: 'running',
-      statusText: 'Thinking…',
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    runs.set(run.id, run);
-    // Installed AFTER the run exists, because the key is the run's own id, and
-    // BEFORE pruneRuns so an eviction in this same tick can still see and clear
-    // it. Absent is the normal case for a client that delegates nothing.
-    if (intentTool) runIntents.set(run.id, { tool: intentTool, list: [] });
-    // The wearer's position, captured on the device when the run was triggered —
-    // there is no route from here to the phone, and no client round trip mid-run
-    // to add one. Kept BESIDE the run and never ON it: a field would be
-    // serialized to every client by runSnapshot/broadcastRun, outliving the one
-    // tool call that needs it. Absent is a normal case, and a location tool that
-    // reads an absent snapshot REFUSES (see location-tool.mjs) rather than
-    // falling back to anything.
-    if (body?.location) runLocations.set(run.id, body.location);
-    pruneRuns();
+    const run = started.run;
     // The answer to "which model is my agent actually running on" exists nowhere
     // else: the run object is broadcast verbatim to both clients, so a bookkeeping
     // field on it would ride into every stored session, and the wearer's own log

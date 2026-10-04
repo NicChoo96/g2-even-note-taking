@@ -60,7 +60,16 @@ const seedBlock = (name) => {
   if (start < 0) return '';
   return capSrc.slice(start, capSrc.indexOf('};', start) + 2);
 };
-const SEEDS = ['WEB_SEED', 'FILES_SEED', 'JEV_SEED', 'TODO_SEED', 'DOCS_SEED', 'NOTES_SEED', 'LOCATION_SEED'].map(
+const SEEDS = [
+  'AGENT_SEED',
+  'WEB_SEED',
+  'TODO_SEED',
+  'DOCS_SEED',
+  'NOTES_SEED',
+  'LOCATION_SEED',
+  'FILES_SEED',
+  'JEV_SEED',
+].map(
   (name) => {
     const block = seedBlock(name);
     const kind = (/kind:\s*'([a-z]+)'/.exec(block) ?? [])[1];
@@ -76,7 +85,7 @@ const SEEDS = ['WEB_SEED', 'FILES_SEED', 'JEV_SEED', 'TODO_SEED', 'DOCS_SEED', '
 
 const missingBlock = SEEDS.filter((s) => !s.kind || !s.words);
 check('every seed block was found and parsed', missingBlock.map((s) => s.name), []);
-check('…and there are seven of them', SEEDS.length, 7);
+check('…and there are eight of them', SEEDS.length, 8);
 
 const RULES = X.promiseRules(SEEDS);
 
@@ -102,16 +111,48 @@ check(
   [true, true, true, true],
 );
 // And the overrides are a NAMED, FINITE set. Pinned exactly, because an override
-// is a claim that speech and prose disagree, and a fourth one added in passing is
+// is a claim that speech and prose disagree, and a fifth one added in passing is
 // the beginning of a second vocabulary.
 check(
-  'exactly the three kinds whose prose differs from speech are overridden',
+  'exactly the four kinds whose prose differs from speech are overridden',
   RULES.filter((r) => r.names.source !== SEEDS.find((s) => s.kind === r.kind).words.source).map((r) => r.kind).sort(),
-  ['files', 'location', 'web'],
+  ['agent', 'files', 'location', 'web'],
 );
 assert(
   'every rule says where its reading came from',
   RULES.every((r) => typeof r.why === 'string' && r.why.length > 10),
+);
+// The check above compares VOCABULARIES, so a kind that overrides only its
+// commitment verbs is invisible to it — and the agent kind is exactly that shape.
+// `notes` is the witness that has no override at all, so its commitment rule IS
+// the borrowed one; anything differing from it is overridden. One kind, pinned,
+// for the same reason as above: this is a claim, not a default.
+const baseCommit = RULES.find((r) => r.kind === 'notes').commit.source;
+check(
+  'only the agent kind needs its own commitment verbs',
+  RULES.filter((r) => r.commit.source !== baseCommit).map((r) => r.kind).sort(),
+  ['agent'],
+);
+// The claim is not "the agent rule contains a word" — it is that the borrowed
+// verbs CANNOT read an orchestrator's instructions while the agent rule's own can.
+// Tested as behaviour, on the phrasings the bug report uses, because a substring
+// check would pass on a rule that names the verb and never matches it.
+const baseCommitRe = RULES.find((r) => r.kind === 'notes').commit;
+const agentCommit = RULES.find((r) => r.kind === 'agent').commit;
+const ORCHESTRATOR_PHRASINGS = [
+  'Ask each of the six daily agents for their report.',
+  'Gather what the agents return.',
+  'Compile the agents\u2019 answers into one page.',
+];
+check(
+  'the borrowed commitment verbs cannot read an orchestrator\u2019s instructions',
+  ORCHESTRATOR_PHRASINGS.map((s) => baseCommitRe.test(s)),
+  [false, false, false],
+);
+check(
+  '  ...and the agent kind\u2019s own verbs can',
+  ORCHESTRATOR_PHRASINGS.map((s) => agentCommit.test(s)),
+  [true, true, true],
 );
 
 // ── 2. What a rule does with a sentence ────────────────────────────────────
@@ -203,10 +244,52 @@ check('describing the input is not a commitment', promised("Today's tasks are li
 check('a modal about the output is not a commitment', promised('These reports must be under 300 words.'), []);
 check('…but the same noun with an act is', promised('File each report you produce.'), ['files']);
 
+// ── 4b. The orchestrator case ──────────────────────────────────────────────
+// THE GAP THIS KIND WAS ADDED FOR. An orchestrator whose prompt instructs it to
+// run the other agents and compile what they found, holding no tool that can run
+// one — so the run has nothing to compile and re-reads an older page instead. The
+// phrasings are the bug report's own ("calls the six daily agents", "reads their
+// results", "compiles them into ... a page").
+check(
+  'running the daily agents promises the agent tool',
+  promised('Call the six daily agents, read their results, and compile them into one page.'),
+  ['agent'],
+);
+check(
+  '  ...and so does naming them without a verb in the store vocabulary',
+  promised('Ask each of the six daily agents what they found, then fold it in.'),
+  ['agent'],
+);
+check(
+  'a multi-agent instruction promises the agent tool',
+  promised('Orchestrate the other agents and gather what they return.'),
+  ['agent'],
+);
+// THE NEAR-MISS, and the reason this kind carries an override. "Digest" is the
+// thing this kind of prompt PRODUCES — the word sits in its own output
+// instructions next to a commitment verb, and reading that as a request to run
+// other agents would propose a tool to an agent that already is one. A proposal
+// the wearer declines is worse than no proposal: it teaches them to decline.
+check(
+  'describing your own digest is not a promise',
+  promised('Send the digest as plain text under 200 words.'),
+  [],
+);
+check(
+  'a digest of headlines is a web promise, not an agent one',
+  promised('Search the news and write a headline digest.'),
+  ['web'],
+);
+check(
+  'naming a person is not naming an agent',
+  promised('The agentic era of assistants is the subject.'),
+  [],
+);
+
 // ── 5. "No tools at all" ───────────────────────────────────────────────────
 check('a toolless agent is recognised', read('You have no tools, work from the prompt alone.').toolless, true);
 // POSITIVE CONTROL: this is the same shape as the report's sentence, and reading
-// it as toolless would withdraw all seven kinds from an agent that only lacks two.
+// it as toolless would withdraw all eight kinds from an agent that only lacks two.
 check('a denial of TWO kinds is not a toolless agent', read(tracker).toolless, false);
 
 // ── 6. Assembling the gap ──────────────────────────────────────────────────
@@ -283,7 +366,7 @@ const long = X.proposalOf({ ...gap, agentName: 'A very long agent name that goes
 assert('a long name is clipped, not spilled', long.text.length <= 118, `${long.text.length} chars`);
 const unicode = X.proposalOf({ ...gap, agentName: 'Caf\u00e9 \u2014 Tr\u00e8s Long' });
 assert('a non-ASCII name cannot reach the ledger', /^[\x20-\x7E]*$/.test(unicode.text), unicode.text);
-check('kind labels are spoken words, not enum values', ['web', 'files', 'docs', 'notes', 'todo', 'location', 'jev'].map((k) => X.kindLabel(k)), [
+check('kind labels are spoken words, not enum values', ['web', 'files', 'docs', 'notes', 'todo', 'location', 'jev', 'agent'].map((k) => X.kindLabel(k)), [
   'web search',
   'the document store',
   'saved docs',
@@ -291,6 +374,7 @@ check('kind labels are spoken words, not enum values', ['web', 'files', 'docs', 
   'the to-do list',
   'location',
   'the decision tool',
+  'another agent',
 ]);
 
 console.log(fail ? `\n${fail} FAILURE(S)` : '\nALL CHECKS PASSED');

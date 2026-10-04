@@ -404,7 +404,17 @@ const clientSrc = readFileSync(resolve('src', 'web', 'jev-client.ts'), 'utf8');
 const storeSrc = readFileSync(resolve('src', 'agents-store.ts'), 'utf8');
 const settingsSrc = readFileSync(resolve('src', 'web', 'SettingsPanel.tsx'), 'utf8');
 
-assert('ToolKind admits the jev kind alongside web', /'web' \| 'http' \| 'jev'/.test(typesSrc));
+// Read as a SET of members, not as a run of characters: the union is written one
+// kind per line, and an assertion pinned to the separators fails the next time it
+// is reformatted while the property it names — that jev is a member — is
+// untouched. The members are printed so a real removal is still diagnosable.
+const toolKindMembers = ((/export type ToolKind =([^;]+);/.exec(typesSrc)?.[1] ?? '').match(/'[a-z]+'/g) ?? [])
+  .map((s) => s.slice(1, -1));
+assert(
+  'ToolKind admits the jev kind alongside web',
+  ['web', 'http', 'jev'].every((k) => toolKindMembers.includes(k)),
+  toolKindMembers.join(', '),
+);
 assert('ToolKind still admits the legacy tavily kind', /'tavily'/.test(typesSrc));
 assert('types.ts exports a jev tool seeder', /export function jevTool\(\): ToolDef/.test(typesSrc));
 assert('the panel can seed jev onto an agent', /addJevToAgent/.test(panelSrc));
