@@ -305,7 +305,11 @@ console.log('\n── Mirror: source invariants ──');
 // 6a. The relay must not keep a transient frame, because the SSE `init` frame is
 //     what hands it to the next client. (`ai`/`ai-ctl` are live signals: they
 //     are broadcast once and forgotten.)
-const relaySrc = readFileSync(new URL('../../web/server/local-sse.mjs', import.meta.url), 'utf8');
+const relaySrc = readFileSync(new URL('../../web/server/local-sse.mjs', import.meta.url), 'utf8')
+  // The working tree is CRLF (`core.autocrlf=true` and no `.gitattributes`), so
+  // any pattern that anchors on `\n` silently misses unless the text is folded
+  // first. A missed slice here is how an assertion starts passing for free.
+  .replace(/\r\n/g, '\n');
 assert('the relay declares its transient channels', /TRANSIENT_CHANNELS = new Set\(\['ai', 'ai-ctl'\]\)/.test(relaySrc));
 // What matters is the RULE, not the number of writers. Originally there was one
 // writer and this counted it; the hub tools added a second, because a change an
@@ -316,14 +320,46 @@ const writes = relaySrc.match(/channel\.lastState = state;/g) ?? [];
 const guarded = relaySrc.match(/if \(!TRANSIENT_CHANNELS\.has\(channel\.name\)\) \{\s*channel\.lastState = state;/g) ?? [];
 assert('the relay caches state somewhere', writes.length > 0);
 check('every cache write refuses transient channels', writes.length, guarded.length);
+
+// 6b. There is no second publisher, and there must never be one again.
+//
+//     `publishHubState()` took a state an agent tool assembled from the relay's
+//     OWN bootstrap copy and cached, persisted and fanned it out — so a write
+//     that reached the hub nowhere looked, to every device, exactly like one that
+//     had. It is gone, and this pins the removal rather than the implementation
+//     detail, because re-adding any function of that shape re-opens the original
+//     bug report ("the tasks are done" with nothing in the database).
 assert(
-  '…the agent-tool publisher obeys it too',
-  /function publishHubState[\s\S]{0,600}?if \(!TRANSIENT_CHANNELS\.has\(channel\.name\)\) \{\s*channel\.lastState = state;/.test(relaySrc),
+  'no agent-tool publisher caches a state of its own',
+  !/function publishHubState/.test(relaySrc),
 );
+// The tombstone is asserted as literal text, not as a loose regex: the marker is
+// written `publishHubState()` — method-style, with the closing backtick glued to
+// the parens — and a pattern that leaves the backtick out silently matches
+// nothing at all. (It matches nothing, and a bare `assert` on «not found» reads
+// like a pass the moment anyone inverts the test, so the two halves below are
+// checked for BOTH presence and proximity.)
+const TOMBSTONE = '`publishHubState()` USED TO LIVE HERE';
+const WHY_NOT = 'the only thing that may write it is `POST /api/stream`';
+const tombAt = relaySrc.indexOf(TOMBSTONE);
+const whyAt = relaySrc.indexOf(WHY_NOT);
 assert(
-  '…but still broadcasts even for a transient channel',
-  /function publishHubState[\s\S]{0,900}?\n  const frame = \{ type: 'state', state \};/.test(relaySrc),
+  '…and the tombstone says why it must not come back',
+  tombAt >= 0 && whyAt > tombAt && whyAt - tombAt < 1600,
+  tombAt < 0 ? 'no tombstone' : whyAt < 0 ? 'no reason given' : `${whyAt - tombAt} chars apart`,
 );
+// What a hub write does instead: it nudges, and the frame carries NO state — each
+// client refetches the one collection from the hub. A frame that carried a state
+// would re-serve a snapshot another device has already superseded, which is the
+// stale frame the hub migration existed to end.
+assert(
+  'the agent-tool path nudges instead of publishing state',
+  /nudgeHubChanged\(HUB_TOOL_COLLECTION\[tool\.kind\], applied\.rev, undefined\)/.test(relaySrc),
+);
+const nudge = /function nudgeHubChanged\(path, rev, origin\) \{[\s\S]*?\n\}/.exec(relaySrc)?.[0] ?? '';
+assert('the nudge body was found, not swallowed', nudge.length > 120 && nudge.length < 1200, `${nudge.length} chars`);
+assert('…and the nudge frame carries no state', !/type: 'state'/.test(nudge));
+assert('…and it fans out through the same helper every other frame uses', /hubChangedFrame\(path, rev, origin\)/.test(nudge));
 
 // 6b. The menu must not promise "Stop AI" for a HUD that is not there: the item
 //     is derived from what is on screen (a held reply, or an open Jarvis mic),

@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.44
+
+v0.3.44 - Jarvis's to-do and doc edits really save now
+
+- To-do and doc changes Jarvis made from the glasses used to be reported as
+ done while the server was never told, so the list came back unchanged.
+- Deleting a task or a document was refused in silence and left the item in
+ place; both now remove it.
+- Ticking, editing and clearing to-dos come back with the real list.
+
 ## 0.3.43
 
 v0.3.43 - Your other devices keep up on their own

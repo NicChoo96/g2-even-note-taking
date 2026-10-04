@@ -341,7 +341,13 @@ eq('the transcript summary names the action', hubToolSummary(tool('todo'), { act
 // ── 10. The relay is wired to this module, and only once ────────────────────
 console.log('\n§10  relay wiring');
 has('the relay imports the module', relaySrc, "from './hub-tools.mjs'");
-has('it imports the schema builder', relaySrc, 'hubToolSchema, isHubTool, runHubTool');
+// The relay takes the SCHEMA and the predicate from this module, and the reducer
+// only through `applyHubTool` in hub-write.mjs. It must not import `runHubTool`
+// itself: reaching the pure reducer without the write-through beside it is the
+// exact mistake that let an agent's write land on a copy nobody read.
+has('it imports the schema and the predicate', relaySrc, 'hubToolSchema, isHubTool');
+eq('but not the bare reducer', /runHubTool[,}]/.test(relaySrc), false);
+has('the write-through is the reducer’s only door', relaySrc, "from './hub-write.mjs'");
 const schemaFn = relaySrc.slice(relaySrc.indexOf('function toolSchemaFor'), relaySrc.indexOf('async function llmOnce'));
 has('toolSchemaFor delegates to hubToolSchema', schemaFn, 'hubToolSchema(t)');
 assert(
@@ -350,11 +356,22 @@ assert(
   'the hub branch must come BEFORE the REST fallback',
 );
 
-const publishFn = relaySrc.slice(relaySrc.indexOf('function publishHubState'), relaySrc.indexOf('function setCors'));
-has('publishHubState caches lastState', publishFn, "channel.lastState = state");
-has('publishHubState mirrors to disk', publishFn, 'void persistState(channel.name, state)');
-has('publishHubState fans out to subscribers', publishFn, 'send(client, frame, channel.name)');
-has('publishHubState publishes a state frame', publishFn, "{ type: 'state', state }");
+// The relay USED to keep a hub copy of its own and publish it from here. That
+// copy is loaded once at boot from a git-ignored file, no client ever refreshed
+// it, and in Docker it does not survive a restart — so every server-side hub
+// tool wrote into a phantom, told the wearer it had worked, and the hub never
+// heard about it. Only the wearer's own tap reached the hub, which is why adds,
+// edits, ticks and deletes from the assistant were invisible everywhere else
+// while the app-to-hub path stayed healthy. `publishHubState` is deleted; what
+// replaces it is a write-through to the hub itself (web/server/hub-write.mjs,
+// covered by tools/hub-write-sim.mjs). These assertions are the tombstone.
+eq('publishHubState is gone, not merely unused', /function publishHubState/.test(relaySrc), false);
+eq('and the refusal for want of a local copy went with it', /NO_HUB_STATE_MSG/.test(relaySrc), false);
+eq(
+  'the only hub state the relay still caches comes from a CLIENT',
+  [...relaySrc.matchAll(/channel\.lastState\s*=/g)].length,
+  1,
+);
 
 const runOnce = fnSource(relaySrc, 'runToolOnce');
 // Up to the declared parameters only. The executor gained a fourth (the run
@@ -367,23 +384,23 @@ has(
   true,
 );
 has('runToolOnce dispatches hub tools', runOnce, 'if (isHubTool(tool))');
-has('it reads the LIVE hub channel', runOnce, "getChannel('hub').lastState");
-has('it publishes only when something changed', runOnce, 'if (result.state) publishHubState(result.state)');
-eq(
-  'the executor publishes exactly once',
-  runOnce.split('publishHubState(').length - 1,
-  1,
-);
+// The executor must not touch the relay's copy of the hub at all: that copy is a
+// bootstrap for the app, never a store for an agent's write.
+eq('it no longer reads the relay copy', /getChannel\('hub'\)/.test(runOnce), false);
+eq('it no longer reduces against one', /runHubTool\(/.test(runOnce), false);
+eq('and it no longer publishes a state', runOnce.split('publishHubState(').length - 1, 0);
+has('it delegates to the ONE write-through helper', runOnce, 'runHubToolOnce(tool, args, signal)');
 
 const proxyAt = relaySrc.indexOf("url.pathname === '/api/tool'");
 const proxy = relaySrc.slice(proxyAt, proxyAt + 4000);
 has('the tool proxy knows hub tools too', proxy, 'if (isHubTool(body))');
-has('and it reuses the SAME publisher', proxy, 'if (result.state) publishHubState(result.state)');
-// A READ is required (the proxy has to hand the live hub to the reducer); what
-// must never appear is a WRITE. Asserting on the bare substring conflated the
-// two and would have forbidden the correct code.
+has('and it goes through the SAME helper', proxy, 'runHubToolOnce(body, args, undefined)');
+has('…so the two routes cannot drift apart', proxy, 'applied.ok');
+// A READ is required (the helper has to fetch the hub before the reducer can
+// act); what must never appear is a WRITE. Asserting on the bare substring
+// conflated the two and would have forbidden the correct code.
 eq('the proxy never WRITES the channel directly', /channel\.lastState\s*=/.test(proxy), false);
-eq('the proxy refuses without a hub copy', proxy.includes('NO_HUB_STATE_MSG'), true);
+eq('and it does not refuse for want of a local copy', /NO_HUB_STATE_MSG/.test(proxy), false);
 
 // ── 11. The client offers them, opt-in ──────────────────────────────────────
 console.log('\n§11  client wiring');
@@ -461,7 +478,7 @@ has('the agent editor offers a notes chip', panelSrc, "{ kind: 'notes', label: '
 has('the catalogue can seed a todo tool', panelSrc, "{ kind: 'todo', label: 'To-do list', make: todoTool }");
 has('the catalogue can seed the docs tool', panelSrc, "{ kind: 'docs', label: 'Docs', make: docsTool }");
 has('the catalogue can seed the notes tool', panelSrc, "{ kind: 'notes', label: 'Notes', make: notesTool }");
-eq('the catalogue seeds are matched on KIND, not id', panelSrc.includes('s.tools.some((t) => t.kind === kind)'), true);
+eq('the catalogue seeds are matched on KIND, not id', panelSrc.includes('t.kind === s.kind'), true);
 has('the kind select can switch to todo', panelSrc, '<option value="todo">');
 has('the kind select can switch to docs', panelSrc, '<option value="docs">');
 has('the kind select can switch to notes', panelSrc, '<option value="notes">');
@@ -476,46 +493,81 @@ eq(
 );
 
 // ── 12. Neither end of the sync may roll the list backwards ─────────────────
-// This is the "my to-do list wiped itself" bug. `HubState` arrives from the
-// relay as a FULL SNAPSHOT, and the relay replays its cached copy on every
-// connect, so a stale frame is not exotic — it is what a reconnect, a restart or
-// a backgrounded peer delivers by default. Adopting one overwrote the newer list
-// and persisted that, which is why the loss looked spontaneous and permanent.
+// This is the "my to-do list wiped itself" bug. A snapshot now arrives from the
+// hub itself (`GET /hub`, via `adopt()`), and the rule that stops a wipe is the
+// same one expressed differently: `applyRemote` may adopt ONCE, at first load,
+// and never again. The old publish-war guard — comparing `updatedAt` against the
+// last stamp we pushed to the relay — went with the hub channel it defended.
+//
+// Every assertion below used to be written against that retired design and had
+// rotted into passing vacuously: `slice(-1, -1)` is the empty string, so "a
+// refused frame returns" and "the replace is unreachable" were true of a slice
+// with no code in it at all. They failed only once the slice was confined, and
+// they failed for the right reason: the code they describe no longer exists.
 console.log('\n§12  a remote snapshot may never move the list backwards');
 const storeSrc = readFileSync(new URL('../src/store.ts', import.meta.url), 'utf8');
-const applyRemoteFn = fnSource(storeSrc, 'applyRemote');
-has(
-  'the slice really is applyRemote',
-  applyRemoteFn.startsWith('function applyRemote(next: HubState): void {'),
-  true,
-);
-has('it still skips our own echo', applyRemoteFn, 'stamp === lastPublishedAt');
-has('it compares the incoming stamp with ours', applyRemoteFn, 'stamp < state.updatedAt');
+// `fnSource` ends at the NEXT declaration, which here is a 500-character
+// deprecation comment — so its idea of "applyRemote" is mostly prose, and a
+// negative assertion over prose is as vacuous as one over the empty string.
+// This bounds to the closing brace at column 0 instead, and returns '' on a miss
+// so a broken slice shows up as a FAILURE rather than as a permissive one.
+const fnBody = (src, name) => {
+  const start = src.indexOf(`function ${name}(`);
+  if (start < 0) return '';
+  const end = src.indexOf('\n}', start);
+  return end < 0 ? '' : src.slice(start, end + 2);
+};
+const applyRemoteFn = fnBody(storeSrc, 'applyRemote');
 assert(
-  'the ordering check runs BEFORE the state is replaced',
-  applyRemoteFn.indexOf('stamp < state.updatedAt') < applyRemoteFn.indexOf('state = { ...next'),
-  'replacing first would make the comparison a no-op',
+  'the slice really is applyRemote, not the tail of the file',
+  applyRemoteFn.startsWith('function applyRemote(next: HubState): void {') && applyRemoteFn.length < 400,
+  `len ${applyRemoteFn.length}`,
 );
-// Slice from the comparison up to the replacement and prove the stale branch
-// RETURNS before it: this is the whole fix. Slicing to `persist(state)` instead
-// would run past the closing brace and include the replacement itself, which is
-// how this assertion first read as a false failure.
-const refusal = applyRemoteFn.slice(
-  applyRemoteFn.indexOf('stamp < state.updatedAt'),
-  applyRemoteFn.indexOf('state = { ...next'),
+has('it adopts only at first load', applyRemoteFn, 'if (hubLoaded || !next?.sections) return;');
+assert(
+  'and the guard runs BEFORE the adoption',
+  applyRemoteFn.indexOf('if (hubLoaded || !next?.sections) return;') < applyRemoteFn.indexOf('state = { ...next'),
+  'adopting a second snapshot is how one device overwrites another',
 );
-has('a refused frame returns instead of falling through', refusal, 'return;');
-has('a refused frame re-publishes what we hold', refusal, 'schedulePublish();');
-eq('and the replace is unreachable from it', refusal.includes('persist(state)'), false);
-has('a handshake is still recorded from any frame', applyRemoteFn, 'sawServerState = true;');
+has('an adopted snapshot is stamped defensively', applyRemoteFn, 'Number(next.updatedAt) || Date.now()');
+has('it is persisted', applyRemoteFn, 'persist(state);');
+has('and it is emitted', applyRemoteFn, 'emit();');
+// The one-way push loop is what made a wipe permanent, so its machinery must be
+// absent rather than merely unreachable.
+eq(
+  'the publish-war machinery is gone',
+  /lastPublishedAt|sawServerState|schedulePublish/.test(applyRemoteFn),
+  false,
+);
+// Pushing the LOCAL copy at the relay when it reported an empty snapshot is the
+// other half of the same bug: "my list is the truth and the server is empty" is
+// how one device overwrites another's data. Seeding is a hub-side import now, so
+// both entry points the relay's SSE wiring still calls must be inert.
+const seedFn = fnBody(storeSrc, 'seedIfEmpty');
+const handshakeFn = fnBody(storeSrc, 'noteServerHandshake');
+assert(
+  'the local-copy pushers still exist for the SSE wiring',
+  seedFn.length > 0 && seedFn.length < 400 && handshakeFn.length > 0 && handshakeFn.length < 400,
+  `seed ${seedFn.length} handshake ${handshakeFn.length}`,
+);
+eq(
+  'but they push nothing anywhere',
+  /\b(fetch|publishState|pushState|send|post)\s*\(/.test(seedFn + handshakeFn),
+  false,
+);
 // A MISSING hub must never be treated as an EMPTY one: the reducer is total, so
 // it normalizes null to an empty store, and every mutation stamps `updatedAt:
 // Date.now()` — a near-empty state that outranks the real copy on the phone.
-eq('the executor refuses without a hub copy', runOnce.includes('NO_HUB_STATE_MSG'), true);
+// That guarantee used to be a refusal against the relay's local copy, and it is
+// now the reason the applier READS the hub first and refuses when the read
+// fails. The wipe itself is covered directly by tools/hub-write-sim.mjs §5;
+// what belongs here is that no branch of the relay reduces against a hub it
+// never fetched.
+eq('the executor no longer refuses for want of a local copy', /NO_HUB_STATE_MSG/.test(runOnce), false);
 assert(
-  'the refusal runs BEFORE the reducer can author a store',
-  runOnce.indexOf('NO_HUB_STATE_MSG') < runOnce.indexOf('runHubTool(tool, args, hub)'),
-  'normalizing a missing hub to empty and stamping it `now` is the wipe',
+  'the executor reaches the hub only through the helper',
+  runOnce.indexOf('runHubToolOnce(tool, args, signal)') > 0 && runOnce.split('publishHubState(').length - 1 === 0,
+  'a second path to the hub is a second way to lose a write',
 );
 // And the relay must not accept a backwards publish either, or the client-side
 // guard just turns a wipe into an endless republish war.

@@ -168,12 +168,14 @@ import { describeRoute, routeTools } from './mcp-router.mjs';
 // are built together, so they cannot drift into the mismatch they once had (the
 // schema advertised `{ body: { ... } }` while the executor sent the args flat).
 import { httpRequestArgs, httpToolSchema } from './http-tool.mjs';
-// The hub's OWN stores (todo list, document library, notes). Until this existed
-// an agent could reach the web, the Jarvis gateway and jev — but not the state
-// the relay was already holding, so "add that to my list" had no route at all.
-// The schema and the reducer live together in hub-tools.mjs; `publishHubState`
-// below is the only part that needs a socket, and it stays here.
-import { hubToolSchema, isHubTool, runHubTool } from './hub-tools.mjs';
+// The hub's OWN stores (todo list, document library, notes). The schema and the
+// reducer are pure and live together in hub-tools.mjs; nothing here knows how an
+// action reaches the store.
+import { hubToolSchema, isHubTool } from './hub-tools.mjs';
+// …and the half that DOES need a socket. A hub tool call is applied to the hub
+// itself, over the same API the app writes through, because the relay's copy of
+// the hub state is a BOOTSTRAP and never an authority (see hub-write.mjs).
+import { applyHubTool, HUB_TOOL_COLLECTION } from './hub-write.mjs';
 import { isLocationTool, locationToolSchema, runLocationTool } from './location-tool.mjs';
 // The hub API (everything the app persists) rides the SAME session as the
 // document store, so this only needs the wrapper — never a second client.
@@ -1153,22 +1155,43 @@ function broadcastRun(run) {
 }
 
 /**
- * What a hub tool reports when the relay holds no hub state at all.
+ * Run one hub tool call and make the change TRUE on the hub.
  *
- * A tool must never AUTHOR the store it is editing. `runHubTool` is deliberately
- * total, so a null hub normalizes to an EMPTY one — and every mutating action
- * stamps its result `updatedAt: Date.now()`. That combination is a silent total
- * wipe: the near-empty state is NEWER than the copy on the wearer's phone, so it
- * gets cached, persisted, and adopted over the real list. (The worst case is a
- * host with an ephemeral filesystem — a redeploy loses `.g2-hub-state.json`, and
- * a tool call in that window would destroy the only copy that still existed.)
+ * ⚠ WHAT WAS HERE BEFORE WAS THE BUG. This used to read the relay channel's own
+ * `lastState`, run the reducer over that snapshot and publish the result. That
+ * snapshot is a BOOTSTRAP copy — a git-ignored disk file locally, an ephemeral
+ * filesystem in the container — so "have my agent add a task" changed the relay's
+ * copy of the list, told the wearer it had worked, and reached neither the hub nor
+ * any other device. Meanwhile the wearer's OWN tap went to the hub, which is why
+ * only the assistant path lost writes.
  *
- * The refusal lives here rather than in the reducer because only the relay knows
- * whether its own copy is missing; the reducer must stay total so a harness can
- * call it with anything.
+ * `getChannel('hub').lastState` is deliberately absent here. `applyHubTool` reads
+ * the hub, runs the same pure reducer over what it read, and writes only the
+ * difference through the same routes the app itself uses (see hub-write.mjs).
+ *
+ * The nudge is the half that needs this process's sockets, and it carries NO
+ * STATE on purpose. Re-broadcasting a snapshot the relay assembled would re-serve
+ * whatever it happened to hold — the stale frame the hub migration existed to end,
+ * and the one way a device that had just written its own list could have it rolled
+ * back underneath it. Naming the collection lets each client refetch just that one.
+ *
+ * A refused write is NOT nudged: nothing changed, so sending every other device
+ * after identical bytes is the refetch storm the hub's `rev` rules exist to stop.
  */
-const NO_HUB_STATE_MSG =
-  'The server has no copy of your to-do list, docs or notes yet. Open the app once so it syncs, then try again.';
+async function runHubToolOnce(tool, args, signal) {
+  const client = (() => {
+    try {
+      return hubRuntime().client;
+    } catch {
+      return null;
+    }
+  })();
+  const applied = await applyHubTool(tool, args, { call: client?.call?.bind(client), signal });
+  if (applied.ok && applied.writes > 0) {
+    nudgeHubChanged(HUB_TOOL_COLLECTION[tool.kind], applied.rev, undefined);
+  }
+  return applied;
+}
 
 /** `JSON.parse` that answers null instead of throwing. */
 function parseJsonOrNull(text) {
@@ -1214,29 +1237,19 @@ function nudgeHubChanged(path, rev, origin) {
 }
 
 /**
- * Adopt a hub state produced by an AGENT TOOL and publish it.
+ * ⚠ `publishHubState()` USED TO LIVE HERE, AND IT WAS THE ONLY REASON THIS
+ * PROCESS COULD CACHE A HUB STATE IT HAD NOT RECEIVED. It took a state an agent
+ * tool had assembled from the relay's own bootstrap copy and cached, persisted
+ * and fanned it out — so a write that reached the hub nowhere looked, to every
+ * device, exactly like one that had. Deleting it makes the rule `nudgeHubChanged`
+ * already states true BY CONSTRUCTION: the relay's cached copy is a bootstrap,
+ * and the only thing that may write it is `POST /api/stream` — a client sending
+ * the state it actually holds.
  *
- * Deliberately the same steps the `POST /api/stream` publish does — cache
- * `lastState`, mirror to disk, fan out to subscribers — because a change an
- * agent makes has to be indistinguishable from one the wearer made by tapping.
- * Skipping the broadcast would leave the glasses showing the old list until the
- * next manual edit; skipping the disk write would lose it on the next restart.
- *
- * The cache write carries the SAME transient guard as every other one. `hub` is
- * not transient, so the guard never fires here — it is here so that "no state is
- * cached outside the transient check" stays true by reading the code, which is
- * the rule the mirror harness pins. The broadcast stays OUTSIDE the guard: a
- * transient channel is live, so it is still worth telling the clients about.
+ * Nothing replaced it. A hub tool call now writes to the hub and nudges; the
+ * fan-out for "here is a state a client just published" is the stream route's own
+ * code above, which is where it belongs.
  */
-function publishHubState(state) {
-  const channel = getChannel('hub');
-  if (!TRANSIENT_CHANNELS.has(channel.name)) {
-    channel.lastState = state;
-    void persistState(channel.name, state);
-  }
-  const frame = { type: 'state', state };
-  for (const client of [...channel.clients]) send(client, frame, channel.name);
-}
 
 /** OpenAI-style tool schema — mirrors the tool shapes in glasses/src/types.ts. */
 function toolSchemaFor(t) {
@@ -1405,16 +1418,8 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
     }
   }
   if (isHubTool(tool)) {
-    // Read the LIVE hub channel, not a copy: two runs (or a run and a wearer's
-    // own edit) must not race on a stale snapshot. Only a call that actually
-    // changed something carries `state`, so a read can never rewrite the hub and
-    // a failed call can never half-apply.
-    const hub = getChannel('hub').lastState;
-    // Refuse rather than invent an empty list. See NO_HUB_STATE_MSG.
-    if (!hub) return NO_HUB_STATE_MSG;
-    const result = runHubTool(tool, args, hub);
-    if (result.state) publishHubState(result.state);
-    return result.text;
+    const applied = await runHubToolOnce(tool, args, signal);
+    return applied.text;
   }
   // Jarvis's faculties, over the hub's MCP rather than a store. It reads no hub
   // channel, so it cannot race a wearer's own edit, and like every branch here
@@ -2793,21 +2798,15 @@ const server = createServer(async (req, res) => {
         json(res, 200, { ok: true, result });
         return;
       }
-      // The hub's own stores, over the same proxy. Routed through the same
-      // `publishHubState` as the agent executor rather than touching the channel
-      // here, so this route can never become a second, divergent way to write
-      // the hub (or a way to write it without telling the glasses).
+      // The hub's own stores, over the same proxy — and through the same
+      // `runHubToolOnce` as the agent executor, rather than a second dispatch of
+      // its own. A second one is what let this route and the executor drift, and
+      // `ok` now comes from whether the HUB took the write: the old `result.ok`
+      // reported the reducer's opinion of an action that had not been saved
+      // anywhere, so a dropped write came back as a success.
       if (isHubTool(body)) {
-        // Same refusal as the agent executor: a store this process does not hold
-        // is not one it may author. See NO_HUB_STATE_MSG.
-        const hub = getChannel('hub').lastState;
-        if (!hub) {
-          json(res, 200, { ok: false, result: NO_HUB_STATE_MSG });
-          return;
-        }
-        const result = runHubTool(body, args, hub);
-        if (result.state) publishHubState(result.state);
-        json(res, 200, { ok: result.ok, result: result.text });
+        const applied = await runHubToolOnce(body, args, undefined);
+        json(res, 200, { ok: applied.ok, result: applied.text, writes: applied.writes });
         return;
       }
 
