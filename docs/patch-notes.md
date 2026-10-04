@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.46
+
+v0.3.46 - Jarvis can search the web, and agents can act on the glasses
+
+- Jarvis has a web search it can run and read the results from.
+- Tell Jarvis to give an agent the tools it is missing - it proposes the change, and one tap applies it.
+- When an agent runs, it can now ask the glasses app to do things you can see, and anything that cannot be undone still waits for your tap.
+
 ## 0.3.45
 
 v0.3.45 - Agents and Docs open full screen
