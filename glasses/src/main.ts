@@ -348,8 +348,9 @@ async function main(): Promise<void> {
    * Signature of the pane layout currently installed on the page.
    *
    *   'single'  one container, a plain page (todo / notes / sign-in / HUD)
-   *   'dual'    the level-2 split of a panel — list + detail
-   *   'pane'    a panel showing ONE of its panes full-canvas (levels 1 and 3)
+   *   'dual'    the split of a panel — list + detail, at level 1 or level 2
+   *   'pane'    a panel showing ONE of its panes full-canvas (level 3, or the
+   *             empty-list fallback)
    *
    * The three are distinct because the container COUNT differs, and a page's
    * container count can only change through rebuildPageContainer.
@@ -361,11 +362,11 @@ async function main(): Promise<void> {
   let docPage = 0; // current page of the docs/notes body
   // Docs tab — the same three-level panel as Agents (see PanelLevel). The list
   // cursor IS the open document: the ring highlights a title and `selectDoc`
-  // makes it the hub's activeDocId, so the level-2 preview and the level-3 body
-  // always describe the document the wearer is actually looking at.
+  // makes it the hub's activeDocId, so the body drawn beside the list and the
+  // full-canvas body always describe the document the wearer is looking at.
   let docLevel: PanelLevel = 1;
   let docCursor = 0;
-  /** Pages the last docs render produced — bounds the level-3 paging swipes. */
+  /** Pages the last docs render produced — bounds the level-2/3 paging swipes. */
   let docPages = 1;
   // Ring position on the Files page. Separate from docPage because Files is a
   // cursor window over a list, not a page-flip body — and it is reset on every
@@ -747,9 +748,9 @@ async function main(): Promise<void> {
    * event capture — exactly one container on a page may be isEventCapture:1, so
    * these two facts are never allowed to drift apart.
    *
-   * `framed` is false for the levels where the pane is the whole canvas: a frame
-   * there would only take width from the text inside it, and there is no second
-   * pane left to be told apart from.
+   * `framed` is false for a pane that IS the whole canvas (level 3, and the
+   * empty-list fallback): a frame there would only take width from the text
+   * inside it, and there is no second pane left to be told apart from.
    */
   function pane(
     id: number,
@@ -777,26 +778,52 @@ async function main(): Promise<void> {
   }
 
   /**
-   * Pane for one side of the level-2 split: left x0 w200, right x208 w368, a 4px
-   * gutter either side of the right pane.
+   * The level-1/2 split: left x0 w200, right x208 w368, a 4px gutter either side
+   * of the right pane.
+   *
+   * Both panes are framed and `focus` lights one of them. That one argument is
+   * the entire difference between level 1 and level 2 — the geometry and the
+   * content are identical, and only the border and the ring move across — which
+   * is why the step reads as "the focus moved" instead of as a new screen.
    */
-  function splitPanes(master: string, detail: string): TextContainerProperty[] {
+  function splitPanes(
+    master: string,
+    detail: string,
+    focus: 'master' | 'detail',
+  ): TextContainerProperty[] {
     return [
-      pane(1, 'master', PANEL_LAYOUT.splitMasterX, PANEL_LAYOUT.splitMasterW, master, true, true),
-      pane(2, 'detail', PANEL_LAYOUT.splitDetailX, PANEL_LAYOUT.splitDetailW, detail, false, true),
+      pane(
+        1,
+        'master',
+        PANEL_LAYOUT.splitMasterX,
+        PANEL_LAYOUT.splitMasterW,
+        master,
+        focus === 'master',
+        true,
+      ),
+      pane(
+        2,
+        'detail',
+        PANEL_LAYOUT.splitDetailX,
+        PANEL_LAYOUT.splitDetailW,
+        detail,
+        focus === 'detail',
+        true,
+      ),
     ];
   }
 
   /**
    * The panes the Agents panel shows at `agentLevel`:
-   *   1  the agent list ALONE, full canvas
-   *   2  list + output pane side by side
+   *   1  list + output pane side by side, the LIST lit
+   *   2  the same split, the OUTPUT lit so it can be scrolled
    *   3  the output ALONE, full canvas
    *
-   * The ring is on the list at levels 1–2 and on the output at level 3, so the
-   * event-capturing pane follows the level. Levels 1 and 3 are a single
-   * container: the layout is rebuilt whenever the level changes, because a
-   * page's container count is only settable through rebuildPageContainer.
+   * The ring is on the list at level 1 and on the output at levels 2–3, so the
+   * event-capturing pane follows the level. Levels 1 and 2 are the same two
+   * containers and level 3 is one, so every level change is a page rebuild — a
+   * container count and a pane border are only settable through
+   * rebuildPageContainer.
    */
   function agentContainers(): TextContainerProperty[] {
     const a = getAgents();
@@ -847,32 +874,40 @@ async function main(): Promise<void> {
     if (agentLevel === 3) {
       return [pane(1, 'detail', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.detail, true, false)];
     }
-    if (agentLevel === 1) {
+    if (list.length === 0) {
+      // Nothing to put beside the list, so the list keeps the whole canvas:
+      // splitting it would spend half the screen proving the library is empty.
       return [pane(1, 'master', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.master, true, false)];
     }
-    return splitPanes(view.master, view.detail);
+    // Levels 1 and 2 are the same split; only the lit pane moves.
+    return splitPanes(view.master, view.detail, agentLevel === 1 ? 'master' : 'detail');
   }
 
   /**
    * The panes the Docs panel shows at `docLevel` — the same three states as the
-   * Agents panel: the document list alone, list + body, then the body alone.
+   * Agents panel: list + body with the list lit, that split with the body lit,
+   * then the body alone.
    *
    * The list cursor IS the open document (`selectDoc` commits it), so the body
-   * this pane shows is always the one the highlighted title names. An empty
-   * bookshelf has nothing to split, so it stays one pane however deep the level
-   * says we are.
+   * this pane shows is always the one the highlighted title names — and because
+   * that body is on screen from level 1 on, the level-1 pane already carries it.
+   * An empty bookshelf has nothing to split, so it stays one pane however deep
+   * the level says we are.
    */
   function docContainers(): TextContainerProperty[] {
     const view = docsPanelView(getState(), docCursor, docPage, docLevel);
     docCursor = view.cursor;
     docPage = view.page;
     docPages = view.pages;
-    const list = pane(1, 'master', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.master, true, false);
-    if (!view.hasDoc || docLevel === 1) return [list];
+    if (!view.hasDoc) {
+      // Nothing to put beside the list, so the list keeps the whole canvas.
+      return [pane(1, 'master', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.master, true, false)];
+    }
     if (docLevel === 3) {
       return [pane(1, 'detail', PANEL_LAYOUT.fullX, PANEL_LAYOUT.fullW, view.detail, true, false)];
     }
-    return splitPanes(view.master, view.detail);
+    // Levels 1 and 2 are the same split; only the lit pane moves.
+    return splitPanes(view.master, view.detail, docLevel === 1 ? 'master' : 'detail');
   }
 
   /**
@@ -1388,9 +1423,9 @@ async function main(): Promise<void> {
 
     // A panel tab (Docs or Agents) paints its own panes. The pane BORDERS encode
     // which pane owns the ring, and a border — like the pane COUNT, which differs
-    // between levels 1/3 (one full-canvas container) and level 2 (two) — is only
-    // settable through rebuildPageContainer, so any level or cursor change is a
-    // rebuild. Skipped while an overlay is up: those render as one container.
+    // between levels 1–2 (the pair) and level 3 (one full-canvas container) — is
+    // only settable through rebuildPageContainer, so any level or cursor change
+    // is a rebuild. Skipped while an overlay is up: those render as one container.
     if (panes) {
       const psig = panelSignature(panes);
       const want = panes.length === 2 ? 'dual' : 'pane';
@@ -1762,10 +1797,10 @@ async function main(): Promise<void> {
       }
       return;
     }
-    // Agents — the ring walks the list at levels 1–2 and pages the output at 3,
-    // which is exactly where each one is drawn.
+    // Agents — the ring walks the list at level 1 and pages the output at levels
+    // 2–3, which is exactly where the border is drawn.
     if (getState().activeSection === 'agents') {
-      if (agentLevel !== 3) {
+      if (agentLevel === 1) {
         const n = getAgents().agents.length;
         if (!n) return;
         // Wrap around: ▲ at the top cycles to the bottom and ▼ at the bottom
@@ -1819,27 +1854,27 @@ async function main(): Promise<void> {
       }
       return;
     }
-    // Docs — the ring walks the document list at levels 1–2 and pages the open
-    // body at 3, the same split as Agents.
+    // Docs — the ring walks the document list at level 1 and pages the open body
+    // at levels 2–3, the same split as Agents.
     if (getState().activeSection === 'docs') {
-      if (docLevel !== 3) {
+      if (docLevel === 1) {
         const docs = getState().sections.docs;
         if (!docs.length) return;
         const next = Math.min(docs.length - 1, Math.max(0, docCursor + dir));
         if (next === docCursor) return;
         docCursor = next;
         docPage = 0;
-        // Moving the ring OPENS the highlighted document. The level-2 preview and
-        // the level-3 body must describe the document the ring is on, and this is
-        // the same `activeDocId` the web companion follows, so the two surfaces
-        // never disagree about which document is open.
+        // Moving the ring OPENS the highlighted document. The body beside the
+        // list — at level 1 as much as at level 3 — must describe the document
+        // the ring is on, and this is the same `activeDocId` the web companion
+        // follows, so the two surfaces never disagree about which one is open.
         selectDoc(docs[next].id);
         void renderGlasses();
         return;
       }
-      // Level 3 is the body alone: the swipe pages it. `docPages` is the paging
-      // state the panel itself produced, so the bound is the pane's, not a guess
-      // derived from a differently-paged view.
+      // Levels 2–3 are the body with the ring on it: the swipe pages it.
+      // `docPages` is the paging state the panel itself produced, so the bound is
+      // the pane's, not a guess derived from a differently-paged view.
       if (dir === -1 && docPage > 0) {
         docPage -= 1;
         void renderGlasses();
@@ -1938,11 +1973,13 @@ async function main(): Promise<void> {
       onPickerTap();
       return;
     }
-    // Agents: a tap steps IN one level — list → list + output → output alone.
+    // Agents: a tap steps the FOCUS in one level — the list, then the output
+    // beside it, then the output alone. The body never leaves the screen before
+    // the last step, so nothing the wearer is reading is lost on the way in.
     if (getState().activeSection === 'agents') {
       if (agentLevel < 3 && agentSelected()) {
-        // Entering the output pane starts at its newest page and newest session,
-        // the same as opening it from the menu.
+        // Handing the ring to the output pane starts it at its newest page and
+        // newest session, the same as opening it from the menu.
         if (agentLevel === 1) {
           agentSessionCursor = 0;
           agentDetailPage = 0;
@@ -1952,8 +1989,9 @@ async function main(): Promise<void> {
       }
       return;
     }
-    // Docs: the same step, and the level-2 step OPENS the highlighted document so
-    // the preview and the body cannot describe two different documents.
+    // Docs: the same step. The body is already on screen at level 1, so this only
+    // pins the highlight and rewinds the page — the two panes were describing the
+    // same document from the moment the ring moved (see the swipe handler).
     if (getState().activeSection === 'docs') {
       if (docLevel < 3 && getState().sections.docs.length) {
         if (docLevel === 1) {
@@ -2203,8 +2241,9 @@ async function main(): Promise<void> {
         return;
       }
       // Double-tap is a BACK gesture first: it pops the panel one level — body
-      // (3) → list + body (2) → list alone (1). Only at the root, where there is
-      // nowhere left to go back to, does it shut the page down.
+      // alone (3) → body lit beside the list (2) → list lit (1). Only at the
+      // root, where there is nowhere left to go back to, does it shut the page
+      // down.
       if (getState().activeSection === 'agents' && agentLevel > 1) {
         agentLevel = (agentLevel - 1) as PanelLevel;
         void renderGlasses();

@@ -6,11 +6,18 @@
  * functions: the container building, the ring routing and the boot redirect are
  * all in `main.ts`, and those are the pieces menu-sim cannot reach.
  *
- *   Change 1 — Agents and Docs each have three levels:
- *       L1 `1:master:0:576:`  list alone, full canvas
- *       L2 `1:master:0:200:…|2:detail:208:368:…`  list + detail
- *       L3 `1:detail:0:576:`  detail alone, full canvas
+ *   Change 1 — Agents and Docs each have three levels, and a level is only WHERE
+ *     THE FOCUS IS, never a new screen:
+ *       L1 `1:master:0:200:…|2:detail:208:368:…`      the split, the LIST lit
+ *       L2 `1:master:0:200:…|2:detail:208:368:…`      the SAME split, the DETAIL lit
+ *       L3 `1:detail:0:576:`                           the detail alone, whole canvas
  *     with one tap advancing a level and one double-tap popping one.
+ *
+ *     L1 and L2 carry byte-identical geometry: the only fields that differ are the
+ *     per-pane `borderWidth:isEventCapture` pair, i.e. which of the two is lit.
+ *     The probe asserts exactly that, because "the border moved and nothing else
+ *     did" is the whole point of levels 1–2 — the detail is already on screen at
+ *     L1, so stepping in must not swap in a different screen.
  *   Change 2 — the app BOOTS onto the Agents page.
  *
  * The geometry is read from the app's own rebuild log, which carries the pane
@@ -104,6 +111,27 @@ function menuIds(msgs) {
     .map((m) => Number(m.split('[hub] menu item ')[1].trim()));
 }
 
+/**
+ * The `borderWidth:isEventCapture` pair of the pane drawn at `x`/`w`. `2:1` means
+ * the pane carries the 2px border and owns the ring; `0:0` means it is neither
+ * lit nor listening. Those two fields are the ONLY difference between level 1 and
+ * level 2, so reading them back is the proof that the border moved.
+ */
+function lit(sig, x, w) {
+  const m = new RegExp(`:${x}:${w}:(\\d+):(\\d+):`).exec(sig);
+  return m ? `${m[1]}:${m[2]}` : '';
+}
+
+/** The coordinates a pane can be drawn at — master/detail of the split, or full. */
+const PANE_GEO = /:(0:200|208:368|0:576):\d+:\d+:/g;
+
+/**
+ * The signature with only the lit/ring flags masked, so two levels can be diffed
+ * for everything EXCEPT the focus. Masking by geometry (not by a bare digit
+ * pattern) keeps pane CONTENT from being accidentally rewritten.
+ */
+const contentOnly = (sig) => sig.replace(PANE_GEO, (_, geo) => `:${geo}:*:*:`);
+
 const last = (a) => (a.length ? a[a.length - 1] : null);
 
 /** Send one of the sim's input actions. */
@@ -138,6 +166,7 @@ async function pickRow(rows) {
 // redirect is what decides, so a stored `docs` (which is what the seeded hub
 // holds) must still come up as Agents.
 let bootMsgs = [];
+let bootSig = '';
 {
   const t0 = Date.now();
   let seen = null;
@@ -149,30 +178,46 @@ let bootMsgs = [];
     await sleep(400);
   }
   const p = last(panels(bootMsgs));
+  bootSig = p ? p.sig : '';
   check(
     'boots onto the Agents page (not the hub snapshot’s section)',
     Boolean(p) && p.section === 'agents',
     p ? `${p.section} L${p.level}` : 'no panel rebuild logged',
   );
-  check('Agents opens at L1 (master list alone)', Boolean(p) && p.level === 1, p ? `L${p.level}` : '');
+  check('Agents opens at L1 (the split, the list lit)', Boolean(p) && p.level === 1, p ? `L${p.level}` : '');
   check(
-    'L1 is ONE full-canvas container',
-    Boolean(p) && /^1:master:0:576:/.test(p.sig),
-    p ? p.sig.slice(0, 60) : '',
+    'L1 is the SPLIT — the detail panel is already on screen beside the list',
+    Boolean(p) && /^1:master:0:200:[^|]*\|2:detail:208:368:/.test(p.sig),
+    p ? p.sig.slice(0, 70) : '',
+  );
+  check(
+    'L1 lights the LIST and leaves the detail panel unlit',
+    Boolean(p) && lit(p.sig, 0, 200) === '2:1' && lit(p.sig, 208, 368) === '0:0',
+    p ? `list ${lit(p.sig, 0, 200)} · detail ${lit(p.sig, 208, 368)}` : '',
   );
 }
 
-// ── 2. Tap advances a level; the geometry changes with it ──────────────────
+// ── 2. Tap advances a level; level 2 moves the BORDER, not the panes ───────
 let litL1 = 0;
 {
   litL1 = await shot('agents-L1.png');
   await send('click');
   const msgs = await drain(1.6);
   const p = last(panels(msgs));
-  check('tap 1 → L2 (list + detail)', Boolean(p) && p.section === 'agents' && p.level === 2, p ? `${p.section} L${p.level}` : 'no rebuild');
+  check('tap 1 → L2 (the focus moved to the detail)', Boolean(p) && p.section === 'agents' && p.level === 2, p ? `${p.section} L${p.level}` : 'no rebuild');
   check(
-    'L2 splits the canvas: list 200px + detail 368px',
+    'L2 keeps the level-1 split: list 200px + detail 368px',
     Boolean(p) && /^1:master:0:200:[^|]*\|2:detail:208:368:/.test(p.sig),
+    p ? p.sig.slice(0, 70) : '',
+  );
+  check(
+    'L2 lights the DETAIL and leaves the list unlit',
+    Boolean(p) && lit(p.sig, 0, 200) === '0:0' && lit(p.sig, 208, 368) === '2:1',
+    p ? `list ${lit(p.sig, 0, 200)} · detail ${lit(p.sig, 208, 368)}` : '',
+  );
+  check(
+    'L1 → L2 changed nothing BUT the focus (same panes, same content)',
+    Boolean(p) && bootSig !== '' && contentOnly(p.sig) === contentOnly(bootSig),
     p ? p.sig.slice(0, 70) : '',
   );
 
@@ -185,8 +230,8 @@ let litL1 = 0;
   const q = last(panels(msgs2));
   check('tap 2 → L3 (detail alone)', Boolean(q) && q.section === 'agents' && q.level === 3, q ? `${q.section} L${q.level}` : 'no rebuild');
   check(
-    'L3 is ONE full-canvas container showing the DETAIL pane',
-    Boolean(q) && /^1:detail:0:576:/.test(q.sig),
+    'L3 is ONE full-canvas container showing the DETAIL pane, unframed',
+    Boolean(q) && /^1:detail:0:576:0:1:/.test(q.sig),
     q ? q.sig.slice(0, 60) : '',
   );
 
@@ -217,8 +262,13 @@ let litL1 = 0;
   const b = last(panels(await drain(1.4)));
   check('double-tap 2 pops L2 → L1', Boolean(b) && b.level === 1, b ? `L${b.level}` : 'no rebuild');
   check(
-    'L1 again is the full-canvas master list (one container)',
-    Boolean(b) && /^1:master:0:576:/.test(b.sig),
+    'L1 again is the split with the LIST lit — the round trip ends where it began',
+    Boolean(b) && /1:master:0:200:2:1:/.test(b.sig) && /2:detail:208:368:0:0:/.test(b.sig),
+    b ? b.sig.slice(0, 60) : '',
+  );
+  check(
+    'stepping back never lands on a full-canvas master list (that model is gone)',
+    Boolean(b) && !b.sig.includes('1:master:0:576:'),
     b ? b.sig.slice(0, 60) : '',
   );
   // NOT another double-tap here: at L1 it is the app's exit gesture.
@@ -246,10 +296,10 @@ let litL1 = 0;
 
   const after = await drain(1.6);
   const p = last(panels(after));
-  check('Docs opens at L1 (list alone, full canvas)', Boolean(p) && p.section === 'docs' && p.level === 1, p ? `${p.section} L${p.level}` : 'no rebuild');
+  check('Docs opens at L1 (the split, the list lit)', Boolean(p) && p.section === 'docs' && p.level === 1, p ? `${p.section} L${p.level}` : 'no rebuild');
   check(
-    'Docs L1 is ONE full-canvas container',
-    Boolean(p) && /^1:master:0:576:/.test(p.sig),
+    'Docs L1 is the SPLIT, the body already beside the list',
+    Boolean(p) && /1:master:0:200:2:1:/.test(p.sig) && /2:detail:208:368:0:0:/.test(p.sig),
     p ? p.sig.slice(0, 60) : '',
   );
   check(
@@ -261,10 +311,15 @@ let litL1 = 0;
   if (p) {
     await send('click');
     const d2 = last(panels(await drain(1.6)));
-    check('Docs tap 1 → L2 (list + detail)', Boolean(d2) && d2.level === 2, d2 ? `L${d2.level}` : 'no rebuild');
+    check('Docs tap 1 → L2 (the focus moved to the body)', Boolean(d2) && d2.level === 2, d2 ? `L${d2.level}` : 'no rebuild');
     check(
-      'Docs L2 splits the canvas',
-      Boolean(d2) && /^1:master:0:200:[^|]*\|2:detail:208:368:/.test(d2.sig),
+      'Docs L2 keeps the split and lights the BODY instead of the list',
+      Boolean(d2) && /1:master:0:200:0:0:/.test(d2.sig) && /2:detail:208:368:2:1:/.test(d2.sig),
+      d2 ? d2.sig.slice(0, 70) : '',
+    );
+    check(
+      'Docs L1 → L2 changed nothing BUT the focus',
+      Boolean(d2) && Boolean(p) && contentOnly(d2.sig) === contentOnly(p.sig),
       d2 ? d2.sig.slice(0, 70) : '',
     );
 

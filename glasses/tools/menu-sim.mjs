@@ -720,22 +720,24 @@ assert(
 );
 
 // ── The three-level panel: Agents and Docs share one model ───────────────────
-// Reported (docs/issue_0_3_43/Glasses_Agent_Docs_Enhancement.md): the master /
-// detail flow reads well, but there was no way to give the CONTENT the whole
-// canvas. Level 1 is the list alone, level 2 the list plus the detail pane, and
-// level 3 the detail alone — one tap advances a level, one double tap steps
-// back. Both panels use the same levels so they cannot drift apart, and the
-// pane that captures the ring is DERIVED from the level.
+// Reported (docs/Changes_Specs/Navigation_Enhancements.md): the master / detail
+// split is how these tabs should read, and the LEVEL only decides where the
+// focus is. Level 1 is the split with the list lit, level 2 the SAME split with
+// the border and the ring moved onto the detail, and level 3 gives the detail the
+// whole canvas — one tap advances a level, one double tap steps back. Both panels
+// use the same levels so they cannot drift apart, and the pane that captures the
+// ring is DERIVED from the level.
 //
-// The geometry is asserted here because it is what makes level 3 worth having:
-// the level-1/3 pane IS the canvas, and the level-2 split must not overlap.
+// The geometry is asserted here because the split must never overlap: level 3 is
+// the only state that gets the whole canvas, and levels 1 and 2 must add up to no
+// more than it.
 assert(
-  'levels 1 and 3 draw into the whole canvas',
+  'level 3 is the one full-canvas pane',
   PANEL_LAYOUT.fullX === 0 && PANEL_LAYOUT.fullW === 576,
   JSON.stringify(PANEL_LAYOUT),
 );
 assert(
-  'the level-2 panes sit side by side with a gutter and stay inside the canvas',
+  'the split panes sit side by side with a gutter and stay inside the canvas',
   PANEL_LAYOUT.splitMasterX + PANEL_LAYOUT.splitMasterW <= PANEL_LAYOUT.splitDetailX &&
     PANEL_LAYOUT.splitDetailX + PANEL_LAYOUT.splitDetailW <= PANEL_LAYOUT.fullW,
   JSON.stringify(PANEL_LAYOUT),
@@ -752,35 +754,35 @@ const agentAt = (level) =>
   });
 
 assert(
-  'level 1 footer offers the tap that steps in',
-  agentAt(1).master.includes('▲▼ move · tap open'),
+  'level 1 footer offers the tap that moves the border onto the detail',
+  agentAt(1).master.includes('▲▼ move · tap detail'),
   agentAt(1).master,
 );
 assert(
-  'level 2 footer promises the full screen the next tap gives',
-  agentAt(2).master.includes('▲▼ move · tap full'),
+  'level 2 footer describes what the ring does now — page the detail',
+  agentAt(2).master.includes('▲▼ page · tap full'),
   agentAt(2).master,
 );
 assert(
-  'level 2 marks the list as the pane that owns the ring',
-  agentAt(2).master.startsWith('Agents 1 ◀'),
+  'level 1 marks the list as the pane that owns the ring',
+  agentAt(1).master.startsWith('Agents 1 ◀'),
+  agentAt(1).master,
+);
+assert(
+  'level 2 hands the ring to the detail, so the list stops claiming it',
+  !agentAt(2).master.includes('◀'),
   agentAt(2).master,
 );
+// The list is only ever a 200px pane now, so its row budget is the narrow one at
+// EVERY level: a name that would fit across 568px must still be truncated here,
+// or it would wrap to two rendered lines and blow the ten-line canvas budget.
 assert(
-  'level 1 does not claim to own a ring it shares with nothing',
-  !agentAt(1).master.includes('◀'),
-  agentAt(1).master,
-);
-// The row budget follows the width the pane is actually drawn at: a name that
-// fits across 568px would wrap to two rendered lines in the 200px pane and blow
-// the ten-line canvas budget.
-assert(
-  'level 1 rows use the wide pane, so the name is not truncated early',
-  agentAt(1).master.includes('Alpha Research Agent With A Very L'),
+  'level 1 rows truncate to the 200px pane',
+  !agentAt(1).master.includes('Alpha Research Agent With A Very L'),
   agentAt(1).master,
 );
 assert(
-  'level 2 rows truncate to the 200px pane',
+  'level 2 rows truncate to the same 200px pane',
   !agentAt(2).master.includes('Alpha Research Agent With A Very L'),
   agentAt(2).master,
 );
@@ -834,25 +836,39 @@ assert(
 );
 assert('docs level 1 marks the cursor', docList.master.includes('▶1.'), docList.master);
 assert(
-  'docs level 1 offers the tap that steps in',
-  docList.master.includes('▲▼ move · tap open'),
+  'docs level 1 offers the tap that moves the border onto the body',
+  docList.master.includes('▲▼ move · tap detail'),
+  docList.master,
+);
+assert(
+  'docs level 1 marks the list as the pane that owns the ring',
+  docList.master.startsWith('Docs 2 ◀'),
   docList.master,
 );
 // The panel is built before the paint decision, so level 1 already carries the
-// body it will show one tap later — that is what makes level 2 instant.
-assert('docs level 1 already carries the body it will show', docList.detail.includes('alpha body'));
+// body drawn beside it — and because the level-2 step only moves the border, the
+// body it moves onto must be the SAME bytes, not a re-laid-out second copy.
+assert(
+  'docs level 1 already carries the body drawn beside it',
+  docList.detail.includes('alpha body'),
+);
 assert('docs level 1 reports the library is not empty', docList.hasDoc === true);
 
 const docSplit = docsPanelView(docsState, 0, 0, 2);
 assert(
-  'docs level 2 marks the list as the pane that owns the ring',
-  docSplit.master.startsWith('Docs 2 ◀'),
+  'docs level 2 hands the ring to the body, so the list stops claiming it',
+  !docSplit.master.includes('◀'),
   docSplit.master,
 );
 assert(
-  'docs level 2 footer promises the full screen',
-  docSplit.master.includes('▲▼ move · tap full'),
+  'docs level 2 footer describes what the ring does now — page the body',
+  docSplit.master.includes('▲▼ page · tap full'),
   docSplit.master,
+);
+assert(
+  'docs level 2 shows the same body level 1 showed beside the list',
+  docSplit.detail === docList.detail,
+  docSplit.detail,
 );
 
 // The CURSOR drives the body, not some other notion of "open": the ring moves

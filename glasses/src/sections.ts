@@ -566,7 +566,7 @@ interface BodyRender {
 /**
  * Page a body of text at the width it will actually be DRAWN at.
  *
- * One document renders in three places — the 360px level-2 detail pane, the
+ * One document renders in three places — the 368px level-1/2 detail pane, the
  * 568px level-3 canvas, and the plain note/todo views — and each wraps
  * differently. Paging at the wrong width is how a 47-column line ends up inside
  * a 200px pane and eats two of the ten rendered lines the canvas holds.
@@ -1195,52 +1195,59 @@ export function docPickerView(
   };
 }
 
-// ── Panels: master → detail → full screen ───────────────────────────────────
+// ── Panels: list + detail → detail → full screen ────────────────────────────
 // The Docs and Agents tabs are the same widget — a list of things on the left,
-// the selected thing on the right — and both grow and shrink the same way:
+// the selected thing on the right — and both move focus the same way:
 //
-//   level 1   the list alone, filling the 576×288 canvas
-//   level 2   list + detail side by side (how both tabs shipped)
-//   level 3   the detail alone, filling the canvas
+//   level 1   list + detail side by side, the LIST lit (border + ring)
+//   level 2   the same split, the border and the ring moved to the DETAIL
+//   level 3   the detail alone, filling the 576×288 canvas
 //
 // ONE RING TAP ADVANCES A LEVEL, ONE DOUBLE TAP STEPS BACK. That is the whole
 // gesture grammar, and it is why the level is the only focus state there is:
-// the ring is on the list at levels 1–2 and on the detail at level 3, so the
+// the ring walks the list at level 1 and pages the detail at levels 2–3, so the
 // pane that captures events is DERIVED from the level rather than tracked next
 // to it (two states that can disagree are two states that will). A double tap at
 // level 1 has nowhere left to go, so it shuts the page down — the same gesture
 // that exits the app from a plain tab.
 //
-// Levels 1 and 3 are ONE full-canvas container; level 2 is the pair. Exactly one
-// container on a page may carry isEventCapture:1, so the R1 ring is routed by
-// this level rather than by which container was touched.
+// Levels 1 and 2 are the SAME pair of containers and only the focus moves
+// between them, which is what makes the step read as "the border moved" rather
+// than as a new screen: the detail is already on screen at level 1, so the tap
+// costs the wearer nothing they were reading. Exactly one container on a page
+// may carry isEventCapture:1, so which one that is — and which one draws the 2px
+// border — is decided by this level rather than by which container was touched.
+// Level 3 is a single full-canvas container, which is why every level change is
+// a page rebuild.
 //
-// The pane border is the only focus cue the firmware gives us, and at levels 1
-// and 3 the pane IS the screen, so those draw unframed: a 2px frame around the
-// whole canvas would only steal width from the text it contains.
+// The pane border is the only focus cue the firmware gives us. At level 3 the
+// pane IS the screen, so it draws unframed: a 2px frame around the whole canvas
+// would only steal width from the text it contains. In the split BOTH panes are
+// framed and the level says which of the two is lit.
 export type PanelLevel = 1 | 2 | 3;
 
-/** Panel geometry: the full-canvas rectangle, and the level-2 split of it. */
+/** Panel geometry: the full-canvas rectangle, and the level-1/2 split of it. */
 export const PANEL_LAYOUT = {
-  /** Levels 1 and 3 — the pane that is the whole screen. */
+  /** Level 3 — the pane that is the whole screen. */
   fullX: 0,
   fullW: 576,
-  /** Left pane of the level-2 split. */
+  /** Left pane of the level-1/2 split. */
   splitMasterX: 0,
   splitMasterW: 200,
-  /** Right pane of the level-2 split — a 4px gutter sits either side of it. */
+  /** Right pane of the level-1/2 split — a 4px gutter sits either side of it. */
   splitDetailX: 208,
   splitDetailW: 368,
   height: 288,
 } as const;
 
-// List row budgets, measured per pane width so a row never wraps (a wrapped row
-// costs two of the ten lines the canvas holds AND makes the cursor window lie
-// about how many things are on screen).
-const ROW_TEXT_SPLIT = 15; // chars per row in the 200px pane
-const ROW_TEXT_FULL = 38; // chars per row in the 576px pane (see TODO_ITEM_TEXT)
-const ROW_COUNT_SPLIT = 7; // rows in the cursor window, 200px pane
-const ROW_COUNT_FULL = 8; // rows in the cursor window, 576px pane
+// List row budget, measured so a row never wraps (a wrapped row costs two of the
+// ten lines the canvas holds AND makes the cursor window lie about how many
+// things are on screen). There used to be a second, wider budget for a list
+// drawn alone on the canvas; that pane is gone — the list now always sits in the
+// 200px half of the split, and a list with nothing to put beside it draws its own
+// short message instead of a cursor window (see agentListView).
+const ROW_TEXT_SPLIT = 15; // chars per row
+const ROW_COUNT_SPLIT = 7; // rows in the cursor window
 
 export interface AgentsView {
   /** Left panel: the agent list. */
@@ -1297,7 +1304,7 @@ export interface AgentsViewInput {
   runningAgentIds?: readonly string[];
 }
 
-/** Inner width of the level-2 detail pane (368px container, paddingLength 4). */
+/** Inner width of the level-1/2 detail pane (368px container, paddingLength 4). */
 const DETAIL_W = 360;
 /**
  * Inner width of the level-3 detail pane — the whole canvas. Text re-wraps to
@@ -1386,40 +1393,41 @@ function transcriptLines(
  * The cursor glyph wins the gutter, so a highlighted agent's own run is not
  * double-marked: the right pane is already showing that run live.
  *
- * Only drawn at levels 1 and 2, and the row budget follows the width the caller
- * will give this pane: 48 columns at level 1 would wrap to two rendered lines in
- * the 200px pane at level 2 and blow the ten-line canvas budget.
+ * Drawn at levels 1 and 2, always in the 200px half of the split, so there is
+ * one row budget and it is the narrow one. `focused` says whether the RING is
+ * here: at level 1 it is — the row gets the `◀` mark and the footer offers the
+ * tap that moves the border across. At level 2 the ring has gone to the detail,
+ * so the footer describes what the ring does THERE rather than a `move` this
+ * pane no longer answers to. With no agents the pane is the whole canvas and
+ * draws the short message below rather than a cursor window.
  */
 function agentListView(
   agents: AgentDef[],
   cursor: number,
-  level: PanelLevel,
+  focused: boolean,
   running: ReadonlySet<string>,
 ): string {
-  const head = `Agents ${agents.length}${level === 2 ? ' ◀' : ''}`;
+  const head = `Agents ${agents.length}${focused && agents.length > 0 ? ' ◀' : ''}`;
   if (agents.length === 0) {
     return clipBytes(
       `${head}\n------------------\n(no agents yet — build one\nin the web app)`,
       MAX_CONTENT_BYTES,
     );
   }
-  const cols = level === 1 ? ROW_TEXT_FULL : ROW_TEXT_SPLIT;
-  const rows = level === 1 ? ROW_COUNT_FULL : ROW_COUNT_SPLIT;
   const clamped = Math.min(agents.length - 1, Math.max(0, cursor));
-  const half = Math.floor(rows / 2);
+  const half = Math.floor(ROW_COUNT_SPLIT / 2);
   let start = Math.max(0, clamped - half);
-  const end = Math.min(agents.length, start + rows);
-  start = Math.max(0, end - rows);
+  const end = Math.min(agents.length, start + ROW_COUNT_SPLIT);
+  start = Math.max(0, end - ROW_COUNT_SPLIT);
 
   const lines: string[] = [head];
   for (let i = start; i < end; i++) {
     const sel = i === clamped ? '▶' : running.has(agents[i].id) ? '●' : ' ';
-    lines.push(`${sel}${i + 1}.${truncate(agents[i].name || '(unnamed)', cols)}`);
+    lines.push(`${sel}${i + 1}.${truncate(agents[i].name || '(unnamed)', ROW_TEXT_SPLIT)}`);
   }
-  // The footer is a hint for the CURRENT level, and it has to fit the pane this
-  // list is in — the 200px one holds about 19 characters, so it gets the short
-  // wording whether or not the wide one could afford more.
-  lines.push(level === 1 ? '▲▼ move · tap open' : '▲▼ move · tap full');
+  // The footer is a hint for where the ring IS, and it has to fit the pane this
+  // list is in — the 200px one holds about 19 characters.
+  lines.push(focused ? '▲▼ move · tap detail' : '▲▼ page · tap full');
   return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
 }
 
@@ -1443,7 +1451,8 @@ const DETAIL_PAGE_BYTES = 820;
 
 /**
  * Right panel: the selected agent's setup + live run output or chosen session.
- * At level 3 this is the whole screen, so it re-wraps to the full canvas width.
+ * At levels 1–2 this shares the canvas with the list and wraps to the split
+ * width; at level 3 it IS the screen, so it re-wraps to the full canvas width.
  */
 function agentDetailView(
   agent: AgentDef | null,
@@ -1587,7 +1596,8 @@ export function agentsMasterDetailView(
     level,
   );
   return {
-    master: agentListView(agents, clamped, level, running),
+    // The ring is on the list only at level 1 — at 2 and 3 it is on the detail.
+    master: agentListView(agents, clamped, level === 1, running),
     detail: detail.text,
     cursor: clamped,
     sessionCursor,
@@ -1608,8 +1618,8 @@ export function agentsStatusLine(running: boolean, error?: string): string {
 /**
  * The Docs panel renders the document list on the left and the highlighted
  * document's body on the right, at the same three levels as the Agents panel
- * (see PanelLevel). Level 1 lists titles, level 2 puts the body beside them, and
- * level 3 fills the canvas with the body.
+ * (see PanelLevel): level 1 lights the list, level 2 moves the border onto the
+ * body so it can be scrolled, and level 3 fills the canvas with the body.
  *
  * The list is in STORE order — the same order the long-press document picker
  * shows. A second list of the same documents in a different order is exactly how
@@ -1618,7 +1628,7 @@ export function agentsStatusLine(running: boolean, error?: string): string {
 export interface DocsView {
   /** Levels 1 and 2: the numbered document list. */
   master: string;
-  /** Levels 2 and 3: the highlighted document's body page. */
+  /** Levels 1–3: the highlighted document's body page. */
   detail: string;
   /** Clamped index into the document list; the caller stores it back. */
   cursor: number;
@@ -1632,32 +1642,36 @@ export interface DocsView {
   hasDoc: boolean;
 }
 
-/** Inner width of the level-2 detail pane (368px container, paddingLength 4). */
+/** Inner width of the level-1/2 detail pane (368px container, paddingLength 4). */
 const DOC_DETAIL_W = 360;
 
-function docListView(docs: readonly DocEntry[], cursor: number, level: PanelLevel): string {
-  const head = `Docs ${docs.length}${level === 2 ? ' ◀' : ''}`;
+/**
+ * Left half of the Docs panel: the numbered document list. Exactly the agent
+ * list's shape — the one narrow row budget (the 200px pane is what this is
+ * always drawn in), `◀` and the step-in footer only while the ring is here
+ * (level 1), and the short message instead of a cursor window when the library
+ * is empty.
+ */
+function docListView(docs: readonly DocEntry[], cursor: number, focused: boolean): string {
+  const head = `Docs ${docs.length}${focused && docs.length > 0 ? ' ◀' : ''}`;
   if (docs.length === 0) {
     return clipBytes(
       `${head}\n------------------\n(no docs yet — long-press for\nNew Doc, or create one on\nthe web app)`,
       MAX_CONTENT_BYTES,
     );
   }
-  // Row budget follows the width this pane is drawn at, never the other level's.
-  const cols = level === 1 ? ROW_TEXT_FULL : ROW_TEXT_SPLIT;
-  const rows = level === 1 ? ROW_COUNT_FULL : ROW_COUNT_SPLIT;
   const clamped = Math.min(docs.length - 1, Math.max(0, cursor));
-  const half = Math.floor(rows / 2);
+  const half = Math.floor(ROW_COUNT_SPLIT / 2);
   let start = Math.max(0, clamped - half);
-  const end = Math.min(docs.length, start + rows);
-  start = Math.max(0, end - rows);
+  const end = Math.min(docs.length, start + ROW_COUNT_SPLIT);
+  start = Math.max(0, end - ROW_COUNT_SPLIT);
 
   const lines: string[] = [head];
   for (let i = start; i < end; i++) {
     const sel = i === clamped ? '▶' : ' ';
-    lines.push(`${sel}${i + 1}.${truncate(docs[i].title || '(untitled)', cols)}`);
+    lines.push(`${sel}${i + 1}.${truncate(docs[i].title || '(untitled)', ROW_TEXT_SPLIT)}`);
   }
-  lines.push(level === 1 ? '▲▼ move · tap open' : '▲▼ move · tap full');
+  lines.push(focused ? '▲▼ move · tap detail' : '▲▼ page · tap full');
   return clipBytes(lines.join('\n'), MAX_CONTENT_BYTES);
 }
 
@@ -1673,7 +1687,8 @@ export function docsPanelView(
   level: PanelLevel,
 ): DocsView {
   const docs = state.sections.docs;
-  const master = docListView(docs, cursor, level);
+  // Same rule as the agent list: the ring is on the list only at level 1.
+  const master = docListView(docs, cursor, level === 1);
   const width = level === 3 ? INNER_W : DOC_DETAIL_W;
   if (docs.length === 0) {
     const empty = bodyPage('Docs', '', page, width);

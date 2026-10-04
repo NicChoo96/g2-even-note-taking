@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.48
+
+v0.3.48 - Agents and Docs open with the list and its detail side by side
+
+- Both tabs now show the list on the left with the detail already beside it,
+ so what the ring points at is on screen before you step in.
+- One tap moves the highlight onto the detail so you can scroll it; a second
+ tap gives the detail the whole screen.
+- A double tap steps back one view at a time, and at the list closes the page
+ as before.
+
 ## 0.3.47
 
 v0.3.47 - Set up a REST tool on the agent page, and steadier agent runs

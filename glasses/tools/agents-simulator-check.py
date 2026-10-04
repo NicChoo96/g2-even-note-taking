@@ -320,7 +320,7 @@ check("switcher delivered Agents (4)", 4 in ids, str(ids))
 r = renders(msgs)
 check("menu switched to the agents section", any(x.get("section") == "agents" for x in r), json.dumps(r[-1]) if r else "")
 
-# ── 5. The panel draws L1 (master list alone) with the seeded data ─────────
+# ── 5. The panel draws L1 (list AND detail, the list lit) with the seeded data ─
 # The rebuild fires as part of the section switch, so it is already in the
 # messages drained by pick(4) -- keep them and top up.
 msgs = msgs + drain(1.5)
@@ -328,11 +328,16 @@ lit_master = lit_pixels(shot("agents-L1.png"))
 check("agents page draws", lit_master > 400, f"{lit_master} lit px")
 reb = agent_rebuilds(msgs)
 check("panel page rebuilt on entry", bool(reb), (reb[-1][-60:] if reb else ""))
-check("Agents opens at L1 (master list alone)", panel_level(msgs) == 1, f"L{panel_level(msgs)}")
+check("Agents opens at L1 (split, list lit)", panel_level(msgs) == 1, f"L{panel_level(msgs)}")
 check(
-    "L1 is ONE full-canvas container labelled master",
-    any("1:master:0:576:" in m for m in reb),
+    "L1 is the SPLIT: master (200px) + detail (368px at x=208)",
+    any("1:master:0:200:" in m and "|2:detail:208:368:" in m for m in reb),
     (reb[-1][-70:] if reb else ""),
+)
+check(
+    "L1 lights the master pane (border 2, event capture 1) and not the detail",
+    any("1:master:0:200:2:1:" in m and "2:detail:208:368:0:0:" in m for m in reb),
+    (reb[-1][-90:] if reb else ""),
 )
 check(
     "master list shows the seeded agents",
@@ -340,21 +345,26 @@ check(
     (reb[-1][-90:] if reb else ""),
 )
 
-# ── 6. Tap advances a level; the second tap fills the screen (L1 -> L2 -> L3) ─
+# ── 6. Tap moves the focus; the second tap fills the screen (L1 -> L2 -> L3) ──
 send("click")
 time.sleep(1.4)
 msgs = drain(1.5)
 lit_split = lit_pixels(shot("agents-L2.png"))
 reb = agent_rebuilds(msgs)
 check("tap 1 rebuilds the agents page", bool(reb), (reb[-1][-40:] if reb else ""))
-check("tap 1 advances to L2 (list + detail)", panel_level(msgs) == 2, f"L{panel_level(msgs)}")
+check("tap 1 advances to L2 (the focus moved to the detail)", panel_level(msgs) == 2, f"L{panel_level(msgs)}")
 check(
-    "L2 splits the page into master (200px) + detail (368px at x=208)",
+    "L2 keeps the L1 split: master (200px) + detail (368px at x=208)",
     any("1:master:0:200:" in m and "|2:detail:208:368:" in m for m in reb),
     (reb[-1][-80:] if reb else ""),
 )
 check(
-    "the detail pane looks different from the master",
+    "L2 moved the border/ring onto the detail and off the master",
+    any("1:master:0:200:0:0:" in m and "2:detail:208:368:2:1:" in m for m in reb),
+    (reb[-1][-90:] if reb else ""),
+)
+check(
+    "L1 and L2 paint differently (the frame moved, the panes did not)",
     lit_split != lit_master,
     f"{lit_master} vs {lit_split} lit px",
 )
@@ -389,7 +399,7 @@ check(
 )
 send("double_click")  # L2 -> L1
 msgs = drain(1.6)
-check("double-tap pops L2 -> L1 (master list alone)", panel_level(msgs) == 1, f"L{panel_level(msgs)}")
+check("double-tap pops L2 -> L1 (the split, list lit again)", panel_level(msgs) == 1, f"L{panel_level(msgs)}")
 still = lit_pixels(shot("agents-popped-to-L1.png"))
 check(
     "page is still up at L1 (a double-tap there would have exited)",
