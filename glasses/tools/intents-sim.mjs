@@ -352,13 +352,61 @@ eq('and the capability did not run a second time', ledgerEntries('run-1').filter
 const resolved = ledgerEntries('run-1').filter((e) => e.refs.length && e.kind === 'call' && e.status === 'ok');
 assert('the outcome cites the proposal it answers', resolved.length === 1 && resolved[0].refs.length === 1);
 
+/**
+ * A transport that behaves like the hub's to-do list, for the length of one
+ * block.
+ *
+ * Every to-do write is CONFIRMED now: it re-reads the list and only reports
+ * success if the change is in it. Against this harness's default `404` that
+ * makes the write FAIL — which is the right answer, and the wrong fixture for a
+ * block that asserts what a SUCCESSFUL delegated action leaves in the ledger.
+ * So the list is kept here, the write is applied to it, and the read-back is
+ * answered out of it.
+ */
+const todoStub = () => {
+  let items = [];
+  let rev = 1;
+  const answer = (body) => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    text: async () => JSON.stringify(body),
+  });
+  return async (_url, init = {}) => {
+    const method = String(init.method ?? 'GET').toUpperCase();
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    if (method === 'GET') return answer({ ok: true, rev, items });
+    rev += 1;
+    if (method === 'PUT') {
+      items = Array.isArray(body.items) ? body.items.map((t) => ({ ...t })) : [];
+      return answer({ ok: true, rev, items });
+    }
+    if (method === 'POST') {
+      const item = { id: `todo-${items.length + 1}`, text: String(body.text ?? ''), done: false };
+      items.push(item);
+      return answer({ ok: true, rev, item });
+    }
+    return answer({ error: 'not found' });
+  };
+};
+
 // ⭐ THE SAFETY INVARIANT: an irreversible action that succeeded without a gate
 // must be impossible, and that is as true for an agent's ask as for the wearer's.
+//
+// A WORKING LIST IS INSTALLED FIRST, which is not incidental. `todo.clear_all`
+// runs through `setTasks`, and with the default `404` transport that write would
+// now be REPORTED as a failure — so the checks below would be asserting the shape
+// of a success while driving a failure, and the gate ordering would be read off a
+// call that never happened.
+const offlineFetch = globalThis.fetch;
+globalThis.fetch = todoStub();
 fresh();
 // The destructive action is only AVAILABLE while there is something to delete,
 // and it is seeded through the capability itself — the same call the app makes,
-// not a direct poke at the store.
-byName('todo.add').run({ text: 'milk' });
+// not a direct poke at the store. It is AWAITED, because the row is not really on
+// the list until the hub has confirmed it: the confirmation adopts the hub's own
+// list, so a create still in flight can be unpainted by it.
+await byName('todo.add').run({ text: 'milk' });
 assert('the destructive action is available with something to delete', byName('todo.clear_all').available?.() !== false);
 claimIntents(RUN, [toolMsg(proposal('run-7:2', 'todo.clear_all', {}, 'start the week clean', 'Clear the list'))]);
 const entries = claimIntents(RUN, [toolMsg(proposal('run-7:2', 'todo.clear_all', {}, 'start the week clean', 'Clear the list'))]);
@@ -394,6 +442,7 @@ const callSeq = ledgerEntries('run-1').find((e) => e.kind === 'call' && e.status
 const gateSeq = ledgerEntries('run-1').find((e) => e.kind === 'gate' && e.status === 'ok')?.seq ?? 0;
 assert('and logged BEFORE the action it gates', gateSeq > 0 && gateSeq < callSeq, `gate seq ${gateSeq}, call seq ${callSeq}`);
 eq('so the ledger does NOT show an ungated irreversible success', ungatedIrreversible().length, 0);
+globalThis.fetch = offlineFetch;
 
 // ⭐ The chain brake. agent→agent is allowed, but a run an agent started may not
 // start another one, or a single ask from the wearer could spend the key

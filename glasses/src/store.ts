@@ -183,6 +183,109 @@ function settle(res: { ok: boolean; error?: string; status?: number }, onOk?: ()
   reportError(res.error || 'Could not reach the hub');
 }
 
+// ── confirmed writes ────────────────────────────────────────────────────────
+
+/**
+ * What a write REALLY did — the return value a caller needs in order to be
+ * honest with the wearer.
+ *
+ * `ok` is only ever set from a RE-READ (see `confirmWrite`), never from the
+ * hub's own acknowledgement. The two are different claims: the hub answers
+ * about the request it received, and the wearer's question is about the list
+ * they are looking at.
+ */
+export interface WriteOutcome {
+  ok: boolean;
+  /** The hub took the write, and the list still does not show it. */
+  unconfirmed?: boolean;
+  error?: string;
+}
+
+/** The failure fields every hub result carries (`HubError` in hub-client.ts). */
+interface WriteResult {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  status?: number;
+  item?: TodoItem;
+}
+
+/**
+ * Name the failure the wearer can act on.
+ *
+ * A `401` is not a network problem and must not be allowed to read like one. It
+ * means the relay does not recognise this device's token: the pairing was reset,
+ * or the token was never re-supplied after a reload (`auth-token.ts` holds it in
+ * memory only). "Could not reach the hub" sent the wearer looking at their signal
+ * for what is really a sign-in problem — and a whole session of writes can be
+ * lost that way while every one of them looks like it worked.
+ */
+function whyRefused(res: WriteResult): string {
+  if (res.status === 401) return 'this device is not signed in to the hub, so nothing was saved';
+  if (res.code === 'STALE_REV') return 'another device changed the list first, so nothing was saved';
+  return res.error || 'the hub refused the write';
+}
+
+/** Run a hub call, turning a thrown transport error into `null` instead of a rejection. */
+async function safeCall<T extends WriteResult>(fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write, then READ BACK, and only then call it done.
+ *
+ * `settle` above states the policy this app runs on — a write that never reached
+ * the hub is REPORTED rather than queued — but reporting a failure is not the
+ * same as refusing to claim success, and the claim is the thing the wearer acts
+ * on. Two halves had to be true at once for a lost write to be invisible:
+ *
+ *   1. Every `todo.*` capability returned `ok: true` before the hub had answered
+ *      at all, so Jarvis said the task was saved either way.
+ *   2. The store kept the optimistic row when the answer was a refusal, and
+ *      `persist()` mirrored it, so the row survived a reload too.
+ *
+ * A confirmed write closes both: it sends the change AND re-reads the list,
+ * checks the change is really in it (`holds`), and adopts the hub's list either
+ * way. A write that did not land therefore cannot stay on screen looking as
+ * though it had — and the caller is told, in time to say so.
+ *
+ * The re-read is not redundant with the acknowledgement. A `PATCH` can be
+ * accepted and leave the row untouched (it named a task another device had
+ * already deleted), and a stale-token `401` is indistinguishable from success
+ * without a read that disagrees.
+ */
+async function confirmWrite(
+  send: () => Promise<WriteResult>,
+  holds: (res: WriteResult, items: TodoItem[]) => boolean,
+): Promise<WriteOutcome> {
+  const res = await safeCall(send);
+  if (!res) return { ok: false, error: 'could not reach the hub, so nothing was saved' };
+  settle(res);
+  if (!res.ok) return { ok: false, error: whyRefused(res) };
+
+  const read = await safeCall(fetchTodos);
+  if (!read) return { ok: false, error: 'the write was sent but the list could not be read back' };
+  settle(read);
+  if (!read.ok) return { ok: false, error: `the write was sent but ${whyRefused(read)}` };
+
+  adoptTodos(read.items);
+  if (!holds(res, read.items)) {
+    return { ok: false, unconfirmed: true, error: 'the hub accepted it and the list still does not show it' };
+  }
+  return { ok: true };
+}
+
+/** Whether two lists hold exactly the same tasks, by id. */
+function sameIds(a: TodoItem[], b: TodoItem[]): boolean {
+  if (a.length !== b.length) return false;
+  const want = new Set(b.map((t) => t.id));
+  return a.every((t) => want.has(t.id));
+}
+
 // One trailing-edge timer per target, so a burst of keystrokes collapses into a
 // single write of the FINAL text rather than one request per character.
 const writers = new Map<string, number>();
@@ -199,6 +302,20 @@ function debounce(key: string, ms: number, run: () => void): void {
       run();
     }, ms),
   );
+}
+
+/**
+ * Drop a pending debounced write because a newer one has been sent.
+ *
+ * Without this a one-shot rename would be followed `EDIT_DEBOUNCE_MS` later by
+ * the timer a keystroke had already armed, writing the text it was about to
+ * supersede — and with confirmation on both sides, two answers for one row.
+ */
+function cancelDebounce(key: string): void {
+  const existing = writers.get(key);
+  if (existing === undefined) return;
+  window.clearTimeout(existing);
+  writers.delete(key);
 }
 
 // Per-document `ETag`. `PUT /hub/docs/{id}` is guarded by `If-Match`, and a write
@@ -450,45 +567,31 @@ export function startHubLiveSync(): void {
  * Add a task.
  *
  * Optimistic: the row appears immediately under a LOCAL id, so the list cannot
- * lag behind a keystroke. The hub mints the real id, so the response swaps it in
- * (see `swapTodoId`). A failed write leaves the row alone — the user asked for it
- * and the failure is surfaced — and the next successful write converges the list.
+ * lag behind a keystroke. The hub mints the real id, and the confirmation's
+ * re-read REPLACES the whole list with the hub's own — so the local id only ever
+ * lives for the length of that one request.
+ *
+ * That read-back is also what retired `swapTodoId`. It could only rewrite the
+ * local row while the row was still there, so a refresh landing between a create
+ * and its response left a `uid()` row the hub had never heard of: a visible
+ * duplicate, and a `404` on the next rename of it. Adopting the hub's list needs
+ * nothing to match.
  */
-export function addTask(text: string): void {
+export async function addTask(text: string): Promise<WriteOutcome> {
   const clean = text.trim();
-  if (!clean) return;
+  if (!clean) return { ok: false, error: 'no task text given' };
   const localId = uid();
   commit((s) => ({
     ...s,
     sections: { ...s.sections, todo: [...s.sections.todo, { id: localId, text: clean, done: false }] },
   }));
-  void hubCreateTodo(clean).then((res) =>
-    settle(res, () => {
-      const item = res.item;
-      if (item?.id && item.id !== localId) swapTodoId(localId, item);
-    }),
+  // Confirmed against the id THE HUB MINTS, not against the text: a task with
+  // this text may already be on the list, and a text match would then report a
+  // create that never happened as a success.
+  return confirmWrite(
+    () => hubCreateTodo(clean),
+    (res, items) => !!res.item?.id && items.some((t) => t.id === res.item?.id),
   );
-}
-
-/**
- * Point the local row at the id the hub just minted — or RE-ADD it if a refresh
- * took it away.
- *
- * A `409` on any write triggers a debounced `loadHub`, and that read adopts the
- * hub's snapshot wholesale. If it lands between a create being issued and the
- * create's response, the optimistic row is gone by the time the response
- * arrives — so a rename alone would match nothing and the task would exist on
- * the hub while being invisible here until the next boot.
- */
-function swapTodoId(localId: string, item: TodoItem): void {
-  commit((s) => {
-    const rows = s.sections.todo;
-    if (rows.some((t) => t.id === localId)) {
-      return { ...s, sections: { ...s.sections, todo: rows.map((t) => (t.id === localId ? { ...item } : t)) } };
-    }
-    if (rows.some((t) => t.id === item.id)) return s;
-    return { ...s, sections: { ...s.sections, todo: [...rows, { ...item }] } };
-  });
 }
 
 function patchTask(id: string, patch: { text?: string; done?: boolean }): void {
@@ -498,20 +601,53 @@ function patchTask(id: string, patch: { text?: string; done?: boolean }): void {
   }));
 }
 
-export function setTaskDone(id: string, done: boolean): void {
+export async function setTaskDone(id: string, done: boolean): Promise<WriteOutcome> {
   patchTask(id, { done });
-  void hubPatchTodo(id, { done }).then((res) => settle(res));
+  return confirmWrite(
+    () => hubPatchTodo(id, { done }),
+    (_res, items) => items.some((t) => t.id === id && t.done === done),
+  );
 }
 
-/** Debounced: a task title is typed character by character. */
+/**
+ * Debounced: a task title is typed character by character.
+ *
+ * Deliberately NOT the confirmed form. This one runs on every keystroke of a
+ * human edit, and the confirmation adopts the hub's list — which would discard
+ * unsent text in any OTHER row the moment this row's timer fired. The banner is
+ * this path's failure surface, as the policy above promises. A caller with no
+ * next keystroke to flush the timer wants `setTaskTextNow`.
+ */
 export function setTaskText(id: string, text: string): void {
   patchTask(id, { text });
   debounce(`todo:${id}`, EDIT_DEBOUNCE_MS, () => void hubPatchTodo(id, { text }).then((res) => settle(res)));
 }
 
-export function removeTask(id: string): void {
+/**
+ * The one-shot rename — what a delegated action uses.
+ *
+ * `setTaskText` arms a 400 ms timer, so awaiting it would answer from inside the
+ * debounce window, before the hub had heard anything: a rename reported as done
+ * that had not been sent yet. This sends immediately, cancels any timer already
+ * armed for the row, and waits for the re-read before answering.
+ */
+export async function setTaskTextNow(id: string, text: string): Promise<WriteOutcome> {
+  patchTask(id, { text });
+  cancelDebounce(`todo:${id}`);
+  return confirmWrite(
+    () => hubPatchTodo(id, { text }),
+    (_res, items) => items.some((t) => t.id === id && t.text === text),
+  );
+}
+
+export async function removeTask(id: string): Promise<WriteOutcome> {
   commit((s) => ({ ...s, sections: { ...s.sections, todo: s.sections.todo.filter((t) => t.id !== id) } }));
-  void hubDeleteTodo(id).then((res) => settle(res));
+  // A rename armed for this row would now write to a task that no longer exists.
+  cancelDebounce(`todo:${id}`);
+  return confirmWrite(
+    () => hubDeleteTodo(id),
+    (_res, items) => !items.some((t) => t.id === id),
+  );
 }
 
 /**
@@ -519,11 +655,15 @@ export function removeTask(id: string): void {
  *
  * Used by the paste categoriser, which rewrites the entire to-do section at
  * once: replaying that as individual creates would be N round trips and would
- * lose the fact that it is a single intent.
+ * lose the fact that it is a single intent. It is also the only sane way to
+ * empty the list, so `todo.clear_all` comes through here too.
  */
-export function setTasks(items: TodoItem[]): void {
+export async function setTasks(items: TodoItem[]): Promise<WriteOutcome> {
   commit((s) => ({ ...s, sections: { ...s.sections, todo: items } }));
-  void hubPutTodos(items).then((res) => settle(res, () => adoptTodos(res.items)));
+  return confirmWrite(
+    () => hubPutTodos(items),
+    (_res, list) => sameIds(list, items),
+  );
 }
 
 /** The list IS the order, so a reorder sends the ids in their new sequence. */
@@ -531,9 +671,12 @@ export function reorderTasks(ids: string[]): void {
   void hubReorderTodos(ids).then((res) => settle(res, () => adoptTodos(res.items)));
 }
 
-export function clearDoneTasks(): void {
+export async function clearDoneTasks(): Promise<WriteOutcome> {
   commit((s) => ({ ...s, sections: { ...s.sections, todo: s.sections.todo.filter((t) => !t.done) } }));
-  void hubClearDone().then((res) => settle(res, () => adoptTodos(res.items)));
+  return confirmWrite(
+    () => hubClearDone(),
+    (_res, items) => !items.some((t) => t.done),
+  );
 }
 
 /** Trust the server's list over the optimistic one whenever it is offered. */

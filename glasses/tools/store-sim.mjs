@@ -119,7 +119,7 @@ ls.set(
 const calls = [];
 let mode = 'hub'; // 'hub' | 'dead'
 let nextFailure = null;
-const patches = { emptyTodos: false, controlDropsTodos: false, alwaysStale: false };
+const patches = { emptyTodos: false, controlDropsTodos: false, alwaysStale: false, swallowWrites: false };
 
 const hub = {
   rev: 40,
@@ -208,6 +208,13 @@ function route(method, rel, body, headers) {
     hub.rev += 1;
     hub.clock += 1;
   };
+  // `swallowWrites` models the failure the bug report is about: the write is
+  // ACKNOWLEDGED with a 2xx and never applied. The rev still advances, which
+  // makes it the HARSHER version of the real failure — nothing but an
+  // independent read of the list can tell the difference.
+  const apply = (fn) => {
+    if (!patches.swallowWrites) fn();
+  };
 
   // ── control plane ──
   if (rel === '') {
@@ -229,16 +236,18 @@ function route(method, rel, body, headers) {
       const e = requireRev();
       if (e) return e;
       const item = { id: `srv-todo-${++hub.seq}`, text: String(body.text ?? ''), done: false };
-      hub.todos.push(item);
+      apply(() => hub.todos.push(item));
       bump();
       return reply(201, { ok: true, rev: hub.rev, item });
     }
     if (method === 'PUT') {
       const e = requireRev();
       if (e) return e;
-      hub.todos = Array.isArray(body.items)
-        ? body.items.map((t) => ({ id: String(t.id), text: String(t.text), done: !!t.done }))
-        : [];
+      apply(() => {
+        hub.todos = Array.isArray(body.items)
+          ? body.items.map((t) => ({ id: String(t.id), text: String(t.text), done: !!t.done }))
+          : [];
+      });
       bump();
       return reply(200, { ok: true, rev: hub.rev, items: patches.emptyTodos ? [] : hub.todos.map((t) => ({ ...t })) });
     }
@@ -254,7 +263,9 @@ function route(method, rel, body, headers) {
   if (rel === '/todos/clear-done' && method === 'POST') {
     const e = requireRev();
     if (e) return e;
-    hub.todos = hub.todos.filter((t) => !t.done);
+    apply(() => {
+      hub.todos = hub.todos.filter((t) => !t.done);
+    });
     bump();
     return reply(200, { ok: true, rev: hub.rev, items: patches.emptyTodos ? [] : hub.todos.map((t) => ({ ...t })) });
   }
@@ -265,15 +276,17 @@ function route(method, rel, body, headers) {
     if (method === 'PATCH') {
       const e = requireRev();
       if (e) return e;
-      if (typeof body.done === 'boolean') hub.todos[i].done = body.done;
-      if (typeof body.text === 'string') hub.todos[i].text = body.text;
+      apply(() => {
+        if (typeof body.done === 'boolean') hub.todos[i].done = body.done;
+        if (typeof body.text === 'string') hub.todos[i].text = body.text;
+      });
       bump();
       return reply(200, { ok: true, rev: hub.rev, item: { ...hub.todos[i] } });
     }
     if (method === 'DELETE') {
       const e = requireRev();
       if (e) return e;
-      hub.todos.splice(i, 1);
+      apply(() => hub.todos.splice(i, 1));
       bump();
       return reply(204, undefined, {}, true);
     }
@@ -620,10 +633,13 @@ section('C. todos — id swap, rev, debounce, and the empty-list guard');
 }
 
 {
-  // `adoptTodos` trusts the server's list whenever it is offered — the hub is
-  // the authority. Its guard is narrower than it looks: it skips the adopt only
-  // when BOTH lists are empty, which is a pointless-commit guard, not a
-  // data-protection one. Both halves are asserted so the distinction is pinned.
+  // The hub is the authority — and since every write is CONFIRMED, it is a READ
+  // of the list that proves it, not the write's own echo. `emptyTodos` fakes
+  // exactly that echo (`PUT /todos` answers `items: []` while the hub really
+  // holds the rows), so this pins the new rule: what is on screen follows the
+  // list, and a response body can no longer repaint it. Before confirmation
+  // existed the echo WAS adopted — a relay that mangled a reply could therefore
+  // empty the wearer's list, and a write that never landed could look applied.
   setTasks([{ id: 'local-only', text: 'just typed', done: false }]);
   await tick();
   patches.emptyTodos = true;
@@ -631,9 +647,10 @@ section('C. todos — id swap, rev, debounce, and the empty-list guard');
   setTasks([{ id: 'local-only', text: 'just typed', done: false }]);
   await tick();
   patches.emptyTodos = false;
-  check('the server’s list wins, even when it is empty', getState().sections.todo.map((t) => t.text), []);
+  check('a write echo does not decide the list; the read does', getState().sections.todo.map((t) => t.text), ['just typed']);
+  check('…and that read was a real GET /todos', exactCalls('GET', '/todos').length >= 1, true);
 
-  // Both empty: the guard skips the adopt entirely, so the RESPONSE adds no
+  // Both empty: `adoptTodos` skips the adopt entirely, so the read-back adds no
   // second repaint. The optimistic commit is expected and is zeroed out below —
   // it is the adopt, not the local edit, that must be skipped here.
   setTasks([]);
@@ -1057,6 +1074,78 @@ section('J. a burst in one tick is SERIALISED — rev is one token, not N');
   check('a permanently stale hub is retried a bounded number of times', attempts.length, 4);
   check('…and then the failure is REPORTED', getHubError().length > 0, true);
   check('…not swallowed', getHubError(), 'rev is stale');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+section('K. a write is only called saved once a READ agrees with it');
+{
+  // This is the bug report this section exists for. A to-do write was
+  // ACKNOWLEDGED and never applied: the hub answered `201`, the list still did
+  // not show the task, and the wearer was told it saved — twice, because the
+  // optimistic row also survived a reload. `swallowWrites` makes the fake hub
+  // behave that way, and the read-back `confirmWrite` performs is the ONLY thing
+  // that can tell the difference. So both halves are asserted: that the read
+  // really happens, and that its answer is what decides `ok`.
+  await tick();
+  calls.length = 0;
+  patches.swallowWrites = true;
+  const ghost = await addTask('ghost task');
+  patches.swallowWrites = false;
+
+  check('the hub acknowledged the create', exactOk('POST', '/todos').length, 1);
+  check('…but the client refused to call it saved', ghost.ok, false);
+  check('…and named it unconfirmed', ghost.unconfirmed, true);
+  check('…because it read the list back', exactCalls('GET', '/todos').length >= 1, true);
+  check('…and the phantom row is NOT left on screen', getState().sections.todo.some((t) => t.text === 'ghost task'), false);
+}
+
+{
+  // The same for a tick and a delete. A `PATCH` can be accepted and leave the
+  // row untouched (it named a task another device had already deleted), and a
+  // `DELETE` can answer `204` without removing anything — the app's own bug
+  // report has exactly this shape for a delete.
+  await tick();
+  await setTasks([{ id: 'swallow-1', text: 'still here', done: false }]);
+
+  patches.swallowWrites = true;
+  const ticked = await setTaskDone('swallow-1', true);
+  check('an acknowledged tick is not reported saved', ticked.ok, false);
+  check('…and the row does not stay ticked', getState().sections.todo.find((t) => t.id === 'swallow-1')?.done, false);
+
+  const gone = await removeTask('swallow-1');
+  patches.swallowWrites = false;
+  check('an acknowledged delete is not reported saved', gone.ok, false);
+  check('…and the row comes BACK rather than vanishing into a lie', getState().sections.todo.some((t) => t.id === 'swallow-1'), true);
+}
+
+{
+  // `clear-done` sends one collection-level write for N rows, so a swallowed
+  // one loses every row at once — the case where the local list and the hub can
+  // disagree most visibly.
+  await tick();
+  await setTasks([
+    { id: 'cd-1', text: 'done one', done: true },
+    { id: 'cd-2', text: 'open one', done: false },
+  ]);
+  patches.swallowWrites = true;
+  const cleared = await clearDoneTasks();
+  patches.swallowWrites = false;
+  check('an acknowledged clear-done is not reported saved', cleared.ok, false);
+  check('…and the finished task is still on the list', getState().sections.todo.some((t) => t.id === 'cd-1'), true);
+}
+
+{
+  // The other half of the same bug: a device that is not paired. The relay
+  // answers `401`, and `authHeaders()` simply OMITS the Authorization header
+  // when the token is missing, so this is not a rare state — it is what every
+  // write does after a reload. `whyRefused()` must name it as a sign-in problem,
+  // not let it read like bad signal.
+  await tick();
+  nextFailure = { status: 401, headers: {}, body: { ok: false, error: 'sign-in required', code: 'UNAUTHORIZED' } };
+  const refused = await addTask('nope');
+  check('a 401 is not reported as saved', refused.ok, false);
+  check('…and is named as a sign-in problem', /not signed in/.test(String(refused.error)), true);
+  check('…rather than a network one', /reach the hub/.test(String(refused.error)), false);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
