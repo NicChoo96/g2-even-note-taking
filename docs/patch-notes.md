@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.53
+
+v0.3.53 - Deleting from the app works again
+
+- The relay advertised only reads and creates, so every delete, rename, tick and save was refused by the browser before it was ever sent.
+- That left the app able to say only "Failed to fetch", which reads like a bad connection - so a bug that happened every single time looked like flaky signal.
+- A blocked change now says plainly that it could not reach the hub.
+
 ## 0.3.52
 
 v0.3.52 - An agent can now run the other agents and read what they said
