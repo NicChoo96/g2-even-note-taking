@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.47
+
+v0.3.47 - Set up a REST tool on the agent page, and steadier agent runs
+
+- A REST tool attached to an agent now shows its address, method, headers and body right under the tools, so it can be edited without leaving the agent.
+- The tool catalogue has moved into Settings, where the global choices now sit together.
+- Buttons are readable again instead of washed-out white.
+- Runs no longer die on a repeated app step or an out-of-date model name.
+
 ## 0.3.46
 
 v0.3.46 - Jarvis can search the web, and agents can act on the glasses

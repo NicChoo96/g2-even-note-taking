@@ -155,8 +155,14 @@ export interface ToolDef {
   description: string;
   /** http tools: absolute endpoint URL. */
   url?: string;
-  /** http tools: request method (default POST). */
-  method?: 'GET' | 'POST';
+  /**
+   * http tools: request method (default POST).
+   *
+   * PUT is here because a REST endpoint that UPDATES a record is the common
+   * case, and the two-method list sent every one of those to POST — which
+   * creates a second record instead of changing the one the wearer meant.
+   */
+  method?: 'GET' | 'POST' | 'PUT';
   /**
    * http tools: a JSON object the user authors, used as the request body (POST)
    * or the query string (GET).
@@ -169,6 +175,22 @@ export interface ToolDef {
    * free-form `body` object.
    */
   bodyTemplate?: string;
+  /**
+   * http tools: extra request headers, authored as a JSON object — e.g.
+   * `{"X-Api-Key": "…", "Accept-Language": "en"}`.
+   *
+   * A REST endpoint that wants an API key in a header of its own, or a version
+   * pin, is not reachable without this: the relay only ever sent `Accept` and
+   * its own bearer token, so the request arrived without the header the endpoint
+   * was asking for and the failure looked like a bad URL. Authored like
+   * `bodyTemplate`, and for the same reason — one place to write it, parsed by
+   * the same module the relay sends from (see `web/server/http-tool.mjs`).
+   *
+   * Values are strings by definition: a header cannot be a number or an object.
+   * A non-string value is dropped rather than stringified, because
+   * `X-Retry: "[object Object]"` is worse than no header at all.
+   */
+  headers?: string;
   /** Secret is stored server-side (relay env / settings store) — never here. */
   hasToken?: boolean;
   /** Web search only — how much to read. Defaults to 'basic'. */

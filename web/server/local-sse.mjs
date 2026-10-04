@@ -167,7 +167,7 @@ import { describeRoute, routeTools } from './mcp-router.mjs';
 // Generic REST tools. The schema the model is offered and the body actually sent
 // are built together, so they cannot drift into the mismatch they once had (the
 // schema advertised `{ body: { ... } }` while the executor sent the args flat).
-import { httpRequestArgs, httpToolSchema } from './http-tool.mjs';
+import { httpRequestArgs, httpRequestHead, httpToolSchema } from './http-tool.mjs';
 // The hub's OWN stores (todo list, document library, notes). The schema and the
 // reducer are pure and live together in hub-tools.mjs; nothing here knows how an
 // action reaches the store.
@@ -1500,10 +1500,10 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
   }
   const target = String(tool.url || '').trim();
   if (!/^https:\/\//i.test(target)) return 'tool error: tool url must be https://';
-  const method = tool.method === 'GET' ? 'GET' : 'POST';
+  // The verb and the headers come from ONE place so this path and the /api/tool
+  // proxy cannot disagree about what the author asked for.
   const token = (tool.id && toolTokens.get(tool.id)) || '';
-  const headers = { Accept: 'application/json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const { method, headers } = httpRequestHead(tool, { token });
   let url = target;
   const init = { method, headers };
   // The template's defaults under the model's arguments — see http-tool.mjs for
@@ -3103,11 +3103,9 @@ const server = createServer(async (req, res) => {
         json(res, 400, { ok: false, error: 'tool url must be https://' });
         return;
       }
-      const method = body?.method === 'GET' ? 'GET' : 'POST';
       const toolId = typeof body?.toolId === 'string' ? body.toolId : '';
       const token = (toolId && toolTokens.get(toolId)) || '';
-      const headers = { Accept: 'application/json' };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const { method, headers } = httpRequestHead(body, { token });
       // Resolve relative dates in the model's own arguments too — a custom
       // REST tool is just as date-sensitive as a web search. The tool's authored
       // template is layered UNDER those arguments here, so this proxy sends the

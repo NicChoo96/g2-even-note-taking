@@ -88,6 +88,10 @@ const wordsOf = (src, from, to) => {
 const relaySrc = readFileSync(new URL('../../web/server/local-sse.mjs', import.meta.url), 'utf8');
 const typesSrc = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
 const panelSrc = readFileSync(new URL('../src/web/AgentsPanel.tsx', import.meta.url), 'utf8');
+// The per-tool EDITOR lives in its own module now — name, kind, description and
+// the bearer token moved out of the agent page when the catalogue became a
+// Settings section. The chips that attach a tool stayed on the agent page.
+const toolsSrc = readFileSync(new URL('../src/web/ToolsPanel.tsx', import.meta.url), 'utf8');
 const capSrc = readFileSync(new URL('../src/ai/capabilities/agents.ts', import.meta.url), 'utf8');
 
 const tool = (kind, name) => ({ id: `tool-${kind}`, name, kind, description: '' });
@@ -475,17 +479,30 @@ eq('the notes seed does not claim documents', notesWords.test('the document stor
 has('the agent editor offers a todo chip', panelSrc, "{ kind: 'todo', label: 'To-do list', add: addTodoToAgent }");
 has('the agent editor offers a docs chip', panelSrc, "{ kind: 'docs', label: 'Docs', add: addDocsToAgent }");
 has('the agent editor offers a notes chip', panelSrc, "{ kind: 'notes', label: 'Notes', add: addNotesToAgent }");
-has('the catalogue can seed a todo tool', panelSrc, "{ kind: 'todo', label: 'To-do list', make: todoTool }");
-has('the catalogue can seed the docs tool', panelSrc, "{ kind: 'docs', label: 'Docs', make: docsTool }");
-has('the catalogue can seed the notes tool', panelSrc, "{ kind: 'notes', label: 'Notes', make: notesTool }");
-eq('the catalogue seeds are matched on KIND, not id', panelSrc.includes('t.kind === s.kind'), true);
-has('the kind select can switch to todo', panelSrc, '<option value="todo">');
-has('the kind select can switch to docs', panelSrc, '<option value="docs">');
-has('the kind select can switch to notes', panelSrc, '<option value="notes">');
+has('the catalogue can seed a todo tool', toolsSrc, "{ kind: 'todo', label: 'To-do list', make: todoTool }");
+has('the catalogue can seed the docs tool', toolsSrc, "{ kind: 'docs', label: 'Docs', make: docsTool }");
+has('the catalogue can seed the notes tool', toolsSrc, "{ kind: 'notes', label: 'Notes', make: notesTool }");
+// Both seed rows match on KIND rather than id, so an install that already holds
+// the tool under another id is not handed a second, identical one. In the
+// catalogue the kind is the argument (`addSeed(kind, make)`); on the agent page
+// it is the chip descriptor's own field.
+eq(
+  'the catalogue seeds are matched on KIND, not id',
+  toolsSrc.includes('t.kind === kind'),
+  true,
+);
+eq(
+  'the agent seed chips are matched on KIND, not id',
+  panelSrc.includes('t.kind === s.kind'),
+  true,
+);
+has('the kind select can switch to todo', toolsSrc, '<option value="todo">');
+has('the kind select can switch to docs', toolsSrc, '<option value="docs">');
+has('the kind select can switch to notes', toolsSrc, '<option value="notes">');
 // The rules the earlier work established must survive this change.
 has('jev is still attachable by name', panelSrc, 'const addJevToAgent = () => attachSeed(JEV_TOOL_ID, jevTool);');
-has('jev is still a kind option', panelSrc, '<option value="jev">');
-has('the skipped-rather-than-guessed copy is intact', panelSrc, 'reports that it was skipped rather than guessing');
+has('jev is still a kind option', toolsSrc, '<option value="jev">');
+has('the skipped-rather-than-guessed copy is intact', toolsSrc, 'reports that it was skipped rather than guessing');
 eq(
   'agents-store.ts still never names a hub kind',
   readFileSync(new URL('../src/agents-store.ts', import.meta.url), 'utf8').includes("'todo'"),

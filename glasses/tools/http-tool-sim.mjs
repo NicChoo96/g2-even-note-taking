@@ -20,10 +20,23 @@
 //   garbage template degrades instead of throwing, and that the relay does not
 //   quietly rebuild either half by hand.
 //
+//   The verb and the authored headers are the third half of the same story. The
+//   executor used to force POST and send only `Accept` + its bearer token, so an
+//   endpoint that UPDATES a record (PUT) or wants its own key/version pin could
+//   not be described at all. Both executors now take verb AND headers from
+//   `httpRequestHead`, which is what §9 proves — on the helper directly, not on
+//   the source text.
+//
 // Run: node tools/http-tool-sim.mjs
 
 import { readFileSync } from 'node:fs';
-import { httpRequestArgs, httpToolSchema, parseBodyTemplate } from '../../web/server/http-tool.mjs';
+import {
+  httpRequestArgs,
+  httpRequestHead,
+  httpToolSchema,
+  parseBodyTemplate,
+  parseHeaderTemplate,
+} from '../../web/server/http-tool.mjs';
 
 let fail = 0;
 const assert = (label, cond, detail = '') => {
@@ -40,7 +53,13 @@ const deepEq = (label, got, want) =>
   eq(label, JSON.stringify(got), JSON.stringify(want));
 
 const relaySrc = readFileSync(new URL('../../web/server/local-sse.mjs', import.meta.url), 'utf8');
-const panelSrc = readFileSync(new URL('../src/web/AgentsPanel.tsx', import.meta.url), 'utf8');
+// The tool EDITOR (name, kind, description, its bearer token) and the REST card
+// the agent page draws under its chips both live in this file now — the agent
+// page keeps only the chips that attach a tool.
+const panelSrc = readFileSync(new URL('../src/web/ToolsPanel.tsx', import.meta.url), 'utf8');
+// ...and the chips themselves, plus the seed row that adds one to this agent.
+const agentsSrc = readFileSync(new URL('../src/web/AgentsPanel.tsx', import.meta.url), 'utf8');
+const storeSrc = readFileSync(new URL('../src/agents-store.ts', import.meta.url), 'utf8');
 const typesSrc = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
 
 const httpTool = (bodyTemplate) => ({
@@ -181,8 +200,24 @@ assert(
 assert('runToolOnce merges through httpRequestArgs', /httpRequestArgs\(tool, args\)/.test(relaySrc));
 assert('the /api/tool proxy merges through httpRequestArgs', /httpRequestArgs\(body, args\)/.test(relaySrc));
 assert(
-  'the relay imports both helpers',
-  /import \{ httpRequestArgs, httpToolSchema \} from '\.\/http-tool\.mjs'/.test(relaySrc),
+  'the relay imports all three helpers',
+  /import \{ httpRequestArgs, httpRequestHead, httpToolSchema \} from '\.\/http-tool\.mjs'/.test(
+    relaySrc,
+  ),
+);
+// The verb and the headers are ONE decision, taken in the helper, so the agent
+// loop and the /api/tool proxy cannot send different requests for the same tool.
+assert(
+  'the agent loop takes verb + headers from httpRequestHead',
+  /httpRequestHead\(tool, \{ token \}\)/.test(relaySrc),
+);
+assert(
+  'the /api/tool proxy takes verb + headers from httpRequestHead',
+  /httpRequestHead\(body, \{ token \}\)/.test(relaySrc),
+);
+assert(
+  'neither path picks the method itself any more',
+  !/method\s*=\s*['"]POST['"]/.test(relaySrc),
 );
 assert(
   'the executor still refuses a non-https url',
@@ -199,17 +234,24 @@ assert(
   /must be a JSON object, e\.g\./.test(panelSrc),
 );
 assert('GET is labelled as query parameters', /Query parameters \(JSON\)/.test(panelSrc));
-assert('POST is labelled as a request body', /Request body \(JSON\)/.test(panelSrc));
+assert('POST is labelled as request body', /Request body \(JSON\)/.test(panelSrc));
+// The REST parameters belong to the agent that holds the tool, so the card that
+// draws them is rendered from the agent page — not from the catalogue row.
+assert('the agent page renders the REST card', /<RestToolConfig key=\{t\.id\} tool=\{t\} \/>/.test(agentsSrc));
+assert(
+  'only the tools this agent holds get a card',
+  /t\.kind === 'http' && agent\.toolIds\.includes\(t\.id\)/.test(agentsSrc),
+);
 
 // ── 8. ONE chip row, not two selectors ──────────────────────────────────────
 console.log('\n§8  the two chip sets are one');
-const chipRowCount = (panelSrc.match(/className="chip-row"/g) || []).length;
-assert('the agent editor renders a chip row', chipRowCount >= 1, `count=${chipRowCount}`);
+const chipRowCount = (agentsSrc.match(/className="chip-row"/g) || []).length;
+assert('the agent editor renders a chip row', chipRowCount === 1, `count=${chipRowCount}`);
 assert(
   'the seed kinds are chips in that row, not a second button row',
-  /\+ \{s\.label\}/.test(panelSrc),
+  /\+ \{s\.label\}/.test(agentsSrc),
 );
-assert('the jev seed is still reachable by name', /addJevToAgent/.test(panelSrc));
+assert('the jev seed is still reachable by name', /addJevToAgent/.test(agentsSrc));
 assert('the jev option survives in the kind select', /<option value="jev">/.test(panelSrc));
 assert(
   'the jev readiness sentence survives',
@@ -217,18 +259,82 @@ assert(
 );
 assert(
   'a kind the catalogue already holds is not offered again as a seed',
-  /seedChips\.filter\(\(s\) => !state\.tools\.some\(\(t\) => t\.kind === s\.kind\)\)/.test(panelSrc),
+  /seedChips\.filter\(\(s\) => !state\.tools\.some\(\(t\) => t\.kind === s\.kind\)\)/.test(agentsSrc),
 );
-const docsActionRows = (panelSrc.match(/className="docs-actions"/g) || []).length;
+// The catalogue moved to Settings, together with the seeds that create tools in
+// it. It must NOT be rendered twice — one catalogue, one place it can be edited.
+assert('the catalogue is rendered by the Settings section', /catalogueSeeds\.map/.test(panelSrc));
+assert('the agent page no longer owns a catalogue', !/catalogueSeeds/.test(agentsSrc));
+assert(
+  'the seed row is not a right-aligned action row',
+  !/className="docs-actions"[\s\S]{0,400}catalogueSeeds/.test(panelSrc),
+);
+const docsActionRows = (agentsSrc.match(/className="docs-actions"/g) || []).length;
 assert('action rows elsewhere are untouched', docsActionRows >= 1, `count=${docsActionRows}`);
 // The agent editor itself is the thing that had two selectors. Slice it out and
 // assert it now holds exactly one chip row and no button row of its own.
-const editorSrc = panelSrc.slice(
-  panelSrc.indexOf('function AgentEditor'),
-  panelSrc.indexOf('function ToolEditor'),
+const editorSrc = agentsSrc.slice(
+  agentsSrc.indexOf('function AgentEditor'),
+  agentsSrc.indexOf('export function AgentsPanel'),
 );
 eq('the agent editor has one chip row', (editorSrc.match(/className="chip-row"/g) || []).length, 1);
 eq('the agent editor has no second tool button row', (editorSrc.match(/className="docs-actions"/g) || []).length, 0);
+
+// ── 9. The verb and the headers are real ────────────────────────────────────
+console.log('\n§9  httpRequestHead decides verb + headers once');
+const curl = (tool, token = '') => httpRequestHead(tool, token ? { token } : {});
+deepEq('no method means POST', curl({}).method, 'POST');
+deepEq('a lowercase put is upper-cased', curl({ method: 'put' }).method, 'put'.toUpperCase());
+deepEq('GET is honoured', curl({ method: 'GET' }).method, 'GET');
+deepEq('an unknown verb falls back to POST', curl({ method: 'DELETE' }).method, 'POST');
+deepEq('a non-string verb falls back to POST', curl({ method: 7 }).method, 'POST');
+deepEq('Accept is always sent', curl({}).headers, { Accept: 'application/json' });
+deepEq('a bearer token is added when there is one', curl({}, 'secret').headers, {
+  Accept: 'application/json',
+  Authorization: 'Bearer secret',
+});
+deepEq('no token means no Authorization header', curl({}, '').headers.Authorization, undefined);
+// An author must not be able to pin the two headers the relay owns — a stale
+// token pasted into the textarea would otherwise shadow the real one and every
+// call would come back 401.
+deepEq('an authored Accept is replaced', curl({ headers: '{"Accept": "text/plain"}' }).headers, {
+  Accept: 'application/json',
+});
+deepEq(
+  'an authored Authorization is replaced',
+  curl({ headers: '{"authorization": "Bearer wrong"}' }, 'right').headers,
+  { Accept: 'application/json', Authorization: 'Bearer right' },
+);
+deepEq(
+  'other authored headers are sent as written',
+  curl({ headers: '{"X-Api-Key": "k", "Accept-Language": "en"}' }).headers,
+  { Accept: 'application/json', 'X-Api-Key': 'k', 'Accept-Language': 'en' },
+);
+deepEq('a non-string value is dropped, not stringified', curl({ headers: '{"X-N": 7}' }).headers, {
+  Accept: 'application/json',
+});
+deepEq('a blank header name is dropped', curl({ headers: '{"": "x"}' }).headers, {
+  Accept: 'application/json',
+});
+
+// ── 10. parseHeaderTemplate is total, like its body twin ────────────────────
+console.log('\n§10  parseHeaderTemplate never throws');
+deepEq('a missing tool is no headers', parseHeaderTemplate(undefined), {});
+deepEq('no headers is no headers', parseHeaderTemplate({ kind: 'http' }), {});
+deepEq('blank is no headers', parseHeaderTemplate({ headers: '  ' }), {});
+deepEq('unparseable JSON degrades to {}', parseHeaderTemplate({ headers: '{ "a": ' }), {});
+deepEq('an array is not a header object', parseHeaderTemplate({ headers: '["a"]' }), {});
+deepEq('a scalar is not a header object', parseHeaderTemplate({ headers: '"x"' }), {});
+deepEq('a real object parses', parseHeaderTemplate({ headers: '{"X-Api-Key": "k"}' }), {
+  'X-Api-Key': 'k',
+});
+// `keepLocalToolFields` re-attaches these on adoption, so a tool adopted by a
+// second device would otherwise lose the headers its author wrote.
+assert(
+  'the store keeps authored headers with the tool',
+  /t\.headers !== undefined/.test(storeSrc),
+);
+assert('ToolDef carries headers', /headers\?: string/.test(typesSrc));
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : `${fail} FAILED`}`);
 process.exit(fail === 0 ? 0 : 1);

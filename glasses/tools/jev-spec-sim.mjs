@@ -394,6 +394,10 @@ assert(
 console.log('\n── 10. agents tool wiring (source) ──');
 const typesSrc = readFileSync(resolve('src', 'types.ts'), 'utf8');
 const panelSrc = readFileSync(resolve('src', 'web', 'AgentsPanel.tsx'), 'utf8');
+// The per-tool editor (the kind select, the jev readiness line) moved to the
+// Tools module when the catalogue became a Settings section; the chips that
+// ATTACH a tool stayed on the agent page, which is why `panelSrc` is still read.
+const toolsSrc = readFileSync(resolve('src', 'web', 'ToolsPanel.tsx'), 'utf8');
 const pagesSrc = readFileSync(resolve('src', 'ai', 'pages.ts'), 'utf8');
 const capSrc = readFileSync(resolve('src', 'ai', 'capabilities', 'jev.ts'), 'utf8');
 const clientSrc = readFileSync(resolve('src', 'web', 'jev-client.ts'), 'utf8');
@@ -404,10 +408,10 @@ assert('ToolKind admits the jev kind alongside web', /'web' \| 'http' \| 'jev'/.
 assert('ToolKind still admits the legacy tavily kind', /'tavily'/.test(typesSrc));
 assert('types.ts exports a jev tool seeder', /export function jevTool\(\): ToolDef/.test(typesSrc));
 assert('the panel can seed jev onto an agent', /addJevToAgent/.test(panelSrc));
-assert('the panel offers jev as a tool kind', /<option value="jev">/.test(panelSrc));
+assert('the panel offers jev as a tool kind', /<option value="jev">/.test(toolsSrc));
 assert(
   'the panel tells the truth when jev has no key',
-  /reports that it was skipped rather than guessing/.test(panelSrc),
+  /reports that it was skipped rather than guessing/.test(toolsSrc),
 );
 assert('pages.ts registers the jev capability', /jevCapabilities/.test(pagesSrc));
 assert('the settings panel reports jev readiness', /Jev ready/.test(settingsSrc));

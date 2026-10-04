@@ -36,6 +36,74 @@ export function parseBodyTemplate(tool) {
   }
 }
 
+/**
+ * The extra headers a tool's author wrote, parsed — always an object, never
+ * null.
+ *
+ * Total by the same rule as `parseBodyTemplate`, and for the same reason: this
+ * runs on the request path of a live run, so a typo in a tool definition must
+ * degrade to "no extra headers" rather than take the run down. It is stricter
+ * about VALUES, though, and only because a header is not a JSON value: the HTTP
+ * layer would coerce a number or an object into something the endpoint never
+ * asked for (`[object Object]`), which is a silently WRONG request rather than a
+ * missing header. Non-string values are therefore dropped, and the panel says so
+ * while the template is being typed.
+ *
+ * `Accept` and `Authorization` are deliberately NOT defaulted here: the relay
+ * owns those, and this module's job is to answer exactly one question — what did
+ * the author write?
+ */
+export function parseHeaderTemplate(tool) {
+  const raw = typeof tool?.headers === 'string' ? tool.headers.trim() : '';
+  if (!raw) return {};
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [name, v] of Object.entries(value)) {
+    if (!name.trim()) continue;
+    if (typeof v !== 'string') continue;
+    out[name] = v;
+  }
+  return out;
+}
+
+/**
+ * The wire head of a REST tool's request: the method, and the headers the
+ * author wrote merged under the two the relay owns.
+ *
+ * BOTH relay executors call this — the agent path (`runToolOnce`) and the
+ * `/api/tool` proxy. A field the panel can set but that only one executor
+ * honours is worse than a field the panel does not offer at all: it would be
+ * telling the truth on one path and lying on the other, and the lie fails as a
+ * 401 or a 404 from an endpoint that was never asked the right question. That is
+ * exactly the drift this module exists to prevent for the body (see the header),
+ * so the method and the headers are settled here too.
+ *
+ * `Accept` and `Authorization` are the relay's to set, so an authored header of
+ * either name is REPLACED rather than merged. The token is the credential stored
+ * against the tool, and letting a template shadow it would mean a tool that
+ * authenticates on one device and 401s on another.
+ *
+ * An unknown method degrades to POST, which is what the executors did before PUT
+ * existed: the failure is then a wrong verb, not a run that never starts.
+ */
+export function httpRequestHead(tool, { token = '' } = {}) {
+  const raw = String(tool?.method || '').toUpperCase();
+  const method = raw === 'GET' || raw === 'PUT' ? raw : 'POST';
+  const headers = { Accept: 'application/json' };
+  for (const [name, value] of Object.entries(parseHeaderTemplate(tool))) {
+    if (name.toLowerCase() === 'accept' || name.toLowerCase() === 'authorization') continue;
+    headers[name] = value;
+  }
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return { method, headers };
+}
+
 /** The JSON Schema type name for a template default. */
 function jsonTypeName(value) {
   if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';

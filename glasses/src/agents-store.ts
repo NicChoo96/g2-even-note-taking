@@ -16,6 +16,8 @@
 //     every adoption. A device that has never seen a REST tool therefore cannot
 //     recover the parameter shape its author wrote — the one real cost of the
 //     migration, stated rather than hidden.
+//   • A tool's `headers` — same column gap, same treatment: re-attached by id on
+//     every adoption, and absent on a device that never saw the tool.
 //   • A tool's `hasToken` — in this app that means "the RELAY holds a
 //     credential", which is a different mechanism from the hub's own
 //     `PUT /hub/tools/{id}/token` store. The relay is what executes a run, so the
@@ -235,6 +237,7 @@ function debounce(key: string, run: () => void): void {
 function localOnlyToolFields(t: Omit<ToolDef, 'id'>): Partial<ToolDef> {
   const out: Partial<ToolDef> = {};
   if (t.bodyTemplate !== undefined) out.bodyTemplate = t.bodyTemplate;
+  if (t.headers !== undefined) out.headers = t.headers;
   if (t.hasToken) out.hasToken = true;
   return out;
 }

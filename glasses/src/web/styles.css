@@ -169,6 +169,17 @@ button {
      the rules below still win wherever a button wants a different colour
      (`button.primary`, `.icon-btn`, `.link-btn`, `.files-tab`). */
   color: var(--text);
+  /* The same mistake twice: a <button> sets no `background` and no `padding`, so
+     the UA paints it its own light-grey box at its own 1px-6px inset. That is the
+     "white button" class of bug — a dark-bordered pill of near-white sitting in a
+     dark panel, which is what `+ Custom REST tool`, `⚡ Trigger prompt`, `■ Stop`,
+     `Refresh status`, `Compact now` and `Run location check` all used to be. Same
+     fix, same place, so the tenth bare button added tomorrow is right by default:
+     a real surface and real padding. Every rule below that wants something else
+     still wins (class selectors outrank this element one), and `.icon-btn` opts out
+     of the padding because it is a fixed square. */
+  background: var(--panel-2);
+  padding: 7px 14px;
   transition: filter 0.15s ease, background 0.15s ease;
 }
 
@@ -375,6 +386,8 @@ select {
   color: var(--muted);
   width: 26px;
   height: 26px;
+  /* A fixed square: the base button's inset would push the glyph off-centre. */
+  padding: 0;
   border-radius: 6px;
   flex: none;
 }
@@ -410,10 +423,15 @@ a.icon-btn {
   color: var(--danger);
 }
 
-li.empty {
+li.empty,
+/* `<p className="empty">` is the paragraph form of the same state, used by the
+   agents list and the tool catalogue. It was never styled, so it rendered at
+   body size and full brightness — louder than the content it stands in for. */
+p.empty {
   color: var(--muted);
   padding: 12px;
   text-align: center;
+  margin: 0;
 }
 
 /* Text sections */
@@ -602,6 +620,37 @@ li.empty {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
+}
+
+/* ── Tool catalogue (Settings) ─────────────────────────────────────────────
+   The catalogue moved off the agent page, and so did the row of "+ <kind>"
+   seed buttons that used to sit under it. They deliberately do NOT reuse
+   `.docs-actions`: that row is right-aligned (it holds Save/Cancel), and a
+   wrapped list of things you can ADD reads wrong pushed against the right
+   edge — it reads as a footer. Left-aligned, same 8px rhythm. */
+.tool-seeds {
+  display: flex;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 4px;
+}
+
+/* ── REST parameters (agent page) ──────────────────────────────────────────
+   The URL/method/headers/body of an http tool, drawn under the chips of the
+   agent that holds it. Indented with a left rule so it reads as a child of the
+   chip row above rather than as another field of the agent itself. */
+.rest-config {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 8px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--border);
+  background: var(--panel-2);
+  border-radius: 0 8px 8px 0;
   min-width: 0;
 }
 

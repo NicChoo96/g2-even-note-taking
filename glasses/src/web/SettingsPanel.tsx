@@ -22,6 +22,7 @@ import { DEFAULT_MODEL } from '../types';
 import { fetchAgentStatus, saveSettings, type AgentStatus, type SettingsPatch, type ValueSource } from './agents-client';
 import { DevicesPanel } from './DevicesPanel';
 import { buildSettingsSave, settingsBody } from './settings-patch';
+import { ToolsSection } from './ToolsPanel';
 
 /** A small pill that says where a value comes from. */
 function SourceBadge({ source }: { source?: ValueSource }) {
@@ -657,6 +658,20 @@ export function SettingsPanel() {
         <code>OPENROUTER_MODEL</code>, <code>SEARCH_PROVIDER</code>, … — are used only where nothing
         is saved here; use "remove saved value" to hand a field back to them.
       </p>
+
+      {/*
+        The tool catalogue, moved here from the agent page. A catalogue is a
+        GLOBAL setting — one list every agent draws from — and the agent page is
+        about one agent. The agent page keeps the chips that attach a tool (and
+        the REST parameters of the tool it attached); this is where a tool comes
+        into existence and where its name, kind and description are edited.
+      */}
+      <ToolsSection
+        jevReady={info?.jev === true}
+        filesReady={info?.files?.configured === true}
+        searchProvider={liveProvider}
+        searchConfigured={searchConfigured}
+      />
 
       <MemoryPanel />
 

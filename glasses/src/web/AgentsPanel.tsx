@@ -16,23 +16,18 @@ import {
   getAgentsError,
   recordSession,
   removeAgent as removeAgentFromStore,
-  removeTool,
   saveAgent,
-  saveTool,
   subscribeAgents,
   subscribeAgentsError,
   toolBody,
-  updateAgents,
 } from '../agents-store';
 import { getRuns, subscribeRuns } from '../agent-runs';
 import { startRun, stopRun } from '../stream';
 import { intentCatalog } from '../ai/intents';
 import { snapshotForRun } from '../location/run';
-import { FREE_TOOL_MODELS } from '../models';
 import {
   DOCS_TOOL_ID,
   docsTool,
-  emptyLlmSettings,
   FILE_TOOL_ID,
   filesTool,
   JEV_TOOL_ID,
@@ -53,7 +48,8 @@ import {
   type ToolDef,
 } from '../types';
 import { MicButton } from './Dictate';
-import { fetchAgentStatus, saveSettings, type AgentStatus } from './agents-client';
+import { RestToolConfig } from './ToolsPanel';
+import { fetchAgentStatus, type AgentStatus } from './agents-client';
 
 function useAgents(): AgentsState {
   return useSyncExternalStore(subscribeAgents, getAgents);
@@ -153,6 +149,18 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
     { kind: 'location', label: 'Location', add: addLocationToAgent },
   ];
   const missingSeeds = seedChips.filter((s) => !state.tools.some((t) => t.kind === s.kind));
+  /**
+   * The REST tools THIS agent holds.
+   *
+   * A REST tool's URL and request shape describe the job the agent was built
+   * for, so they are edited here, next to the chips that attach them, rather
+   * than in the global catalogue where two agents would have to share one
+   * endpoint. Only the attached ones get a card — settings for a tool the run
+   * cannot call are settings that can never matter.
+   */
+  const attachedRestTools = state.tools.filter(
+    (t) => t.kind === 'http' && agent.toolIds.includes(t.id),
+  );
 
   /** Create a new REST tool and attach it to this agent in one step. */
   const addRestToolToAgent = async () => {
@@ -235,11 +243,15 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         <button
           className="doc-chip"
           onClick={addRestToolToAgent}
-          title="Create a REST tool and attach it — then set its URL and request body under Tools"
+          title="Create a REST tool and attach it — then set its URL, method, headers and body below"
         >
           + REST tool
         </button>
       </div>
+
+      {attachedRestTools.map((t) => (
+        <RestToolConfig key={t.id} tool={t} />
+      ))}
 
       <label className="field-label">Model override (blank = global)</label>
       <input
@@ -252,219 +264,10 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   );
 }
 
-function ToolEditor({
-  tool,
-  jevReady,
-  filesReady,
-  searchProvider,
-  searchConfigured,
-}: {
-  tool: ToolDef;
-  jevReady: boolean;
-  /** True when the relay holds a credential for the Jarvis document store. */
-  filesReady: boolean;
-  /** Which backend serves web-search tools, as chosen on the relay. */
-  searchProvider?: string;
-  searchConfigured?: boolean;
-}) {
-  const [token, setToken] = useState('');
-  const searchProviderLabel = searchConfigured
-    ? searchProvider === 'brave'
-      ? 'Brave Search'
-      : 'Tavily'
-    : null;
-  /**
-   * Paint now, PATCH once the typing stops.
-   *
-   * `hasToken` rides along locally only — it means "the RELAY holds a
-   * credential" in this app, which is a different mechanism from the hub's own
-   * tool-token store, and the hub has no column for `bodyTemplate` at all. Both
-   * are preserved across an adoption instead. See `agents-store`.
-   */
-  const patch = (p: Partial<ToolDef>) => saveTool(tool.id, p);
-
-  const method = tool.method ?? 'POST';
-  /** GET puts the template in the query string, POST in the body. */
-  const payloadLabel = method === 'GET' ? 'Query parameters (JSON)' : 'Request body (JSON)';
-  /**
-   * Read the authored template the same way the relay does (see
-   * `http-tool.mjs`), so what this field promises and what a run sends cannot
-   * disagree. The relay degrades an unparseable template to "no template"
-   * rather than failing a run, so the error is surfaced here, where it can be
-   * fixed, instead of being discovered by a model that got the wrong shape.
-   */
-  const template = (() => {
-    const raw = (tool.bodyTemplate ?? '').trim();
-    if (!raw) return { keys: [] as string[], error: null as string | null };
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return { keys: [] as string[], error: 'must be a JSON object, e.g. {"query": ""}' };
-      }
-      return { keys: Object.keys(parsed as Record<string, unknown>), error: null as string | null };
-    } catch {
-      return { keys: [] as string[], error: 'is not valid JSON' };
-    }
-  })();
-
-  const saveToken = async () => {
-    if (!token.trim()) return;
-    await saveSettings({ toolTokens: { [tool.id]: token.trim() } });
-    patch({ hasToken: true });
-    setToken('');
-  };
-
-  return (
-    <div className="tool-row">
-      <div className="tool-head">
-        <input
-          className="tool-name"
-          value={tool.name}
-          onChange={(e) => patch({ name: e.target.value.replace(/\s+/g, '_') })}
-          placeholder="tool_name"
-        />
-        <select value={tool.kind} onChange={(e) => patch({ kind: e.target.value as ToolDef['kind'] })}>
-          <option value="web">Web search</option>
-          <option value="jev">Jev decision</option>
-          <option value="http">REST API</option>
-          <option value="files">Stored documents</option>
-          {/* The hub's own stores. Changing a tool's kind to one of these is
-              legitimate — it is how a wearer turns a REST tool they built into
-              "actually, just my notes" — and every one of them is server-held,
-              so there is nothing further to configure. */}
-          <option value="todo">To-do list</option>
-          <option value="docs">Docs (my documents)</option>
-          <option value="notes">Notes</option>
-          {/* The one kind whose data is not the relay's. It takes no config
-              either — the position is read on the DEVICE and travels with the
-              run — but it only works if the wearer has granted location, so the
-              note below says where that happens. */}
-          <option value="location">Location</option>
-        </select>
-        <button
-          className="icon-btn danger"
-          aria-label="Remove tool"
-          onClick={() => removeTool(tool.id)}
-        >
-          ✕
-        </button>
-      </div>
-
-      <input
-        value={tool.description}
-        onChange={(e) => patch({ description: e.target.value })}
-        placeholder="What this tool does (the model reads this to decide when to call it)"
-      />
-
-      {tool.kind === 'web' && (
-        <label className="inline-field">
-          Search depth
-          <select
-            value={tool.searchDepth ?? 'basic'}
-            onChange={(e) => patch({ searchDepth: e.target.value as ToolDef['searchDepth'] })}
-          >
-            <option value="basic">basic (fast, cheap)</option>
-            <option value="advanced">advanced (deeper)</option>
-          </select>
-        </label>
-      )}
-
-      {tool.kind === 'web' && (
-        <p className="hint-line">
-          Served by <strong>{searchProviderLabel}</strong>
-          {searchProviderLabel === null
-            ? ' — set a search key in Settings.'
-            : ' (change the provider in Settings; this tool does not change).'}
-        </p>
-      )}
-
-      {tool.kind === 'jev' && (
-        <p className="empty">
-          {jevReady
-            ? 'Ready — uses the OpenRouter key held server-side, so there is nothing to configure here.'
-            : 'No OpenRouter key on the server yet. Add one in Settings; until then this tool reports that it was skipped rather than guessing.'}
-        </p>
-      )}
-
-      {tool.kind === 'files' && (
-        <p className="empty">
-          {filesReady
-            ? 'Ready — publishes HTML pages the wearer reads on the Files tab. The document body is never returned to the model, so agents publish and stop.'
-            : 'No document-store credential on the server yet. Set JARVIS_FILE_USER and JARVIS_FILE_PWD (or JARVIS_FILE_API_KEY) in the relay environment.'}
-        </p>
-      )}
-
-      {tool.kind === 'location' && (
-        <p className="empty">
-          Reports where the wearer is. The position is captured on the device when the run starts and
-          travels with it — a run cannot take a new reading while it is in flight — so this tool answers
-          with where the wearer was as the run began, and states the age. In the glasses app the Even Hub
-          app supplies it (grant location when it asks); in a browser the browser asks. If it is refused
-          or unavailable the tool says so instead of guessing.
-        </p>
-      )}
-
-      {tool.kind === 'http' && (
-        <>
-          <input
-            value={tool.url ?? ''}
-            onChange={(e) => patch({ url: e.target.value })}
-            placeholder="https://api.example.com/v1/endpoint"
-          />
-          <label className="inline-field">
-            Method
-            <select
-              value={method}
-              onChange={(e) => patch({ method: e.target.value as 'GET' | 'POST' })}
-            >
-              <option value="POST">POST (JSON body)</option>
-              <option value="GET">GET (query params)</option>
-            </select>
-          </label>
-          <textarea
-            className="doc-textarea"
-            rows={4}
-            value={tool.bodyTemplate ?? ''}
-            onChange={(e) => patch({ bodyTemplate: e.target.value })}
-            placeholder={'{"query": "", "limit": 5}'}
-          />
-          <p className={template.error ? 'warn-line' : 'hint-line'}>
-            {template.error ? (
-              <>
-                {payloadLabel}: {template.error}
-              </>
-            ) : template.keys.length ? (
-              <>
-                {payloadLabel}: the model is offered <strong>{template.keys.join(', ')}</strong>. An
-                empty value is <strong>required</strong> of the model; a filled one is the default it
-                may omit or override.
-              </>
-            ) : (
-              <>
-                {payloadLabel} is empty, so the model sends whatever JSON it decides — which is how a
-                REST tool becomes a guessing game. Write an object (e.g.{' '}
-                <code>{'{"query": ""}'}</code>) and its keys become the parameters the model is told
-                to send.
-              </>
-            )}
-          </p>
-          <div className="token-row">
-            <input
-              type="password"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder={tool.hasToken ? '••••••• (saved — type to replace)' : 'Bearer token (stored server-side)'}
-            />
-            <button className="primary" onClick={() => void saveToken()} disabled={!token.trim()}>
-              Save
-            </button>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
+// `ToolEditor` and the catalogue's seed buttons live in `./ToolsPanel` now —
+// they are global settings, and the catalogue column that held them is what this
+// move removed. `RestToolConfig` is there too, and is what the agent page
+// renders under its chips.
 export function AgentsPanel() {
   const state = useAgents();
   const runs = useRuns();
@@ -550,42 +353,6 @@ export function AgentsPanel() {
     removeAgentFromStore(id);
     if (selected === id) setSelected(null);
   };
-
-  const addTool = async () => {
-    await createTool({
-      name: `tool_${getAgents().tools.length + 1}`,
-      kind: 'http',
-      description: '',
-      url: '',
-      method: 'POST',
-    });
-  };
-
-  /**
-   * Add one of the seeded kinds to the catalogue if it is not already there.
-   *
-   * Matched on `kind` rather than `id` so a worn-in install that somehow holds
-   * the tool under another id is not given a second, identical one — the same
-   * rule the per-agent chips use, and the reason the buttons below are keyed by
-   * kind instead of id.
-   */
-  const addSeed = async (kind: ToolDef['kind'], make: () => ToolDef) => {
-    if (getAgents().tools.some((t) => t.kind === kind)) return;
-    await createTool(toolBody(make()));
-  };
-
-  const catalogueSeeds: Array<{ kind: ToolDef['kind']; label: string; make: () => ToolDef }> = [
-    { kind: 'web', label: 'Web search', make: webSearchTool },
-    { kind: 'jev', label: 'Jev decision', make: jevTool },
-    { kind: 'files', label: 'Stored docs', make: filesTool },
-    // The hub's own stores — the To-Do list, the Docs library and Notes. They
-    // are seeded from here for the same reason the others are: an agent cannot
-    // be given a tool the catalogue does not hold, and the wearer should not have
-    // to visit the to-do page first to make one exist.
-    { kind: 'todo', label: 'To-do list', make: todoTool },
-    { kind: 'docs', label: 'Docs', make: docsTool },
-    { kind: 'notes', label: 'Notes', make: notesTool },
-  ];
 
   /**
    * Runs go to the RELAY, not this tab: the loop keeps executing if the phone
@@ -676,48 +443,14 @@ export function AgentsPanel() {
           <button className="primary" onClick={addAgent}>
             + New agent
           </button>
-
-          <div className="panel-label spaced">
-            Tools
-          </div>
-          {state.tools.map((t) => (
-            <ToolEditor
-              key={t.id}
-              tool={t}
-              jevReady={statusInfo?.jev === true}
-              filesReady={statusInfo?.files?.configured === true}
-              searchProvider={statusInfo?.search?.provider}
-              searchConfigured={statusInfo?.search?.configured}
-            />
-          ))}
-          <div className="docs-actions">
-            <button onClick={addTool}>+ Custom REST tool</button>
-            {catalogueSeeds.map((seed) => (
-              <button key={seed.kind} onClick={() => addSeed(seed.kind, seed.make)}>
-                + {seed.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="panel-label spaced">
-            Model
-          </div>
-          <input
-            list="free-tool-models"
-            value={state.llm.model}
-            onChange={(e) =>
-              updateAgents((s) => ({ ...s, llm: { ...s.llm, model: e.target.value } }))
-            }
-            placeholder={emptyLlmSettings().model}
-          />
-          <datalist id="free-tool-models">
-            {FREE_TOOL_MODELS.map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
+          {/* The catalogue used to be drawn here, under the agent list, with the
+              global model below it. Both are GLOBAL, and this column is about
+              one agent, so they moved to Settings — where a catalogue belongs.
+              What is left here is what an agent owns: its tools and its model
+              OVERRIDE. */}
           <p className="hint-line">
-            Only tool-capable free models work here. The key itself is stored server-side in
-            Settings.
+            Tools and the global model now live in <strong>Settings</strong>. This page holds what
+            belongs to one agent — its prompt, which tools it attaches, and its model override.
           </p>
         </div>
 
@@ -750,6 +483,7 @@ export function AgentsPanel() {
                   {running ? `Running… ${status}` : '▶ Run agent'}
                 </button>
                 <button
+                  className="primary"
                   onClick={() => void run(agent.prompt)}
                   disabled={running || !agent.prompt.trim()}
                   title="Run the saved Trigger prompt (same as the glasses menu)"
