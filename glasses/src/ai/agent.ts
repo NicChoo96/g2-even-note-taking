@@ -8,6 +8,7 @@
 // and the web panel can render) while keeping the loop itself a plain async
 // function that a node harness can drive with a stubbed LLM.
 import { GLOBAL_PAGE, effectOf, type Capability, type CapabilityResult, type PageId, type ToolSchema } from './types';
+import { confirmCopy } from './confirm';
 import { llmChat, type WireMessage, type LlmReply, type WireToolCall } from '../web/agents-client';
 import { appSnapshotText } from './context';
 import {
@@ -40,17 +41,22 @@ import { stripToolMarkup } from './tool-markup';
 /**
  * DeepSeek tolerates more, but a tight tool set measurably improves selection.
  *
- * 13 rather than 12 because the RESERVE below gained one entry (location.get) and
- * the PAGE BUDGET — this cap minus the reserve — is what the pages are sized
- * against: 9, so that the busiest page still receives every one of its OWN
- * actions (docs declares 7, the most of any page, and the reserve is 4). When the
- * reserve grows against a fixed cap a page starts losing its own actions to it,
- * and that eviction is the 0.3.28 bug. So the cap and the reserve move TOGETHER,
- * and tools/jev-spec-sim.mjs measures their difference against the largest page
- * rather than either number on its own. Exported for exactly that: a harness that
- * hardcodes 12 stops testing anything the moment this changes.
+ * The PAGE BUDGET — this cap minus the reserve — is what the pages are sized
+ * against, and it is 10 so that the busiest page still receives every one of its
+ * OWN actions. `agents` declares 10, the most of any page, and the reserve is 5.
+ *
+ * That is why every entry the reserve has gained has moved this number with it:
+ * 12 → 13 for location.get, 13 → 14 for web.search, and 14 → 15 when `agents`
+ * gained agents.expose and its own action count went 9 → 10. When the reserve
+ * grows against a fixed cap a page starts losing its own actions to it, and that
+ * eviction is the 0.3.28 bug — an advertised-but-absent tool, which is worse
+ * than an omitted one because the PAGES block tells the model to call it. So the
+ * cap and the reserve move TOGETHER, and tools/jev-spec-sim.mjs measures their
+ * difference against the largest page rather than either number on its own.
+ * Exported for exactly that: a harness that hardcodes 12 stops testing anything
+ * the moment this changes.
  */
-export const MAX_TOOLS = 13;
+export const MAX_TOOLS = 15;
 
 /**
  * Provider-safe name for anything that crosses the wire. `prepare` accepts both
@@ -123,11 +129,18 @@ const MANDATORY = ['say.reply', 'nav.open_page'];
  * action it would have to be ROUTED to, and "where am I?" must not change the
  * page the wearer is looking at in order to answer a question about the world.
  * It could not survive in `rest` either — a busy page consumes all 9 remaining
- * budget slots before the remainder is reached (docs, files and agents each fill
- * the 9), so a non-reserved global is handed on the quiet pages and dropped on
- * the busy ones, which is the same as unreliable.
+ * budget slots before the remainder is reached (agents alone declares 9), so a
+ * non-reserved global is handed on the quiet pages and dropped on the busy ones,
+ * which is the same as unreliable.
+ *
+ * web.search belongs here for both of those reasons at once. It is a FACULTY
+ * rather than a page's action — "what is the news" is a question about the
+ * world, not about a tab — and it is the one the assistant is least able to
+ * substitute for: the system prompt tells the model never to answer a
+ * current-events question from memory, so a turn that dropped this global would
+ * be a turn where the model is told to search and given no way to.
  */
-const ALWAYS_AVAILABLE = ['jev.decide', 'location.get'];
+const ALWAYS_AVAILABLE = ['jev.decide', 'location.get', 'web.search'];
 
 /** Everything taken out of the budget before page actions are considered. */
 export const RESERVED: string[] = [...MANDATORY, ...ALWAYS_AVAILABLE];
@@ -306,21 +319,6 @@ export function shortJson(result: CapabilityResult): string {
     });
   }
   return text;
-}
-
-/** Human-readable HUD copy for the tap-to-confirm prompt. */
-function confirmCopy(cap: Capability, args: Record<string, unknown>): { title: string; lines: string[] } {
-  const lines: string[] = [];
-  // Show the arguments that describe WHAT is about to be destroyed.
-  for (const p of cap.params) {
-    const v = args[p.name];
-    if (v === undefined || v === '') continue;
-    const text = String(v).replace(/\s+/g, ' ');
-    lines.push(`${p.name}: ${text.length > 48 ? `${text.slice(0, 48)}…` : text}`);
-    if (lines.length >= 2) break;
-  }
-  if (!lines.length) lines.push(cap.description);
-  return { title: cap.title, lines };
 }
 
 function clean(text: string, max = MAX_STEP_CHARS): string {

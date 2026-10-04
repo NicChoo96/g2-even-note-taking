@@ -32,6 +32,9 @@ import {
   type ToolKind,
 } from '../../types';
 import { enqueueMonitoredRun, monitorAge, type MonitorStatus } from '../monitor';
+import { exposureGaps, kindLabel, promiseRules, proposalOf } from '../exposure';
+import { ledgerAppend, ledgerResolve, pendingEntries, type Entry } from '../ledger';
+import { intentCatalog } from '../intents';
 import type { Capability, CapabilityResult } from '../types';
 import { resolveAgent, short } from './shared';
 
@@ -152,7 +155,16 @@ const LOCATION_SEED: SeedTool = {
  * report would be published where they are not looking. LOCATION_SEED sits there
  * too: "where am I" is not a document request.
  */
-const SEED_TOOLS: readonly SeedTool[] = [
+/**
+ * The seed table, exported so the exposure policy can be driven by the SAME
+ * vocabulary the builder attaches tools with.
+ *
+ * This is why `exposure.ts` takes its seeds as an argument instead of owning a
+ * table: one list, so a kind cannot be attachable and undetectable at the same
+ * time. tools/exposure-sim.mjs holds the same edge closed from the other side, by
+ * failing if any rule's vocabulary stops being the seed's.
+ */
+export const SEED_TOOLS: readonly SeedTool[] = [
   WEB_SEED,
   TODO_SEED,
   DOCS_SEED,
@@ -621,6 +633,10 @@ export const agentsCapabilities: Capability[] = [
         // Same rule as the other two trigger sites (see src/location/run.ts):
         // read the position only for an agent that has the location tool.
         location: await snapshotForRun(tools),
+        // What this device will let the run ASK for. Built from the registry, so
+        // a capability added to any page becomes delegable by existing — there is
+        // no second list to keep in step. See src/ai/intents.ts.
+        capabilities: intentCatalog(),
         model: agent.model || st.llm.model,
       });
       if (!started.runId) return { ok: false, summary: `Could not start ${short(agent.name, 20)}`, hint: started.error };
@@ -841,6 +857,176 @@ export const agentsCapabilities: Capability[] = [
         ok: true,
         summary: `Cloned to "${short(name, 20)}"`,
         data: { id, from: src.id, tools: src.toolIds.map(nameOf) },
+      };
+    },
+  },
+  {
+    name: 'agents.expose',
+    page: 'agents',
+    effect: 'write',
+    title: 'Match agents to their prompts',
+    description:
+      'Compare what each agent\'s prompt PROMISES — "run 4 to 6 web searches", "add each finding to ' +
+      'my to-do list" — with the tools the agent actually holds, and report the difference. Pass ' +
+      '"apply" to ACCEPT a proposal and attach the tools it names; a plain check changes nothing.',
+    params: [
+      { name: 'agent', type: 'string', description: 'Check one agent, by name or number. Omit to check every agent.' },
+      {
+        name: 'apply',
+        type: 'string',
+        description:
+          'Accept a proposal: an agent name or number, the key a previous check reported, or "all". ' +
+          'This is the only path that attaches anything.',
+      },
+    ],
+    run: async (args): Promise<CapabilityResult> => {
+      const state = getAgents();
+      // Re-derived on EVERY call, never cached. The prompts live on the hub and can
+      // be edited from a machine that has never heard of a proposal, so a stored
+      // snapshot of "what is missing" would be wrong the moment it was written. The
+      // derivation is the cheap part; the WRITE is what needs a human.
+      const gaps = exposureGaps({ agents: state.agents, tools: state.tools }, promiseRules(SEED_TOOLS));
+
+      /** Pending proposals already in the ledger — the accept list. */
+      const open = (): Entry[] =>
+        pendingEntries().filter((e) => {
+          const p = e.payload as { agentId?: unknown; add?: unknown } | undefined;
+          return typeof p?.agentId === 'string' && Array.isArray(p.add);
+        });
+
+      // ── The accept arm ──────────────────────────────────────────────────────
+      const ask = typeof args.apply === 'string' ? args.apply.trim() : '';
+      if (ask) {
+        const name = typeof args.agent === 'string' ? args.agent.trim() : '';
+        let chosen = open();
+        if (/^(all|everything|yes|both|them)$/i.test(ask)) {
+          // every open proposal
+        } else {
+          // A key, an agent name, or a number — the same forgiveness the rest of
+          // this page applies to a spoken name, because the wearer will say
+          // "yes, the model tracker one" far more often than they will read a key.
+          const lower = ask.toLowerCase();
+          const who = resolveAgent(name || ask, state.agents);
+          chosen = open().filter((e) => {
+            const p = e.payload as { key: string; agentId: string };
+            return p.key.toLowerCase() === lower || (who !== null && p.agentId === who.id);
+          });
+          if (name && !who) {
+            return { ok: false, summary: `No agent matches "${short(name, 20)}"`, hint: `agents: ${agentNames()}` };
+          }
+        }
+        if (!chosen.length) {
+          const texts = open().map((e) => e.text).slice(0, 4);
+          return {
+            ok: false,
+            summary: `Nothing to accept for "${short(ask, 20)}"`,
+            hint: texts.length
+              ? `open proposals: ${texts.join(' | ')}`
+              : 'nothing is proposed — run a check first (agents.expose)',
+          };
+        }
+
+        // The ONE write path in this file that a detector can reach, and it is
+        // still the same one the wearer's own words use: ensureSeedTool resolves
+        // the kind into a catalog row (creating it if the hub has never seen it),
+        // then saveAgent PUTs the new set. Nothing here invents a second way to
+        // give an agent a tool.
+        const done: string[] = [];
+        for (const entry of chosen) {
+          const p = entry.payload as { key: string; agentId: string; add: ToolKind[] };
+          const who = getAgents().agents.find((a) => a.id === p.agentId);
+          if (!who) {
+            ledgerResolve(entry.seq, 'skipped', 'that agent is gone');
+            continue;
+          }
+          const ids = [...who.toolIds];
+          const added: string[] = [];
+          let broke = false;
+          for (const kind of p.add) {
+            const seed = SEED_TOOLS.find((s) => s.kind === kind);
+            if (!seed) continue;
+            const tool = await ensureSeedTool(seed);
+            if (!tool) {
+              ledgerResolve(entry.seq, 'failed', `could not create the ${kindLabel(kind)} tool`);
+              broke = true;
+              break;
+            }
+            if (!ids.includes(tool.id)) {
+              ids.push(tool.id);
+              added.push(tool.name);
+            }
+          }
+          if (broke) return { ok: false, summary: 'Could not create the tool', hint: getAgentsError() };
+          if (!added.length) {
+            ledgerResolve(entry.seq, 'skipped', `${short(who.name, 18)} already has them`);
+            continue;
+          }
+          saveAgent(who.id, { toolIds: ids });
+          // Resolved, not edited: the proposal stays in the trace so the worn
+          // record shows that something was asked and what came of it.
+          ledgerResolve(entry.seq, 'ok', `gave ${short(who.name, 18)} ${added.join(', ')}`);
+          done.push(`${short(who.name, 20)}: ${added.join(', ')}`);
+        }
+        if (!done.length) return { ok: true, summary: 'Nothing to change — already attached' };
+        return {
+          ok: true,
+          summary: `Attached tools to ${done.length} agent${done.length === 1 ? '' : 's'}`,
+          data: { applied: done },
+        };
+      }
+
+      // ── The report arm. Reads only; records what it found as a PROPOSAL ──────
+      const wanted = typeof args.agent === 'string' ? args.agent.trim() : '';
+      const target = wanted ? resolveAgent(wanted, state.agents) : null;
+      if (wanted && !target) {
+        return { ok: false, summary: `No agent matches "${short(wanted, 20)}"`, hint: `agents: ${agentNames()}` };
+      }
+      const rows = target ? gaps.filter((g) => g.agentId === target.id) : gaps;
+      const seen = new Set(open().map((e) => (e.payload as { key: string }).key));
+      const proposed: Array<{ agent: string; add: ToolKind[]; key: string }> = [];
+      const contradictions: Array<{ agent: string; denied: ToolKind[] }> = [];
+
+      for (const gap of rows) {
+        if (gap.denied.length) {
+          contradictions.push({ agent: gap.agentName, denied: gap.denied });
+        }
+        const p = proposalOf(gap);
+        if (!p) continue; // nothing missing, or a contradiction: never actionable
+        proposed.push({ agent: gap.agentName, add: p.add, key: p.key });
+        // Idempotent by construction (the key is derived from the gap, not from
+        // the clock), so looking twice cannot stack two questions about the same
+        // agent. Detection is free to run on every single look.
+        if (seen.has(p.key)) continue;
+        seen.add(p.key);
+        ledgerAppend({
+          kind: 'ask',
+          by: 'jarvis',
+          effect: 'write',
+          status: 'pending',
+          locus: 'client',
+          text: p.text,
+          payload: { key: p.key, agentId: gap.agentId, add: p.add, because: p.because },
+        });
+      }
+
+      if (!rows.length) {
+        return {
+          ok: true,
+          summary: target
+            ? `"${short(target.name, 24)}" has every tool its prompt promises`
+            : 'Every agent already has the tools its prompt promises',
+        };
+      }
+      const first = proposed[0];
+      const hint = first
+        ? `say "accept ${first.agent}"${proposed.length > 1 ? ` (or one of ${proposed.length})` : ''} to attach them`
+        : `no tool to attach — these prompts disown what they mention`;
+      const said = contradictions.length ? `; ${contradictions.length} prompt(s) disown a tool` : '';
+      return {
+        ok: true,
+        summary: `${rows.length} agent${rows.length === 1 ? '' : 's'} promise tools they do not have${said}`,
+        data: { proposals: proposed, contradictions },
+        hint,
       };
     },
   },

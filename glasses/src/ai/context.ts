@@ -7,6 +7,8 @@
 import { getAgents } from '../agents-store';
 import { getState } from '../store';
 import { activeDoc, type DocEntry, type TodoItem } from '../types';
+import { SEED_TOOLS } from './capabilities/agents';
+import { exposureGaps, kindLabel, promiseRules } from './exposure';
 import { getMonitorView } from './monitor';
 import { pageTitle } from './registry';
 import { getAiFocus } from './store';
@@ -52,6 +54,32 @@ export function appSnapshotText(): string {
     if (running) lines.push(`Running agents: ${running}`);
   } else {
     lines.push('Agents: none configured');
+  }
+  // Where an agent's words and its tool list disagree.
+  //
+  // This is here rather than in the Agents page because it is a fact about the
+  // APP, like "how many tasks are open" — and because both readers of this
+  // function need it: the system prompt, so Jarvis can SAY what is missing when
+  // asked, and `app.status`, so "is anything misconfigured?" gets the same answer
+  // from the same code. Re-derived every call and never stored: a prompt can be
+  // edited on another machine, so a remembered answer would be the one thing
+  // guaranteed to be stale.
+  const gaps = exposureGaps({ agents: a.agents, tools: a.tools }, promiseRules(SEED_TOOLS));
+  const short = gaps.filter((g) => g.missing.length);
+  if (short.length) {
+    const list = short.map((g) => `${trim(g.agentName, 24)} (${g.missing.map(kindLabel).join(', ')})`);
+    lines.push(
+      `Agent tool gaps — the prompt promises a tool the agent does not hold: ${names(list)}. ` +
+        'Call agents__expose to PROPOSE attaching them; a tool is only attached once the wearer accepts.',
+    );
+  }
+  // A prompt that both mentions and disowns a capability. Reported, never acted
+  // on: this is the case where attaching the tool would be the app arguing with
+  // the agent's own instructions, so agents__expose leaves it alone and says so.
+  const denied = gaps.filter((g) => g.denied.length);
+  if (denied.length) {
+    const list = denied.map((g) => `${trim(g.agentName, 24)} (${g.denied.map(kindLabel).join(', ')})`);
+    lines.push(`Agents whose prompt disowns a tool it mentions: ${names(list)}`);
   }
   // The runs Jarvis itself started, still being watched. Without this the model
   // would only learn a run had finished if the wearer asked — and "is it done?"

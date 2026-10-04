@@ -489,7 +489,19 @@ unset(
 );
 assert('  ...and never as a run field at all', !/^\s*location:/m.test(runRoute));
 const execFn = fnSource(relaySrc, 'executeRun');
-has('the executor reads it by run id', execFn, '{ location: runLocations.get(run.id) }');
+// The snapshot is read BY RUN ID. The assertion is on the LOOKUP, not on the
+// whole context literal: that same context also carries the run id and the run's
+// intent queue, so matching the closing brace would pin an argument list and
+// break the moment a fourth field is added — testing the shape of a call rather
+// than the property under test.
+has('the executor reads the snapshot by run id', execFn, 'location: runLocations.get(run.id)');
+assert(
+  '  ...and passes the run id and its intent queue through the same context',
+  /location: runLocations\.get\(run\.id\),\s*runId: run\.id,\s*intents: runIntents\.get\(run\.id\),/.test(
+    execFn,
+  ),
+  'one context per call — a module-level lookup would let two runs see each other',
+);
 const toolRoute = routeSource(relaySrc, "url.pathname === '/api/tool'");
 assert(
   'the tool proxy answers a location tool as a location tool',

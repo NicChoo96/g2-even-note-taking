@@ -114,6 +114,7 @@ import {
 } from './ai';
 import { isLiveStatus, requestRemoteConfirm, requestRemoteStop, startAiMirror } from './ai/sync';
 import { startLedgerMirror } from './ai/ledger-sync';
+import { intentCatalog, claimIntents, runPendingIntents } from './ai/intents';
 import { mountUi } from './web/ui';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -1543,6 +1544,12 @@ async function main(): Promise<void> {
       // run's snapshot is taken at trigger time by definition — the relay has no
       // way to ask for one afterwards.
       location: await snapshotForRun(tools),
+      // Same rule as the location snapshot above and for the same reason: the
+      // relay executes the run and cannot reach this device, so the list of
+      // actions it may ASK for has to travel with the ask. Always sent — an
+      // empty catalogue is not a valid expression of "this device does nothing",
+      // and the tool's absence is expressed by a client that sends no field.
+      capabilities: intentCatalog(),
       model: agent.model || st.llm.model,
     });
     if (!started.runId) {
@@ -1992,6 +1999,29 @@ async function main(): Promise<void> {
     void renderGlasses();
   });
 
+  /**
+   * Read ONE finished run's transcript for asks and put them on the ledger.
+   *
+   * Claiming is a pure read of a SETTLED transcript, and the claim is keyed, so
+   * it is idempotent: a replayed terminal frame — a reconnect re-delivers every
+   * frame — cannot propose the same thing twice. That is exactly what lets the
+   * caller sweep every run on every frame instead of hunting for a one-shot edge.
+   *
+   * The count comes back instead of being judged in here, because whether to
+   * DRAIN is the caller's decision: claiming is per run, and the drain is per
+   * handler pass, so that two runs settling in the same pass cannot start two
+   * drains racing for the same action.
+   */
+  function claimRunIntents(run: AgentRun): number {
+    const claimed = claimIntents(
+      { id: run.id, agentId: run.agentId, agentName: run.agentName },
+      run.messages,
+    );
+    if (!claimed.length) return 0;
+    console.log('[hub] agent intents claimed', { run: run.id, count: claimed.length });
+    return claimed.length;
+  }
+
   // Live run frames (server-side execution) re-render the detail pane so each
   // turn appears as it is produced, and settle the run into a session once.
   subscribeRuns(() => {
@@ -2016,6 +2046,31 @@ async function main(): Promise<void> {
       // queue flag alone is the channel — the next sentence will say it.
       if (getAi().status !== 'idle') aiStep('note', line);
       console.log('[hub] watched run settled', { run: done.runId, line });
+    }
+    // ── the asks a run left behind ──────────────────────────────────────────
+    // Claimed off the run MIRROR, never off the monitor queue above. That queue
+    // holds only the runs Jarvis itself asked for — which is what keeps its "new"
+    // badge honest — while an agent started by hand from the Agents tab asks
+    // through the same transcript and would otherwise be answered by nobody.
+    //
+    // Only a run that has STOPPED is read: one still going may ask for one more
+    // thing, so its transcript is only readable as a whole once it stops writing
+    // to it. This pass therefore repeats on every frame, which is why claiming is
+    // keyed — the repetition is harmless rather than an at-least-once delivery.
+    let claimed = 0;
+    for (const run of getRuns()) {
+      if (run.status === 'running') continue;
+      claimed += claimRunIntents(run);
+    }
+    // ONE drain per pass, and only after the whole sweep: two runs settling in
+    // the same pass must not start two drains racing for the same action.
+    if (claimed) {
+      // Drains EVERY pending intent, not only the ones just claimed: a proposal
+      // whose own run frame was missed (the device was asleep) is still pending,
+      // and the write the wearer asked for should still happen.
+      void runPendingIntents().then((done) => {
+        if (done.length) console.log('[hub] agent intents settled', done);
+      });
     }
     void renderGlasses();
   });

@@ -803,19 +803,27 @@ for (const [label, q, a] of [
 }
 
 // The capability must expose the reader, and must NOT have grown the catalog
-// beyond the one global that is genuinely app-wide and reserved. The count is 9,
-// not 8: location.get joined jev.decide. It was NOT a page action — "where am I?"
-// must not have to route the wearer somewhere to answer — and it could not live
-// in the unreserved remainder either, because a busy page fills all 9 remaining
-// slots before the remainder is reached (docs, files and agents each do) and it
-// would be dropped on exactly the runs most likely to ask. See ALWAYS_AVAILABLE
-// in agent.ts.
+// beyond the globals that are genuinely app-wide and reserved. The count is 10,
+// not 9 or 8: location.get joined jev.decide, and then web.search joined both.
+// location.get was NOT a page action — "where am I?" must not have to route the
+// wearer somewhere to answer — and it could not live in the unreserved remainder
+// either, because a busy page fills all remaining slots before the remainder is
+// reached (docs, files and agents each do) and it would be dropped on exactly the
+// runs most likely to ask. See ALWAYS_AVAILABLE in agent.ts.
+//
+// web.search is reserved for the same reason and one more: it is the only way
+// Jarvis can answer a question whose answer is not already in the app. Routing to
+// a page to run a search would be a page the wearer never asked for, and the
+// remainder slot it would need is the one a busy page has already taken — so
+// "search for X" would work on an idle page and fail on a busy one, which is the
+// worst shape a capability can have. It is `effect: 'read'`, so reserving it
+// takes nothing away from the pages.
 assert('the jev capability offers an optional rank switch to Jarvis', /name: 'rank',\s*\n\s*type: 'boolean'/.test(capSrc));
 assert('the capability derives a ranking from the decision', /rankAnswers\(parsed\.value, reply\.answers\)/.test(capSrc));
 check(
-  'the app-wide catalog is jev.decide plus location.get and the seven nav/app actions',
+  'the app-wide catalog is jev.decide plus location.get and web.search and the seven nav/app actions',
   ui.allCapabilities().filter((c) => c.page === ui.GLOBAL_PAGE).length,
-  9,
+  10,
 );
 
 // The invariant behind the 0.3.28 bug, stated as a test rather than a comment:

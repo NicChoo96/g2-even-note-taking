@@ -359,9 +359,17 @@ export function aiSetSteps(steps: AiStep[]): void {
 
 /**
  * Park the run until the user answers. Resolves true = approved.
- * A no-resolver call (headless harness) resolves false immediately.
+ *
+ * `runId` is who the gate BELONGS to. Almost always the caller omits it, because
+ * a prompt raised from inside a run is already inside `ledgerBegin`'s run and
+ * `ledgerAppend` falls back to it. It is passed when the asker is NOT the
+ * current run: a delegated intent is executed while the wearer is somewhere
+ * else entirely, and `isGated(runId, seq)` — the check behind the
+ * `ungatedIrreversible` invariant — matches on runId. Record the gate under the
+ * wrong run and a destructive agent-requested action looks UNGATED in the audit
+ * even though the wearer approved it.
  */
-export function aiAskConfirm(title: string, lines: string[]): Promise<boolean> {
+export function aiAskConfirm(title: string, lines: string[], runId?: string): Promise<boolean> {
   if (cancelled) return Promise.resolve(false);
   // Never leave an earlier prompt dangling.
   if (confirmResolver) {
@@ -381,6 +389,7 @@ export function aiAskConfirm(title: string, lines: string[]): Promise<boolean> {
       text: title,
       effect: 'irreversible',
       status: 'pending',
+      runId,
       payload: { lines },
     }).seq;
     set({ status: 'confirm', pending: { title, lines } });

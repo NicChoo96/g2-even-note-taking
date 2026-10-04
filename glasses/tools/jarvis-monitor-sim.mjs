@@ -485,6 +485,82 @@ has('snapshot announces the queue', snapshot, 'Jarvis agent queue');
 has('snapshot flags the new run', snapshot, '[NEW]');
 has('snapshot names the agent', snapshot, 'News');
 
+// ── 3b. The tool-gap line ───────────────────────────────────────────────────
+// The snapshot is where an agent's words and its tool list are compared, and it
+// has two readers: this prompt, and `app.status`. Asserted here rather than in
+// exposure-sim because only a real `appSnapshotText()` call proves the two are
+// actually joined up — the policy can be perfect and still be wired to nothing,
+// which is exactly the failure this whole change exists to fix.
+console.log('\n── tool gaps ──');
+const gapAgent = (over) => ({
+  id: 'agent-gap',
+  name: 'Tracker',
+  systemPrompt: 'Run 4 to 6 web searches about model releases.',
+  prompt: 'Track models',
+  toolIds: [],
+  model: '',
+  createdAt: ago(1000),
+  updatedAt: ago(1000),
+  ...over,
+});
+const withAgent = (a) => agentsStore.updateAgents((s) => ({ ...s, agents: [...s.agents, a] }));
+// The block has TWO lines and they mean opposite things, so the assertions read
+// the line they are about rather than the whole snapshot. (`Agents: News, Mail,
+// Tracker` also names every agent, so a substring test on the snapshot would pass
+// no matter what the gap line said.)
+const line = (text, starts) => text.split('\n').find((l) => l.startsWith(starts)) ?? '';
+
+withAgent(gapAgent({}));
+let gapSnap = appSnapshotText();
+has('an agent that promises a tool it lacks is reported', line(gapSnap, 'Agent tool gaps'), 'Tracker (web search)');
+has('…and Jarvis is told which capability fixes it', line(gapSnap, 'Agent tool gaps'), 'agents__expose');
+has('…and that the wearer has to accept', line(gapSnap, 'Agent tool gaps'), 'once the wearer accepts');
+// The seeded News agent says "You are a news desk." and saves "Give me the news".
+// Neither is a tool instruction, but the second IS a promise of news — so this
+// asserts the SAVED prompt is read, not just the system prompt, which is the half
+// a reader would assume was overlooked.
+has('…and the saved task prompt counts as a promise', line(gapSnap, 'Agent tool gaps'), 'News (web search)');
+
+// Give every agent the tool it promised. A gap that survived being fixed would
+// make the line noise the model learns to ignore.
+const webTool = agentsStore.getAgents().tools.find((t) => t.kind === 'web');
+assert('the store offers a web tool to attach', !!webTool, JSON.stringify(agentsStore.getAgents().tools));
+agentsStore.updateAgents((s) => ({
+  ...s,
+  agents: s.agents.map((a) => ({ ...a, toolIds: [webTool.id] })),
+}));
+gapSnap = appSnapshotText();
+is('once every agent holds what it promised, the block disappears', line(gapSnap, 'Agent tool gaps'), '');
+check('…and the snapshot carries no half-line left behind', gapSnap.includes('Agent tool gaps'), false);
+
+// A prompt that both mentions and disowns a capability. Reported on its own line
+// because the fix is the opposite one: not "attach it" but "leave the prompt and
+// the tool list alone".
+withAgent(
+  gapAgent({
+    id: 'agent-deny',
+    name: 'Offline',
+    systemPrompt: 'Search the web.\nYou have no internet access.',
+  }),
+);
+gapSnap = appSnapshotText();
+has('a prompt that disowns what it mentions is reported', line(gapSnap, 'Agents whose prompt disowns'), 'Offline (web search)');
+is(
+  '…and a contradiction is never proposed for an attach',
+  line(gapSnap, 'Agent tool gaps'),
+  '',
+);
+
+// ── 3c. The gap line is ASCII and short enough for the prompt ───────────────
+// Every other line in the snapshot survives the firmware font, and every char
+// spent here is a char the model does not get to spend on the request.
+check('the gap line is printable ASCII', unsafeChars(gapSnap).length, 0);
+assert(
+  'the gap block stays small enough to sit in every prompt',
+  gapSnap.length < 2000,
+  `${gapSnap.length} chars`,
+);
+
 let captured = null;
 const scripted = async ({ messages, tools }) => {
   if (!captured) captured = { tools: (tools ?? []).map((t) => t.function.name), system: messages[0].content };

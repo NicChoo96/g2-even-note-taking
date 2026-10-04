@@ -571,6 +571,21 @@ export async function startRun(args: {
    * error: the tool reports that it has no position rather than inventing one.
    */
   location?: LocationFix;
+  /**
+   * The actions this device is willing to be ASKED to perform.
+   *
+   * The relay holds no list of the app's capabilities of its own — a second copy
+   * of that table is the drift docs/agent-architecture.md section 8 refuses by
+   * name — so the delegable catalogue arrives here, per run, built from this
+   * process's own registry by `intentCatalog()` in src/ai/intents.ts. The relay
+   * forwards it verbatim into the `jarvis_app` tool's schema.
+   *
+   * Omitted when the caller delegates nothing, which is what keeps an unchanged
+   * caller's wire bytes identical to what they were before this field existed,
+   * and is also what makes an older client's run wire-compatible with a newer
+   * relay: no catalogue, no `jarvis_app` tool, run proceeds as it always did.
+   */
+  capabilities?: unknown[];
   model: string;
 }): Promise<RunStartResult> {
   try {

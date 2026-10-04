@@ -200,6 +200,16 @@ import {
   isHubMcpTool,
   runHubMcpTool,
 } from './hub-mcp-tools.mjs';
+// Delegated intents: the app's own capabilities, offered to a run as a tool that
+// PROPOSES a change for the device to run. Built per run from the catalogue the
+// CLIENT sends, held in a side table, and kept out of the router — see ./intents.
+import {
+  INTENT_TOOL_NAME,
+  intentToolFor,
+  intentToolSchema,
+  isIntentTool,
+  runIntentTool,
+} from './intents.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -1124,12 +1134,31 @@ const runAbort = new Map(); // runId -> AbortController
  */
 const runLocations = new Map(); // runId -> snapshot
 
+/**
+ * A run's delegated-intent state, keyed by run id: the installed tool plus the
+ * list of proposals it has recorded.
+ *
+ * A SIDE TABLE for a different reason than `runLocations`, and worth stating.
+ *   - The TOOL is not on `run.tools` because the router would then be free to
+ *     rank it away. Routing answers "which servers does this turn need"; asking
+ *     the device what it can do is not one of the choices, it is the alternative
+ *     to them, and a turn that dropped it would be a turn where an agent with a
+ *     document to file silently could not file it.
+ *   - The LIST is how a proposal gets a stable identity that does not repeat if
+ *     the run's transcript is replayed to a client on reconnect (see
+ *     `intent.key`). Nothing here is serialized; the proposal itself travels as
+ *     the ordinary tool message, which is what makes it visible in the run the
+ *     wearer is reading.
+ */
+const runIntents = new Map(); // runId -> { tool, list }
+
 function pruneRuns() {
   const now = Date.now();
   for (const [id, run] of runs) {
     if (run.status !== 'running' && now - run.updatedAt > RUN_TTL_MS) {
       runs.delete(id);
       runLocations.delete(id);
+      runIntents.delete(id);
     }
   }
   while (runs.size > MAX_RUNS) {
@@ -1140,6 +1169,7 @@ function pruneRuns() {
     if (!victim) break;
     runs.delete(victim.id);
     runLocations.delete(victim.id);
+    runIntents.delete(victim.id);
   }
 }
 
@@ -1339,6 +1369,12 @@ function toolSchemaFor(t) {
     const schema = hubMcpToolSchema(t);
     if (schema) return schema;
   }
+  // The device's own capabilities, as a tool the run may PROPOSE through. Its
+  // `action` enum is built from the catalogue the client sent with this run, so
+  // there is no list of app actions anywhere in this process to drift. A
+  // proposal is not an effect — see runIntentTool — it is an ask the device
+  // answers by running the action through its own gate.
+  if (isIntentTool(t)) return intentToolSchema(t);
   // Where the wearer is. Unlike every other kind this one has nothing to
   // configure and no arguments: the position is a SNAPSHOT taken on the device
   // when the run started and sent with it, because the relay cannot reach the
@@ -1427,6 +1463,13 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
   // cost the model one tool call, not the whole run.
   if (isHubMcpTool(tool)) {
     return runHubMcpTool(tool, args, { mcp: hubRuntime().client, signal });
+  }
+  // The device's own capabilities, as a proposal. Placed last among the
+  // built-ins because it is the only branch that reaches nothing at all — no hub
+  // read, no key, no network. It records the ask on the run and returns; the
+  // DEVICE decides whether to run it, and gates it there if it cannot be undone.
+  if (isIntentTool(tool)) {
+    return runIntentTool(tool, args, { runId: ctx.runId, list: ctx.intents?.list });
   }
   // No hub read needed and no key to check — but no second source either. A run
   // that carried no snapshot gets a refusal that says so, never coordinates.
@@ -1593,7 +1636,15 @@ async function executeRun(run) {
   // access to something it does have.
   const route = await offerTools(run, resolved.text);
   const keptNames = new Set(route.chosen.map((c) => c.name));
-  const schemas = run.tools.filter((t) => keptNames.has(t.name)).map(toolSchemaFor);
+  // The intent tool joins the offer AFTER the router, never inside it. Routing
+  // answers "which of this run's servers does this turn need", and the device's
+  // capabilities are not one of the choices — they are the alternative to them.
+  // Ranked, a run that had a document to file would lose the ability to file it
+  // on any turn where the ask happened to read as a search.
+  const intentState = runIntents.get(run.id);
+  const offered = run.tools.filter((t) => keptNames.has(t.name));
+  if (intentState) offered.push(intentState.tool);
+  const schemas = offered.map(toolSchemaFor);
   if (run.tools.length > 1) console.log(`[g2-hub] agent run: ${describeRoute(route)}`);
   // Recorded ONLY when the toolset was actually narrowed. A fail-open line would
   // be noise on every ordinary run, while a narrowed one is the missing
@@ -1602,8 +1653,8 @@ async function executeRun(run) {
     push({
       role: 'assistant',
       content:
-        `[tools] offered ${schemas.length} of ${run.tools.length}: ` +
-        `${route.chosen.map((c) => c.name).join(', ')}` +
+        `[tools] offered ${schemas.length} of ${run.tools.length + (intentState ? 1 : 0)}: ` +
+        `${schemas.map((s) => s.function.name).join(', ')}` +
         `${route.unresolved ? ' (order unresolved)' : ''}`,
       at: Date.now(),
     });
@@ -1648,12 +1699,16 @@ async function executeRun(run) {
         });
         run.statusText = `Searching · ${name}…`;
         broadcastRun(run);
-        const tool = run.tools.find((t) => t.name === name);
+        const tool = offered.find((t) => t.name === name);
         // A tool the router did NOT OFFER is not an unknown tool, and saying so
         // would send the model hunting for a typo instead of recovering. Naming
         // what is actually callable lets it retry in one step.
         const result = tool
-          ? await runToolOnce(tool, rawArgs, ac.signal, { location: runLocations.get(run.id) })
+          ? await runToolOnce(tool, rawArgs, ac.signal, {
+              location: runLocations.get(run.id),
+              runId: run.id,
+              intents: runIntents.get(run.id),
+            })
           : `tool error: ${name} is not available for this request. Call one of: `
             + `${schemas.map((s) => s.function.name).join(', ') || '(no tools)'}`;
         wire.push({ role: 'tool', content: result, tool_call_id: call.id });
@@ -2500,10 +2555,22 @@ const server = createServer(async (req, res) => {
     // the router happened to keep would decide what that name meant.
     const authored = Array.isArray(body?.tools)
       ? body.tools
-          .filter((t) => t && typeof t.name === 'string' && !HUB_MCP_AGENT_NAMES.has(t.name))
+          .filter(
+            (t) =>
+              t &&
+              typeof t.name === 'string' &&
+              !HUB_MCP_AGENT_NAMES.has(t.name) &&
+              t.name !== INTENT_TOOL_NAME,
+          )
           .slice(0, 10)
       : [];
-    const tools = [...authored, ...HUB_MCP_AGENT_TOOLS];
+    // The device's own capabilities, described by the device. Null when it sent
+    // none, which is how an older client keeps its old toolset rather than
+    // getting a tool with an empty enum that can only refuse.
+    const intentTool = intentToolFor(body?.capabilities);
+    const tools = intentTool
+      ? [...authored, ...HUB_MCP_AGENT_TOOLS, intentTool]
+      : [...authored, ...HUB_MCP_AGENT_TOOLS];
     const run = {
       id: randomBytes(8).toString('hex'),
       agentId: String(agent.id ?? ''),
@@ -2526,6 +2593,10 @@ const server = createServer(async (req, res) => {
       updatedAt: Date.now(),
     };
     runs.set(run.id, run);
+    // Installed AFTER the run exists, because the key is the run's own id, and
+    // BEFORE pruneRuns so an eviction in this same tick can still see and clear
+    // it. Absent is the normal case for a client that delegates nothing.
+    if (intentTool) runIntents.set(run.id, { tool: intentTool, list: [] });
     // The wearer's position, captured on the device when the run was triggered —
     // there is no route from here to the phone, and no client round trip mid-run
     // to add one. Kept BESIDE the run and never ON it: a field would be
@@ -2830,6 +2901,23 @@ const server = createServer(async (req, res) => {
       if (isLocationTool(body)) {
         const result = runLocationTool(body, args, body?.location);
         json(res, 200, { ok: result.ok, result: result.text });
+        return;
+      }
+
+      // A delegated intent, over the proxy. REFUSED here rather than handled,
+      // and the refusal is the point: a proposal belongs to a RUN — it is a
+      // record in that run's transcript that the device later claims and gates.
+      // This route serves a single tool call from the spoken loop, by a caller
+      // that has no run, so a proposal posted here would be an ask with no owner:
+      // recorded nowhere, gated by nobody. Falling through instead would be
+      // worse than either — the generic REST path would report "tool url must be
+      // https://" for a tool that is not an HTTP tool at all.
+      if (isIntentTool(body)) {
+        json(res, 200, {
+          ok: false,
+          result:
+            'tool error: app actions can only be asked for from a run, not through the tool proxy',
+        });
         return;
       }
 

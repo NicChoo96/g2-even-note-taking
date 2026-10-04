@@ -26,6 +26,7 @@ import {
 } from '../agents-store';
 import { getRuns, subscribeRuns } from '../agent-runs';
 import { startRun, stopRun } from '../stream';
+import { intentCatalog } from '../ai/intents';
 import { snapshotForRun } from '../location/run';
 import { FREE_TOOL_MODELS } from '../models';
 import {
@@ -609,6 +610,10 @@ export function AgentsPanel() {
       // raise the browser's permission prompt, so it must never be raised for a
       // run that has no use for a position.
       location: await snapshotForRun(tools),
+      // What the run may ask THIS device to do. The panel runs the same code as
+      // the glasses, so the catalogue is the same registry-derived list — an
+      // action reachable from a tab is reachable by an agent on either surface.
+      capabilities: intentCatalog(),
       model: agent.model || state.llm.model,
     });
     if (!started.runId) {
