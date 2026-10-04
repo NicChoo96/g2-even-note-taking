@@ -9,7 +9,8 @@ import {
   type EvenAppBridge,
   type MenuContainerProperty,
 } from '@evenrealities/even_hub_sdk';
-import { connectAgentsStream, connectStream, startRun, stopRun, type AgentRun } from './stream';
+import { connectAgentsStream, connectStream, startRun, stopRun, type AgentRun, type HubChanged } from './stream';
+import { isOwnEcho } from './client-id';
 import { snapshotForRun } from './location/run';
 import { probeLocation } from './location/probe';
 import { getRuns, isAgentRunning, latestRunFor, subscribeRuns } from './agent-runs';
@@ -40,12 +41,14 @@ import {
   hubReady,
   loadHub,
   noteServerHandshake,
+  refreshSection,
   removeDoc,
   seedIfEmpty,
   selectDoc,
   selectSection,
   setConnStatus,
   setTaskDone,
+  startHubLiveSync,
   subscribe,
   update,
 } from './store';
@@ -132,6 +135,32 @@ function setStatus(line: string): void {
   console.log('[hub]', line);
 }
 
+/**
+ * A PEER device changed a hub collection (§2.4).
+ *
+ * OUR OWN WRITE COMES BACK TOO. The relay fans the frame out over the `hub`
+ * channel without being able to ask "which of these sockets is the writer?", so
+ * it echoes the writer's client id on the frame instead and the drop happens
+ * here. Ignoring our own echo is what keeps a save from costing its author a
+ * pointless round trip — and, for a document, from repainting the body
+ * underneath the cursor that is still typing in it.
+ *
+ * An ABSENT origin is NOT a match: it means the relay could not say who wrote,
+ * and delivering the refresh is far better than silently missing a peer's edit.
+ *
+ * Agents are the one collection this crosses over for, because they live in
+ * `agents-store.ts` rather than in `store.ts`; everything else goes to
+ * `refreshSection`, which knows which collections the hub state actually owns.
+ */
+function onPeerHubChange(changed: HubChanged): void {
+  if (isOwnEcho(changed.origin)) return;
+  if (changed.path === '/agents') {
+    void loadAgents();
+    return;
+  }
+  refreshSection(changed.path);
+}
+
 async function main(): Promise<void> {
   // ONE app, ONE URL: render the companion web UI in any browser (including the
   // Even App WebView), then draw to the glasses via the SDK when the bridge is
@@ -143,6 +172,9 @@ async function main(): Promise<void> {
   //    If the credential changes (device re-paired or revoked), the stream is
   //    torn down and re-created so a kicked device can't keep streaming.
   mountUi();
+  // Catch up whenever this page comes back to the foreground: a nudge can only
+  // arrive while the stream is open, and the relay replays nothing. Idempotent.
+  startHubLiveSync();
   let closeStream: (() => void) | null = null;
   let closeAgentsStream: (() => void) | null = null;
   let closeAiMirror: (() => void) | null = null;
@@ -159,6 +191,7 @@ async function main(): Promise<void> {
     if (!token) return; // kicked / not authenticated — no stream
     closeStream = connectStream({
       onState: (next) => applyRemote(next),
+      onHubChanged: (changed) => onPeerHubChange(changed),
       onStatus: (s) => {
         setStatus(`📡 SSE ${s}`);
         setConnStatus(s);

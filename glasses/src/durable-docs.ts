@@ -134,11 +134,14 @@ export async function clearDeviceSession(): Promise<void> {
 }
 
 /**
- * Owner session — the Google sign-in credential. Every client signs in now,
- * including the Even App WebView, so the token has to outlive the WebView's own
- * (wiped) browser storage or the user re-authenticates on every launch.
- * Only the Even App mirror is stored here; a plain browser keeps its token in
- * sessionStorage exactly as before.
+ * Owner session — the Google sign-in credential.
+ *
+ * Every client signs in now, including the Even App WebView, so the token has to
+ * outlive the browser storage it is mirrored from. Durable storage is the record
+ * of truth in EVERY environment; the caller's `sessionStorage` copy is only a
+ * synchronous fast path in front of it. Gating this on the Even App (as it once
+ * was) signed a plain browser out on every new tab and every restart, even with a
+ * perfectly good session sitting right here.
  */
 export interface OwnerSession {
   token: string;

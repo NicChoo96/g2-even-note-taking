@@ -178,6 +178,19 @@ import { isLocationTool, locationToolSchema, runLocationTool } from './location-
 // The hub API (everything the app persists) rides the SAME session as the
 // document store, so this only needs the wrapper — never a second client.
 import { createHubClient, forwardedHeaders, HUB_MAX_BODY_BYTES } from './hub-api.mjs';
+// The `hub-changed` nudge (§2.2): when another device writes a collection, every
+// OTHER device is told to refetch just that one. The rules are pure and live in
+// their own module because importing THIS file starts a server, so anything left
+// here could only ever be asserted as text.
+import { collectionPath, hubChangedFrame, isOwnEcho, revOf, shouldNudge } from './hub-nudge.mjs';
+// The auth store's durability rules (§2.1): the SHA-256 re-keying that keeps
+// everyone signed in across the change, and the sweep that keeps the blob
+// bounded. Pure for the same reason as the nudge above.
+import { digestToken, normaliseAuthBlob, SESSION_TTL_MS } from './relay-auth.mjs';
+// …and the conversation with the hub that mirrors that store there, so it
+// survives a redeploy. Injected dependencies: nothing in it reaches a socket
+// directly, so it can be driven against a stub instead of a live gateway.
+import { createAuthStoreSync } from './relay-auth-sync.mjs';
 import {
   HUB_MCP_AGENT_NAMES,
   HUB_MCP_AGENT_TOOLS,
@@ -328,15 +341,21 @@ if (DOCS_ORIGIN && DOC_LISTEN_PORT === 0 && !process.env.DOC_TICKET_SECRET) {
 }
 
 // ── Auth store: owner sessions + approved devices ────────────────────────────
-// sessions: { [token]: { email, createdAt } }
+// sessions: { [sha256(token)]: { email, createdAt } }
 // devices:  { [deviceId]: { deviceId, status, pairCode, email, createdAt, approvedAt } }
-const SESSION_TTL_MS = 30 * 24 * 3600e3; // 30 days
+//
+// The session map is keyed by the DIGEST of the token, never the token, so a copy
+// of this file — or of the hub blob it is now mirrored to — is not a working key
+// ring. A legacy file is keyed by the token itself; `normaliseAuthBlob` re-keys
+// those entries in place on load, so a user who is signed in now stays signed in
+// across the upgrade instead of being logged out by the change meant to protect
+// their session.
 const PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
 let authStore = { sessions: {}, devices: {} };
 
 function loadAuthStore() {
   try {
-    authStore = JSON.parse(readFileSync(AUTH_FILE, 'utf8')) || authStore;
+    authStore = normaliseAuthBlob(JSON.parse(readFileSync(AUTH_FILE, 'utf8'))).value;
   } catch {
     /* fresh start */
   }
@@ -361,10 +380,11 @@ function randomPairCode() {
 }
 
 function sessionByToken(token) {
-  const s = authStore.sessions[token];
+  const key = digestToken(token);
+  const s = authStore.sessions[key];
   if (!s) return null;
-  if (Date.now() - s.createdAt > SESSION_TTL_MS) {
-    delete authStore.sessions[token];
+  if (Date.now() - Number(s.createdAt) > SESSION_TTL_MS) {
+    delete authStore.sessions[key];
     persistAuthStore();
     return null;
   }
@@ -785,6 +805,49 @@ function hubRuntime() {
   return { client: hubClientRef, error: '' };
 }
 
+// ── Auth store ↔ the hub (§2.1) ──────────────────────────────────────────────
+// The auth file lives on the container's EPHEMERAL filesystem, so every redeploy
+// wiped every owner session AND every approved device — the app then 401'd
+// everywhere and signed the user out, and the Settings device list came back
+// empty. The blob is mirrored to the hub now, which is durable.
+//
+// The FILE STAYS the working copy and the fallback. A hub that is down,
+// unconfigured, or (today) refusing the route must never break sign-in, because
+// that would be worse than the bug being fixed.
+const authSync = createAuthStoreSync({
+  call: (method, path, opts) => {
+    let client = null;
+    try {
+      client = hubRuntime().client;
+    } catch {
+      client = null;
+    }
+    // A status of 0 is "no answer", which every caller already treats as "keep
+    // running from the file" — so an unconfigured hub is not a special case.
+    if (!client) return Promise.resolve({ status: 0, ok: false, headers: {}, text: '' });
+    return client.call(method, path, opts);
+  },
+  getStore: () => authStore,
+  setStore: (next) => {
+    authStore = next;
+  },
+  save: persistAuthStore,
+  log: (m) => console.log(m),
+  warn: (m) => console.warn(m),
+});
+
+/**
+ * The ONLY way a mutation to the auth store is persisted.
+ *
+ * The file goes first and synchronously — it is the fallback, so it has to be
+ * current the instant anything reads it — and the hub mirror rides behind a
+ * debounce. Deliberately not awaited by any caller: sign-in worked before the
+ * hub existed and must keep working when the hub does not answer.
+ */
+function markAuthChanged() {
+  authSync.markChanged();
+}
+
 /**
  * The document store as a TOOL, for the server-side agent loop.
  *
@@ -1106,6 +1169,49 @@ function broadcastRun(run) {
  */
 const NO_HUB_STATE_MSG =
   'The server has no copy of your to-do list, docs or notes yet. Open the app once so it syncs, then try again.';
+
+/** `JSON.parse` that answers null instead of throwing. */
+function parseJsonOrNull(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tell the OTHER devices that a hub collection changed (§2.2).
+ *
+ * The hub has no push route and the app now fetches every collection from it, so
+ * without this a write on one device stayed invisible on the other until a
+ * reload. The relay is the one component both devices already hold a connection
+ * to, so it fans a small frame out along the `hub` channel.
+ *
+ * The frame carries NO state. The relay's cached copy is a BOOTSTRAP, not the
+ * authority (see `applyRemote()` in the app's store), so re-broadcasting it would
+ * re-serve a snapshot another device has already superseded — which is the stale
+ * frame the hub migration existed to end. The frame names a collection and each
+ * client refetches just that one from the hub.
+ *
+ * `rev` is passed through ONLY when the upstream response really had one, and
+ * `hubChangedFrame` enforces it: sessions, memory, the ledger and settings do not
+ * move `rev`, so a frame that invented one would announce a to-do change on a
+ * routine session write.
+ */
+function nudgeHubChanged(path, rev, origin) {
+  const channel = getChannel('hub');
+  // Nobody to tell. Deliberately before the frame is built, so a single-device
+  // deployment does no work at all for a nudge it cannot deliver.
+  if (channel.clients.size === 0) return;
+  const frame = hubChangedFrame(path, rev, origin);
+  for (const client of [...channel.clients]) {
+    // The author already has the new state — it wrote it — and a refetch under
+    // its own cursor would fight whoever is typing in the document it just
+    // saved. `client.g2Origin` is set when the SSE subscription is registered.
+    if (isOwnEcho(frame, client.g2Origin)) continue;
+    send(client, frame, channel.name);
+  }
+}
 
 /**
  * Adopt a hub state produced by an AGENT TOOL and publish it.
@@ -1714,7 +1820,11 @@ function setCors(res) {
   //   If-Match        — the agents/docs concurrency guard. Losing it turns an
   //                     optimistic write into a 412 the app cannot distinguish
   //                     from a real conflict.
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, If-Match, Idempotency-Key');
+  //   X-Client-Id     — the WRITER's own id, so the relay can skip that one
+  //                     client when it fans a `hub-changed` nudge out (§2.2).
+  //                     Losing it does not break sync: every client then just
+  //                     refetches its own write, costing one round trip.
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, If-Match, Idempotency-Key, X-Client-Id');
   // Response headers the app must READ. Neither is CORS-safelisted, so a
   // cross-origin caller sees them as undefined unless they are exposed here:
   //   ETag      — the value it has to send back as `If-Match` on the next write.
@@ -2002,6 +2112,13 @@ const server = createServer(async (req, res) => {
     const multi = wanted.length > 0;
     if (multi) MULTIPLEXED.add(res);
 
+    // The subscriber's OWN id, so the `hub-changed` fan-out can skip this socket
+    // when it is the one that wrote. ABSENT is fine — the client then refetches
+    // its own write, costing one round trip and nothing else. Held as a private
+    // property on `res`: the frame shape is pinned by stream-mux-sim.mjs, so
+    // nothing may be added to what is SENT.
+    res.g2Origin = String(url.searchParams.get('origin') || '');
+
     const subs = names.map((n) => getChannel(n));
     for (const sub of subs) sub.clients.add(res);
 
@@ -2056,8 +2173,10 @@ const server = createServer(async (req, res) => {
       const email = (payload?.email || '').toLowerCase();
       if (payload && email && allowed.includes(email)) {
         const sessionToken = randomToken();
-        authStore.sessions[sessionToken] = { email: payload.email, createdAt: Date.now() };
-        persistAuthStore();
+        // Keyed by the DIGEST of the token, so neither this file nor the hub blob
+        // it is mirrored to is a working key ring if it leaks.
+        authStore.sessions[digestToken(sessionToken)] = { email: payload.email, createdAt: Date.now() };
+        markAuthChanged();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, email: payload.email, sessionToken }));
       } else {
@@ -2076,9 +2195,11 @@ const server = createServer(async (req, res) => {
   // Owner sign-out — revoke the session token.
   if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
     const token = readToken(req, url);
-    if (token && authStore.sessions[token]) {
-      delete authStore.sessions[token];
-      persistAuthStore();
+    // The map is keyed by digest, so the presented token is hashed to find it.
+    const key = token ? digestToken(token) : '';
+    if (key && authStore.sessions[key]) {
+      delete authStore.sessions[key];
+      markAuthChanged();
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');
@@ -2132,7 +2253,7 @@ const server = createServer(async (req, res) => {
         createdAt: Date.now(),
       };
       authStore.devices[deviceId] = dev;
-      persistAuthStore();
+      markAuthChanged();
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, status: 'pending', pairCode: dev.pairCode }));
@@ -2178,7 +2299,7 @@ const server = createServer(async (req, res) => {
     dev.status = 'approved';
     dev.email = owner.email;
     dev.approvedAt = Date.now();
-    persistAuthStore();
+    markAuthChanged();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, deviceId: dev.deviceId }));
     return;
@@ -2223,7 +2344,7 @@ const server = createServer(async (req, res) => {
     const deviceId = String(parsed.deviceId || '');
     if (deviceId && authStore.devices[deviceId]) {
       delete authStore.devices[deviceId];
-      persistAuthStore();
+      markAuthChanged();
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');
@@ -2890,6 +3011,25 @@ const server = createServer(async (req, res) => {
       ...forwardedHeaders(upstream),
     });
     res.end(upstream.text ?? '');
+
+    // ── The `hub-changed` nudge (§2.2) ────────────────────────────────────────
+    // ONLY a 2xx on a mutating method: a read changed nothing and a FAILED write
+    // changed nothing, so nudging either would send every other device off to
+    // refetch identical bytes. The rules themselves live in hub-nudge.mjs —
+    // importing THIS file starts a server, so they cannot be asserted here.
+    if (shouldNudge(req.method, upstream.status)) {
+      // The writer's own id, echoed onto the frame so its socket can be skipped.
+      const origin = String(req.headers['x-client-id'] || '');
+      // `rev` is read off the response only when the body is small enough to be a
+      // metadata reply. A document PUT echoes the whole document, and parsing
+      // megabytes to learn one integer is worse than doing without it: the client
+      // adopts the rev from the refetch this nudge already asks for.
+      const rev =
+        typeof upstream.text === 'string' && upstream.text.length <= 64 * 1024
+          ? revOf(parseJsonOrNull(upstream.text))
+          : null;
+      nudgeHubChanged(collectionPath(hubPath), rev, origin);
+    }
     return;
   }
 
@@ -3590,6 +3730,14 @@ async function checkFilesSchemaDrift() {
 }
 
 await loadPersistedState();
+
+// Reconcile the auth store with the hub BEFORE the listener accepts anything.
+// The file is ephemeral and this container may be brand new, so without this a
+// perfectly valid token would 401 for a moment at boot — and the app's
+// `onAuthRejected` path would sign the user straight out, which is the bug this
+// change fixes, re-entering as a startup race. Bounded (5s), never throws, and
+// it degrades to the file, so a hub that is down cannot break sign-in.
+await authSync.reconcile();
 
 server.listen(PORT, () => {
   console.log(`[g2-hub] relay on http://0.0.0.0:${PORT}`);

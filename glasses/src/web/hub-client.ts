@@ -36,6 +36,7 @@
 //   yields `undefined` — a real bug this codebase has already had — so the
 //   envelope is identified by `ok` before anything is read out of it.
 import { getStreamToken, notifyAuthRejected } from '../auth-token';
+import { clientId } from '../client-id';
 import { API_BASE } from '../stream';
 import type { Effect, EntryBy, EntryKind, EntryLocus, EntryStatus } from '../ai/ledger';
 import {
@@ -372,6 +373,13 @@ async function sendRequest<T = unknown>(
     const payload = opts.rev ? { ...(opts.body ?? {}), rev } : opts.body;
     const headers = authHeaders(payload !== undefined);
     if (sendsKey) headers['Idempotency-Key'] = key;
+    // WHICH PAGE wrote this. The relay echoes it back as the `origin` of the
+    // `hub-changed` nudge, so this tab can ignore the echo of its own write
+    // instead of refetching a document someone is still typing in (§2.2). It is
+    // addressed to the RELAY, never the hub — the passthrough forwards only
+    // `Idempotency-Key` and `If-Match` on purpose — so a deployment that does not
+    // know the header behaves exactly as it did before.
+    if (method !== 'GET') headers['X-Client-Id'] = clientId();
     if (opts.etag) headers['If-Match'] = opts.etag;
 
     let res: Response;

@@ -1,5 +1,6 @@
 import type { AgentsState, HubState } from './types';
 import { getStreamToken, notifyAuthRejected } from './auth-token';
+import { clientId } from './client-id';
 import type { LocationFix } from './location/spec';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
@@ -66,6 +67,28 @@ export interface StreamHandlers {
   onStatus?(status: 'connecting' | 'open' | 'error'): void;
   /** The relay answered; `hasSnapshot` is false when it holds nothing yet. */
   onHandshake?(hasSnapshot: boolean): void;
+  /**
+   * ANOTHER device wrote a hub collection (§2.2).
+   *
+   * The hub has no push route, so the relay fans a stateless nudge out along
+   * this channel and every client refetches just the collection it names. The
+   * frame deliberately carries no state: re-serving the relay's cached snapshot
+   * would overwrite whatever a peer has since written, which is the stale-frame
+   * wipe the hub migration ended.
+   */
+  onHubChanged?(changed: HubChanged): void;
+}
+
+/** What a `hub-changed` nudge names. See `StreamHandlers.onHubChanged`. */
+export interface HubChanged {
+  /** The hub-RELATIVE collection: `/todos`, `/docs`, `/notes`, `/files`, `/`. */
+  path: string;
+  /** Present ONLY when the upstream response actually carried one. Sessions,
+   *  memory, the ledger and settings never move `rev`, so its absence is
+   *  normal and must not be read as "nothing changed". */
+  rev?: number;
+  /** The client id of the WRITER. Absent means "not correlated — refresh". */
+  origin?: string;
 }
 
 export interface AgentsStreamHandlers {
@@ -144,7 +167,45 @@ async function credentialStillValid(): Promise<boolean> {
  * but we manage re-creation to surface status changes).
  */
 export function connectStream(handlers: StreamHandlers): () => void {
-  return subscribe(CHANNEL_HUB, (frame) => (frame.state ? (frame.state as HubState) : undefined), handlers);
+  return subscribe<HubFrame>(
+    CHANNEL_HUB,
+    (frame) => {
+      if (frame.state) return { kind: 'state', state: frame.state as HubState };
+      // A peer's write rides the SAME subscription rather than getting one of its
+      // own. `route()` refuses an UNTAGGED frame whenever a socket has more than
+      // one subscriber, and a relay that predates multiplexing sends exactly
+      // those — so a second hub subscriber would silently kill hub state on such
+      // a relay. One subscriber keeps that fallback intact.
+      const changed = hubChangedOf(frame);
+      return changed ? { kind: 'changed', changed } : undefined;
+    },
+    {
+      ...handlers,
+      onState: (frame) => {
+        // A nudge never reaches `onState`, so a consumer of hub state can never
+        // be handed a frame with no `state` on it.
+        if (frame.kind === 'changed') handlers.onHubChanged?.(frame.changed);
+        else handlers.onState(frame.state);
+      },
+    },
+  );
+}
+
+/** What a hub frame is delivered as, so a nudge cannot be mistaken for a snapshot. */
+type HubFrame =
+  | { kind: 'state'; state: HubState }
+  | { kind: 'changed'; changed: HubChanged };
+
+/** A well-formed `hub-changed` frame, or null. A malformed one is dropped. */
+function hubChangedOf(frame: Record<string, unknown>): HubChanged | null {
+  if (frame.type !== 'hub-changed') return null;
+  const path = typeof frame.path === 'string' ? frame.path : '';
+  if (!path) return null;
+  return {
+    path,
+    rev: typeof frame.rev === 'number' ? frame.rev : undefined,
+    origin: typeof frame.origin === 'string' ? frame.origin : undefined,
+  };
 }
 
 /** Same SSE client, pointed at the separate 'agents' channel. */
@@ -274,7 +335,9 @@ function hub(base: string): Hub {
 function hubUrl(h: Hub): string {
   const names = [...new Set([...h.subs].map((s) => s.channel))];
   names.sort();
-  return withToken(`${h.base}/api/stream?channels=${names.join(',')}`);
+  // `origin` identifies THIS page load, so the relay can skip this socket when
+  // it fans out a nudge for a write this very client just made (§2.2).
+  return withToken(`${h.base}/api/stream?channels=${names.join(',')}&origin=${encodeURIComponent(clientId())}`);
 }
 
 /**

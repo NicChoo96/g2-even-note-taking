@@ -37,8 +37,11 @@ import {
   saveOwnerSession,
 } from '../durable-docs';
 
-const AUTH_KEY = 'hub:auth'; // owner email (sessionStorage)
-const SESSION_KEY = 'hub:session'; // owner session token (sessionStorage)
+// The owner session's FAST PATH — a synchronous read for event handlers, effects
+// and render. The durable copy in `durable-docs` is the record of truth in every
+// environment; these two are only the cache in front of it (§2.3).
+const AUTH_KEY = 'hub:auth'; // owner email
+const SESSION_KEY = 'hub:session'; // owner session token
 
 export interface PairedDevice {
   deviceId: string;
@@ -151,6 +154,31 @@ async function verify(idToken: string): Promise<{
   }
 }
 
+/**
+ * The owner session token, from whichever store has it (§2.3).
+ *
+ * WHAT WAS WRONG: the token lived ONLY in `sessionStorage` — tab-scoped, and
+ * gone when the tab or the browser closes — with the durable copy written
+ * exclusively inside the Even App WebView. So in a plain browser every new tab
+ * and every restart was signed out with no warning, and a reload took the paired
+ * device list with it. Durable storage is the record of truth in EVERY
+ * environment now; `sessionStorage` survives only as the synchronous fast path,
+ * because this is reached from event handlers that cannot await.
+ *
+ * Reading TOPS UP the fast path, so the first async read in a fresh tab makes
+ * every later synchronous read cheap. Exported for `tools/hub-session-sim.mjs`,
+ * which is the only thing that can prove the fallback is real.
+ */
+export async function anyOwnerToken(): Promise<{ token: string; email: string | null } | null> {
+  const tok = sessionStorage.getItem(SESSION_KEY);
+  if (tok) return { token: tok, email: sessionStorage.getItem(AUTH_KEY) };
+  const saved = await loadOwnerSession();
+  if (!saved?.token) return null;
+  sessionStorage.setItem(SESSION_KEY, saved.token);
+  if (saved.email) sessionStorage.setItem(AUTH_KEY, saved.email);
+  return saved;
+}
+
 /** Is this stored owner session token still accepted by the relay? */
 async function me(sessionToken: string): Promise<{ ok: boolean; email?: string }> {
   try {
@@ -214,12 +242,29 @@ async function pairApprove(pairCode: string, sessionToken: string): Promise<{ ok
   }
 }
 
-async function devicesList(sessionToken: string): Promise<{ devices: PairedDevice[] }> {
-  const res = await fetch(`${API_BASE}/api/devices`, {
-    headers: { Authorization: `Bearer ${sessionToken}` },
-  });
-  const data = (await res.json()) as { ok?: boolean; devices?: PairedDevice[] };
-  return { devices: data.devices ?? [] };
+/**
+ * The paired-device list, WITH the outcome.
+ *
+ * The `ok` flag has to come back. This used to answer `{devices: []}` for a 401
+ * or a dead relay exactly as it did for "nothing is paired" — the flag was read
+ * off the response and thrown away — so a failed read rendered as a perfectly
+ * valid empty list and looked like every pairing had disappeared.
+ * Exported for `tools/hub-session-sim.mjs`: the flag is the whole fix, and a
+ * harness that re-implemented this read could not see the difference.
+ */
+export async function devicesList(
+  sessionToken: string,
+): Promise<{ ok: boolean; devices: PairedDevice[]; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/devices`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    const data = (await res.json()) as { ok?: boolean; devices?: PairedDevice[]; error?: string };
+    if (!res.ok || !data.ok) return { ok: false, devices: [], error: data.error };
+    return { ok: true, devices: data.devices ?? [] };
+  } catch {
+    return { ok: false, devices: [], error: 'network error' };
+  }
 }
 
 async function deviceRevoke(deviceId: string, sessionToken: string): Promise<void> {
@@ -265,11 +310,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       let tok = sessionStorage.getItem(SESSION_KEY);
       let em = sessionStorage.getItem(AUTH_KEY);
 
-      // Even App WebView: its browser storage does not survive a restart, so
-      // fall back to the host store. main.ts mounts this UI BEFORE the SDK
-      // bridge resolves (waitForEvenAppBridge, up to ~4s) — wait for it rather
-      // than racing it and wrongly concluding "signed out" on every launch.
-      if (!tok && inEvenApp) {
+      // Durable fallback in EVERY environment (§2.3), not just the Even App.
+      // This used to be gated on `inEvenApp`, so a plain browser was refused its
+      // own saved session and signed out on every new tab and every restart.
+      //
+      // The Even App WebView's bridge can take up to ~4s to resolve (main.ts
+      // mounts this UI BEFORE `waitForEvenAppBridge`), and until it does an
+      // empty answer is not yet definitive — so retry briefly, but ONLY while
+      // the bridge is genuinely pending. Where there is no bridge to wait for,
+      // the first answer is final and the loop would just be four wasted
+      // seconds in front of the login screen.
+      if (!tok) {
         for (let i = 0; i < 8 && !cancelled; i++) {
           const saved = await loadOwnerSession();
           if (saved) {
@@ -282,6 +333,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           // No bridge yet => the host store was not readable. Once the bridge is
           // up an empty answer is definitive, so stop waiting.
           if (getDurableBridge()) break;
+          if (!inEvenApp) break; // nothing to wait for — the answer is final
           await new Promise((r) => window.setTimeout(r, 500));
         }
       }
@@ -316,6 +368,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setAuthedState(true);
         setEmail(em || m.email || null);
       } else {
+        // The relay did not recognise it. Drop the durable copy too: leaving it
+        // behind would let the NEXT page load restore the same dead token and
+        // sign the user out again, one full boot later, for no visible reason.
         sessionStorage.removeItem(AUTH_KEY);
         sessionStorage.removeItem(SESSION_KEY);
         void clearOwnerSession();
@@ -418,6 +473,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // ID is the fallback for a paired secondary device.
   useEffect(() => {
     if (loading) return;
+    // Safe to read synchronously: `authed` only ever becomes true once the boot
+    // effect or `setAuthed` has put the token in `sessionStorage`, including when
+    // the boot effect restored it from durable storage.
     const owner = authed ? sessionStorage.getItem(SESSION_KEY) : null;
     setStreamToken(owner ?? (paired ? thisDeviceId : null));
   }, [loading, authed, paired, thisDeviceId]);
@@ -450,9 +508,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setPairingState(false);
     setPairCode(null);
     setPairError(null);
-    // The Even App WebView wipes browser storage on restart, so mirror the
-    // session into the host store there (a plain browser keeps sessionStorage).
-    if (detectEvenApp()) void saveOwnerSession({ token: sessionToken, email: em });
+    // Mirror the session into DURABLE storage in every environment (§2.3). The
+    // Even App WebView wipes browser storage on restart and a plain browser loses
+    // `sessionStorage` when the tab closes, so this is what makes "stay signed
+    // in" true on both. BOTH are written: `sessionStorage` is the synchronous
+    // fast path, durable storage is the record that survives the restart.
+    void saveOwnerSession({ token: sessionToken, email: em });
   }, []);
 
   const signOut = useCallback(() => {
@@ -487,21 +548,45 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const refreshDevices = useCallback(async () => {
-    const tok = sessionStorage.getItem(SESSION_KEY);
+    // The DURABLE token, not just the tab's copy: this is the read that renders
+    // Settings → Devices, and it is most often called from a freshly opened tab
+    // where `sessionStorage` has nothing yet but a saved session exists (§2.3).
+    const tok = await anyOwnerToken();
     if (!tok) return;
-    try {
-      const { devices: list } = await devicesList(tok);
-      setDevices(list);
-    } catch {
-      /* ignore */
+    const { ok, devices: list, error: why } = await devicesList(tok.token);
+    // A FAILED READ MUST NOT RENDER AS "NOTHING PAIRED" (§2.4). Keep the list we
+    // already have and say what went wrong; replacing it with `[]` is precisely
+    // the "my paired devices disappeared" report.
+    if (!ok) {
+      setError(why ?? 'Could not load paired devices.');
+      return;
     }
+    setError(null);
+    setDevices(list);
   }, []);
+
+  // Settings → Devices is a RELAY read, so it gets no `hub-changed` nudge the way
+  // hub collections do. Returning to the tab is the moment it is most likely to
+  // have changed underneath us (a pairing approved on another surface, or a
+  // relay that restarted), so re-read it then.
+  useEffect(() => {
+    if (loading || !authed) return;
+    const onBack = (): void => {
+      if (document.visibilityState !== 'hidden') void refreshDevices();
+    };
+    window.addEventListener('focus', onBack);
+    document.addEventListener('visibilitychange', onBack);
+    return () => {
+      window.removeEventListener('focus', onBack);
+      document.removeEventListener('visibilitychange', onBack);
+    };
+  }, [loading, authed, refreshDevices]);
 
   const pairDevice = useCallback(
     async (code: string): Promise<{ ok: boolean; error?: string }> => {
-      const tok = sessionStorage.getItem(SESSION_KEY);
+      const tok = await anyOwnerToken();
       if (!tok) return { ok: false, error: 'Not signed in.' };
-      const r = await pairApprove(code.trim().toUpperCase(), tok);
+      const r = await pairApprove(code.trim().toUpperCase(), tok.token);
       if (r.ok) {
         setPairError(null);
         void refreshDevices();
@@ -515,9 +600,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const revokeDevice = useCallback(
     async (deviceId: string) => {
-      const tok = sessionStorage.getItem(SESSION_KEY);
+      const tok = await anyOwnerToken();
       if (!tok) return;
-      await deviceRevoke(deviceId, tok);
+      await deviceRevoke(deviceId, tok.token);
       void refreshDevices();
     },
     [refreshDevices],

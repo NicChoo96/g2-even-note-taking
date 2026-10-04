@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.43
+
+v0.3.43 - Your other devices keep up on their own
+
+- Signing in now survives closing the tab and restarting the browser,
+ so you are not signed out on every fresh load.
+- The paired-devices list no longer empties itself when the server
+ cannot be reached; it says what went wrong and keeps what it had.
+- Change a list, doc or note on one device and your others pick it up
+ without a manual refresh.
+
 ## 0.3.42
 
 v0.3.42 - Your data lives on the server now

@@ -97,6 +97,11 @@ const latest = () => live().at(-1);
 const paramsOf = (es) => new URL(es.url, 'http://relay.test').searchParams;
 const channelsOf = (es) => paramsOf(es).get('channels');
 const tokenOf = (es) => paramsOf(es).get('token');
+const originOf = (es) => paramsOf(es).get('origin');
+// A URL with the per-PAGE `origin` removed — it is regenerated per process, so
+// it can never be part of an equality assertion about the channel set.
+const urlNoOrigin = (es) =>
+  es.url.replace(/([?&])origin=[^&]*/g, '$1').replace(/[?&]$/, '');
 
 // ── Bundle the real module ──────────────────────────────────────────────────
 // `env` is injected as import.meta.env so the same source can be loaded for a
@@ -130,12 +135,16 @@ const keys = ['hub', 'agents', 'ai', 'ai-ctl'];
 const seen = Object.fromEntries(keys.map((k) => [k, []]));
 const status = Object.fromEntries(keys.map((k) => [k, []]));
 const handshake = Object.fromEntries(keys.map((k) => [k, []]));
+// `hub-changed` nudges (§2.2). Only the hub channel ever sends one, but every
+// record carries the hook so the routing assertion below can be exact.
+const nudges = [];
 const record = (key) => ({
   onState: (s) => seen[key].push(s),
   onStatus: (st) => status[key].push(st),
   onHandshake: (has) => handshake[key].push(has),
+  onHubChanged: (c) => nudges.push({ channel: key, ...c }),
 });
-const clearSeen = () => keys.forEach((k) => seen[k].splice(0));
+const clearSeen = () => keys.forEach((k) => seen[k].splice(0)) || nudges.splice(0);
 
 section('1. Four channels coalesce onto ONE socket');
 const offs = [
@@ -149,6 +158,12 @@ await tick();
 check('four subscriptions opened exactly ONE socket', FakeEventSource.all.length, 1);
 check('the socket names every channel, sorted and de-duplicated', channelsOf(latest()), 'agents,ai,ai-ctl,hub');
 check('a pre-auth subscription carries no token', tokenOf(latest()), null);
+// The page's own id rides the URL so the relay can skip THIS socket when it
+// fans a write out to the other devices (§2.2).
+assert(
+  'the URL declares this page-load client id',
+  /^c-[0-9a-f]{16}$/.test(String(originOf(latest()))),
+);
 
 section('2. A repeat subscriber must not reconnect');
 const urlBefore = latest().url;
@@ -233,7 +248,33 @@ check('the retry kept the full channel set', channelsOf(retried), 'agents,ai,ai-
 check('the retry URL carries the credential that arrived while offline', tokenOf(retried), 'tok_live');
 
 // ════════════════════════════════════════════════════════════════════════════
-section('8. Back-compat: a single-channel socket accepts untagged frames');
+section("8. A peer's write arrives as a `hub-changed` nudge, not as state");
+clearSeen();
+latest().emit({ channel: 'hub', type: 'hub-changed', path: '/todos', rev: 41, origin: 'c-other' });
+check('the nudge reached the hub subscriber', nudges, [
+  { channel: 'hub', path: '/todos', rev: 41, origin: 'c-other' },
+]);
+// The frame carries NO state on purpose — re-serving the relay's cached snapshot
+// would overwrite whatever the peer has written since.
+check('…and was NOT delivered as hub state', seen.hub, []);
+check('…nor to any other channel', seen.agents, []);
+clearSeen();
+// A write to a collection that never moves `rev` (sessions, memory, the ledger,
+// settings) sends no rev, and an absent origin means the relay could not say who
+// wrote. Neither may make the frame disappear.
+latest().emit({ channel: 'hub', type: 'hub-changed', path: '/sessions' });
+check('a rev-less, origin-less nudge survives normalisation', nudges, [
+  { channel: 'hub', path: '/sessions', rev: undefined, origin: undefined },
+]);
+clearSeen();
+// A frame with no usable path can name no collection to refetch, so it must be
+// dropped rather than handed over as a nudge that refreshes nothing.
+latest().emit({ channel: 'hub', type: 'hub-changed' });
+latest().emit({ channel: 'hub', type: 'hub-changed', path: '' });
+check('a nudge with no usable path is dropped', nudges, []);
+
+// ════════════════════════════════════════════════════════════════════════════
+section('9. Back-compat: a single-channel socket accepts untagged frames');
 // Drop down to one channel. The channel set changed, so this is a reconnect —
 // and it is also exactly what a pre-multiplexing relay looks like to the client.
 const superseded = live();
@@ -257,13 +298,13 @@ clearSeen();
 latest().emit({ channel: 'agents', type: 'state', state: { v: 'foreign' } });
 check('a tagged frame for a channel we no longer hold is dropped', seen.hub, []);
 
-section('9. The socket is released with its last subscriber');
+section('10. The socket is released with its last subscriber');
 offs[0]();
 await tick();
 check('every socket is closed once nothing subscribes', live().length, 0);
 
 // ════════════════════════════════════════════════════════════════════════════
-section('10. Channels on DIFFERENT relays never share a socket');
+section('11. Channels on DIFFERENT relays never share a socket');
 const socketsBefore = FakeEventSource.all.length;
 const split = await loadBundle({
   VITE_HUB_STREAM_URL: 'http://relay-a.test/api/stream?channel=hub',
@@ -277,7 +318,7 @@ const created = FakeEventSource.all.slice(socketsBefore);
 check('two relays get two sockets', created.length, 2);
 check(
   'each socket is addressed to its own relay and channel',
-  created.map((e) => e.url).sort(),
+  created.map(urlNoOrigin).sort(),
   ['http://relay-a.test/api/stream?channels=hub', 'http://relay-b.test/api/stream?channels=agents'],
 );
 created[0].emit({ type: 'state', state: { v: 'from-a' } });

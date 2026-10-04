@@ -21,7 +21,10 @@ import {
   deleteDoc as hubDeleteDoc,
   deleteTodo as hubDeleteTodo,
   fetchDoc as hubFetchDoc,
+  fetchDocs,
   fetchHub,
+  fetchNotes,
+  fetchTodos,
   onStaleState,
   patchHub,
   patchTodo as hubPatchTodo,
@@ -30,6 +33,7 @@ import {
   renameDoc as hubRenameDoc,
   reorderTodos as hubReorderTodos,
   updateDocContent as hubUpdateDocContent,
+  type DocMeta,
   type HubSnapshot,
 } from './web/hub-client';
 import {
@@ -317,6 +321,127 @@ function wireStaleRefresh(): void {
   if (staleWired) return;
   staleWired = true;
   onStaleState(() => debounce('stale-refresh', EDIT_DEBOUNCE_MS + 400, () => void loadHub()));
+}
+
+// ── live sync ───────────────────────────────────────────────────────────────
+
+/**
+ * Refetch ONE collection because a PEER device changed it (§2.4).
+ *
+ * WHY NOT JUST `loadHub()`: that read inlines every document body (63 KB across
+ * the 19 documents in this deployment) and replaces `activeSection` and
+ * `activeDocId` with the server's — so a peer ticking one to-do would repaint
+ * the entire app and could pull the wearer out of the document they are reading.
+ * Only the collection the nudge named is read.
+ *
+ * `/files` and `/` really do fall back to the snapshot, and for one reason each:
+ * a file appears in HubState as a `FileRef` and this store has no read that
+ * returns `FileRef[]` on its own, and `/` IS the state document, so the snapshot
+ * read is the only read that names it.
+ *
+ * EVERYTHING ELSE IS DROPPED ON PURPOSE — `/sessions`, `/memory`, `/ledger`,
+ * `/settings`, `/relay`. Those collections never move `rev`, are not part of
+ * HubState, and their screens read them on demand; turning such a frame into a
+ * snapshot read would cost 63 KB to learn nothing.
+ *
+ * DEBOUNCED PER COLLECTION: a peer typing in a document produces a nudge per
+ * write, and eight reads where one will do is just load. The delay also lets the
+ * peer's own writer settle, mirroring `wireStaleRefresh` above.
+ */
+export function refreshSection(path: string): void {
+  const one = `/${String(path).split('/').filter(Boolean)[0] ?? ''}`;
+  if (one === '/') {
+    void loadHub();
+    return;
+  }
+  if (one === '/files') {
+    debounce('peer-files', EDIT_DEBOUNCE_MS, () => void loadHub());
+    return;
+  }
+  if (one === '/todos') {
+    debounce('peer-todos', EDIT_DEBOUNCE_MS, () => {
+      void fetchTodos().then((res) => settle(res, () => adoptTodos(res.items)));
+    });
+    return;
+  }
+  if (one === '/notes') {
+    debounce('peer-notes', EDIT_DEBOUNCE_MS, () => {
+      void fetchNotes().then((res) => {
+        settle(res, () => {
+          // Only when it really differs. This frame is usually the echo of an
+          // append this very tab made a moment ago (the relay skips only the
+          // socket it can identify), and committing identical text would emit a
+          // state change and repaint every surface for nothing.
+          if (res.content !== getState().sections.notes) {
+            commit((s) => ({ ...s, sections: { ...s.sections, notes: res.content } }));
+          }
+        });
+      });
+    });
+    return;
+  }
+  if (one === '/docs') {
+    debounce('peer-docs', EDIT_DEBOUNCE_MS, () => {
+      void fetchDocs().then((res) => settle(res, () => adoptDocs(res.items)));
+    });
+  }
+}
+
+/**
+ * Merge the server's document LIST into the local one.
+ *
+ * The list read does not include bodies — that is opt-in because a body is
+ * unbounded — so replacing `sections.docs` outright would set every `content` to
+ * `undefined` and blank the document the wearer has open. The server owns WHICH
+ * documents exist and what they are called; a body already held locally is kept.
+ *
+ * A document the server no longer lists is dropped, and if it was the open one
+ * the view falls back rather than pointing at nothing.
+ */
+function adoptDocs(metas: DocMeta[]): void {
+  if (!metas.length && !getState().sections.docs.length) return;
+  const have = new Map(getState().sections.docs.map((d) => [d.id, d]));
+  const docs: DocEntry[] = metas.map((m) => ({
+    id: m.id,
+    title: m.title,
+    content: typeof m.content === 'string' ? m.content : (have.get(m.id)?.content ?? ''),
+    updatedAt: m.updatedAt,
+  }));
+  const open = getState().activeDocId;
+  commit((s) => ({
+    ...s,
+    sections: { ...s.sections, docs },
+    activeDocId: open && docs.some((d) => d.id === open) ? open : null,
+  }));
+}
+
+let liveWired = false;
+
+/**
+ * Catch up after the tab was away (§2.4).
+ *
+ * A NUDGE ONLY ARRIVES IF THE SOCKET WAS OPEN. A backgrounded phone, a closed
+ * lid or a sleeping laptop drops the stream, and the relay replays nothing a
+ * client missed — so a device that comes back after an hour would otherwise be
+ * showing an hour-old list with no sign anything is wrong. Re-reading on return
+ * is what closes that gap. It is ONE read on one event, never a poll.
+ *
+ * Debounced because a single app switch can fire `focus`, `visibilitychange` and
+ * a resize in quick succession, and there is no reason to read three times.
+ *
+ * Only AFTER the first successful load: the boot path owns the first read, and
+ * racing it would fire a request before the credential is even attached.
+ */
+export function startHubLiveSync(): void {
+  if (liveWired) return;
+  liveWired = true;
+  const back = (): void => {
+    if (!hubLoaded) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    debounce('foreground-refresh', CONTROL_DEBOUNCE_MS + 150, () => void loadHub());
+  };
+  window.addEventListener('focus', back);
+  document.addEventListener('visibilitychange', back);
 }
 
 // ── todos ───────────────────────────────────────────────────────────────────
