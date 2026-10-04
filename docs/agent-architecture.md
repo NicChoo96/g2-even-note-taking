@@ -169,22 +169,32 @@ The fixed order (`sectionMenu`, `glasses/src/sections.ts`):
 ```
 1. Jarvis  (→ "Stop AI" while a run is live or a conversation is open)
 2. Undo AI  — only while a revertible batch exists and nothing is running
-3. Back  — wherever it applies (docs, agents)
-4. this tab's own actions
-     Docs   → New Docs · Select Docs · Delete Docs
+3. this tab's own action, when there is one
+     Docs   → Delete Docs (only while a document exists)
      Agents → Trigger (→ Stop while a run is in flight)
-     other  → Agents · To-Do · Docs · Notes switchers
+4. the core items — Agents · To-Do · Docs · Notes · Files, on EVERY tab
 5. Dictate  — always LAST and never trimmed
 ```
 
+The menu is **flat** (0.3.49): the five switchers are on every tab and there is no
+`Back` row, so a state that strands a tab with no exit is not even representable
+(0.3.10). What still moves is the *position* of those five rows: on Docs and Agents
+the page's own action is inserted above them, and `Undo AI` belongs above that, so
+the switchers sit one row lower on those two tabs — and one row lower again while a
+revertible batch exists. The five names and their relative order never change, and
+pressing the switcher for the tab you are already on is inert on purpose: keeping
+all five rows drawn beats four rows plus a highlight that moves with the page.
+
 `Dictate` is last on purpose: it is the raw, agent-free path into the page, so it
 is the one you must reach for deliberately. `Jarvis` is first because it is the
-flagship action.
+flagship action. `New Docs` and `Select Docs` are gone as well: a document is
+created in the web app or by asking Jarvis, and the L1 list already opens a
+document as you swipe it.
 
 ### The conversation exception
 
 While a Jarvis conversation is open the menu is **the AI group alone** — `Stop AI`
-· `Undo AI?` · `Back?` · `Dictate`.
+· `Undo AI?` · `Dictate`.
 
 A conversation is modal by design: the HUD owns the tap and the mic re-arms
 without a menu trip. Listing the page's own actions next to a live transcript made
@@ -192,26 +202,33 @@ the long-press two menus in one — `Delete Docs` sitting under a half-finished
 sentence is genuinely ambiguous about whether you are talking to Jarvis or
 commanding the page. Removing them makes the long-press answer **one** question.
 
-The rule that decides *what* may be trimmed: **never trim an item that is the only
-way out of a tab** (0.3.10). So:
+The rule that decides *what* may be trimmed: **never trim the last way out of a
+state** (0.3.10). So:
 
 | Item | Trimmed? | Why |
 |---|---|---|
-| `Stop AI` | no | ends the conversation; always item 1 |
+| `Stop AI` | **no** | ends the conversation; always item 1 |
 | `Undo AI` | kept if present | suppresses a live run; between turns is exactly when a revert is wanted |
-| `Back` | **kept on docs/agents** | the only way off agents (its switchers are hidden) |
 | `Dictate` | **never** | keeps the raw page path one press away |
-| this tab's actions | yes | reachable the moment the conversation ends; double-tap also ends it |
+| this tab's own action | yes | comes straight back the moment the conversation ends |
+| the core switchers | yes | costs a step, never a dead end — see below |
 
-Measured item counts (`menu-sim.mjs`, 167 checks):
+That last row is the one trade the flattening makes, so it is written down rather
+than left to look like an oversight: while a conversation is open there is no menu
+shortcut to another tab. `Stop AI` (item 1) or a double-tap ends the conversation,
+and the five switchers are back the instant it does — one extra press, not a
+stranded state.
+
+Measured item counts (`menu-sim.mjs`):
 
 | State | Docs | Agents | To-Do | Notes |
 |---|---|---|---|---|
-| normal | 6 | 4 | 6 | 6 |
-| in conversation | **3** | **3** | **2** | **2** |
+| normal | 8 | 8 | 7 | 7 |
+| in conversation | **2** | **2** | **2** | **2** |
 
-Well under the cap in both states, and ending the conversation restores the menu
-**byte-identically** — asserted.
+Docs is one shorter without a document to delete and Agents is one shorter
+without an agent to run. Well under the cap in every state, and ending the
+conversation restores the menu **byte-identically** — asserted.
 
 ---
 
