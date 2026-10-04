@@ -2330,7 +2330,16 @@ async function persistState(name, lastState) {
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  // EVERY method the app actually sends, not just the simple ones. A preflight
+  // names ONE method, and the browser refuses the whole request unless that
+  // exact name comes back here. `GET, POST` covered reads and creates while
+  // every delete, rename, tick and save was blocked before it left the browser
+  // - which the client cannot tell apart from being offline: `fetch` rejects
+  // with a bare `TypeError: Failed to fetch`, so the wearer was told "Failed to
+  // fetch" and a perfectly reproducible method bug read as a flaky connection.
+  // tools/cors-sim.mjs derives the set the clients send from their own sources
+  // and fails if one of them is missing from this list.
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   // `Authorization` MUST be listed: a browser (or a WebView on a different
   // origin than the relay) sends the session/device token as a Bearer header,
   // which makes the request non-simple and triggers a preflight. Omitting it

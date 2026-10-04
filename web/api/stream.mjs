@@ -22,7 +22,10 @@ function getChannel(name) {
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  // Matches the relay's list (see web/server/local-sse.mjs). A preflight names
+  // ONE method and is refused unless that exact name is advertised, so a short
+  // list here blocks the request in the browser before it is ever sent.
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 

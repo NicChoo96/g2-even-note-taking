@@ -219,8 +219,21 @@ interface WriteResult {
  * memory only). "Could not reach the hub" sent the wearer looking at their signal
  * for what is really a sign-in problem — and a whole session of writes can be
  * lost that way while every one of them looks like it worked.
+ *
+ * The mirror image cost just as much. A `status: 0` is what `hub-client.ts`
+ * reports when `fetch` itself REJECTS, and its `error` is then the browser's own
+ * wording ("Failed to fetch"). Passing that straight through meant a
+ * deterministic, perfectly reproducible failure - the relay advertising only
+ * `GET, POST` in `Access-Control-Allow-Methods`, so every rule-off, rename,
+ * clear and delete was refused at the CORS preflight before it was ever sent -
+ * was read for weeks as flaky signal, the one reading that makes you retry
+ * instead of investigate. A blocked preflight and a dead network are
+ * indistinguishable from in here by design, so the sentence names only what is
+ * actually known: the request got no answer.
  */
 function whyRefused(res: WriteResult): string {
+  // The opposite mistake, and the more expensive one - see the note above.
+  if (res.status === 0) return 'could not reach the hub, so nothing was saved';
   if (res.status === 401) return 'this device is not signed in to the hub, so nothing was saved';
   if (res.code === 'STALE_REV') return 'another device changed the list first, so nothing was saved';
   return res.error || 'the hub refused the write';

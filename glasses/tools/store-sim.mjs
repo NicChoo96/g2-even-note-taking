@@ -1148,6 +1148,27 @@ section('K. a write is only called saved once a READ agrees with it');
   check('…rather than a network one', /reach the hub/.test(String(refused.error)), false);
 }
 
+{
+  // The shape the wearer actually hit, and the reason it took two reports.
+  // A preflight refused by CORS and a dead network are indistinguishable from
+  // inside the client BY DESIGN: `fetch` rejects in both cases, `sendRequest`
+  // catches, and the write ends as `{ status: 0, error: <the browser's own
+  // wording> }`. Passing that wording straight through is what made a perfectly
+  // deterministic method bug — the relay advertising only `GET, POST`, so every
+  // delete and rename was refused before it left the page — read as flaky
+  // signal, the one reading that makes you retry instead of investigate.
+  // `whyRefused()` has to speak for itself here, and name only what is known:
+  // the request got no answer.
+  await tick();
+  mode = 'dead';
+  const stranded = await addTask('nope');
+  mode = 'hub';
+  await tick();
+  check('an unreachable hub is not reported as saved', stranded.ok, false);
+  check('…and is named as unreachable', /could not reach the hub/.test(String(stranded.error)), true);
+  check('…rather than replaying the network string verbatim', /fetch failed/.test(String(stranded.error)), false);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${fail === 0 ? 'ALL PASS' : `${fail} FAILURE(S)`} — ${pass} checks`);
 process.exit(fail === 0 ? 0 : 1);
