@@ -1600,6 +1600,91 @@ async function offerTools(run, ask) {
 }
 
 /**
+ * The one fault a toolset can have that is worth REFUSING a run over: two tools
+ * under one name.
+ *
+ * A provider answers a duplicate function name by rejecting the whole request, so
+ * the run dies before the first prompt lands and the wearer is left looking at a
+ * run that never arrived rather than one that failed. Catching it here is what
+ * turns that into a sentence naming the collision.
+ *
+ * Answers the message to show, or null when the toolset is usable. Every OTHER
+ * fault is the model's to route around — a thin description, a tool the router
+ * then drops — and must not be allowed to block a run.
+ */
+function toolSetFault(tools) {
+  const seen = new Set();
+  for (const t of tools) {
+    const name = String(t?.name ?? '').trim();
+    if (!name) return 'a tool arrived with no name';
+    if (seen.has(name)) return `two tools are both named "${name}"`;
+    seen.add(name);
+  }
+  return null;
+}
+
+/**
+ * The other fault worth REFUSING a run over: a model the configured backend
+ * cannot serve.
+ *
+ * `cfg.model` is the relay's own choice and is provider-correct by construction,
+ * but the other two layers are not. An agent saved while this relay ran
+ * OpenRouter still carries a `vendor/model` id, and the provider answers an id it
+ * does not serve by rejecting the whole request — the same shape of death as a
+ * duplicate tool name, at the same moment, before the first prompt lands. Probe
+ * against the live backend: one `jarvis_app` returns 200 and two return
+ * "Tool names must be unique."; a model name it does not serve returns "The
+ * supported API model names are …, but you passed …".
+ *
+ * The provider is the only one who can rule on this and the relay cannot reach it
+ * to ask, so the check is deliberately narrow: DeepSeek's own model names carry
+ * no vendor prefix, so an id containing a `/` cannot be one of theirs. Refusing on
+ * anything more would be guessing at a provider's catalogue.
+ *
+ * Answers the message to show, or null when the model is at least plausibly
+ * servable. An EMPTY model is a fault too — it would reach the provider as a
+ * missing field, which reads to the wearer as nothing at all.
+ */
+function modelProviderFault(model, provider) {
+  const id = String(model ?? '').trim();
+  if (!id) return 'no model is configured — set one in Settings';
+  if (provider === 'deepseek' && id.includes('/')) {
+    return (
+      `the deepseek backend cannot serve "${id}" — DeepSeek's models are named ` +
+      'without a vendor prefix, so this looks like a model saved for OpenRouter'
+    );
+  }
+  return null;
+}
+
+/**
+ * Record a failure ON the run instead of letting it escape.
+ *
+ * Every path that can fail once the run exists funnels through here: a throw
+ * inside the agent loop, a throw while the turn's offer is being built (both are
+ * inside executeRun's own guard), and — via the `.catch` on the launch in the run
+ * route — a throw BEFORE that guard, in the preprocessor or the wire assembly.
+ *
+ * That last one is why this is a named function rather than a catch block.
+ * `void executeRun(run)` turned an early throw into an unhandled rejection:
+ * nothing was recorded, the run stayed `running` until its TTL expired, and a
+ * client watching the queue saw a run that simply never landed. A guard that can
+ * only be reached from inside the function it protects is not a guard.
+ *
+ * Idempotent for a run that already finished, so the net at the launch site
+ * cannot overwrite a real answer with a late bookkeeping error.
+ */
+function failRun(run, err) {
+  if (run.status === 'done' || run.status === 'stopped') return;
+  const message = err instanceof Error ? err.message : String(err);
+  run.messages.push({ role: 'assistant', content: `⚠️ ${message}`, at: Date.now() });
+  run.status = 'error';
+  run.error = message;
+  run.statusText = '';
+  broadcastRun(run);
+}
+
+/**
  * Run the agent loop and stream every turn to both clients. Never throws: the
  * failure is recorded on the run so the glasses and the browser both show it.
  */
@@ -1629,39 +1714,56 @@ async function executeRun(run) {
     });
     broadcastRun(run);
   }
-  // Which of the agent's tools THIS turn is offered. Ranked against the request
-  // itself, and it FAILS OPEN in every unhappy case — see the router's header.
-  // The rule being protected: a turn with too many tools is degraded, a turn
-  // with NO tools is broken, because the model then tells the wearer it has no
-  // access to something it does have.
-  const route = await offerTools(run, resolved.text);
-  const keptNames = new Set(route.chosen.map((c) => c.name));
-  // The intent tool joins the offer AFTER the router, never inside it. Routing
-  // answers "which of this run's servers does this turn need", and the device's
-  // capabilities are not one of the choices — they are the alternative to them.
-  // Ranked, a run that had a document to file would lose the ability to file it
-  // on any turn where the ask happened to read as a search.
-  const intentState = runIntents.get(run.id);
-  const offered = run.tools.filter((t) => keptNames.has(t.name));
-  if (intentState) offered.push(intentState.tool);
-  const schemas = offered.map(toolSchemaFor);
-  if (run.tools.length > 1) console.log(`[g2-hub] agent run: ${describeRoute(route)}`);
-  // Recorded ONLY when the toolset was actually narrowed. A fail-open line would
-  // be noise on every ordinary run, while a narrowed one is the missing
-  // explanation for a model that went looking for a tool it could not see.
-  if (route.routed) {
-    push({
-      role: 'assistant',
-      content:
-        `[tools] offered ${schemas.length} of ${run.tools.length + (intentState ? 1 : 0)}: ` +
-        `${schemas.map((s) => s.function.name).join(', ')}` +
-        `${route.unresolved ? ' (order unresolved)' : ''}`,
-      at: Date.now(),
-    });
-  }
   const ac = new AbortController();
   runAbort.set(run.id, ac);
   try {
+    // ── The turn's offer, built INSIDE the guard ────────────────────────────
+    // It used to be built ABOVE the try, which made any throw here an unhandled
+    // rejection: `void executeRun(run)` discarded it, nothing was recorded, and
+    // the run sat `running` until its TTL ran out. Ranking reaches a model
+    // (`jevResponder`), so a bad toolset or an upstream blip can fail right here
+    // — and the wearer's only symptom was a run that never landed.
+    //
+    // Which of the agent's tools THIS turn is offered. Ranked against the request
+    // itself, and it FAILS OPEN in every unhappy case — see the router's header.
+    // The rule being protected: a turn with too many tools is degraded, a turn
+    // with NO tools is broken, because the model then tells the wearer it has no
+    // access to something it does have.
+    const route = await offerTools(run, resolved.text);
+    const keptNames = new Set(route.chosen.map((c) => c.name));
+    // The intent tool joins the offer AFTER the router, never inside it. Routing
+    // answers "which of this run's servers does this turn need", and the device's
+    // capabilities are not one of the choices — they are the alternative to them.
+    // Ranked, a run that had a document to file would lose the ability to file it
+    // on any turn where the ask happened to read as a search.
+    //
+    // `some` rather than an unconditional push, because the property that matters
+    // is not "the intent tool is offered" but "it is offered EXACTLY ONCE". Two
+    // functions under one name is refused by the provider before the first prompt
+    // lands, which is not a run that failed — it is a run that never arrived. The
+    // route keeps it off `run.tools` (see the side table's header) so the two
+    // cannot collide; this guard is what makes that collision impossible rather
+    // than merely absent.
+    const intentState = runIntents.get(run.id);
+    const offered = run.tools.filter((t) => keptNames.has(t.name));
+    if (intentState && !offered.some((t) => t.name === intentState.tool.name)) {
+      offered.push(intentState.tool);
+    }
+    const schemas = offered.map(toolSchemaFor);
+    if (run.tools.length > 1) console.log(`[g2-hub] agent run: ${describeRoute(route)}`);
+    // Recorded ONLY when the toolset was actually narrowed. A fail-open line would
+    // be noise on every ordinary run, while a narrowed one is the missing
+    // explanation for a model that went looking for a tool it could not see.
+    if (route.routed) {
+      push({
+        role: 'assistant',
+        content:
+          `[tools] offered ${schemas.length} of ${run.tools.length + (intentState ? 1 : 0)}: ` +
+          `${schemas.map((s) => s.function.name).join(', ')}` +
+          `${route.unresolved ? ' (order unresolved)' : ''}`,
+        at: Date.now(),
+      });
+    }
     for (let step = 0; step < MAX_STEPS; step++) {
       if (run.status === 'stopped') return;
       run.statusText = step === 0 ? 'Thinking…' : 'Reasoning…';
@@ -1748,12 +1850,7 @@ async function executeRun(run) {
     broadcastRun(run);
   } catch (err) {
     if (run.status === 'stopped') return; // user pressed Stop
-    const message = err instanceof Error ? err.message : String(err);
-    run.messages.push({ role: 'assistant', content: `⚠️ ${message}`, at: Date.now() });
-    run.status = 'error';
-    run.error = message;
-    run.statusText = '';
-    broadcastRun(run);
+    failRun(run, err);
   } finally {
     runAbort.delete(run.id);
     pruneRuns();
@@ -2547,12 +2644,25 @@ const server = createServer(async (req, res) => {
       json(res, 400, { ok: false, error: 'prompt is required' });
       return;
     }
+    // The device's own capabilities, described by the device. Null when it sent
+    // none, which is how an older client keeps its old toolset rather than
+    // getting a tool with an empty enum that can only refuse.
+    //
+    // Built BEFORE the wearer's tools, because whether this built-in exists is
+    // what decides whether an authored tool may keep that name (see below).
+    const intentTool = intentToolFor(body?.capabilities);
     // Cap the wearer's own tools FIRST, then append Jarvis's own faculties after
     // it, so a run that already sits at the cap cannot lose the memory tools.
     // Deduped by name with the built-in winning: a stored row called
     // `jarvis_memory` is a different tool wearing a name we own, and letting
     // both through would hand the model two schemas for one name — whichever
     // the router happened to keep would decide what that name meant.
+    //
+    // `jarvis_app` is the exception, because the built-in only exists when the
+    // device sent a catalogue: the name is given up ONLY when the built-in is
+    // actually there to take it. Dropping it unconditionally — which this did —
+    // discarded the wearer's own tool for every older client that sends no
+    // capabilities, leaving the slot empty and saying nothing about it.
     const authored = Array.isArray(body?.tools)
       ? body.tools
           .filter(
@@ -2560,17 +2670,64 @@ const server = createServer(async (req, res) => {
               t &&
               typeof t.name === 'string' &&
               !HUB_MCP_AGENT_NAMES.has(t.name) &&
-              t.name !== INTENT_TOOL_NAME,
+              !(intentTool && t.name === INTENT_TOOL_NAME),
           )
           .slice(0, 10)
       : [];
-    // The device's own capabilities, described by the device. Null when it sent
-    // none, which is how an older client keeps its old toolset rather than
-    // getting a tool with an empty enum that can only refuse.
-    const intentTool = intentToolFor(body?.capabilities);
-    const tools = intentTool
-      ? [...authored, ...HUB_MCP_AGENT_TOOLS, intentTool]
-      : [...authored, ...HUB_MCP_AGENT_TOOLS];
+    // A tool that was handed over, not silently lost: the caller offered one
+    // wearing our name and the built-in exists to take its place. Worth a line in
+    // the log, because the alternative is a wearer wondering where their tool
+    // went.
+    const gaveUpName =
+      Boolean(intentTool) &&
+      Array.isArray(body?.tools) &&
+      body.tools.some((t) => t?.name === INTENT_TOOL_NAME);
+    // The intent tool is deliberately NOT on `tools`. It lives in the side table
+    // the executor reads (see runIntents), and the header there says exactly why:
+    // on the list, the router would be free to rank it away, and a turn with a
+    // document to file would silently lose the ability to file it.
+    //
+    // ⚠ LISTING IT HERE WAS ALSO THE BUG. With the tool in this array AND in the
+    // side table, the executor offered it twice — once through the router's
+    // shortlist and once by appending the side table's copy — so the request
+    // carried two functions named `jarvis_app`. The provider refuses that, so the
+    // run died before the first prompt landed and the queue showed a run that
+    // never arrived. Two homes for one tool was the whole fault; the side table is
+    // now the only one.
+    const tools = [...authored, ...HUB_MCP_AGENT_TOOLS];
+    // A toolset that cannot reach the model is refused HERE, while the caller is
+    // still listening and before the run exists, so the answer can name the fault.
+    // The alternative is what the duplicate above produced: a run that was
+    // accepted, broadcast, and then quietly died with nothing on it to say why.
+    const fault = toolSetFault(intentTool ? [...tools, intentTool] : tools);
+    if (fault) {
+      json(res, 400, { ok: false, error: `cannot start this run — ${fault}` });
+      return;
+    }
+    // Which model this run will use, resolved once, out loud.
+    //
+    // The AGENT's own model wins: an agent is a SAVED configuration, so a run of
+    // that agent is expected to use the model it was saved with.
+    //
+    // The CALLER's model does NOT, and that was the second way these runs died.
+    // `body.model` is the device's session model — by default an OpenRouter id
+    // (`emptyLlmSettings`) until a visit to Settings syncs it from this relay — so
+    // an agent with no model of its own could be launched on a model the relay's
+    // backend does not serve, and the provider killed the request before the first
+    // prompt landed. The relay's OWN configured model is the right fallback: it is
+    // the model this relay was told to use, provider-correct by construction, and a
+    // model set in Settings is written to the RELAY — so the caller's copy is a
+    // mirror that can only go stale. The field is still read here, and reported
+    // below when it disagrees, because an older client goes on sending it.
+    const agentModel = String(agent.model ?? '').trim();
+    const callerModel = String(body?.model ?? '').trim();
+    const runModel = String(agentModel || cfg.model);
+    const modelSource = agentModel ? 'agent' : 'relay';
+    const modelFault = modelProviderFault(runModel, cfg.provider);
+    if (modelFault) {
+      json(res, 400, { ok: false, error: `cannot start this run — ${modelFault}` });
+      return;
+    }
     const run = {
       id: randomBytes(8).toString('hex'),
       agentId: String(agent.id ?? ''),
@@ -2582,7 +2739,7 @@ const server = createServer(async (req, res) => {
       // these fields existed — which is the property the delta plan rests on.
       savedPrompt: String(body?.savedPrompt ?? ''),
       instructions: String(body?.instructions ?? ''),
-      model: String(body?.model || agent.model || cfg.model),
+      model: runModel,
       prompt,
       title: prompt.slice(0, 48),
       tools,
@@ -2606,9 +2763,28 @@ const server = createServer(async (req, res) => {
     // falling back to anything.
     if (body?.location) runLocations.set(run.id, body.location);
     pruneRuns();
+    // The answer to "which model is my agent actually running on" exists nowhere
+    // else: the run object is broadcast verbatim to both clients, so a bookkeeping
+    // field on it would ride into every stored session, and the wearer's own log
+    // is the right place for a configuration fact. Model ids only — no key, no
+    // token, and nothing the caller sent beyond the model it asked for.
+    // A caller mirror that AGREES is not news, so it is mentioned only when it
+    // disagrees — the one case where a reader needs to know it was read and
+    // deliberately not used.
+    const callerNote =
+      callerModel && callerModel !== run.model ? `, ignoring the caller's ${callerModel}` : '';
+    const nameNote = gaveUpName ? `, the caller's ${INTENT_TOOL_NAME} given up for the built-in` : '';
+    console.log(
+      `[g2-hub] agent run ${run.id}: model=${run.model} (from ${modelSource}), ` +
+        `tools=${tools.length}${intentTool ? ' + intent' : ''}${nameNote}${callerNote}`,
+    );
     json(res, 200, { ok: true, runId: run.id });
     broadcastRun(run);
-    void executeRun(run);
+    // A net UNDER the loop's own guard. executeRun covers everything from the
+    // offer onwards, so this is what catches a throw BEFORE it — the preprocessor
+    // or the wire assembly — which would otherwise be an unhandled rejection on a
+    // run the client is already watching.
+    void executeRun(run).catch((err) => failRun(run, err));
     return;
   }
 

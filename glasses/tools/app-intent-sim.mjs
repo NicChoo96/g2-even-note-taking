@@ -404,6 +404,15 @@ assert(
   pushAt > offeredAt,
   'ranked, a turn with a document to file would lose the ability to file it',
 );
+// ...and appends it only when the router did not already carry it. Presence was
+// never the property that mattered: the run that prompted this was offering the
+// tool TWICE, which the provider refuses outright.
+const guardAt = execFn.indexOf('!offered.some((t) => t.name === intentState.tool.name)');
+assert(
+  'and appends it only when the shortlist does not already carry it',
+  guardAt > offeredAt && guardAt < pushAt,
+  'guarded after the push is not a guard; the second slot is what the provider refused',
+);
 has('  ...read from the run own side table', execFn, 'const intentState = runIntents.get(run.id)');
 has('  ...and the dispatcher is given the same context', execFn, 'intents: runIntents.get(run.id)');
 
@@ -420,10 +429,132 @@ assert(
   'an older client keeps its old toolset instead of an empty enum',
 );
 has(
-  '  ...and refuses a caller smuggling one in as an authored tool',
+  '  ...and gives up the name only when the built-in is there to take it',
+  runRoute,
+  '!(intentTool && t.name === INTENT_TOOL_NAME)',
+  'HUB_MCP_AGENT_NAMES already covers its siblings, but that name has no built-in unless the device sent a catalogue',
+);
+unset(
+  '  ...and never drops it unconditionally',
   runRoute,
   't.name !== INTENT_TOOL_NAME',
-  'HUB_MCP_AGENT_NAMES already covers its siblings',
+  'unconditional was the hole: for a client that sends no capabilities there is no built-in, so the slot was left empty and nothing was said about it',
+);
+// POSITIVE CONTROL for that negative pin — the same predicate against a MUTANT
+// with the unconditional filter put back.
+const rewoundFilter = runRoute.replace(
+  '!(intentTool && t.name === INTENT_TOOL_NAME)',
+  't.name !== INTENT_TOOL_NAME',
+);
+assert(
+  '...and that pin can actually fail (positive control)',
+  rewoundFilter.includes('t.name !== INTENT_TOOL_NAME') && rewoundFilter !== runRoute,
+  'the mutant did not apply, so the pin above proves nothing',
+);
+has(
+  '  ...and says so when a tool was handed over rather than silently lost',
+  runRoute,
+  'given up for the built-in',
+  'otherwise the wearer is left wondering where their own tool went',
+);
+
+// ── The duplicate slot, and the guard that made it impossible ───────────────
+//
+// WHAT WENT WRONG, because the shape of the fault is why these checks are here.
+// The run route put the intent tool on `run.tools` as well as in the side table,
+// so the executor offered it TWICE — once through the router's shortlist and once
+// by appending the side table's copy. The request then carried two functions named
+// `jarvis_app`, the provider refused it, and the run died before the first prompt
+// landed: the queue showed a run that never arrived rather than one that failed.
+//
+// Every check ABOVE passed while that was true, because the tool WAS offered. So
+// what is pinned is the COUNT, not the presence — and one home for the tool.
+unset(
+  'the run route keeps the intent tool OFF run.tools',
+  runRoute,
+  'HUB_MCP_AGENT_TOOLS, intentTool]',
+  'two homes for one tool IS the duplicate slot, and on the list it is also rankable away',
+);
+has(
+  '  ...so the run toolset is the authored tools plus the hub own faculties',
+  runRoute,
+  'const tools = [...authored, ...HUB_MCP_AGENT_TOOLS];',
+);
+// POSITIVE CONTROL for that negative pin. A `unset` whose needle no version of the
+// code can produce is a check that cannot fail, which is worse than no check. The
+// same predicate is run against a MUTANT with the duplicate home put back.
+const rewound = runRoute.replace(
+  'const tools = [...authored, ...HUB_MCP_AGENT_TOOLS];',
+  'const tools = intentTool\n      ? [...authored, ...HUB_MCP_AGENT_TOOLS, intentTool]\n      : [...authored, ...HUB_MCP_AGENT_TOOLS];',
+);
+assert(
+  '...and that pin can actually fail (positive control)',
+  rewound.includes('HUB_MCP_AGENT_TOOLS, intentTool]') && rewound !== runRoute,
+  'the mutant did not apply, so the pin above proves nothing',
+);
+// The executor's own guard is what makes the collision impossible rather than
+// merely absent: a second home cannot produce a second slot.
+has(
+  'the offer names the intent tool at most once',
+  execFn,
+  'if (intentState && !offered.some((t) => t.name === intentState.tool.name))',
+);
+// The offer is built INSIDE the failure boundary. Above it, a throw while ranking
+// was an unhandled rejection off `void executeRun(run)`: nothing recorded, the run
+// left `running` until its TTL, and the wearer shown a run that never landed.
+assert(
+  'the offer is built inside the failure boundary',
+  execFn.indexOf('runAbort.set(run.id, ac)') <
+    execFn.indexOf('const route = await offerTools(run, resolved.text)'),
+  'a throw in the offer build must land on the run, not vanish',
+);
+has('  ...and every failure records itself through one path', execFn, 'failRun(run, err)');
+has(
+  'a toolset that would collide is refused before the run exists',
+  runRoute,
+  'const fault = toolSetFault(intentTool ? [...tools, intentTool] : tools);',
+);
+has('  ...in words the caller can act on', runRoute, 'cannot start this run');
+has(
+  '  ...and the launch keeps a net under the loop own guard',
+  runRoute,
+  'void executeRun(run).catch((err) => failRun(run, err));',
+);
+// An agent is a SAVED configuration, so its own model wins. The CALLER's does not
+// — `body.model` is the device's session model, an OpenRouter id by default, and
+// with the relay on DeepSeek that is a model the backend cannot serve: the
+// provider rejects the request before the first prompt lands. The relay's own
+// configured model is the fallback instead, because Settings writes THE RELAY, so
+// the caller's copy is a mirror that can only go stale.
+has('the run uses the model the AGENT was saved with', runRoute, 'const runModel = String(agentModel || cfg.model);');
+has('  ...and never the caller own mirror of it', runRoute, 'const modelSource = agentModel ? \'agent\' : \'relay\';');
+unset('  ...however loudly the caller asks', runRoute, 'agentModel || callerModel ||');
+has(
+  '  ...and a model the backend cannot serve is refused before the run exists',
+  runRoute,
+  'const modelFault = modelProviderFault(runModel, cfg.provider);',
+);
+has(
+  '  ...by a rule that only rules on what the provider actually told us',
+  fnSource(relaySrc, 'modelProviderFault'),
+  "if (provider === 'deepseek' && id.includes('/'))",
+);
+// POSITIVE CONTROL, same shape as the one above: the needle must be able to
+// appear, or the `unset` proves nothing at all.
+const mirrored = runRoute.replace(
+  'const runModel = String(agentModel || cfg.model);',
+  'const runModel = String(agentModel || callerModel || cfg.model);',
+);
+assert(
+  '...and that pin can actually fail (positive control)',
+  mirrored.includes('agentModel || callerModel ||') && mirrored !== runRoute,
+  'the mutant did not apply, so the pin above proves nothing',
+);
+has('  ...and the relay log says which layer supplied it', runRoute, 'model=${run.model} (from ${modelSource})');
+has(
+  '  ...naming the caller model it declined, when the two disagree',
+  runRoute,
+  "`, ignoring the caller's ${callerModel}`",
 );
 
 const toolRoute = routeSource(relaySrc, "url.pathname === '/api/tool'");
