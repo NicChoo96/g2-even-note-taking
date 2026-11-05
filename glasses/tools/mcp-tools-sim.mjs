@@ -44,6 +44,12 @@ import {
   routeTools,
 } from '../../web/server/mcp-router.mjs';
 import { filesToolSchema } from '../../web/server/jarvis-files.mjs';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RELAY_SRC = readFileSync(join(HERE, '../../web/server/local-sse.mjs'), 'utf8');
 
 let fail = 0;
 const assert = (label, cond, detail = '') => {
@@ -555,6 +561,101 @@ console.log('\n§7  labels are unique and legal');
     respond: async () => probs(Object.fromEntries(six.map((t) => [t.name, 0.1 + six.indexOf(t) * 0.01]))),
   });
   eq('the default shortlist size is used', r.chosen.length, DEFAULT_TOP);
+}
+
+// ── §7b  PINNED tools are never the ranker's to cut ─────────────────────────
+console.log('\n§7b  an attached tool is never ranked away');
+
+{
+  // THE SHAPE THAT SHIPPED, reproduced: an agent carrying three tools the wearer
+  // tapped, plus the two hub faculties every run appends. `top` was 4, so FIVE
+  // candidates were ranked and ONE ATTACHED TOOL WAS ALWAYS DROPPED — chosen by
+  // the ranker, i.e. arbitrarily. The model then called the tool the wearer had
+  // just enabled and was told it was "not available for this request", which is
+  // indistinguishable from the tool not being wired up at all.
+  const attached = ['jev_decide', 'jarvis_files', 'web_search'];
+  const builtIns = ['jarvis_memory', 'jarvis_sessions'];
+  const catalogue = [...attached, ...builtIns].map((n) => ({ name: n, description: `Does ${n}.` }));
+  // A deliberately hostile ranker: it puts the file tool the request is about LAST.
+  const hostile = async () =>
+    probs({ web_search: 0.34, jarvis_memory: 0.3, jarvis_sessions: 0.2, jev_decide: 0.1, jarvis_files: 0.02 });
+
+  const unpinned = await routeTools({ ask: 'publish an HTML report', catalogue, top: 4, respond: hostile });
+  assert(
+    'control: without pinning, an attached tool IS dropped (this is the bug)',
+    unpinned.chosen.filter((c) => attached.includes(c.name)).length === 2,
+    unpinned.chosen.map((c) => c.name).join(', '),
+  );
+
+  const pinned = await routeTools({
+    ask: 'publish an HTML report',
+    catalogue,
+    top: 4,
+    respond: hostile,
+    pinned: attached,
+  });
+  eq(
+    'every tool the wearer attached survives the shortlist',
+    attached.filter((n) => pinned.chosen.some((c) => c.name === n)),
+    attached,
+  );
+  eq('…and the ranker still fills the remaining slots', pinned.chosen.length, 4);
+  assert(
+    '…from the tools that were NOT pinned',
+    pinned.chosen.filter((c) => !attached.includes(c.name)).every((c) => builtIns.includes(c.name)),
+    pinned.chosen.map((c) => c.name).join(', '),
+  );
+  eq('the pinned set is reported back', pinned.pinned.map((p) => p.name).sort(), [...attached].sort());
+  eq('the turn really was narrowed', pinned.routed, true);
+
+  // A pinned set that already fills the turn cannot be widened, and nothing
+  // pinned may be traded for an extra built-in.
+  const full = await routeTools({
+    ask: 'publish an HTML report',
+    catalogue,
+    top: 3,
+    respond: hostile,
+    pinned: attached,
+  });
+  eq('a pinned set that fills the turn is offered whole', full.chosen.map((c) => c.name), attached);
+  eq('…and no ranked candidate is added on top', full.chosen.length, 3);
+}
+
+{
+  // The relay must actually PASS the pin set, and its threshold must be above the
+  // click a wearer can produce. Both are source-level because importing
+  // local-sse.mjs starts a server — the same reason its other seams are asserted
+  // as text.
+  const offer = RELAY_SRC.slice(
+    RELAY_SRC.indexOf('async function offerTools'),
+    RELAY_SRC.indexOf('\n}\n', RELAY_SRC.indexOf('async function offerTools')),
+  );
+  assert('the relay pins the wearer\'s own tools', /pinned/.test(offer) && /HUB_MCP_AGENT_NAMES/.test(offer), offer.slice(0, 80));
+  has('…and hands the pin set to the router', offer, 'pinned }');
+  const top = Number(/const ROUTE_TOP = (\d+);/.exec(RELAY_SRC)?.[1] ?? 0);
+  assert(
+    'the routing threshold is above the most tools an agent can carry',
+    top >= 12,
+    `ROUTE_TOP = ${top}`,
+  );
+  assert(
+    'the threshold is stated as a ceiling, not a shortlist',
+    /ROUTE_TOP = 12/.test(RELAY_SRC),
+  );
+
+  // The per-agent tool cap exists in TWO files because the relay cannot import
+  // TypeScript. They are the same number or the panel lets a wearer build an agent
+  // the relay will refuse to run, so the literals are asserted equal rather than
+  // trusted to a comment.
+  const typesSrc = readFileSync(join(HERE, '../src/types.ts'), 'utf8');
+  const relayCap = Number(/const MAX_AUTHORED_TOOLS = (\d+);/.exec(RELAY_SRC)?.[1] ?? -1);
+  const clientCap = Number(/export const MAX_AGENT_TOOLS = (\d+);/.exec(typesSrc)?.[1] ?? -2);
+  eq('the panel and the relay agree on the per-agent tool cap', [clientCap, relayCap], [10, 10]);
+  assert(
+    'the relay REFUSES an over-full agent instead of truncating it',
+    /MAX_AUTHORED_TOOLS\) \{\s*\n\s*json\(res, 400/.test(RELAY_SRC),
+    'a slice here would drop a tool with no error anywhere',
+  );
 }
 
 // ── §8  the substrate and the router compose ────────────────────────────────

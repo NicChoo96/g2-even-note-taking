@@ -1129,11 +1129,22 @@ function llmHeaders(cfg) {
 // `{ type: 'run', run }` frames and kept in a small ring for replay. The final
 // transcript is persisted by the CLIENTS as a normal session (capped at 5).
 const MAX_STEPS = 5;
-// How many of an agent's tools one turn is offered once the catalogue is big
-// enough to be worth ranking (see offerTools). Deliberately small: MAX_STEPS is
-// the loop's other budget, and a shortlist wider than the loop can use would
-// spend the model's attention without buying a step.
-const ROUTE_TOP = 4;
+// How many tools one turn is offered before the router is allowed to choose a
+// shortlist. It was 4, and that number was the bug: EVERY run carries two
+// built-in hub faculties (`jarvis_memory`, `jarvis_sessions`) beside the
+// wearer's own tools, so an agent with three attached tools had five candidates
+// — and `top` of 4 meant one ATTACHED TOOL WAS ALWAYS RANKED AWAY. JEV chose
+// which, so it was arbitrary, and the model then called the tool the wearer had
+// just enabled and was told it was "not available for this request".
+//
+// The router exists for a DISCOVERED catalogue whose size we do not control
+// (see mcp-router.mjs). An agent's own toolset is 10 at the absolute most, and
+// 12 is the provider-safe count the app itself already sends on the Jarvis
+// path — below it there is nothing to gain from ranking and a capability to
+// lose. Above it the router still runs, and the wearer's own tools are PINNED:
+// `offerTools` marks them, so the ranker can only ever choose among the
+// built-ins it was given on top.
+const ROUTE_TOP = 12;
 const MAX_RUNS = 8;
 const RUN_TTL_MS = 30 * 60e3; // drop finished runs after 30 min
 const RUN_MAX_BYTES = 256 * 1024;
@@ -1560,6 +1571,16 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
       return `tool error: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
+  // Everything above is a kind this process knows how to RUN. What is left must
+  // be a REST tool, and the kind is checked rather than assumed: this branch used
+  // to be the catch-all, so a tool whose kind nothing here handles was reported
+  // as "tool url must be https://" — a lie about a missing URL that sent the
+  // model hunting for a typo in a field that was never the problem. An agent can
+  // be authored by a NEWER client than the relay it runs on, so the honest
+  // answer names the tool and the kind.
+  if (String(tool.kind ?? '').trim() && tool.kind !== 'http') {
+    return `tool error: ${tool.name} is attached, but this relay cannot run a "${tool.kind}" tool`;
+  }
   const target = String(tool.url || '').trim();
   if (!/^https:\/\//i.test(target)) return 'tool error: tool url must be https://';
   // The verb and the headers come from ONE place so this path and the /api/tool
@@ -1658,7 +1679,14 @@ async function offerTools(run, ask) {
     serverName: String(t?.name ?? ''),
     description: String(t?.description ?? ''),
   }));
-  return routeTools({ ask, catalogue, top: ROUTE_TOP, respond: jevResponder() });
+  // The wearer's OWN tools are pinned, and the built-in faculties are not. An
+  // attachment is a decision the wearer already made by tapping a chip, so the
+  // ranker does not get a vote on it; `jarvis_memory` / `jarvis_sessions` were
+  // added by this process and are the only candidates that can be traded away.
+  const pinned = run.tools
+    .filter((t) => t && !HUB_MCP_AGENT_NAMES.has(String(t.name ?? '')))
+    .map((t) => String(t.name));
+  return routeTools({ ask, catalogue, top: ROUTE_TOP, respond: jevResponder(), pinned });
 }
 
 /**
@@ -1851,6 +1879,16 @@ function parseHubTools(payload) {
       ...(typeof row.url === 'string' ? { url: row.url } : {}),
       ...(typeof row.method === 'string' ? { method: row.method } : {}),
       ...(typeof row.searchDepth === 'string' ? { searchDepth: row.searchDepth } : {}),
+      // ⚠ THESE TWO ARE PART OF THE TOOL, not decoration. A REST tool's authored
+      // request shape (`bodyTemplate`) is what the model is told the parameters
+      // are, and `headers` is how an endpoint that wants its own key or version
+      // pin is reachable at all. Dropping them here did not make the tool fail —
+      // it made it run with an empty body and no headers, i.e. a request the
+      // endpoint would answer with something plausible and wrong. A child run's
+      // toolset is built from THIS function, so anything missing here is a tool
+      // that is attached, callable and silently not the one the wearer authored.
+      ...(typeof row.bodyTemplate === 'string' ? { bodyTemplate: row.bodyTemplate } : {}),
+      ...(typeof row.headers === 'string' ? { headers: row.headers } : {}),
       hasToken: Boolean(row.hasToken),
     });
   }
@@ -3041,17 +3079,32 @@ const server = createServer(async (req, res) => {
     // actually there to take it. Dropping it unconditionally — which this did —
     // discarded the wearer's own tool for every older client that sends no
     // capabilities, leaving the slot empty and saying nothing about it.
-    const authored = Array.isArray(body?.tools)
-      ? body.tools
-          .filter(
-            (t) =>
-              t &&
-              typeof t.name === 'string' &&
-              !HUB_MCP_AGENT_NAMES.has(t.name) &&
-              !(intentTool && t.name === INTENT_TOOL_NAME),
-          )
-          .slice(0, 10)
+    const offeredTools = Array.isArray(body?.tools)
+      ? body.tools.filter(
+          (t) =>
+            t &&
+            typeof t.name === 'string' &&
+            !HUB_MCP_AGENT_NAMES.has(t.name) &&
+            !(intentTool && t.name === INTENT_TOOL_NAME),
+        )
       : [];
+    // ⚠ A SILENT `.slice(0, 10)` HERE IS THE SAME BUG AS THE ROUTER'S SHORTLIST.
+    // An agent carrying eleven tools would run with ten and nothing anywhere would
+    // say which one went missing — the wearer sees an attachment, the model sees a
+    // tool that is not there. This count is only reachable by authoring more tools
+    // than the UI offers, so it refuses rather than truncates: the caller is still
+    // listening at this point and can be told exactly what to remove.
+    const MAX_AUTHORED_TOOLS = 10;
+    if (offeredTools.length > MAX_AUTHORED_TOOLS) {
+      json(res, 400, {
+        ok: false,
+        error:
+          `this agent carries ${offeredTools.length} tools and a run can execute ` +
+          `${MAX_AUTHORED_TOOLS} — remove ${offeredTools.length - MAX_AUTHORED_TOOLS} before running it`,
+      });
+      return;
+    }
+    const authored = offeredTools;
     // A tool that was handed over, not silently lost: the caller offered one
     // wearing our name and the built-in exists to take its place. Worth a line in
     // the log, because the alternative is a wearer wondering where their tool

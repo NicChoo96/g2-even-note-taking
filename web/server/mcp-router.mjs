@@ -38,6 +38,21 @@
 //     with too many tools is degraded; a turn with NO tools is broken, and the
 //     model will tell the wearer it has no access to something it does have.
 //
+// PINNED TOOLS ARE NEVER RANKED AWAY
+//   `pinned` names the tools that belong to the caller rather than to the
+//   catalogue being discovered — for an agent run, the tools the wearer TAPPED
+//   ON. Those are not candidates for a shortlist: the wearer already made the
+//   choice, and a ranker that disagrees does not get to overrule it. They are
+//   taken out of the budget before anything is ranked, exactly as the app's own
+//   `selectTools` reserves its mandatory actions.
+//
+//   This is not a refinement, it fixes a 100%-reproducible bug: with two
+//   built-ins appended to every run, an agent carrying three attached tools had
+//   five candidates and `top` was 4, so ONE ATTACHED TOOL WAS ALWAYS DROPPED —
+//   chosen by JEV, which means arbitrarily. The model then called the tool the
+//   wearer had just enabled and was told it was "not available for this
+//   request", which is indistinguishable from the tool not being wired up.
+//
 // ASCII only, no import side effects, and the network call is INJECTED (`respond`)
 // so the whole ranking path is assertable against a stub.
 
@@ -134,9 +149,14 @@ export function buildRouteSpec(entries, ask) {
  * answers object. Everything else here is pure, so the failure branches below
  * are all reachable from a harness without a server.
  *
+ * `pinned` names tools that are KEPT unconditionally (see the header). They are
+ * removed from the ranked candidates rather than ranked first, so the ranker can
+ * never vote one out, and the shortlist is `pinned + the best of the rest`.
+ *
  * @returns {Promise<{
  *   chosen: {name: string, serverName: string}[],
  *   all: {name: string, serverName: string}[],
+ *   pinned: {name: string, serverName: string}[],
  *   routed: boolean,
  *   ranking: object|null,
  *   unresolved: boolean,
@@ -148,6 +168,7 @@ export async function routeTools({
   catalogue,
   top = DEFAULT_TOP,
   respond,
+  pinned = [],
   minCandidates = 2,
 } = {}) {
   const all = (catalogue ?? []).map((t) => ({
@@ -155,27 +176,51 @@ export async function routeTools({
     serverName: String(t.serverName ?? t.name ?? ''),
     description: String(t.description ?? ''),
   }));
-  const everything = { chosen: all, all, routed: false, ranking: null, unresolved: false, reason: null };
+  const pinSet = new Set((Array.isArray(pinned) ? pinned : []).map((n) => String(n ?? '')));
+  const keep = all.filter((t) => pinSet.has(t.name));
+  const rankable = all.filter((t) => !pinSet.has(t.name));
+  const everything = {
+    chosen: all,
+    all,
+    pinned: keep,
+    routed: false,
+    ranking: null,
+    unresolved: false,
+    reason: null,
+  };
 
+  // The pinned tools alone fill the turn: there is no slot left to rank for, and
+  // the caller's own choice still wins over anything the catalogue would add.
+  if (all.length > 0 && keep.length >= top) {
+    return {
+      ...everything,
+      chosen: keep,
+      routed: keep.length < all.length,
+      reason: 'the pinned tools already fill the turn',
+    };
+  }
   // Nothing to rank, or nothing to rank AGAINST: either way, offer it all.
   if (all.length === 0) return { ...everything, reason: 'no tools to route' };
   if (!String(ask ?? '').trim()) return { ...everything, reason: 'no request to route against' };
   if (all.length <= minCandidates) return { ...everything, reason: 'too few tools to rank' };
   // Already small enough to send whole: ranking could only reorder it.
   if (all.length <= top) return { ...everything, reason: 'the catalogue already fits' };
+  // Only the pinned tools plus at most one other — ranking one candidate buys
+  // nothing, and dropping it to save a slot would be an arbitrary cut.
+  if (rankable.length <= 1) return { ...everything, reason: 'too few tools to rank' };
   if (!respond) return { ...everything, reason: 'no ranker configured' };
-  if (all.length > MAX_CANDIDATES) {
+  if (rankable.length > MAX_CANDIDATES) {
     // Deliberately NOT truncated. See the header: a silently shortened catalogue
     // is a tool that disappears with no error, which is worse than a fat list.
     return {
       ...everything,
-      reason: `the catalogue has ${all.length} tools, above the ${MAX_CANDIDATES} a single ranking can hold`,
+      reason: `the catalogue has ${rankable.length} rankable tools, above the ${MAX_CANDIDATES} a single ranking can hold`,
     };
   }
 
-  const entries = routeLabels(all.map((t) => t.name)).map((l) => ({
+  const entries = routeLabels(rankable.map((t) => t.name)).map((l) => ({
     ...l,
-    description: all.find((t) => t.name === l.name)?.description ?? '',
+    description: rankable.find((t) => t.name === l.name)?.description ?? '',
   }));
 
   const spec = buildRouteSpec(entries, ask);
@@ -215,18 +260,22 @@ export async function routeTools({
   }
 
   const byLabel = new Map(entries.map((e) => [e.label, e.name]));
-  const chosen = ranking.ranked
-    .slice(0, Math.max(1, top))
+  const budget = Math.max(0, top - keep.length);
+  const ranked = ranking.ranked
+    .slice(0, budget)
     .map((r) => byLabel.get(r.label))
     .filter(Boolean)
-    .map((name) => all.find((t) => t.name === name));
+    .map((name) => rankable.find((t) => t.name === name));
 
-  if (!chosen.length) return { ...everything, reason: 'the ranking named no tool we hold' };
+  if (!ranked.length) return { ...everything, reason: 'the ranking named no tool we hold' };
+  // Pinned first, then the ranker's order for whatever budget was left.
+  const chosen = [...keep, ...ranked];
 
   return {
     chosen,
     all,
-    routed: true,
+    pinned: keep,
+    routed: chosen.length < all.length,
     ranking,
     // Reported, never repaired. An unresolved order means the leader is inside
     // JEV's margin of the runner-up: we still hand back the shortlist (a caller
@@ -245,6 +294,11 @@ export function describeRoute(result) {
   }
   const body = describeRanking(result.ranking);
   const kept = result.chosen.map((c) => c.name).join(', ');
+  // Naming the pinned set matters on a narrowed turn: it is the difference
+  // between "the ranker kept these" and "these were never the ranker's to cut".
+  const pinned = (result.pinned ?? []).length
+    ? ` (pinned: ${result.pinned.map((p) => p.name).join(', ')})`
+    : '';
   const flag = result.unresolved ? ` (unresolved: ${result.reason})` : '';
-  return `route: kept ${kept} of ${result.all.length}${flag} | ${body}`;
+  return `route: kept ${kept} of ${result.all.length}${pinned}${flag}${body ? ` | ${body}` : ''}`;
 }

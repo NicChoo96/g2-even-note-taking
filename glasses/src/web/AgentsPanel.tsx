@@ -34,6 +34,7 @@ import {
   jevTool,
   LOCATION_TOOL_ID,
   locationTool,
+  MAX_AGENT_TOOLS,
   NOTES_TOOL_ID,
   notesTool,
   orderedAgents,
@@ -53,6 +54,19 @@ import { fetchAgentStatus, type AgentStatus } from './agents-client';
 
 function useAgents(): AgentsState {
   return useSyncExternalStore(subscribeAgents, getAgents);
+}
+
+/**
+ * How many of an agent's attachments the catalogue actually holds.
+ *
+ * Counted against `tools`, not `toolIds`: `run()` builds the run's toolset with
+ * `state.tools.filter(agent.toolIds.includes(id))`, so an id naming a tool the
+ * catalogue no longer holds is one the relay never receives — and a filter
+ * cannot report what it did not find. A count that included it would be a number
+ * the run cannot honour.
+ */
+function liveToolCount(agent: AgentDef, tools: ToolDef[]): number {
+  return agent.toolIds.filter((id) => tools.some((t) => t.id === id)).length;
 }
 
 /** Live relay runs (transient — the finished transcript becomes a session). */
@@ -96,12 +110,15 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
    */
   const patch = (p: Partial<AgentDef>) => saveAgent(agent.id, p);
 
-  const toggleTool = (id: string) =>
+  const toggleTool = (id: string) => {
+    const on = agent.toolIds.includes(id);
+    // Attaching past the cap is refused HERE rather than at run time, where it
+    // would be a run that cannot start. Detaching is always allowed.
+    if (!on && liveToolCount(agent, state.tools) >= MAX_AGENT_TOOLS) return;
     patch({
-      toolIds: agent.toolIds.includes(id)
-        ? agent.toolIds.filter((t) => t !== id)
-        : [...agent.toolIds, id],
+      toolIds: on ? agent.toolIds.filter((t) => t !== id) : [...agent.toolIds, id],
     });
+  };
 
   /**
    * Opt this agent in to one of the seeded tool kinds, creating it if the
@@ -117,6 +134,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
    * here (or a spoken request, which resolves to the same kinds server-side).
    */
   const attachSeed = async (id: string, make: () => ToolDef) => {
+    if (liveToolCount(agent, state.tools) >= MAX_AGENT_TOOLS) return;
     const toolId = getAgents().tools.some((t) => t.id === id) ? id : await createTool(toolBody(make()));
     if (!toolId) return;
     const live = getAgents().agents.find((a) => a.id === agent.id);
@@ -150,6 +168,18 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   ];
   const missingSeeds = seedChips.filter((s) => !state.tools.some((t) => t.kind === s.kind));
   /**
+   * Attached ids the catalogue no longer holds.
+   *
+   * `run()` builds the run's toolset with `state.tools.filter(agent.toolIds
+   * .includes(id))`, so a dangling id is a tool the wearer believes is attached
+   * and the relay never receives — silently, because a filter cannot report what
+   * it did not find. That is the same class of failure as an advertises-but-absent
+   * tool: the run looks wired up and behaves as if it is not. The chip row is
+   * built from `state.tools`, so a dangling id draws NO chip at all and leaves
+   * nothing on screen to explain the gap, which is why it is named here.
+   */
+  const missingToolIds = agent.toolIds.filter((id) => !state.tools.some((t) => t.id === id));
+  /**
    * The REST tools THIS agent holds.
    *
    * A REST tool's URL and request shape describe the job the agent was built
@@ -164,6 +194,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
 
   /** Create a new REST tool and attach it to this agent in one step. */
   const addRestToolToAgent = async () => {
+    if (liveToolCount(agent, state.tools) >= MAX_AGENT_TOOLS) return;
     const id = await createTool({
       name: `tool_${getAgents().tools.length + 1}`,
       kind: 'http',
@@ -248,6 +279,29 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
           + REST tool
         </button>
       </div>
+
+      {liveToolCount(agent, state.tools) >= MAX_AGENT_TOOLS && (
+        <p className="hint-line">
+          This agent carries the maximum {MAX_AGENT_TOOLS} tools a run can execute — detach one
+          before attaching another.
+        </p>
+      )}
+
+      {missingToolIds.length > 0 && (
+        <p className="warn-line">
+          ⚠️ {missingToolIds.length} attached tool{missingToolIds.length === 1 ? '' : 's'} no longer
+          exist{missingToolIds.length === 1 ? 's' : ''} — the run cannot call{' '}
+          {missingToolIds.length === 1 ? 'it' : 'them'}.{' '}
+          <button
+            className="doc-chip"
+            onClick={() =>
+              patch({ toolIds: agent.toolIds.filter((id) => state.tools.some((t) => t.id === id)) })
+            }
+          >
+            Remove missing
+          </button>
+        </p>
+      )}
 
       {attachedRestTools.map((t) => (
         <RestToolConfig key={t.id} tool={t} />
@@ -431,7 +485,8 @@ export function AgentsPanel() {
                 <button className="agent-pick" onClick={() => setSelected(a.id)}>
                   <span className="agent-name">{a.name || '(unnamed)'}</span>
                   <span className="agent-meta">
-                    {a.toolIds.length} tool{a.toolIds.length === 1 ? '' : 's'}
+                    {liveToolCount(a, state.tools)} tool
+                    {liveToolCount(a, state.tools) === 1 ? '' : 's'}
                   </span>
                 </button>
                 <button className="icon-btn danger" onClick={() => removeAgent(a.id)} aria-label="Remove agent">

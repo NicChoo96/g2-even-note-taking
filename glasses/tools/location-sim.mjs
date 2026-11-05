@@ -477,6 +477,18 @@ const dispatchFn = fnSource(relaySrc, 'runToolOnce');
 eq('the dispatcher gained exactly one location branch', (dispatchFn.match(/isLocationTool\(/g) ?? []).length, 1);
 has('  ...which passes the snapshot through', dispatchFn, 'runLocationTool(tool, args, ctx.location)');
 has('  ...from a per-run context, so two runs cannot see each other', dispatchFn, 'ctx = {}');
+// The REST branch is the LAST one, and it used to be the catch-all: a tool whose
+// kind nothing here handles fell into it and was reported as "tool url must be
+// https://" — a lie about a missing URL that sent the model hunting for a typo.
+// An agent authored by a newer client than the relay it runs on must be told the
+// truth instead, so the guard is asserted ahead of the URL check.
+const dispatchCode = dispatchFn.replace(/^[ \t]*\/\/.*$/gm, '');
+assert(
+  'an unknown tool kind is refused BY NAME, not treated as a REST tool',
+  /cannot run a/.test(dispatchCode) &&
+    dispatchCode.indexOf('cannot run a') < dispatchCode.indexOf('tool url must be https://'),
+  'an attached-but-unusable tool must not look like a malformed URL',
+);
 const pruneFn = fnSource(relaySrc, 'pruneRuns');
 has('a finished run drops its snapshot', pruneFn, 'runLocations.delete(id)');
 has('  ...and so does an evicted one', pruneFn, 'runLocations.delete(victim.id)');

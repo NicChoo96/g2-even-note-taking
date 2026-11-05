@@ -39,24 +39,33 @@ import { beginAiBatch, endAiBatch } from './undo';
 import { stripToolMarkup } from './tool-markup';
 
 /**
- * DeepSeek tolerates more, but a tight tool set measurably improves selection.
+ * A CEILING on the tool list — not a budget to spend.
  *
- * The PAGE BUDGET — this cap minus the reserve — is what the pages are sized
- * against, and it is 10 so that the busiest page still receives every one of its
- * OWN actions. `agents` declares 10, the most of any page, and the reserve is 5.
+ * This used to be a budget: the reserve was taken out first, then the focused
+ * page's actions, and whatever was left went to the remaining globals, with a
+ * final `slice(0, MAX_TOOLS)`. That arithmetic had one failure mode and it hit
+ * every time — a page declaring enough of its OWN actions consumed the whole
+ * list, and every remaining global was silently sliced off. `agents` declares
+ * 10 and the reserve was 5, so at a cap of 15 exactly ZERO globals survived on
+ * that page, while `pageCatalogText()` went on telling the model that nav__back,
+ * undo__last, app__status, nav__list_pages and nav__list_actions were all
+ * "always callable". The model called them, got an unknown tool, and reported a
+ * failure the wearer could not act on. An advertised-but-absent tool is worse
+ * than an omitted one, because the prompt is what sends the model to it.
  *
- * That is why every entry the reserve has gained has moved this number with it:
- * 12 → 13 for location.get, 13 → 14 for web.search, and 14 → 15 when `agents`
- * gained agents.expose and its own action count went 9 → 10. When the reserve
- * grows against a fixed cap a page starts losing its own actions to it, and that
- * eviction is the 0.3.28 bug — an advertised-but-absent tool, which is worse
- * than an omitted one because the PAGES block tells the model to call it. So the
- * cap and the reserve move TOGETHER, and tools/jev-spec-sim.mjs measures their
- * difference against the largest page rather than either number on its own.
- * Exported for exactly that: a harness that hardcodes 12 stops testing anything
- * the moment this changes.
+ * So nothing is trimmed any more: `selectTools` hands over every app-wide action
+ * plus the focused page's own actions. MAX_TOOLS is asserted against the real
+ * selection per page rather than spent, and it is the sum of the two things that
+ * actually bound the list — the 10 app-wide actions and the busiest page's 10.
+ * Grow a page past this and a harness fails, which is the signal to make a
+ * deliberate decision; a tool disappearing with no error is not.
+ *
+ * The count is also within what the provider accepts: the relay's own agent path
+ * sends at most 12 authored tools beside its built-ins, and DeepSeek's tool limit
+ * is well above 20. Export kept because a harness that hardcodes 12 stops testing
+ * anything the moment this changes.
  */
-export const MAX_TOOLS = 15;
+export const MAX_TOOLS = 20;
 
 /**
  * Provider-safe name for anything that crosses the wire. `prepare` accepts both
@@ -110,46 +119,45 @@ const MAX_STEP_CHARS = 240;
 const MAX_ANSWER_CHARS = 8000;
 
 /**
- * Actions this loop cannot function without. They are reserved out of the tool
- * budget BEFORE page actions are considered, so an action-heavy page can never
- * evict the ability to route to another page or to speak an answer.
+ * Actions this loop cannot function without. They lead the list, so an answer and
+ * a way to another page are always the first two tools the model reads.
+ *
+ * They USED to be reserved out of a fixed budget, which is what made the budget
+ * dangerous: the reserve was satisfied by taking slots away from the page, and
+ * the page's own actions then took slots away from the globals, silently. See
+ * MAX_TOOLS above — nothing is trimmed now, and this list only decides ORDER.
  */
 const MANDATORY = ['say.reply', 'nav.open_page'];
 
 /**
- * App-wide actions that belong to no page and are ADVERTISED as always callable
- * by `pageCatalogText()`. They are reserved exactly like MANDATORY because
- * `rest` below is ranked by PRIORITY and then truncated by the final slice: on
- * a page with enough of its own actions the remainder is eaten before these are
- * reached, and jev__decide disappeared from every Docs and Agents turn that
- * way. An advertised-but-absent tool is worse than an omitted one — the PAGES
- * block tells the model to call it, so it calls it and eats a provider error.
+ * App-wide actions that `pageCatalogText()` advertises on EVERY turn, so they must
+ * also be handed over on every turn. When the list was a budget, `rest` ranked by
+ * PRIORITY and then truncated at the end — the remainder was eaten before these
+ * were reached on any action-heavy page, and jev__decide disappeared from every
+ * Docs and Agents turn that way. Listing them here keeps them at the FRONT, so a
+ * future change to the ceiling can never push them off the end.
  *
- * location.get is reserved for that reason, and for one of its own: as a page
- * action it would have to be ROUTED to, and "where am I?" must not change the
- * page the wearer is looking at in order to answer a question about the world.
- * It could not survive in `rest` either — a busy page consumes all 9 remaining
- * budget slots before the remainder is reached (agents alone declares 9), so a
- * non-reserved global is handed on the quiet pages and dropped on the busy ones,
- * which is the same as unreliable.
+ * location.get is also here because, as a page action, it would have to be
+ * ROUTED to, and "where am I?" must not change the page the wearer is looking at
+ * in order to answer a question about the world.
  *
- * web.search belongs here for both of those reasons at once. It is a FACULTY
- * rather than a page's action — "what is the news" is a question about the
- * world, not about a tab — and it is the one the assistant is least able to
- * substitute for: the system prompt tells the model never to answer a
- * current-events question from memory, so a turn that dropped this global would
- * be a turn where the model is told to search and given no way to.
+ * web.search is the one the assistant is least able to substitute for: the system
+ * prompt tells the model never to answer a current-events question from memory,
+ * so a turn without this global is a turn where the model is told to search and
+ * given no way to.
  */
 const ALWAYS_AVAILABLE = ['jev.decide', 'location.get', 'web.search'];
 
-/** Everything taken out of the budget before page actions are considered. */
+/** Everything that leads the list: the actions this loop and the prompt assume. */
 export const RESERVED: string[] = [...MANDATORY, ...ALWAYS_AVAILABLE];
 
 /**
- * Order for whatever budget is left, highest value first. Page actions sit above
- * the introspection helpers on purpose: the system prompt's PAGES block lists
- * every page and every action, so nav.list_* are a convenience, not a
- * requirement, and they are the first to go when a page is action-heavy.
+ * Order for the remainder, highest value first. Page actions sit above the
+ * introspection helpers on purpose: the system prompt's PAGES block lists every
+ * page and every action, so nav.list_* are a convenience, not a requirement.
+ *
+ * This is now an ORDER and not a cut-off. A name absent from this list sorts to
+ * the end rather than out of the request.
  */
 const PRIORITY = [
   'say.reply',
@@ -162,36 +170,38 @@ const PRIORITY = [
 ];
 
 /**
- * The tool list handed to the model for one focus. Exported because the budget,
- * not the registry, decides whether a capability is REACHABLE: a registered
- * action that falls off the end of `ranked` might as well not exist, and the
- * prompt still advertises it. Only a real per-page selection can test that.
+ * The tool list handed to the model for one focus.
+ *
+ * THE INVARIANT: everything the prompt advertises for this turn is here. The
+ * PAGES block names every page's actions, and it is allowed to name an action on
+ * a page you are NOT focused on — that is what routing is for, and the prompt
+ * says so. What it may never do is name an APP-WIDE action as "always callable"
+ * while this function has quietly dropped it, which is exactly what the old
+ * budget did on the busiest page.
+ *
+ * Exported because the budget, not the registry, used to decide whether a
+ * capability was reachable: a registered action that fell off the end might as
+ * well not exist, and the prompt still advertised it. Only a real per-page
+ * selection can test that, and tools/jev-spec-sim.mjs does it for every page and
+ * every global.
  */
 export function selectTools(focused: PageId): ToolSchema[] {
   const pageCaps = capabilitiesForPage(focused);
   const pageNames = new Set(pageCaps.map((c) => c.name));
-  const global = capabilitiesForPage(GLOBAL_PAGE).filter((c) => !pageNames.has(c.name));
+  const globals = capabilitiesForPage(GLOBAL_PAGE).filter((c) => !pageNames.has(c.name));
+  const rank = (name: string) => {
+    const i = PRIORITY.indexOf(name);
+    return i < 0 ? 99 : i;
+  };
+  const reserved = globals.filter((c) => RESERVED.includes(c.name)).sort((a, b) => rank(a.name) - rank(b.name));
+  const rest = globals.filter((c) => !RESERVED.includes(c.name)).sort((a, b) => rank(a.name) - rank(b.name));
 
-  // Anything not reserved competes for what is left, so cap the page's own
-  // actions BEFORE adding them: their slice must leave the reserve untouched.
-  // Pushing them in first and slicing at the end is what used to let a page
-  // evict the reserve, and what pushed jev off the list entirely.
-  const reserved: Capability[] = [];
-  for (const name of RESERVED) {
-    const cap = global.find((c) => c.name === name);
-    if (cap) reserved.push(cap);
-  }
-  const rest = global.filter((c) => !RESERVED.includes(c.name));
-  rest.sort((a, b) => {
-    const ai = PRIORITY.indexOf(a.name);
-    const bi = PRIORITY.indexOf(b.name);
-    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
-  });
+  // Reserved globals, the focused page's own actions, then the remaining
+  // app-wide helpers. NOTHING is dropped here; the slice is a runaway guard that
+  // the per-page assertions keep unreachable.
+  const ordered: Capability[] = [...reserved, ...pageCaps, ...rest];
 
-  const pageBudget = Math.max(0, MAX_TOOLS - reserved.length);
-  const ranked: Capability[] = [...pageCaps.slice(0, pageBudget), ...reserved, ...rest];
-
-  return toToolSchemas(ranked.slice(0, MAX_TOOLS));
+  return toToolSchemas(ordered).slice(0, MAX_TOOLS);
 }
 
 function systemPrompt(converse = false): string {

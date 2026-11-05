@@ -158,6 +158,20 @@ export type WebDepth = 'basic' | 'advanced';
 
 /** The seeded web-search tool's id. A legacy install has 'tool-tavily'. */
 export const SEED_TOOL_ID = 'tool-web';
+/**
+ * How many tools ONE agent may carry, enforced by the panel and by the relay.
+ *
+ * The relay has its own copy of this number (`MAX_AUTHORED_TOOLS` in
+ * `web/server/local-sse.mjs`) because it cannot import TypeScript, and the two
+ * must never disagree: the panel is what a wearer can reach, the relay is what
+ * actually runs. They agree at 10, and `tools/mcp-tools-sim.mjs` asserts the two
+ * literals are equal rather than trusting a comment.
+ *
+ * The number is what the relay can execute in one run beside its own built-ins.
+ * Above it the relay REFUSES the run and names the excess; it never truncates,
+ * because a truncated toolset is an attachment that silently does nothing.
+ */
+export const MAX_AGENT_TOOLS = 10;
 const LEGACY_SEED_TOOL_ID = 'tool-tavily';
 /** The legacy model-facing name for the same tool. */
 const LEGACY_SEED_TOOL_NAME = 'tavily_search';

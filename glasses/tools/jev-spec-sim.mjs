@@ -878,5 +878,33 @@ for (const pid of ui.listPages().map((p) => p.id)) {
   );
 }
 
+// THE OTHER HALF OF THAT INVARIANT, and the half nothing measured. `selectTools`
+// used to SPEND a fixed budget: the reserve was taken out first, then the focused
+// page's actions, and the remainder of the globals was cut by the final slice. On
+// the busiest page that produced exactly zero survivors — `agents` declares 10,
+// the reserve was 5 and the cap was 15 — so `pageCatalogText()` went on telling
+// the model that nav__back, undo__last, app__status, nav__list_pages and
+// nav__list_actions were "always callable" while the tool list held none of them.
+// The list is a catalogue now, and this is the assertion that keeps it one.
+//
+// Counted from `capabilitiesForPage` on BOTH sides on purpose: a capability whose
+// `available()` is false is not callable right now (undo.last with nothing to
+// undo), so it is legitimately absent from the list and from this expectation.
+// `pageCatalogText()` still names it, deliberately — the model should plan for an
+// action that is temporarily gated rather than believe it does not exist.
+const globalCaps = ui.capabilitiesForPage(ui.GLOBAL_PAGE);
+const globalNames = globalCaps.map((c) => ui.toWireName(c.name));
+for (const pid of ui.listPages().map((p) => p.id)) {
+  const handed = ui.selectTools(pid).map((s) => s.function.name);
+  const lost = globalNames.filter((n) => !handed.includes(n));
+  assert(`every app-wide action is callable from '${pid}'`, lost.length === 0, lost.join(', '));
+  const own = ui.capabilitiesForPage(pid).map((c) => ui.toWireName(c.name));
+  assert(
+    `'${pid}' is handed the whole catalogue it advertises`,
+    handed.length === globalNames.length + own.length,
+    `${handed.length} of ${globalNames.length} globals + ${own.length} own`,
+  );
+}
+
 console.log(fail ? `\n${fail} FAILURE(S) of ${total}` : `\nALL PASS (${total} assertions)`);
 process.exit(fail ? 1 : 0);
