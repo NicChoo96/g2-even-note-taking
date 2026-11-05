@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.54
+
+v0.3.54 - Every tool attached to an agent can now actually be called
+
+- An agent with three or more tools was losing one before every run, so it reported a tool you had enabled as "not available".
+- The tools you attach are now always offered, and nothing the assistant is told about is missing from what it can call.
+- Too many tools is refused with a count instead of quietly trimmed, and attachments that no longer exist are named.
+
 ## 0.3.53
 
 v0.3.53 - Deleting from the app works again
