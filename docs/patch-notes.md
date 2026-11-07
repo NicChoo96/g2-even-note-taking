@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.55
+
+v0.3.55 - A softer companion app, with light and dark
+
+- The web app has a new soft look, built mobile first: larger text, bigger tap targets, no sideways scrolling, and every page opens on its own content.
+- Pick light or dark from the header on any screen - the choice is remembered.
+- The paste box is gone. Ask Jarvis instead.
+- Every panel was measured on a phone, so nothing is too small to read or tap.
+
 ## 0.3.54
 
 v0.3.54 - Every tool attached to an agent can now actually be called
