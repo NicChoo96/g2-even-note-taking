@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.56
+
+v0.3.56 - Light and dark each stay on their own side
+
+- The Google sign-in button was always the dark one, so it sat as a black pill on the light app and carried a white square on the dark one. It now follows the theme you picked.
+- Changing theme no longer shows a half-and-half palette while it swaps, and a dark page no longer shows white above and below it.
+- Text selection, autofill and scrollbars are themed as well.
+
 ## 0.3.55
 
 v0.3.55 - A softer companion app, with light and dark

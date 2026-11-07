@@ -105,6 +105,21 @@ body,
   margin: 0;
 }
 
+/*
+ * The ROOT carries the background too, not just <body>.
+ *
+ * On iOS a rubber-band overscroll at the top or bottom reveals the canvas
+ * behind <body>, which was the UA's white — so a dark page flashed white at
+ * both ends of every scroll. Painting `html` with --bg is what stops that.
+ */
+html {
+  background: var(--bg);
+  -webkit-text-size-adjust: 100%;
+  /* Firefox's scrollbar; Chromium uses the same colours. `color-scheme` covers
+     the rest, but a WebView that ignores it still gets this. */
+  scrollbar-color: var(--border-strong) var(--bg);
+}
+
 html {
   -webkit-text-size-adjust: 100%;
 }
@@ -115,9 +130,42 @@ body {
     var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
-  /* The palette switch must feel instant, but a transition on `color` alone
-     would leave large surfaces snapping while text eased — so both, briefly. */
-  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/*
+ * NO COLOUR TRANSITION ON THE THEME SWITCH.
+ *
+ * A 0.2s fade looked nice, but any frame captured during it is a MIXED palette
+ * — dark surfaces with light text, or the reverse — and in a throttled tab (the
+ * Even App WebView, a background browser tab) the transition can be left
+ * part-way. A theme switch is instant now: one attribute change, one repaint,
+ * never a hybrid state.
+ */
+
+/* Selection must not fall back to the UA's blue-on-white, which is unreadable
+   on a dark surface. */
+::selection {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/*
+ * Chrome paints autofilled fields with its own pale blue/yellow and ignores
+ * `background-color` and `color-scheme` while doing it — a bright rectangle in
+ * the middle of a dark form. The inset shadow is the only reliable override;
+ * the long transition is what stops the browser repainting it.
+ */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  -webkit-box-shadow: 0 0 0 1000px var(--panel-2) inset;
+  box-shadow: 0 0 0 1000px var(--panel-2) inset;
+  caret-color: var(--text);
+  transition: background-color 9999s ease-out 0s;
 }
 
 /* ── Shell — MOBILE FIRST ────────────────────────────────────────────────────
@@ -299,8 +347,7 @@ button {
   color: var(--text);
   background: var(--panel-2);
   padding: 8px 14px;
-  transition: filter 0.15s ease, background-color 0.15s ease, color 0.15s ease,
-    border-color 0.15s ease;
+  transition: filter 0.15s ease;
 }
 
 button:active {
@@ -776,8 +823,7 @@ p.empty {
   }
 }
 
-/* ── Sign-in / pair screens ──────────────────────────────────────────────────
-   A centred column with the toggle in the top-right, so the palette can be
+/* ── Sign-in / pair screens ──────────────────────────────────────────────────   A centred column with the toggle in the top-right, so the palette can be
    changed before an account exists. `min-height: 100dvh` + centring lives here
    rather than in inline styles: the old screens used three different inline
    paddings and none of them accounted for the safe area. */
@@ -813,6 +859,21 @@ p.empty {
   flex-direction: column;
   gap: 8px;
   align-items: stretch;
+}
+
+/*
+ * Google Sign-In draws its button as IN-PAGE DOM (not only an iframe), so it is
+ * the one control on this page that cannot inherit the palette. Two things are
+ * ours to fix:
+ *
+ *  1. the variant — chosen in auth.tsx (`outline` in light, `filled_black` in
+ *     dark), because a hardcoded black pill sat in a white card in light mode;
+ *  2. the brand tile. Its 36px white square is the only bright block on a dark
+ *     card, and it is not part of Google's dark variant — letting the button
+ *     surface show through removes it without touching the wordmark.
+ */
+:root[data-theme='dark'] .nsm7Bb-HzV7m-LgbsSe-Bz112c-haAclf {
+  background: transparent !important;
 }
 
 @media (min-width: 720px) {

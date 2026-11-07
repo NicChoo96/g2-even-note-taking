@@ -20,6 +20,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react';
 import { API_BASE } from '../stream';
 import { onAuthRejected, setStreamToken } from '../auth-token';
@@ -40,6 +41,7 @@ import {
 // sign-in page, and it has to be here: a wearer who lands on a light page and
 // wants it dark cannot reach Settings to say so.
 import { ThemeToggle } from './ThemeToggle';
+import { getTheme, subscribeTheme } from './theme';
 
 // The owner session's FAST PATH — a synchronous read for event handlers, effects
 // and render. The durable copy in `durable-docs` is the record of truth in every
@@ -668,34 +670,53 @@ export function LoginScreen() {
     };
   }, []);
 
+  const theme = useSyncExternalStore(subscribeTheme, getTheme);
+  /**
+   * Google's button is its OWN surface, and it is drawn by Google's script — so
+   * it cannot inherit our palette and has to be told which one to draw.
+   *
+   * It was hardcoded to `filled_black`, which left a black pill sitting in a
+   * white card whenever the app was in light mode: the one element on the page
+   * that ignored the theme. `outline` is Google's light variant.
+   *
+   * `initialize` runs ONCE (Google warns on a second call); only the button is
+   * re-rendered, and the container is emptied first so a theme switch cannot
+   * stack two buttons.
+   */
+  const gsiInitialised = useRef(false);
+
   useEffect(() => {
     if (!clientId || !btnRef.current) return;
     let cancelled = false;
 
     const renderButton = (g: NonNullable<Window['google']>['accounts']['id']) => {
       if (cancelled || !btnRef.current) return;
-      g.initialize({
-        client_id: clientId,
-        ux_mode: 'popup',
-        callback: async (resp: { credential?: string }) => {
-          if (!resp?.credential) {
-            setError('Sign-in was cancelled.');
-            return;
-          }
-          const v = await verify(resp.credential);
-          if (v.ok && v.email && v.sessionToken) {
-            setAuthed(v.email, v.sessionToken);
-          } else {
-            setError(
-              v.error === 'not whitelisted'
-                ? 'This Google account is not whitelisted. Only the owner can use this app.'
-                : 'Sign-in failed. Please try again.',
-            );
-          }
-        },
-      });
+      if (!gsiInitialised.current) {
+        g.initialize({
+          client_id: clientId,
+          ux_mode: 'popup',
+          callback: async (resp: { credential?: string }) => {
+            if (!resp?.credential) {
+              setError('Sign-in was cancelled.');
+              return;
+            }
+            const v = await verify(resp.credential);
+            if (v.ok && v.email && v.sessionToken) {
+              setAuthed(v.email, v.sessionToken);
+            } else {
+              setError(
+                v.error === 'not whitelisted'
+                  ? 'This Google account is not whitelisted. Only the owner can use this app.'
+                  : 'Sign-in failed. Please try again.',
+              );
+            }
+          },
+        });
+        gsiInitialised.current = true;
+      }
+      btnRef.current.innerHTML = '';
       g.renderButton(btnRef.current, {
-        theme: 'filled_black',
+        theme: theme === 'light' ? 'outline' : 'filled_black',
         size: 'large',
         shape: 'pill',
         text: 'signin_with',
@@ -731,7 +752,7 @@ export function LoginScreen() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [clientId, setError, setAuthed]);
+  }, [clientId, setError, setAuthed, theme]);
 
   return (
     <div className="app auth-screen">
