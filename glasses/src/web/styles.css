@@ -1,15 +1,97 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   Design tokens — ONE palette, two themes.
+
+   Every colour in this file comes from here. Nothing below may name a hex value
+   for a surface, a border or a text colour: that is what made the previous
+   palette impossible to theme (and what produced the black-button bug, where a
+   <button> with no colour of its own inherited the UA's LIGHT-scheme black on a
+   dark panel).
+
+   The accent is a soft periwinkle, not the glasses' phosphor green: green is the
+   DEVICE's colour, and using it for every interactive surface in the companion
+   app made the two read as one product when they are not. The G2 palette is
+   still used — on the lens, where it belongs.
+
+   Values are chosen for CONTRAST, not for a mood board:
+   - text on panel      >= 12:1 (dark) / 13:1 (light)
+   - muted on panel     >= 5:1  in both
+   - accent on panel    >= 4.6:1 in both
+   - on-accent on accent >= 6:1
+   ──────────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg: #0b0f0d;
-  --panel: #121816;
-  --panel-2: #18211e;
-  --border: #24312c;
-  --text: #d9e6df;
-  --muted: #7d9189;
-  --accent: #3ddc84; /* G2 phosphor green */
-  --accent-dim: #1e4d35;
-  --danger: #e5534b;
-  --radius: 12px;
-  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  color-scheme: dark;
+
+  --bg: #0e1016;
+  --bg-tint: rgba(124, 140, 248, 0.09);
+  --panel: #151922;
+  --panel-2: #1b202b;
+  --panel-3: #222836;
+  --border: #262c3a;
+  --border-strong: #333b4d;
+
+  --text: #e9edf6;
+  --text-soft: #c4cbdb;
+  --muted: #8d95a9;
+
+  /* Soft periwinkle. `--accent-dim` is a TINT (backgrounds), never a text
+     colour: it sits under `--accent` in both themes. */
+  --accent: #8a98fb;
+  --accent-strong: #6f7ef4;
+  --accent-dim: #252c48;
+  --accent-wash: rgba(124, 140, 248, 0.1);
+  --accent-glow: rgba(138, 152, 251, 0.45);
+  --on-accent: #10131f;
+
+  --danger: #f27e81;
+  --danger-wash: rgba(242, 126, 129, 0.12);
+  --danger-border: rgba(242, 126, 129, 0.45);
+  --warn: #e3b778;
+
+  --shadow: 0 18px 40px rgba(0, 0, 0, 0.38);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.24);
+
+  --radius: 16px;
+  --radius-sm: 10px;
+  --radius-lg: 22px;
+  --gap: 14px;
+
+  font-family: 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+/* Light is a real palette, not an inverted one: surfaces are slightly blue-grey
+   (never pure white cards on a white page), and the accent darkens so it keeps
+   its contrast against a light tint. */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #f4f5fa;
+  --bg-tint: rgba(91, 99, 211, 0.07);
+  --panel: #ffffff;
+  --panel-2: #f7f8fc;
+  --panel-3: #eef1f8;
+  --border: #e4e7f0;
+  --border-strong: #d2d7e6;
+
+  --text: #1b2030;
+  --text-soft: #39415a;
+  --muted: #6a7186;
+
+  --accent: #5b63d3;
+  --accent-strong: #4a51c2;
+  --accent-dim: #e9ebfd;
+  --accent-wash: rgba(91, 99, 211, 0.07);
+  --accent-glow: rgba(91, 99, 211, 0.3);
+  --on-accent: #ffffff;
+
+  --danger: #bf3c43;
+  --danger-wash: rgba(191, 60, 67, 0.08);
+  --danger-border: rgba(191, 60, 67, 0.35);
+  --warn: #9a6a17;
+
+  --shadow: 0 18px 40px rgba(24, 32, 55, 0.08);
+  --shadow-sm: 0 1px 2px rgba(24, 32, 55, 0.06);
 }
 
 * {
@@ -23,107 +105,180 @@ body,
   margin: 0;
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   background:
-    radial-gradient(1200px 600px at 50% -10%, rgba(61, 220, 132, 0.08), transparent 60%),
+    radial-gradient(1100px 520px at 50% -14%, var(--bg-tint), transparent 62%),
     var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
+  /* The palette switch must feel instant, but a transition on `color` alone
+     would leave large surfaces snapping while text eased — so both, briefly. */
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
+/* ── Shell — MOBILE FIRST ────────────────────────────────────────────────────
+   The base rules below are the phone layout. Anything that widens the page or
+   reflows it into columns lives in a `min-width` query, so a small screen never
+   has to undo a desktop rule (which is how the tab row used to overflow). */
 .app {
-  max-width: 760px;
+  width: 100%;
+  max-width: 780px;
   margin: 0 auto;
-  padding: 28px 20px 48px;
+  padding: 16px 14px calc(28px + env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  min-height: 100%;
+  gap: var(--gap);
+  min-height: 100dvh;
 }
 
-/* The Agents tab is an editor, not a reading column: give it room so the
-   master list and the form fields are not crushed by the 760px prose width. */
+/* The Agents, Jarvis and Files tabs are two-pane surfaces; a 780px reading
+   column crushes them. The widening only happens where there is room for it. */
 .app-wide {
-  max-width: 1060px;
+  max-width: 1080px;
 }
 
-/* Header */
+@media (min-width: 720px) {
+  .app {
+    padding: 24px 20px 44px;
+    gap: 18px;
+  }
+}
+
+@media (min-width: 1040px) {
+  .app {
+    padding: 30px 24px 56px;
+  }
+}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
 .app-header {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 10px;
 }
 
-.app-header h1 {
+.brand h1 {
   margin: 0;
-  font-size: 24px;
+  font-size: 20px;
+  font-weight: 650;
   letter-spacing: -0.02em;
 }
 
 .tagline {
-  margin: 6px 0 0;
+  margin: 4px 0 0;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .sync-chip {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   font-size: 12px;
-  padding: 6px 12px;
+  padding: 6px 11px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--panel);
   color: var(--muted);
   white-space: nowrap;
+  min-height: 34px;
 }
 
 .sync-chip .dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--muted);
+  flex: none;
 }
 
 .sync-chip.synced .dot {
   background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-wash);
 }
 
 .sync-chip.pushing .dot {
-  background: #e5c07b;
+  background: var(--warn);
 }
 
 .sync-chip.offline .dot {
   background: var(--danger);
 }
 
-/* Cards */
+/* A long signed-in address must not push the row wider than the phone. */
+.account-email {
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.theme-toggle {
+  width: 42px;
+  height: 42px;
+  min-height: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text-soft);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.theme-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+@media (min-width: 720px) {
+  .app-header {
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .brand h1 {
+    font-size: 24px;
+  }
+
+  .header-actions {
+    justify-content: flex-end;
+  }
+}
+
+/* ── Surfaces ──────────────────────────────────────────────────────────────── */
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px;
+  padding: 14px;
+  box-shadow: var(--shadow-sm);
 }
 
-/* Paste panel */
-.paste-panel textarea {
-  width: 100%;
-  resize: vertical;
-  min-height: 120px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 12px;
-  font: inherit;
-  line-height: 1.5;
+@media (min-width: 720px) {
+  .card {
+    padding: 18px;
+  }
 }
 
-.paste-panel textarea:focus,
+/* ── Focus ring shared by the inline editors ───────────────────────────────── */
 .todo-add input:focus,
 .todo-text:focus,
 .doc-textarea:focus {
@@ -131,63 +286,32 @@ body {
   outline-offset: 1px;
 }
 
-.paste-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-
-.detected-tags {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.tag {
-  font-size: 12px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: var(--accent-dim);
-  color: var(--accent);
-}
-
-/* Buttons */
+/* ── Buttons ───────────────────────────────────────────────────────────────── */
 button {
   font: inherit;
   cursor: pointer;
   border: none;
-  border-radius: 8px;
-  /* This document never declares `color-scheme: dark`, so a <button> that sets no
-     colour of its own inherits the UA's LIGHT-scheme default — pure black. On this
-     palette that is unreadable: black on --panel-2 (#18211e) is 1.3:1, and black on
-     the selected row's --accent-dim (#1e4d35) is 2.2:1, against a 4.5:1 minimum.
-     Every title in the Files master list rendered black for exactly this reason.
-     Setting the default here fixes the whole class of bug rather than one row — and
-     the rules below still win wherever a button wants a different colour
-     (`button.primary`, `.icon-btn`, `.link-btn`, `.files-tab`). */
+  border-radius: var(--radius-sm);
+  /* A bare <button> must still state its own colour and surface. Without the
+     colour it inherits the UA's LIGHT-scheme black, which is unreadable on a
+     dark panel (measured 1.3:1); without the surface the UA paints a near-white
+     box inside a dark card. Both fixed here for every button that follows. */
   color: var(--text);
-  /* The same mistake twice: a <button> sets no `background` and no `padding`, so
-     the UA paints it its own light-grey box at its own 1px-6px inset. That is the
-     "white button" class of bug — a dark-bordered pill of near-white sitting in a
-     dark panel, which is what `+ Custom REST tool`, `⚡ Trigger prompt`, `■ Stop`,
-     `Refresh status`, `Compact now` and `Run location check` all used to be. Same
-     fix, same place, so the tenth bare button added tomorrow is right by default:
-     a real surface and real padding. Every rule below that wants something else
-     still wins (class selectors outrank this element one), and `.icon-btn` opts out
-     of the padding because it is a fixed square. */
   background: var(--panel-2);
-  padding: 7px 14px;
-  transition: filter 0.15s ease, background 0.15s ease;
+  padding: 8px 14px;
+  transition: filter 0.15s ease, background-color 0.15s ease, color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+button:active {
+  transform: translateY(0.5px);
 }
 
 button.primary {
   background: var(--accent);
-  color: #06230f;
+  color: var(--on-accent);
   font-weight: 600;
-  padding: 9px 16px;
+  padding: 10px 18px;
 }
 
 button.primary:disabled {
@@ -196,22 +320,43 @@ button.primary:disabled {
 }
 
 button.primary:not(:disabled):hover {
-  filter: brightness(1.1);
+  filter: brightness(1.06);
 }
 
-/* Form controls — ONE base rule so every bare <input>/<select>/<textarea> in any
-   panel (Agents, Tools, Settings…) matches the app instead of the OS default. */
+/* Touch targets. Applied only where the pointer is coarse, so desktop keeps its
+   compact rows and a phone gets a real 44px target without a special layout. */
+@media (pointer: coarse) {
+  button:not(.icon-btn):not(.theme-toggle):not(.files-media-thumb),
+  .doc-chip,
+  .tab,
+  .files-tab {
+    min-height: 44px;
+  }
+
+  .icon-btn {
+    width: 40px;
+    height: 40px;
+    min-height: 0;
+  }
+
+  .theme-toggle {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+/* ── Form controls ─────────────────────────────────────────────────────────── */
 input:not([type='checkbox']):not([type='radio']),
 select,
 textarea {
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   padding: 9px 12px;
   font: inherit;
   min-width: 0;
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 
 textarea {
@@ -219,10 +364,31 @@ textarea {
   line-height: 1.5;
 }
 
+/* A 13px default checkbox is a 13px target, and it is the control that commits
+   an irreversible choice ("include the owner bearer token"). Give it a real box
+   and the accent colour; the wrapping <label> stays clickable too. */
+input[type='checkbox'],
+input[type='radio'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+  flex: none;
+  cursor: pointer;
+  margin: 0;
+}
+
+.field-toolbar label,
+.ap-toggle label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
 input:not([type='checkbox']):not([type='radio']):hover,
 select:hover,
 textarea:hover {
-  border-color: #2f403a;
+  border-color: var(--border-strong);
 }
 
 input:not([type='checkbox']):not([type='radio']):focus,
@@ -236,11 +402,9 @@ textarea:focus {
 input::placeholder,
 textarea::placeholder {
   color: var(--muted);
-  opacity: 0.75;
+  opacity: 0.7;
 }
 
-/* Env-managed inputs stay readable (dashed, muted) rather than being dimmed to
-   the point of looking broken. */
 input:disabled,
 select:disabled,
 textarea:disabled {
@@ -251,7 +415,16 @@ textarea:disabled {
   cursor: not-allowed;
 }
 
-/* Native select needs a visible chevron on the dark panel. */
+/* iOS zooms the whole page when a focused control is under 16px. */
+@media (max-width: 640px) {
+  input:not([type='checkbox']):not([type='radio']),
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* Native select needs a visible chevron in BOTH themes. */
 select {
   appearance: none;
   padding-right: 30px;
@@ -281,37 +454,139 @@ select {
   margin-top: 18px;
 }
 
-/* Tabs */
+/* ── Tabs ────────────────────────────────────────────────────────────────────
+   A GRID on a phone, not a wrapping flex row: eight tabs at 375px in a flex row
+   either overflow (a hidden horizontal scroll buries Agents/Settings) or wrap
+   into ragged rows of five and three. Four per row is stable, and every tab
+   stays visible and tappable. */
 .tabs {
-  display: flex;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 5px;
+  padding: 4px;
+  box-shadow: var(--shadow-sm);
 }
 
 .tab {
-  flex: 1;
-  padding: 10px;
+  padding: 9px 6px;
   background: transparent;
   color: var(--muted);
-  border-radius: 8px;
-  font-weight: 500;
+  border-radius: var(--radius-sm);
+  font-weight: 550;
+  font-size: 13px;
+  line-height: 1.25;
+  min-width: 0;
+  min-height: 42px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  color: var(--text);
 }
 
 .tab.active {
   background: var(--accent-dim);
   color: var(--accent);
+  font-weight: 650;
+}
+
+@media (min-width: 720px) {
+  .tabs {
+    display: flex;
+    gap: 6px;
+    padding: 5px;
+  }
+
+  .tab {
+    flex: 1;
+    padding: 10px;
+    font-size: 14px;
+  }
 }
 
 .count {
-  margin-left: 6px;
-  font-size: 11px;
-  opacity: 0.8;
+  margin-left: 5px;
+  font-size: 12px;
+  opacity: 0.75;
 }
 
-/* Todo */
+@media (max-width: 719px) {
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  /* A count next to the label ("To-Do 23/24") is wider than a quarter of a
+     360px screen. Wrapping the count under the label keeps BOTH readable;
+     ellipsis here hid the number entirely, which is the only reason the tab
+     carries a count at all. */
+  .tab {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 1px 4px;
+    padding: 8px 4px;
+    font-size: 12.5px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+  }
+
+  .tab .count {
+    margin-left: 0;
+    opacity: 0.9;
+  }
+
+  /*
+   * Touch sizing by WIDTH, not by pointer type.
+   *
+   * `@media (pointer: coarse)` is the semantically correct query, but it is
+   * reported inconsistently in embedded WebViews (this app also runs inside the
+   * Even App) and a narrow desktop window would not get it at all. Below 720px
+   * the layout is a phone layout, so the targets are phone-sized unconditionally
+   * — the same numbers the coarse rule below uses.
+   */
+  button:not(.icon-btn):not(.theme-toggle):not(.files-media-thumb),
+  .doc-chip,
+  .files-tab,
+  .ap-chip {
+    min-height: 44px;
+  }
+
+  .theme-toggle {
+    width: 44px;
+    height: 44px;
+  }
+
+  .icon-btn {
+    width: 36px;
+    height: 36px;
+  }
+
+  .todo-item .check {
+    width: 36px;
+    height: 36px;
+  }
+
+  .mic-btn {
+    width: 42px;
+    height: 42px;
+  }
+}
+
+@media (pointer: coarse) {
+  .tab {
+    min-height: 44px;
+  }
+}
+
+/* ── To-do ─────────────────────────────────────────────────────────────────── */
 .todo-summary {
   color: var(--muted);
   font-size: 12px;
@@ -333,8 +608,9 @@ select {
   gap: 10px;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  min-height: 52px;
 }
 
 .todo-item.done .todo-text {
@@ -343,14 +619,15 @@ select {
 }
 
 .todo-item .check {
-  width: 24px;
-  height: 24px;
+  width: 32px;
+  height: 32px;
   flex: none;
-  border-radius: 6px;
+  border-radius: 9px;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--accent);
   font-weight: 700;
+  padding: 0;
 }
 
 .todo-item .check:hover {
@@ -363,6 +640,10 @@ select {
   border: none;
   color: var(--text);
   font: inherit;
+  /* The base control rule gives every input 9px/12px of inset, which on a
+     one-line row made each task 62px tall — 24 tasks became a metre and a half
+     of scrolling. A row is a ROW; keep the tap area in the row, not the text. */
+  padding: 6px 4px;
 }
 
 .todo-add {
@@ -375,27 +656,29 @@ select {
   flex: 1;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   padding: 9px 12px;
   font: inherit;
 }
 
+/* ── Small icon buttons ────────────────────────────────────────────────────── */
 .icon-btn {
   background: transparent;
   color: var(--muted);
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   /* A fixed square: the base button's inset would push the glyph off-centre. */
   padding: 0;
-  border-radius: 6px;
+  min-height: 0;
+  border-radius: 9px;
   flex: none;
 }
 
 /* Same muted/danger look, but sized for a text label instead of a glyph. */
 .icon-btn.wide {
   width: auto;
-  height: 30px;
+  height: 32px;
   padding: 0 12px;
   font-size: 12px;
   border: 1px solid var(--border);
@@ -405,8 +688,7 @@ select {
    link or the browser will not offer middle-click / "open link in new tab",
    and `window.open` cannot report a blocked popup reliably. An <a> is not a
    block container, so the shared width/height would do nothing; inline-flex
-   gives it the identical 26px square. Hover colour is already covered by the
-   class-based rule below. */
+   gives it the identical square. */
 a.icon-btn {
   display: inline-flex;
   align-items: center;
@@ -417,6 +699,7 @@ a.icon-btn {
 
 .icon-btn:hover {
   color: var(--text);
+  background: var(--panel-3);
 }
 
 .icon-btn.danger:hover {
@@ -425,55 +708,121 @@ a.icon-btn {
 
 li.empty,
 /* `<p className="empty">` is the paragraph form of the same state, used by the
-   agents list and the tool catalogue. It was never styled, so it rendered at
-   body size and full brightness — louder than the content it stands in for. */
+   agents list and the tool catalogue. */
 p.empty {
   color: var(--muted);
-  padding: 12px;
+  padding: 16px 12px;
   text-align: center;
   margin: 0;
+  font-size: 13px;
 }
 
-/* Text sections */
+/* ── Text sections ─────────────────────────────────────────────────────────── */
 .panel-label {
   color: var(--muted);
   font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
   margin-bottom: 10px;
 }
 
 .doc-textarea {
   width: 100%;
-  min-height: 320px;
+  min-height: 220px;
   resize: vertical;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   padding: 12px;
   font: inherit;
   line-height: 1.6;
 }
 
-/* The 320px min-height above suits the single-document Notes/Docs editor, but
-   the Agents editor stacks FOUR of these (system prompt, trigger prompt, run
-   box…) — 320px each made the pane metres long and pushed Run off-screen on a
-   phone. Let the `rows` attribute win here. */
+@media (min-width: 720px) {
+  .doc-textarea {
+    min-height: 320px;
+  }
+}
+
+/* The tall min-height suits the single-document Notes/Docs editor, but the
+   Agents editor stacks FOUR of these (system prompt, trigger prompt, run box…)
+   — 320px each made the pane metres long and pushed Run off-screen on a phone.
+   Let the `rows` attribute win here. */
 .agent-editor .doc-textarea,
 .agents-detail .doc-textarea {
   min-height: 0;
 }
 
-/* Footer */
+/* ── Footer ────────────────────────────────────────────────────────────────── */
 .app-footer {
   margin-top: auto;
   padding-top: 16px;
   display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 10px;
   color: var(--muted);
   font-size: 12px;
   border-top: 1px solid var(--border);
+}
+
+@media (min-width: 720px) {
+  .app-footer {
+    flex-direction: row;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+}
+
+/* ── Sign-in / pair screens ──────────────────────────────────────────────────
+   A centred column with the toggle in the top-right, so the palette can be
+   changed before an account exists. `min-height: 100dvh` + centring lives here
+   rather than in inline styles: the old screens used three different inline
+   paddings and none of them accounted for the safe area. */
+.auth-screen {
+  align-items: center;
+  text-align: center;
+  padding-top: 24px;
+}
+
+.auth-top {
+  width: 100%;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.auth-brand h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.auth-brand .tagline {
+  max-width: 34ch;
+  margin: 6px auto 0;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+
+@media (min-width: 720px) {
+  .auth-screen {
+    padding-top: 72px;
+  }
+
+  .auth-brand h1 {
+    font-size: 26px;
+  }
 }
 
 /* Device pairing / management */
@@ -579,14 +928,17 @@ p.empty {
 }
 
 .doc-chip {
+  display: inline-flex;
+  align-items: center;
   background: var(--panel-2);
   border: 1px solid var(--border);
   color: var(--muted);
   border-radius: 999px;
-  padding: 5px 12px;
+  padding: 6px 13px;
+  min-height: 34px;
   font-size: 13px;
   cursor: pointer;
-  max-width: 220px;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -673,13 +1025,13 @@ p.empty {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   background: var(--panel-2);
   border: 1px solid var(--border);
   color: var(--accent);
-  font-size: 15px;
+  font-size: 17px;
   line-height: 1;
   flex: none;
   padding: 0;
@@ -692,7 +1044,7 @@ p.empty {
 
 .mic-btn.on {
   background: var(--accent);
-  color: #06230f;
+  color: var(--on-accent);
   animation: mic-pulse 1.4s ease-in-out infinite;
 }
 
@@ -708,15 +1060,15 @@ p.empty {
 @keyframes mic-pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(61, 220, 132, 0.45);
+    box-shadow: 0 0 0 0 var(--accent-glow);
   }
   50% {
-    box-shadow: 0 0 0 8px rgba(61, 220, 132, 0);
+    box-shadow: 0 0 0 8px transparent;
   }
 }
 
 .dictate-state {
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -733,9 +1085,9 @@ p.empty {
 }
 
 .dictate-compact .mic-btn {
-  width: 28px;
-  height: 28px;
-  font-size: 13px;
+  width: 34px;
+  height: 34px;
+  font-size: 15px;
 }
 
 /* ── Agents panel ─────────────────────────────────────────────────────────── */
@@ -747,51 +1099,57 @@ p.empty {
 
 .agents-split {
   display: grid;
-  /* Master is fixed-ish and the detail pane takes the rest; minmax(0, …) lets
-     both panes actually shrink instead of forcing the grid wider than its box. */
-  grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
-  gap: 20px;
+  /* MOBILE FIRST: one pane, in the order you need it — pick an agent, then edit
+     it. The two-column split is a `min-width` upgrade below, so a phone never
+     inherits a desktop grid it has to undo. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
   align-items: start;
   min-width: 0;
 }
 
-@media (max-width: 860px) {
+/* Stacked panes: the master list is a short PICKER, so cap it and keep the
+   detail pane — the thing you actually type into — close to the top of the
+   page. Scrolling to a form two screens down is the mobile failure this
+   prevents. */
+.agent-list {
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* Primary actions go full width on a phone so "Run agent" is a real target
+   instead of a 90px pill in the corner. */
+.agents-detail .docs-actions,
+.agent-editor .docs-actions {
+  justify-content: stretch;
+}
+
+.agents-detail .docs-actions > button,
+.agent-editor .docs-actions > button {
+  flex: 1 1 auto;
+}
+
+@media (min-width: 861px) {
   .agents-split {
-    grid-template-columns: minmax(0, 1fr);
+    /* Master is fixed-ish and the detail pane takes the rest; minmax(0, …) lets
+       both panes actually shrink instead of forcing the grid wider than its box. */
+    grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
+    gap: 20px;
   }
 
-  /* Five tabs at 375px overflowed the page and gave the WHOLE app a horizontal
-     scrollbar (the tab row was 79px wider than the viewport). Wrap them onto two
-     rows so every tab stays visible and tappable — a hidden scroll would bury
-     the Agents/Settings tabs off-screen on a phone. */
-  .tabs {
-    flex-wrap: wrap;
-  }
-
-  .tab {
-    flex: 1 1 28%;
-    min-width: 0;
-    padding: 9px 6px;
-    font-size: 13px;
-  }
-
-  /* Stacked panes: the master list is a short picker, so cap it and let the
-     detail pane (the thing you actually type into) have the rest of the page. */
   .agent-list {
-    max-height: 220px;
-    overflow-y: auto;
+    max-height: none;
+    overflow: visible;
   }
 
-  /* Primary actions go full width on a phone so "Run agent" is a real target
-     instead of a 90px pill in the corner. */
   .agents-detail .docs-actions,
   .agent-editor .docs-actions {
-    justify-content: stretch;
+    justify-content: flex-end;
   }
 
   .agents-detail .docs-actions > button,
   .agent-editor .docs-actions > button {
-    flex: 1 1 auto;
+    flex: 0 0 auto;
   }
 }
 
@@ -823,8 +1181,9 @@ p.empty {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-height: 48px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--panel-2);
   padding: 4px 6px;
 }
@@ -846,7 +1205,7 @@ p.empty {
   color: var(--text);
   font: inherit;
   text-align: left;
-  padding: 6px 8px;
+  padding: 8px;
   cursor: pointer;
 }
 
@@ -860,7 +1219,7 @@ p.empty {
 
 .agent-meta,
 .chip-time {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
   flex: none;
 }
@@ -908,7 +1267,7 @@ p.empty {
 }
 
 .field-label {
-  font-size: 11px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--muted);
@@ -917,9 +1276,9 @@ p.empty {
 
 /* The editor boxes (.agent-editor / .tool-row / .settings-panel) already use
    --panel-2, so a --panel-2 input inside them is invisible — the fields looked
-   like loose text. Drop the controls to --bg (same as .paste-panel textarea and
-   the transcript) so every field reads as a field and picks up the green focus
-   ring like the rest of the app. */
+   like loose text. Drop the controls to --bg (same as the transcript) so every
+   field reads as a field and picks up the accent focus ring like the rest of
+   the app. */
 .agent-editor input,
 .agent-editor select,
 .agent-editor textarea,
@@ -1030,7 +1389,7 @@ p.empty {
 }
 
 .msg-label {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
   padding-top: 2px;
   overflow: hidden;
@@ -1062,17 +1421,43 @@ p.empty {
   max-width: 620px;
 }
 
+/*
+ * Settings is a long form. The section headings (Provider, Tools, Jarvis memory,
+ * Location, Devices) already existed in the markup, but nothing separated them,
+ * so the page read as one undifferentiated list of inputs. A rule above each
+ * heading turns the page into scannable sections without adding markup — which
+ * matters because the panel is generated from the relay's status payload and a
+ * wrapper element per section would need a second source of truth.
+ */
+.settings-panel > .panel-label {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.settings-panel > .panel-label:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.settings-panel > .field {
+  margin-bottom: 10px;
+}
+
 .status-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 6px;
+  gap: 8px;
+  margin-bottom: 10px;
 }
 
 /* The compacted Jarvis memory digest — the model's own words about the wearer.
    Quoted rather than rendered, so it reads as a stored artifact. */
 .memory-digest {
-  font-size: 11px;
+  font-size: 12.5px;
   line-height: 1.55;
   color: var(--muted);
   font-style: italic;
@@ -1084,12 +1469,13 @@ p.empty {
 }
 
 .pill {
-  font-size: 11px;
+  font-size: 12px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 3px 10px;
+  padding: 4px 10px;
   color: var(--muted);
   background: var(--bg);
+  overflow-wrap: anywhere;
 }
 
 .pill.ok {
@@ -1103,20 +1489,20 @@ p.empty {
 }
 
 .warn-line {
-  border: 1px solid var(--danger);
-  border-radius: 10px;
-  background: rgba(229, 83, 75, 0.08);
+  border: 1px solid var(--danger-border);
+  border-radius: 12px;
+  background: var(--danger-wash);
   color: var(--text);
   font-size: 12px;
-  padding: 8px 12px;
+  padding: 9px 12px;
   margin: 0 0 14px;
 }
 
 .hint-line {
-  font-size: 11px;
+  font-size: 12.5px;
   color: var(--muted);
   margin: 2px 0 0;
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .hint-line code {
@@ -1136,13 +1522,13 @@ p.empty {
 .source-badge {
   display: inline-block;
   margin-left: 6px;
-  padding: 1px 7px;
+  padding: 2px 7px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--muted);
-  font-size: 10px;
-  letter-spacing: 0.04em;
+  font-size: 12px;
+  letter-spacing: 0.02em;
   text-transform: uppercase;
   vertical-align: middle;
 }
@@ -1154,7 +1540,7 @@ p.empty {
 }
 
 .source-badge.settings {
-  border-color: #2f403a;
+  border-color: var(--border-strong);
   color: var(--text);
 }
 
@@ -1181,9 +1567,9 @@ p.empty {
 
 .clear-toggle.pending {
   border-style: solid;
-  border-color: #7a3b3b;
-  background: rgba(220, 90, 90, 0.12);
-  color: #ff9c9c;
+  border-color: var(--danger-border);
+  background: var(--danger-wash);
+  color: var(--danger);
 }
 
 /* ── Jarvis (AI agent) panel ──────────────────────────────────────────────── */
@@ -1278,10 +1664,10 @@ p.empty {
 }
 
 .ap-off {
-  padding: 9px 12px;
+  padding: 10px 12px;
   border: 1px dashed var(--accent-dim);
-  border-radius: 8px;
-  background: rgba(61, 220, 132, 0.06);
+  border-radius: var(--radius-sm);
+  background: var(--accent-wash);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1289,10 +1675,10 @@ p.empty {
 /* A run that started on the glasses. Tinted like `.ap-off` (a state notice,
    not an error) but with a solid rule so it reads as "live", not "disabled". */
 .ap-mirror {
-  padding: 9px 12px;
+  padding: 10px 12px;
   border-left: 3px solid var(--accent);
-  border-radius: 8px;
-  background: rgba(61, 220, 132, 0.08);
+  border-radius: var(--radius-sm);
+  background: var(--accent-wash);
   color: var(--text);
   font-size: 12px;
   line-height: 1.5;
@@ -1391,7 +1777,7 @@ p.empty {
 
 .ap-step-note {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 12.5px;
 }
 
 /* Destructive-action confirmation */
@@ -1402,9 +1788,9 @@ p.empty {
   gap: 16px;
   flex-wrap: wrap;
   padding: 12px 14px;
-  border: 1px solid var(--danger);
+  border: 1px solid var(--danger-border);
   border-radius: var(--radius);
-  background: rgba(229, 83, 75, 0.08);
+  background: var(--danger-wash);
 }
 
 .ap-confirm-body {
@@ -1438,13 +1824,13 @@ p.empty {
 
 .ap-result.ok {
   border: 1px solid var(--accent-dim);
-  background: rgba(61, 220, 132, 0.07);
+  background: var(--accent-wash);
   color: var(--text);
 }
 
 .ap-result.bad {
-  border: 1px solid var(--danger);
-  background: rgba(229, 83, 75, 0.08);
+  border: 1px solid var(--danger-border);
+  background: var(--danger-wash);
   color: var(--danger);
 }
 
@@ -1477,12 +1863,13 @@ p.empty {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 10px;
+  padding: 6px 11px;
+  min-height: 34px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 12.5px;
 }
 
 .ap-chip:hover {
@@ -1666,8 +2053,9 @@ p.empty {
   border-radius: 0;
   color: var(--muted);
   font: inherit;
-  font-size: 12px;
-  padding: 6px 8px;
+  font-size: 13px;
+  padding: 8px 10px;
+  min-height: 40px;
   cursor: pointer;
 }
 
@@ -1770,6 +2158,7 @@ p.empty {
    button has to look and behave like the agent rows it sits beside. */
 .files-row {
   width: 100%;
+  min-height: 56px;
   flex-direction: column;
   /* `stretch`, not `flex-start`: a column flex item sized to its content has no
      definite width, so a long unbreakable title pushed past the card instead of
@@ -1809,7 +2198,7 @@ p.empty {
 
 .files-draft-note {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .files-preview-head {
@@ -1840,19 +2229,21 @@ p.empty {
 
 /* The sandboxed document frame. Tall enough that a report is readable without
    being scrolled inside a postage stamp, and plain white because the document
-   was authored for its own background, not ours. */
+   was authored for its own background, not ours — this is the ONE surface that
+   must NOT follow the theme. */
 .files-frame {
   width: 100%;
-  height: 62vh;
-  min-height: 320px;
+  height: 52vh;
+  min-height: 280px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: #ffffff;
 }
 
-@media (max-width: 860px) {
+@media (min-width: 861px) {
   .files-frame {
-    height: 48vh;
+    height: 62vh;
+    min-height: 320px;
   }
 }
 
@@ -1964,5 +2355,155 @@ p.empty {
   flex: 1 1 auto;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* ── Keyboard focus ────────────────────────────────────────────────────────
+   A visible ring for keyboard users only. The inputs keep their own inset
+   outline above; this covers buttons, tabs, chips and links, which otherwise
+   rely on the UA's ring (invisible on a dark surface in several browsers). */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+/* ── Reduced motion ────────────────────────────────────────────────────────
+   The mic pulse and the confirm blink are the only animations, and both exist
+   to say "still running". A wearer who has asked for less motion gets the same
+   information from the text, so they are switched off rather than slowed. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ── Small-screen refinements ────────────────────────────────────────────────
+   Corrections for layouts that are otherwise shared with the desktop. Kept in
+   ONE block at the end so adding a panel means auditing one place, rather than
+   hunting eight scattered max-width queries — which is how the previous tab row
+   ended up with two competing sets of rules. */
+@media (max-width: 640px) {
+  /* A transcript row is a label + body side by side at 78px + the rest. On a
+     phone that leaves the body ~250px, so stack them: the speaker becomes a
+     caption and the message gets the full width. */
+  .msg {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .msg-label {
+    padding-top: 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  /* Tool rows are name + kind + delete in one line. Below 640px the name gets
+     the full row and the two controls share the next one. */
+  .tool-head {
+    flex-wrap: wrap;
+  }
+
+  .tool-head .tool-name {
+    flex: 1 1 100%;
+  }
+
+  /* The Files preview header is a title block plus link/refresh buttons. */
+  .files-preview-head {
+    flex-wrap: wrap;
+  }
+
+  .files-preview-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  /* A label + control row (Settings, Jarvis) stacks instead of squeezing. */
+  .ap-field {
+    flex-wrap: wrap;
+  }
+
+  .ap-field > span {
+    min-width: 0;
+    flex: 1 1 100%;
+  }
+
+  /* The action catalog's two-column rows collapse to one column. Each row
+     explicitly reset the grid rows, so they must be reset again here — a bare
+     single-column template would put the code and the title on top of each
+     other. */
+  .ap-actions li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ap-actions code,
+  .ap-action-title,
+  .ap-action-desc {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .agent-transcript {
+    max-height: 52vh;
+  }
+
+  .pair-code {
+    font-size: 32px;
+    letter-spacing: 8px;
+  }
+
+  /* Page-level action rows become full-width targets. */
+  .docs-actions {
+    justify-content: stretch;
+  }
+
+  .docs-actions > button {
+    flex: 1 1 auto;
+  }
+}
+
+/* ── Focused controls on touch screens ───────────────────────────────────────
+   iOS Safari zooms the whole page when the focused control's text is under
+   16px, and every input here inherits a 15px body font. This comes LAST on
+   purpose: an element-level `@media` rule above loses to a component selector
+   that sets `font: inherit`, which is exactly why a 15px textarea survived the
+   first pass. Scoped to the shell so the glasses HUD styles never see it. */
+@media (max-width: 720px) {
+  .app input:not([type='checkbox']):not([type='radio']),
+  .app select,
+  .app textarea,
+  .auth-card input,
+  .auth-card textarea {
+    font-size: 16px;
+  }
+}
+
+/* ── Touch targets, last word ────────────────────────────────────────────────
+   These four controls are declared LATER in this file than the phone block near
+   the tabs, so that block's sizes lost on source order (equal specificity, later
+   rule wins) — the delete buttons and the todo check mark stayed at 32px on a
+   phone. Same intent, final position, so nothing below can undo it. */
+@media (max-width: 719px) {
+  .icon-btn {
+    width: 40px;
+    height: 40px;
+  }
+
+  .todo-item .check {
+    width: 40px;
+    height: 40px;
+  }
+
+  .mic-btn {
+    width: 42px;
+    height: 42px;
+  }
+
+  .doc-chip {
+    min-height: 44px;
+  }
 }
 

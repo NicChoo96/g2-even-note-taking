@@ -1,5 +1,4 @@
 import { useEffect, useSyncExternalStore, useState } from 'react';
-import { categorize } from './categorize';
 import { useAuth } from './auth';
 import { MicButton } from './Dictate';
 import { AgentsPanel } from './AgentsPanel';
@@ -24,12 +23,12 @@ import {
   setNotes as storeSetNotes,
   setTaskDone,
   setTaskText,
-  setTasks,
   subscribe,
   subscribeConn,
 } from '../store';
 import type { ConnStatus } from '../store';
 import { activeDoc, type HubState, type SectionId } from '../types';
+import { ThemeToggle } from './ThemeToggle';
 
 const SECTION_LABELS: Record<SectionId, string> = {
   todo: 'To-Do',
@@ -71,8 +70,6 @@ export default function App() {
   const state = useHubState();
   const conn = useConn();
   const { authed, email, inEvenApp, signOut } = useAuth();
-  const [paste, setPaste] = useState('');
-  const [detected, setDetected] = useState<SectionId[]>([]);
   const [newTask, setNewTask] = useState('');
   /** Local tab override — lets Settings show without changing the glasses section. */
   const [tab, setTab] = useState<Tab | null>(null);
@@ -94,23 +91,6 @@ export default function App() {
     // Guard the cast: a typo'd page name must not blank the content area.
     if (TAB_ORDER.includes(requested as Tab)) setTab(requested as Tab);
   }, [requested]);
-
-  const handleCategorize = () => {
-    if (!paste.trim()) return;
-    const result = categorize(paste, state.sections.todo);
-    setDetected(result.detected);
-    // Each part is its own hub write, because the hub takes ONE collection per
-    // route — there is no "apply this whole state" endpoint any more. The doc
-    // append is a read-modify-write against the body the panel already holds.
-    if (result.docs) {
-      const cur = activeDoc(state);
-      if (cur) appendDoc(cur.id, result.docs);
-      else addDoc(result.docs.split('\n')[0].trim().slice(0, 40) || 'Untitled', result.docs);
-    }
-    if (result.notes) appendNote(result.notes);
-    setTasks(result.todo);
-    setPaste('');
-  };
 
   const addTask = () => {
     const text = newTask.trim();
@@ -153,10 +133,6 @@ export default function App() {
 
   const setNotes = (text: string) => storeSetNotes(text);
 
-  const appendPaste = (text: string) => {
-    setPaste((p) => (p.trim() ? `${p.replace(/\s+$/, '')}\n${text}` : text));
-  };
-
   const appendTask = (text: string) => {
     setNewTask((t) => (t.trim() ? `${t.replace(/\s+$/, ' ')}${text}` : text));
   };
@@ -195,48 +171,31 @@ export default function App() {
       }`}
     >
       <header className="app-header">
-        <div>
-          <h1>🥽 G2 Even Reality Hub</h1>
-          <p className="tagline">Paste once → stream live into your glasses → control with the R1 ring.</p>
+        <div className="brand">
+          <h1>Reality Hub</h1>
+          <p className="tagline">Ask Jarvis, or edit any page — it streams live to your glasses.</p>
         </div>
-        <div className={`sync-chip ${chip.cls}`} title="Stream status">
-          <span className="dot" />
-          {chip.label}
-          {state.updatedAt ? ` · ${new Date(state.updatedAt).toLocaleTimeString()}` : ''}
-        </div>
-        {authed && (
-          <div className="sync-chip" title="Signed-in account">
-            <span>👤 {email}</span>
-            <button className="icon-btn" onClick={signOut} aria-label="Sign out">⏻</button>
+        <div className="header-actions">
+          <div className={`sync-chip ${chip.cls}`} title="Stream status">
+            <span className="dot" />
+            {chip.label}
+            {state.updatedAt ? ` · ${new Date(state.updatedAt).toLocaleTimeString()}` : ''}
           </div>
-        )}
-        {inEvenApp && <div className="sync-chip">Even App mode</div>}
+          {authed && (
+            <div className="sync-chip" title="Signed-in account">
+              <span className="account-email">{email}</span>
+              <button className="icon-btn" onClick={signOut} aria-label="Sign out">
+                ⏻
+              </button>
+            </div>
+          )}
+          {inEvenApp && <div className="sync-chip">Even App mode</div>}
+          {/* The theme toggle belongs to the SHELL, not to Settings: it is a
+              property of the whole surface, and a wearer flips it in the light
+              they are standing in rather than in a configuration page. */}
+          <ThemeToggle />
+        </div>
       </header>
-
-      <section className="paste-panel card">
-        <div className="field-toolbar">
-          <MicButton onText={appendPaste} hint="Speak → text lands in the box below" />
-        </div>
-        <textarea
-          value={paste}
-          onChange={(e) => setPaste(e.target.value)}
-          placeholder={'Paste anything — notes, docs, tasks, meeting minutes…\n\n' +
-            'Auto-sort hints:\n  • "- Do the dishes" or "todo: fix bug"  → To-Do\n  • "note: call mom" or "@idea"            → Notes\n  • anything else                          → Docs'}
-          rows={7}
-        />
-        <div className="paste-actions">
-          <div className="detected-tags">
-            {detected.map((d) => (
-              <span key={d} className="tag">
-                → {SECTION_LABELS[d]}
-              </span>
-            ))}
-          </div>
-          <button className="primary" onClick={handleCategorize} disabled={!paste.trim()}>
-            Categorize & Send
-          </button>
-        </div>
-      </section>
 
       <nav className="tabs" role="tablist">
         {TAB_ORDER.map((id) => (
@@ -284,7 +243,7 @@ export default function App() {
             </div>
             <ul className="todo-list">
               {state.sections.todo.length === 0 && (
-                <li className="empty">No tasks yet — paste some or add one below.</li>
+                <li className="empty">No tasks yet — add one below, or ask Jarvis.</li>
               )}
               {state.sections.todo.map((t) => (
                 <li key={t.id} className={t.done ? 'todo-item done' : 'todo-item'}>

@@ -36,6 +36,10 @@ import {
   saveDeviceSession,
   saveOwnerSession,
 } from '../durable-docs';
+// The palette switch. On the auth screens it is the ONLY control besides the
+// sign-in page, and it has to be here: a wearer who lands on a light page and
+// wants it dark cannot reach Settings to say so.
+import { ThemeToggle } from './ThemeToggle';
 
 // The owner session's FAST PATH — a synchronous read for event handlers, effects
 // and render. The durable copy in `durable-docs` is the record of truth in every
@@ -730,12 +734,15 @@ export function LoginScreen() {
   }, [clientId, setError, setAuthed]);
 
   return (
-    <div className="app" style={{ alignItems: 'center', textAlign: 'center', paddingTop: 80 }}>
-      <div>
-        <h1>🥽 G2 Even Reality Hub</h1>
-        <p className="tagline">Private — sign in with the owner's Google account to edit.</p>
+    <div className="app auth-screen">
+      <div className="auth-top">
+        <ThemeToggle />
       </div>
-      <div className="card" style={{ minWidth: 300 }}>
+      <div className="auth-brand">
+        <h1>Reality Hub</h1>
+        <p className="tagline">Private - sign in with the owner's Google account to edit.</p>
+      </div>
+      <div className="card auth-card">
         <div ref={btnRef} />
         {cfgError && <p style={{ color: 'var(--danger)', fontSize: 13 }}>{cfgError}</p>}
         {error && <p style={{ color: 'var(--danger)', fontSize: 13 }}>{error}</p>}
@@ -763,16 +770,19 @@ export function LoginScreen() {
 export function PairScreen() {
   const { pairCode, pairStatus, pairError, paired, setPairing } = useAuth();
   return (
-    <div className="app" style={{ alignItems: 'center', textAlign: 'center', paddingTop: 60 }}>
-      <div>
-        <h1>🥽 Pair this device</h1>
+    <div className="app auth-screen">
+      <div className="auth-top">
+        <ThemeToggle />
+      </div>
+      <div className="auth-brand">
+        <h1>Pair this device</h1>
         <p className="tagline">
           A device code is an alternative to signing in on this device.
         </p>
       </div>
-      <div className="card" style={{ minWidth: 300 }}>
+      <div className="card auth-card">
         {pairStatus === 'approved' ? (
-          <p style={{ color: 'var(--good)', fontSize: 14 }}>✓ Device approved — starting…</p>
+          <p style={{ color: 'var(--accent)', fontSize: 14 }}>✓ Device approved — starting…</p>
         ) : pairCode ? (
           <>
             <p style={{ color: 'var(--muted)', fontSize: 13 }}>Enter this code on the web app:</p>

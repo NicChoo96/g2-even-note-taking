@@ -2,10 +2,37 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>G2 Even Reality Hub</title>
     <link rel="icon" type="image/png" href="/icon.png" />
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!--
+      Resolve the theme BEFORE the first paint.
+
+      The whole palette is driven by custom properties on [data-theme], so
+      deciding this after the bundle loads means one frame of the dark palette
+      for a wearer who chose light — a flash that is most obvious on exactly the
+      surface this app is used on (a phone in daylight). The key and the
+      precedence mirror src/web/theme.ts: stored choice, then the operating
+      system, then dark.
+    -->
+    <script>
+      (function () {
+        var theme;
+        try {
+          var saved = localStorage.getItem('hub:theme');
+          theme = saved === 'light' || saved === 'dark'
+            ? saved
+            : window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+              ? 'light'
+              : 'dark';
+        } catch (e) {
+          theme = 'dark';
+        }
+        document.documentElement.setAttribute('data-theme', theme);
+        document.documentElement.style.colorScheme = theme;
+      })();
+    </script>
     <!-- Google Sign-In (Google Identity Services) for the web control app -->
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
