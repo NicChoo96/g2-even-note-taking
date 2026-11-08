@@ -49,7 +49,13 @@ export interface MetricsState {
   collectors: Collector[];
   updatedAt: number | null;
   now: number;
-  store: { file: string; durable: boolean };
+  /**
+   * Where the readings live. `hub` means durable; `relay` means this box's disk.
+   * `degraded` is set when the hub is configured but unreachable right now — the
+   * page is then showing a copy, and says so.
+   */
+  store: { mode: 'hub' | 'relay'; api?: string; file?: string; durable: boolean };
+  degraded?: boolean;
   error?: string;
 }
 

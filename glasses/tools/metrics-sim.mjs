@@ -119,6 +119,80 @@ check('one point is a stat', viewKindFor(price, 1), 'stat');
 check('three points is a series', viewKindFor(price, 3), 'series');
 check('text is a table', viewKindFor(headline, 50), 'table');
 
+// ── 6b. the HUB adapter's four wire traps ──────────────────────────────────
+// Each of these was found by probing the live service; each fails silently or at
+// the worst possible moment if it is wrong.
+const remote = await import(`${pathToFileURL(resolve(here, '../../web/server/metrics-remote.mjs')).href}?v=${Date.now()}`);
+check('a space in a slot becomes a T', remote.toWireSlot('2026-11-09 09:00'), '2026-11-09T09:00');
+check('and comes back as a space', remote.fromWireSlot('2026-11-09T09:00'), '2026-11-09 09:00');
+check('an empty slot stays absent', remote.toWireSlot(''), undefined);
+check(
+  'a number series crosses the wire as a number',
+  remote.toWireSample({ series: 'a.b', value: 36.4, slot: '2026-11-09 09:00' }).value,
+  36.4,
+);
+// The hub refuses "36.10" for a number series, so the adapter must never send it.
+check(
+  'and a numeric string would go as text, which the hub refuses — so callers coerce first',
+  typeof remote.toWireSample({ series: 'a.b', value: '36.10' }).value,
+  'string',
+);
+
+check(
+  'a long URL is squeezed into the 32-char provenance field',
+  remote.toWireSample({ series: 'a.b', value: 1, source: 'https://api.github.com/repos/nodejs/node' }).source.length,
+  32,
+);
+check(
+  'and keeps the host, which is what identifies the source',
+  remote.toWireSample({ series: 'a.b', value: 1, source: 'https://api.github.com/repos/nodejs/node' }).source.startsWith(
+    'api.github.com',
+  ),
+  true,
+);
+
+/** A stub that answers with a fixed status/body, for the mapping rules. */
+const stub = (status, body) => async () => ({
+  status,
+  text: async () => (body === undefined ? '' : JSON.stringify(body)),
+});
+
+const clientFor = (status, body) =>
+  remote.createMetricsRemote({ baseUrl: 'http://stub/hub/metrics', token: 'k', fetchImpl: stub(status, body) });
+
+const allRejected = await clientFor(400, {
+  ok: false,
+  code: 'VALIDATION_ERROR',
+  details: { rejected: [{ index: 0, field: 'samples[0].value', error: 'value must be a number' }] },
+}).append([{ series: 'a.b', value: 1 }]);
+check('an all-rejected 400 is per-item, not a transport failure', allRejected.allRejected, true);
+check('and keeps the per-item reason', allRejected.rejected[0]?.error, 'value must be a number');
+
+const partial = await clientFor(200, {
+  ok: true,
+  accepted: 1,
+  rejected: [{ index: 1, field: 'samples[1].value', error: 'nope' }],
+  samples: [{ action: 'replaced' }],
+}).append([{ series: 'a.b', value: 1 }, { series: 'a.b', value: 'x' }]);
+check('a partial batch counts what landed', partial.accepted, 1);
+check('and notes the replacement', partial.replaced, 1);
+
+const locked = await clientFor(409, {
+  ok: false,
+  code: 'SERIES_SHAPE_LOCKED',
+  details: { current: { type: 'number', unit: 'x' } },
+}).declare({ key: 'a.b', label: 'A', unit: 'USD', type: 'number' });
+check('a locked shape is its own outcome', locked.shapeLocked, true);
+check('and reports the current shape', locked.current?.unit, 'x');
+
+const notEmpty = await clientFor(409, {
+  ok: false,
+  code: 'SERIES_NOT_EMPTY',
+  details: { key: 'a.b', count: 7 },
+}).remove('a.b');
+check('a non-empty delete says how many readings', notEmpty.count, 7);
+check('and does not pretend it worked', notEmpty.ok, false);
+
 // ── 7. the REAL relay over HTTP ─────────────────────────────────────────────
 const PORT = 6200 + Math.floor(Math.random() * 60);
 const dir = mkdtempSync(join(tmpdir(), 'g2-metrics-'));

@@ -275,6 +275,11 @@ import {
   trimSamples,
   viewKindFor,
 } from './metrics.mjs';
+// The hub's metric store, when one is configured. Its header lists the four wire
+// differences (slot must not contain a space, values must be JSON numbers, an
+// all-rejected batch is a 400, and a non-empty series cannot be deleted) — each
+// one found by probing the live service, not by reading a description of it.
+import { createMetricsRemote } from './metrics-remote.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -3711,7 +3716,7 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (cronReady) await cronReady;
-    json(res, 200, metricsPayload());
+    json(res, 200, await metricsPayload());
     return;
   }
 
@@ -3757,7 +3762,7 @@ const server = createServer(async (req, res) => {
       json(res, 502, { ok: false, error: result.error });
       return;
     }
-    json(res, 200, { ...metricsPayload(), sample: result.sample });
+    json(res, 200, { ...(await metricsPayload()), sample: result.sample });
     return;
   }
 
@@ -3786,16 +3791,17 @@ const server = createServer(async (req, res) => {
         rejected.push({ series: item?.series ?? null, error: parsed.error });
         continue;
       }
-      const existing = metricStore.samples[series.key] ?? [];
-      const merged = appendSamples(existing, [parsed.sample]);
-      metricStore.samples[series.key] = trimSamples(merged.samples, series.retention);
+      const stored = await storeSample(parsed.sample);
+      if (!stored.ok) {
+        rejected.push({ series: parsed.sample.series, error: stored.error });
+        continue;
+      }
       accepted.push(parsed.sample);
     }
-    if (accepted.length) saveMetrics();
     // Partial acceptance is reported as partial: a caller that sent ten numbers
     // and had two refused must not be told "ok".
     json(res, accepted.length || !rejected.length ? 200 : 400, {
-      ...metricsPayload(),
+      ...(await metricsPayload()),
       accepted,
       rejected,
       ok: accepted.length > 0 || rejected.length === 0,
@@ -3819,10 +3825,30 @@ const server = createServer(async (req, res) => {
       });
       return;
     }
+    if (metricsRemote) {
+      const removed = await metricsRemote.remove(key);
+      if (!removed.ok) {
+        // The hub will not delete a series that still holds readings and offers no
+        // route to delete them. Say exactly that rather than "failed".
+        json(res, removed.notEmpty ? 409 : 502, {
+          ok: false,
+          error: removed.notEmpty
+            ? `the hub still holds ${removed.count} reading(s) for "${key}" and has no route to delete them, ` +
+              'so the series cannot be removed yet'
+            : removed.error || 'the hub refused the delete',
+        });
+        return;
+      }
+      delete metricStore.series[key];
+      delete metricStore.samples[key];
+      saveMetrics();
+      json(res, 200, await metricsPayload());
+      return;
+    }
     delete metricStore.series[key];
     delete metricStore.samples[key];
     saveMetrics();
-    json(res, 200, metricsPayload());
+    json(res, 200, await metricsPayload());
     return;
   }
 
@@ -5355,6 +5381,29 @@ async function saveCronConfig(config) {
 const METRICS_FILE = process.env.METRICS_FILE || join(DATA_DIR, '.g2-metrics.json');
 
 /**
+ * Where readings actually live.
+ *
+ * `METRICS_API` unset -> the local file (this relay only). Set to the hub's
+ * metrics base (e.g. `http://host/hub/metrics`) -> the hub holds them, and the
+ * definition of "durable" stops being a hope. The credential is the same API key
+ * the relay already uses for relay state.
+ */
+let metricsRemote = null;
+if (String(process.env.METRICS_API ?? '').trim()) {
+  const token = String(process.env.JARVIS_FILE_API_KEY || '').trim();
+  if (!token) {
+    console.log('[metrics] METRICS_API is set but JARVIS_FILE_API_KEY is not — staying on the local file');
+  } else {
+    try {
+      metricsRemote = createMetricsRemote({ baseUrl: process.env.METRICS_API, token });
+      console.log(`[metrics] hub store: ${metricsRemote.baseUrl}`);
+    } catch (err) {
+      console.log(`[metrics] hub store refused — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+/**
  * Samples, and the series definitions currently in force.
  *
  * SAMPLES LIVE IN A FILE, DECLARATIONS LIVE IN THE SCHEDULE (see storedSchedule).
@@ -5415,6 +5464,25 @@ function syncSeriesFromConfig(list) {
       continue;
     }
     metricStore.series[next.key] = { ...next, createdAt: prev?.createdAt ?? Date.now() };
+    // The hub is the store of record when configured, so the declaration has to
+    // reach it too — otherwise the first write would be refused for a series the
+    // hub has never heard of. Fire-and-forget: a save must not block on it.
+    if (metricsRemote) {
+      void metricsRemote
+        .declare(next)
+        .then((res) => {
+          if (res.ok) return;
+          if (res.shapeLocked) {
+            console.log(
+              `[metrics] hub keeps ${next.key} as ${res.current?.type}/${res.current?.unit || 'no unit'} — ` +
+                `a change needs a new key`,
+            );
+            return;
+          }
+          console.log(`[metrics] hub refused the declaration of ${next.key} — ${res.error}`);
+        })
+        .catch((err) => console.log(`[metrics] hub declare failed — ${err instanceof Error ? err.message : String(err)}`));
+    }
   }
   saveMetrics();
 }
@@ -5478,31 +5546,58 @@ async function runCollector(job, signal) {
       Date.now(),
     );
     if (!normalised.ok) return { ok: false, error: normalised.error };
-    const existing = metricStore.samples[series.key] ?? [];
-    const merged = appendSamples(existing, [normalised.sample]);
-    metricStore.samples[series.key] = trimSamples(merged.samples, series.retention);
-    saveMetrics();
-    return { ok: true, sample: normalised.sample, replaced: merged.replaced > 0 };
+    const stored = await storeSample(normalised.sample);
+    if (!stored.ok) return { ok: false, error: stored.error };
+    return {
+      ok: true,
+      sample: normalised.sample,
+      replaced: stored.replaced,
+      where: stored.where,
+      degraded: stored.degraded,
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-/** What the Data tab renders: declarations plus recent points, newest last. */
-function metricsPayload() {
-  const series = Object.values(metricStore.series).map((def) => {
-    const samples = metricStore.samples[def.key] ?? [];
-    return {
-      ...def,
-      count: samples.length,
-      latest: latestOf(samples),
-      delta: deltaOf(samples),
-      view: viewKindFor(def, Math.min(samples.length, 200)),
-      provenance: describeSample(latestOf(samples)),
-      points: samples.slice(-240).map((s) => ({ ts: s.ts, value: s.value })),
-    };
-  });
-  // A collector is a schedule entry, so the tab can show what feeds each series.
+/**
+ * Store one already-validated sample.
+ *
+ * The hub is the store of record when configured. If it refuses at the transport
+ * level the reading is kept LOCALLY and the result says so — losing a reading to
+ * be tidy would be worse than storing it in the second-best place, and a silent
+ * fallback would make the page claim durability it does not have.
+ */
+async function storeSample(sample) {
+  if (metricsRemote) {
+    try {
+      const res = await metricsRemote.append([sample]);
+      if (res.ok || res.allRejected) {
+        const bad = res.rejected?.[0];
+        if (bad) return { ok: false, error: bad.error };
+        return { ok: true, where: 'hub', replaced: res.replaced > 0 };
+      }
+      // A transport/authorisation failure: fall through and keep it locally.
+      console.log(`[metrics] hub write failed (${res.error ?? res.status}) — keeping ${sample.series} locally`);
+    } catch (err) {
+      console.log(`[metrics] hub write threw — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const series = metricStore.series[sample.series];
+  const existing = metricStore.samples[sample.series] ?? [];
+  const merged = appendSamples(existing, [sample]);
+  metricStore.samples[sample.series] = trimSamples(merged.samples, series?.retention);
+  saveMetrics();
+  return { ok: true, where: metricsRemote ? 'relay (hub unreachable)' : 'relay', degraded: Boolean(metricsRemote), replaced: merged.replaced > 0 };
+}
+
+/**
+ * What the Data tab renders: declarations plus recent points, newest last.
+ *
+ * Async because the hub is asked for the truth when it is configured — a local
+ * cache would be a second answer to the same question.
+ */
+async function metricsPayload() {
   const collectors = (cronConfig?.jobs ?? [])
     .filter((j) => j.kind === 'fetch')
     .map((j) => ({
@@ -5515,6 +5610,50 @@ function metricsPayload() {
       method: j.request?.method ?? 'GET',
       nextAt: nextRunAt(j, Date.now(), cronConfig?.timeZone ?? 'Asia/Singapore'),
     }));
+
+  const decorate = (def, samples) => ({
+    ...def,
+    count: samples.length,
+    latest: latestOf(samples),
+    delta: deltaOf(samples),
+    view: viewKindFor(def, Math.min(samples.length, 200)),
+    provenance: describeSample(latestOf(samples)),
+    points: samples.slice(-240).map((s) => ({ ts: s.ts, value: s.value })),
+  });
+
+  if (metricsRemote) {
+    const listed = await metricsRemote.listSeries();
+    if (listed.ok) {
+      const series = [];
+      for (const def of listed.series) {
+        const read = await metricsRemote.read(def.key, 240);
+        series.push(decorate({ ...def, label: def.label || def.key }, read.ok ? read.samples : []));
+        if (!read.ok) console.log(`[metrics] could not read ${def.key} — ${read.error}`);
+      }
+      return {
+        ok: true,
+        series: series.sort((a, b) => a.label.localeCompare(b.label)),
+        collectors,
+        updatedAt: Date.now(),
+        now: Date.now(),
+        store: { mode: 'hub', api: metricsRemote.baseUrl, durable: true },
+      };
+    }
+    // The hub is unreachable: show what this process has, and SAY SO.
+    const local = Object.values(metricStore.series).map((def) => decorate(def, metricStore.samples[def.key] ?? []));
+    return {
+      ok: true,
+      series: local.sort((a, b) => a.label.localeCompare(b.label)),
+      collectors,
+      updatedAt: metricStore.updatedAt || null,
+      now: Date.now(),
+      store: { mode: 'hub', api: metricsRemote.baseUrl, durable: true },
+      degraded: true,
+      error: `the hub metric store is unreachable — showing this relay's copy (${listed.error})`,
+    };
+  }
+
+  const series = Object.values(metricStore.series).map((def) => decorate(def, metricStore.samples[def.key] ?? []));
   return {
     ok: true,
     series: series.sort((a, b) => a.label.localeCompare(b.label)),
@@ -5522,7 +5661,7 @@ function metricsPayload() {
     updatedAt: metricStore.updatedAt || null,
     now: Date.now(),
     // Said out loud: without a real store these samples do not survive a deploy.
-    store: { file: METRICS_FILE, durable: false },
+    store: { mode: 'relay', file: METRICS_FILE, durable: false },
   };
 }
 

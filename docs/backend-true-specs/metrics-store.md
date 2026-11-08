@@ -10,6 +10,7 @@
 | **Who writes** | The relay's clock (`kind: 'fetch'` collector jobs) and, later, agents through `metric.write`. |
 | **Who reads** | The relay (dashboard), the glasses (one number at a time), agents (their own history). |
 | **Relay identity** | The same API key already minted for relay state (`g2-relay`, `content:read`, `content:write`). Add the two namespaces to the same allow-list mechanism (`HUB_RELAY_WRITERS` or its successor). |
+| **Status** | **IMPLEMENTED AND LIVE** (commit `eb2cd82`, schema v2). The relay talks to it when `METRICS_API` is set; verified end to end by `scripts/probe-metrics-remote-e2e.mjs` (12/12) including a real HTTPS collector whose reading landed in the hub. Two live-only constraints and one gap are recorded in §7. |
 
 ---
 
@@ -116,6 +117,8 @@ Rules:
 * `value` for a `number` series: a finite JSON number, or a string that parses to one after stripping thousands separators. **Blank, `null`, `"n/a"`, `NaN` and `Infinity` are rejected** — a coercion to `0` would plot a fake reading.
 * `value` for a `string` series: stored in `value_text` as given (≤ 500 chars).
 * `ts` absent → server `now()`. `ts` given → must be within ±365 days, else `400`.
+* `slot`, when present, must match `^[A-Za-z0-9:._-]{1,32}$` — **a space is refused**. The relay's own slot format is `YYYY-MM-DD HH:MM`, so it crosses the wire as `YYYY-MM-DDTHH:MM` and is translated back by the adapter (`metrics-remote.mjs`).
+* `source`, when present, is **at most 32 characters**. The relay sends `host + path`, truncated; a longer value takes the whole reading down with `samples[0].source must be at most 32 characters`. See §7 for why this costs provenance.
 * No `slot` → plain append (a point in time, not a scheduled reading).
 * Duplicate `slot` → **UPDATE** the existing row (`value`, `ts`, `source`, `run_id`), and report it in `accepted` with `replaced: true`.
 * Request body cap: 256 KiB, `413 TOO_LARGE` above it.
@@ -250,7 +253,25 @@ A collector job is a cron entry and needs no backend support:
 
 ---
 
-## 6. Phase 2 (only if the numbers are actually used)
+## 7. Live-only constraints and one gap
+
+Found by probing the deployed service after it shipped; recorded because each one is invisible until a write fails.
+
+1. **A slot may not contain a space** (`[A-Za-z0-9:._-]{1,32}`). The relay's canonical slot is `YYYY-MM-DD HH:MM`, so the adapter translates to `T` on the way out and back on the way in. One place, tested.
+2. **`source` is capped at 32 characters.** Provenance therefore shows `host + path`, truncated — for a deep URL the path is lost. If provenance matters more than the column width, widening this to 120–200 would restore it; the relay sends it already shortened, so nothing else has to change.
+3. **A batch where nothing was accepted answers `400`**, not `200` with all items rejected. The adapter treats it as per-item outcomes, which is what it means; a caller that treats it as a transport error will retry a permanently invalid payload.
+4. **GAP — samples cannot be deleted, so a series with readings can never be removed.** `DELETE /hub/metrics/series/{key}` answers `409 SERIES_NOT_EMPTY` with `details.count`, and there is no `DELETE /samples` route (`DELETE /hub/metrics/samples?series=` → 404). The consequence is visible in the UI: the Data tab's delete button refuses with *"the hub still holds N reading(s) … and has no route to delete them"*. Two small routes would close it:
+
+```
+DELETE /hub/metrics/samples?series={key}[&before={ts}]   → 204, {deleted: n}
+GET    /hub/metrics/series/{key}                          → 200 / 404 (single declaration)
+```
+
+Until then, purging a series with data needs SQL, which is why the verification probes above clean up by prefix (`where series like 'probe.%'`).
+
+---
+
+## 8. Phase 2 (only if the numbers are actually used)
 
 1. **`metric.write` as an agent tool**, so an LLM can store a reading it computed. It must go through the same validation — a model must never be able to widen a series' shape.
 2. **Downsampling with a declared policy** (`mean`/`last`/`min`/`max` per series) once a chart has more points than pixels.

@@ -352,10 +352,16 @@ export function DataPanel() {
 
       {note && <p className="ok-line">{note}</p>}
       {warn && <p className="warn-line">⚠️ {warn}</p>}
-      {metrics && metrics.store && metrics.store.durable === false && (
+      {metrics?.degraded && (
+        <p className="warn-line">⚠️ {metrics.error ?? 'the hub metric store is unreachable'}</p>
+      )}
+      {metrics?.store?.mode === 'hub' && !metrics.degraded && (
+        <p className="hint-line">Readings are stored on the hub — they survive a deploy.</p>
+      )}
+      {metrics?.store?.mode === 'relay' && (
         <p className="hint-line">
-          Readings are stored on the relay at {metrics.store.file} — they survive a restart, not a deploy.
-          Series <em>declarations</em> are stored on the hub with the schedule.
+          Readings are stored on the relay at {metrics.store.file ?? 'its own disk'} — they survive a restart, not a
+          deploy. Series <em>declarations</em> are stored on the hub with the schedule.
         </p>
       )}
 
