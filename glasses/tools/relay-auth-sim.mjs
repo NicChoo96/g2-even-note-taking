@@ -182,6 +182,9 @@ for (const [label, input] of [
     v: AUTH_BLOB_VERSION,
     sessions: {},
     devices: {},
+    // Empty, but PRESENT: a union of two copies needs somewhere to record a
+    // removal, or a sign-out can never propagate and a revoked device comes back.
+    revoked: {},
   });
 }
 // A corrupt/missing blob must always be REPLACEABLE — never a reason for the

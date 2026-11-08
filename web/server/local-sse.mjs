@@ -411,7 +411,7 @@ if (DOCS_ORIGIN && DOC_LISTEN_PORT === 0 && !process.env.DOC_TICKET_SECRET) {
 // across the upgrade instead of being logged out by the change meant to protect
 // their session.
 const PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
-let authStore = { sessions: {}, devices: {} };
+let authStore = { sessions: {}, devices: {}, revoked: {} };
 
 function loadAuthStore() {
   try {
@@ -909,6 +909,38 @@ const authSync = createAuthStoreSync({
  */
 function markAuthChanged() {
   authSync.markChanged();
+}
+
+/**
+ * Record that a credential was DELIBERATELY removed.
+ *
+ * The auth store is now reconciled as a UNION of this process's copy and the
+ * hub's, which is what keeps a fresh sign-in alive across a restart. But a union
+ * cannot express a deletion — so without this, the next reconcile would happily
+ * resurrect the session the wearer just signed out of, or the device the owner
+ * just revoked, which is a security bug rather than a convenience one.
+ *
+ * The tombstone travels in the same blob, is swept by the same 30-day TTL, and
+ * beats a live record from the other side.
+ */
+function tombstone(key) {
+  if (!key) return;
+  if (!authStore.revoked || typeof authStore.revoked !== 'object') authStore.revoked = {};
+  authStore.revoked[key] = Date.now();
+}
+
+/**
+ * Persist AND mirror NOW, for the two moments where losing the mirror loses the
+ * credential itself: a new owner session, and a device approval.
+ *
+ * `markChanged` is debounced and its timer is `unref`'d, so a restart within a
+ * couple of hundred milliseconds of signing in could leave the hub holding a blob
+ * that had never heard of the session — and the next boot adopted it and signed
+ * the wearer out. These two writes cannot wait for a debounce.
+ */
+function markAuthChangedNow() {
+  authSync.markChanged();
+  void authSync.pushNow();
 }
 
 /**
@@ -3100,7 +3132,7 @@ const server = createServer(async (req, res) => {
         // Keyed by the DIGEST of the token, so neither this file nor the hub blob
         // it is mirrored to is a working key ring if it leaks.
         authStore.sessions[digestToken(sessionToken)] = { email: payload.email, createdAt: Date.now() };
-        markAuthChanged();
+        markAuthChangedNow();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, email: payload.email, sessionToken }));
       } else {
@@ -3122,8 +3154,12 @@ const server = createServer(async (req, res) => {
     // The map is keyed by digest, so the presented token is hashed to find it.
     const key = token ? digestToken(token) : '';
     if (key && authStore.sessions[key]) {
+      // Tombstone, as well as delete: the store is now merged with the hub's copy
+      // on every boot, so a plain delete would be undone by the very copy this
+      // sign-out was meant to leave behind.
       delete authStore.sessions[key];
-      markAuthChanged();
+      tombstone(key);
+      markAuthChangedNow();
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');
@@ -3242,7 +3278,9 @@ const server = createServer(async (req, res) => {
     dev.status = 'approved';
     dev.email = owner.email;
     dev.approvedAt = Date.now();
-    markAuthChanged();
+    // Immediately, not on a debounce: an approval that only exists in this
+    // process's memory is a device that the next restart throws out of the app.
+    markAuthChangedNow();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, deviceId: dev.deviceId }));
     return;
@@ -3312,7 +3350,8 @@ const server = createServer(async (req, res) => {
     const deviceId = String(parsed.deviceId || '');
     if (deviceId && authStore.devices[deviceId]) {
       delete authStore.devices[deviceId];
-      markAuthChanged();
+      tombstone(deviceId);
+      markAuthChangedNow();
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');

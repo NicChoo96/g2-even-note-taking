@@ -131,15 +131,52 @@ console.log('\n== 2. Adopt at boot: the hub is the authority ==');
   ok('and wrapped into the versioned shape', relay.state.store.v === AUTH_BLOB_VERSION);
 }
 {
-  // The hub wins even when the file holds a session the hub does not know about.
-  // Anything else makes the two copies diverge forever.
+  // WAS: "the hub wins even when the file holds a session the hub does not know
+  // about", on the grounds that anything else lets the two copies diverge.
+  //
+  // THAT RULE SIGNED THE WEARER OUT. The hub copy is only as fresh as the last
+  // successful push, and a push is debounced and `unref`'d, so a restart moments
+  // after a sign-in booted with a blob that had never heard of it — and adopting
+  // it deleted a session the wearer had just been granted, on the web AND on the
+  // phone (its approved device lived in the same blob).
+  //
+  // The copies are reconciled as a UNION instead, and divergence is prevented by
+  // the thing a union actually needs: a TOMBSTONE. A removal is recorded, so a
+  // deliberate sign-out or device revoke still propagates, while a record one
+  // side has simply not seen yet survives.
   const hub = fakeHub([
     { method: 'GET', path: AUTH_HUB_PATH, status: 200, text: JSON.stringify({ value: { v: 1, sessions: {}, devices: {} } }) },
   ]);
-  const relay = makeRelay({ sessions: { [digestToken('stale-local')]: row(T) }, devices: {} });
+  const relay = makeRelay({ sessions: { [digestToken('fresh-local')]: row(T) }, devices: {} });
   const sync = createAuthStoreSync({ ...relay, call: hub.call, now: () => T, timeoutMs: 500 });
-  check('an empty hub blob still wins', await sync.reconcile(), 'adopted');
-  check('the stale local session is gone', Object.keys(relay.state.store.sessions), []);
+  check('an empty hub blob boots', await sync.reconcile(), 'adopted');
+  check(
+    'a session the hub had not yet heard of SURVIVES the boot',
+    Object.keys(relay.state.store.sessions),
+    [digestToken('fresh-local')],
+  );
+  ok('…and is pushed up, so the next deploy starts from it', hub.puts().length >= 1);
+}
+{
+  // The other half of that rule: a REMOVAL must still win, or a union would
+  // resurrect exactly what the owner signed out of.
+  const gone = digestToken('signed-out');
+  const hub = fakeHub([
+    {
+      method: 'GET',
+      path: AUTH_HUB_PATH,
+      status: 200,
+      text: JSON.stringify({ value: { v: 1, sessions: {}, devices: {}, revoked: { [gone]: T } } }),
+    },
+  ]);
+  const relay = makeRelay({
+    sessions: { [gone]: row(T) },
+    devices: { 'dev-1': { status: 'approved', createdAt: T } },
+  });
+  const sync = createAuthStoreSync({ ...relay, call: hub.call, now: () => T, timeoutMs: 500 });
+  await sync.reconcile();
+  check('a tombstoned session is NOT resurrected', Object.keys(relay.state.store.sessions), []);
+  check('and a device the owner never revoked is kept', Object.keys(relay.state.store.devices), ['dev-1']);
 }
 {
   // A blob the OLD relay uploaded is token-keyed. Adopting it verbatim would
@@ -375,7 +412,10 @@ ok('and the file it saves is the relay\'s file', /save: persistAuthStore/.test(r
 // never mirror it, so a redeploy would lose that change and nothing else.
 check(
   'all five auth mutations use markAuthChanged()',
-  (relaySrc.match(/markAuthChanged\(\);/g) || []).length,
+  // `…Now` is the same marker plus an immediate mirror — required for a new
+  // session and a device approval, where waiting for a debounce can lose the
+  // credential to a restart. Both count as "went through the durable path".
+  (relaySrc.match(/markAuthChanged(?:Now)?\(\);/g) || []).length,
   5,
 );
 ok('markAuthChanged delegates to the sync', /function markAuthChanged\(\) \{\s*authSync\.markChanged\(\);/.test(relaySrc));

@@ -25,7 +25,7 @@
 //     many times anyone signs in.
 //
 // Zero runtime dependencies (node built-ins only).
-import { AUTH_KEY, authBlobOf, describeAuthBlob, normaliseAuthBlob } from './relay-auth.mjs';
+import { AUTH_KEY, authBlobOf, describeAuthBlob, mergeAuthBlobs, normaliseAuthBlob } from './relay-auth.mjs';
 
 /** The blob's path under the hub prefix. Part 1 fixes the key as a path segment. */
 export const AUTH_HUB_PATH = `/relay/${AUTH_KEY}`;
@@ -133,7 +133,6 @@ export function createAuthStoreSync({
     flush() {
       return chain;
     },
-
     /** One push of the current store, out of band. */
     pushNow() {
       return pushBlob(authBlobOf(getStore(), now()));
@@ -170,10 +169,29 @@ export function createAuthStoreSync({
       ]);
 
       if (read.status === 200 && read.value) {
-        const hub = normaliseAuthBlob(read.value, now());
-        setStore(hub.value);
+        // `.value` — normalise returns {value, changed}. Passing the wrapper
+        // instead made the merge read `src.sessions` off an object that has no
+        // such key, i.e. an EMPTY store, which is the very failure this code
+        // exists to prevent.
+        const hub = normaliseAuthBlob(read.value, now()).value;
+        // UNION, never replace. The hub copy is only as fresh as the last
+        // successful push, and that push is debounced — so a restart moments
+        // after a sign-in used to adopt a blob that had never heard of it and
+        // delete the session that had just been minted. The wearer was thrown
+        // back to the sign-in screen with `unauthorized`, and the paired device
+        // went with it.
+        const merged = mergeAuthBlobs(authBlobOf(getStore(), now()), hub, now());
+        setStore(merged);
         save();
-        log(`[g2-hub] auth store adopted from the hub (${describeAuthBlob(hub.value)})`);
+        // Push the UNION back, so the hub carries what only this process knew.
+        // Without this the next deployment starts from the same stale copy and
+        // the wearer is signed out again.
+        const same = JSON.stringify(merged) === JSON.stringify(hub);
+        const pushed = same ? true : await pushBlob(merged);
+        log(
+          `[g2-hub] auth store reconciled (${describeAuthBlob(merged)})` +
+            (pushed ? '' : ' — hub push failed, the local file is ahead'),
+        );
         return 'adopted';
       }
 

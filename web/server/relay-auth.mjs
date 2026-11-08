@@ -29,7 +29,16 @@ export const AUTH_KEY = 'auth';
 export const AUTH_BLOB_VERSION = 1;
 
 /** Backend spec §2.1 step 4 — the sweep's two limits. */
-export const SESSION_TTL_MS = 30 * 24 * 3600e3; // 30 days
+/**
+ * How long a sign-in lasts.
+ *
+ * A YEAR, not the 30 days this used to be. There is exactly one account, it is
+ * the owner's, and the only thing a shorter window buys is a random sign-out in
+ * the middle of the day with no event to explain it — which reads as a bug, not
+ * as a policy. The store is bounded by MAX_SESSIONS and swept on every write, so a
+ * long window cannot grow it without limit.
+ */
+export const SESSION_TTL_MS = 365 * 24 * 3600e3;
 export const MAX_SESSIONS = 50;
 
 /** A session key is a sha256 hex digest, and nothing else is accepted as one. */
@@ -121,10 +130,21 @@ export function normaliseAuthBlob(raw, now = Date.now()) {
   const rekeyed = rekeySessions(src.sessions);
   const swept = sweepSessions(rekeyed.sessions, now);
   const devices = isPlainObject(src.devices) ? src.devices : {};
+  // A REMOVAL has to be storable, or a union of two copies can never agree on
+  // one. `revoked` is `{ [digest or deviceId]: removedAt }` — the tombstone that
+  // lets a merge keep everything either copy knows about WITHOUT resurrecting a
+  // device the owner deliberately removed.
+  const revoked = {};
+  for (const [key, at] of Object.entries(isPlainObject(src.revoked) ? src.revoked : {})) {
+    const when = Number(at);
+    if (!Number.isFinite(when)) continue;
+    if (now - when > SESSION_TTL_MS) continue;
+    revoked[key] = when;
+  }
   const changed =
     rekeyed.changed || swept.changed || src.v !== AUTH_BLOB_VERSION || src.devices !== devices;
   return {
-    value: { v: AUTH_BLOB_VERSION, sessions: swept.sessions, devices },
+    value: { v: AUTH_BLOB_VERSION, sessions: swept.sessions, devices, revoked },
     changed,
   };
 }
@@ -137,6 +157,61 @@ export function normaliseAuthBlob(raw, now = Date.now()) {
  */
 export function authBlobOf(store, now = Date.now()) {
   return normaliseAuthBlob(store, now).value;
+}
+
+/**
+ * UNION two blobs: this process's and the hub's.
+ *
+ * WHY THIS EXISTS — and it is the fix for "signed out after logging in".
+ *   `reconcile()` used to ADOPT the hub's blob WHOLESALE at boot. The hub copy is
+ *   only as fresh as the last successful push, and a push is DEBOUNCED and
+ *   `unref`'d — so a restart within a moment of a sign-in (a deploy, a crash, an
+ *   OOM kill, a platform restart) could boot with a hub blob that had never heard
+ *   of the session that had just been minted. Adoption then deleted it, every
+ *   token on the device 401'd, and the wearer landed back on "Sign in with
+ *   Google" with `unauthorized` under the button. The Even App lost its approved
+ *   device the same way, which is why both surfaces fell over together.
+ *
+ *   Losing a session is never correct: both inputs are legitimate, and a session
+ *   is only ever ADDITIVE. So the store is the union of the two, with the newer
+ *   record winning where they disagree, and an approval beating a pending row.
+ *
+ * ORDER: `local` first, `hub` second. On an exact tie the LOCAL record wins,
+ * because it is the one this process has actually been serving from.
+ */
+export function mergeAuthBlobs(local, hub, now = Date.now()) {
+  const a = normaliseAuthBlob(local, now).value;
+  const b = normaliseAuthBlob(hub, now).value;
+
+  const sessions = { ...b.sessions };
+  for (const [key, value] of Object.entries(a.sessions)) {
+    const other = sessions[key];
+    if (!other || Number(value?.createdAt) >= Number(other?.createdAt)) sessions[key] = value;
+  }
+
+  const devices = { ...b.devices };
+  const rank = (d) => (d?.status === 'approved' ? 2 : d?.status === 'pending' ? 1 : 0);
+  for (const [key, value] of Object.entries(a.devices)) {
+    const other = devices[key];
+    if (!other) {
+      devices[key] = value;
+      continue;
+    }
+    if (rank(value) > rank(other)) devices[key] = value;
+    else if (rank(value) === rank(other) && Number(value?.createdAt) >= Number(other?.createdAt)) {
+      devices[key] = value;
+    }
+  }
+
+  // A tombstone from EITHER side wins over a record from the other: a removal is
+  // an explicit act, a presence may simply be a stale copy.
+  const revoked = { ...b.revoked, ...a.revoked };
+  for (const key of Object.keys(revoked)) {
+    delete sessions[key];
+    delete devices[key];
+  }
+
+  return normaliseAuthBlob({ v: AUTH_BLOB_VERSION, sessions, devices, revoked }, now).value;
 }
 
 /** How much of the blob is real. Used for one honest log line, never for a decision. */
