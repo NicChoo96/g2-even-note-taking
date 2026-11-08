@@ -260,7 +260,21 @@ import {
   MAX_JOBS_PER_TICK,
   nextRunAt,
   parseCronConfig,
+  slotAt,
 } from './agent-cron.mjs';
+// The metric store's rules. Pure, so a harness can pin the three that matter:
+// declare-before-write, idempotent by slot, additive schema only.
+import {
+  appendSamples,
+  deltaOf,
+  describeSample,
+  dotGet,
+  latestOf,
+  normaliseSample,
+  normaliseSeries,
+  trimSamples,
+  viewKindFor,
+} from './metrics.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -3687,6 +3701,131 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // ── Metrics ───────────────────────────────────────────────────────────────
+  // Owner-only for the same reason the schedule is: a series is configuration,
+  // and writing one spends network requests on the wearer's behalf.
+  if (url.pathname === '/api/metrics' && req.method === 'GET') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    if (cronReady) await cronReady;
+    json(res, 200, metricsPayload());
+    return;
+  }
+
+  // Run one collector NOW, without saving it. This is how the Data tab proves a
+  // URL/header/select triple before it is put on a schedule — the same request
+  // path the clock will take, so a green test here is a real green.
+  if (url.pathname === '/api/metrics/collect' && req.method === 'POST') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 16 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    const seriesKey = String(body?.series ?? '').trim().toLowerCase();
+    const series = metricStore.series[seriesKey];
+    if (!series) {
+      json(res, 404, { ok: false, error: `series "${seriesKey}" is not declared` });
+      return;
+    }
+    const url0 = String(body?.request?.url ?? '').trim();
+    if (!/^https:\/\//i.test(url0)) {
+      json(res, 400, { ok: false, error: 'request.url must be https://' });
+      return;
+    }
+    const result = await runCollector({
+      kind: 'fetch',
+      series: seriesKey,
+      select: String(body?.select ?? '').trim(),
+      request: {
+        url: url0,
+        method: String(body?.request?.method ?? 'GET').trim().toUpperCase(),
+        headers: String(body?.request?.headers ?? '').trim(),
+        bodyTemplate: String(body?.request?.bodyTemplate ?? '').trim(),
+      },
+    });
+    if (!result.ok) {
+      json(res, 502, { ok: false, error: result.error });
+      return;
+    }
+    json(res, 200, { ...metricsPayload(), sample: result.sample });
+    return;
+  }
+
+  // Append samples directly — the door an agent or a script uses when the number
+  // was already fetched by something else. Idempotent by `slot`.
+  if (url.pathname === '/api/metrics/samples' && req.method === 'POST') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 64 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    const items = Array.isArray(body?.samples) ? body.samples : [body];
+    const accepted = [];
+    const rejected = [];
+    for (const item of items) {
+      const series = metricStore.series[String(item?.series ?? '').trim().toLowerCase()];
+      const parsed = normaliseSample(item, series, Date.now());
+      if (!parsed.ok) {
+        rejected.push({ series: item?.series ?? null, error: parsed.error });
+        continue;
+      }
+      const existing = metricStore.samples[series.key] ?? [];
+      const merged = appendSamples(existing, [parsed.sample]);
+      metricStore.samples[series.key] = trimSamples(merged.samples, series.retention);
+      accepted.push(parsed.sample);
+    }
+    if (accepted.length) saveMetrics();
+    // Partial acceptance is reported as partial: a caller that sent ten numbers
+    // and had two refused must not be told "ok".
+    json(res, accepted.length || !rejected.length ? 200 : 400, {
+      ...metricsPayload(),
+      accepted,
+      rejected,
+      ok: accepted.length > 0 || rejected.length === 0,
+    });
+    return;
+  }
+
+  const seriesMatch = /^\/api\/metrics\/series\/([a-z0-9._-]{3,80})$/.exec(url.pathname);
+  if (seriesMatch && req.method === 'DELETE') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    const key = seriesMatch[1].toLowerCase();
+    const inUse = (cronConfig?.jobs ?? []).some((j) => j.kind === 'fetch' && j.series === key);
+    if (inUse) {
+      json(res, 409, {
+        ok: false,
+        error: `"${key}" is still collected by the schedule — remove that collector first`,
+      });
+      return;
+    }
+    delete metricStore.series[key];
+    delete metricStore.samples[key];
+    saveMetrics();
+    json(res, 200, metricsPayload());
+    return;
+  }
+
   // ── The agent schedule ────────────────────────────────────────────────────
   // Owner-only, because a schedule spends money unattended and names agents.
   // The body is the WHOLE schedule every time: a per-job PATCH would need its own
@@ -5068,13 +5207,34 @@ function storedSchedule(config) {
     enabled: config.enabled !== false,
     timeZone: config.timeZone,
     graceMinutes: config.graceMinutes,
-    jobs: (config.jobs ?? []).map((j) => ({
-      agent: j.agent,
-      at: j.at,
-      ...(j.days && j.days.length ? { days: j.days } : {}),
-      ...(j.ask ? { ask: j.ask } : {}),
-      enabled: j.enabled !== false,
-    })),
+    // SERIES LIVE HERE, not in the sample file, because the schedule is the one
+    // document that is already durable and validated. A deployment therefore
+    // keeps its declarations even though the samples themselves are local.
+    ...(config.series && config.series.length ? { series: config.series } : {}),
+    jobs: (config.jobs ?? []).map((j) =>
+      j.kind === 'fetch'
+        ? {
+            kind: 'fetch',
+            series: j.series,
+            ...(j.select ? { select: j.select } : {}),
+            request: {
+              url: j.request?.url,
+              method: j.request?.method,
+              ...(j.request?.headers ? { headers: j.request.headers } : {}),
+              ...(j.request?.bodyTemplate ? { bodyTemplate: j.request.bodyTemplate } : {}),
+            },
+            at: j.at,
+            ...(j.days && j.days.length ? { days: j.days } : {}),
+            enabled: j.enabled !== false,
+          }
+        : {
+            agent: j.agent,
+            at: j.at,
+            ...(j.days && j.days.length ? { days: j.days } : {}),
+            ...(j.ask ? { ask: j.ask } : {}),
+            enabled: j.enabled !== false,
+          },
+    ),
   };
 }
 
@@ -5106,6 +5266,7 @@ async function loadCronConfig() {
           cronConfig = parsed.config;
           cronConfigSource = 'hub';
           for (const p of parsed.problems) console.log(`[cron] ${p}`);
+          syncSeriesFromConfig(parsed.config.series);
           return;
         }
         console.log(`[cron] hub schedule refused — ${parsed.error ?? 'unusable'}`);
@@ -5140,6 +5301,7 @@ async function loadCronConfig() {
   }
   cronConfig = parsed.config;
   for (const p of parsed.problems) console.log(`[cron] ${p}`);
+  syncSeriesFromConfig(parsed.config.series);
   // The hub had nothing, so push what this process already had: otherwise the
   // first deploy after this change would silently forget a hand-written file.
   if (client && cronConfig.jobs.length) {
@@ -5159,6 +5321,7 @@ async function loadCronConfig() {
 async function saveCronConfig(config) {
   cronConfig = config;
   cronConfigSource = 'ui';
+  syncSeriesFromConfig(config.series);
   let onDisk = false;
   try {
     writeFileSync(CRON_FILE, `${JSON.stringify(storedSchedule(config), null, 2)}\n`);
@@ -5188,6 +5351,181 @@ async function saveCronConfig(config) {
   }
 }
 
+// ── Metric store ─────────────────────────────────────────────────────────────
+const METRICS_FILE = process.env.METRICS_FILE || join(DATA_DIR, '.g2-metrics.json');
+
+/**
+ * Samples, and the series definitions currently in force.
+ *
+ * SAMPLES LIVE IN A FILE, DECLARATIONS LIVE IN THE SCHEDULE (see storedSchedule).
+ * That split is deliberate: definitions are configuration and must survive a
+ * deploy, so they ride the one document already mirrored to the hub; samples are
+ * append-only data and want a real table, which is what the backend spec asks
+ * for. Until then this file keeps them across a restart — the honest guarantee
+ * available on a container without a volume.
+ */
+let metricStore = { version: 1, series: {}, samples: {}, updatedAt: 0 };
+
+function loadMetrics() {
+  try {
+    const raw = JSON.parse(readFileSync(METRICS_FILE, 'utf8'));
+    if (!raw || typeof raw !== 'object') return;
+    metricStore = {
+      version: 1,
+      series: raw.series && typeof raw.series === 'object' ? raw.series : {},
+      samples: raw.samples && typeof raw.samples === 'object' ? raw.samples : {},
+      updatedAt: Number(raw.updatedAt) || 0,
+    };
+  } catch {
+    // Absence is normal: a fresh box has no metrics yet.
+  }
+}
+
+function saveMetrics() {
+  metricStore.updatedAt = Date.now();
+  try {
+    writeFileSync(METRICS_FILE, JSON.stringify(metricStore));
+  } catch (err) {
+    console.log(`[metrics] could not save — ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Adopt the schedule's declarations, refusing anything that would violate the
+ * additive-only rule: a unit or type change needs a NEW series (`foo.v2`),
+ * because every chart already drawn assumed the old one.
+ */
+function syncSeriesFromConfig(list) {
+  if (!Array.isArray(list)) return;
+  for (const raw of list) {
+    const parsed = normaliseSeries(raw);
+    if (!parsed.ok) {
+      console.log(`[metrics] series refused — ${parsed.error}`);
+      continue;
+    }
+    const next = parsed.series;
+    const prev = metricStore.series[next.key];
+    if (prev && (prev.type !== next.type || prev.unit !== next.unit)) {
+      console.log(
+        `[metrics] series ${next.key} keeps ${prev.type}/${prev.unit || 'no unit'} — ` +
+          `a type or unit change needs a new key (${next.key}.v2)`,
+      );
+      continue;
+    }
+    metricStore.series[next.key] = { ...next, createdAt: prev?.createdAt ?? Date.now() };
+  }
+  saveMetrics();
+}
+
+/**
+ * Run one collector: the same request path an agent's REST tool takes, with no
+ * model anywhere in it.
+ *
+ * WHY REUSE http-tool.mjs: URL, method, header template and body template are
+ * already refined there — including the rule that GET templates become query
+ * parameters and that a non-string header is dropped rather than stringified.
+ * A second implementation would drift, and the drift would look like "the agent
+ * can hit this endpoint but the collector cannot".
+ */
+async function runCollector(job, signal) {
+  const series = metricStore.series[job.series];
+  if (!series) {
+    return { ok: false, error: `series "${job.series}" is not declared — add it before collecting` };
+  }
+  const tool = {
+    id: `collector:${job.series}`,
+    name: `collector ${job.series}`,
+    kind: 'http',
+    url: job.request?.url,
+    method: job.request?.method,
+    headers: job.request?.headers,
+    bodyTemplate: job.request?.bodyTemplate,
+  };
+  const { method, headers } = httpRequestHead(tool, { token: '' });
+  let target = String(tool.url || '').trim();
+  const init = { method, headers, signal };
+  try {
+    const payload = httpRequestArgs(tool, {});
+    if (method === 'GET') {
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(payload)) qs.set(k, String(v));
+      if ([...qs.keys()].length) {
+        target = `${target}${target.includes('?') ? '&' : '?'}${qs.toString()}`;
+      }
+    } else {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(payload);
+    }
+    const res = await fetch(target, init);
+    const text = await res.text().catch(() => '');
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status} ${text.slice(0, 200)}` };
+    let body = text;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // A plain-text endpoint is legitimate; `select` then means nothing.
+    }
+    const picked = job.select ? dotGet(body, job.select) : body;
+    if (picked === undefined) {
+      return { ok: false, error: `select "${job.select}" found nothing in the response` };
+    }
+    const slot = slotAt(Date.now(), cronConfig?.timeZone ?? 'Asia/Singapore');
+    const normalised = normaliseSample(
+      { value: picked, slot, source: job.request?.url, runId: '' },
+      series,
+      Date.now(),
+    );
+    if (!normalised.ok) return { ok: false, error: normalised.error };
+    const existing = metricStore.samples[series.key] ?? [];
+    const merged = appendSamples(existing, [normalised.sample]);
+    metricStore.samples[series.key] = trimSamples(merged.samples, series.retention);
+    saveMetrics();
+    return { ok: true, sample: normalised.sample, replaced: merged.replaced > 0 };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** What the Data tab renders: declarations plus recent points, newest last. */
+function metricsPayload() {
+  const series = Object.values(metricStore.series).map((def) => {
+    const samples = metricStore.samples[def.key] ?? [];
+    return {
+      ...def,
+      count: samples.length,
+      latest: latestOf(samples),
+      delta: deltaOf(samples),
+      view: viewKindFor(def, Math.min(samples.length, 200)),
+      provenance: describeSample(latestOf(samples)),
+      points: samples.slice(-240).map((s) => ({ ts: s.ts, value: s.value })),
+    };
+  });
+  // A collector is a schedule entry, so the tab can show what feeds each series.
+  const collectors = (cronConfig?.jobs ?? [])
+    .filter((j) => j.kind === 'fetch')
+    .map((j) => ({
+      series: j.series,
+      at: j.at,
+      days: j.days ?? null,
+      enabled: j.enabled !== false,
+      select: j.select ?? '',
+      url: j.request?.url ?? '',
+      method: j.request?.method ?? 'GET',
+      nextAt: nextRunAt(j, Date.now(), cronConfig?.timeZone ?? 'Asia/Singapore'),
+    }));
+  return {
+    ok: true,
+    series: series.sort((a, b) => a.label.localeCompare(b.label)),
+    collectors,
+    updatedAt: metricStore.updatedAt || null,
+    now: Date.now(),
+    // Said out loud: without a real store these samples do not survive a deploy.
+    store: { file: METRICS_FILE, durable: false },
+  };
+}
+
 /** Everything the page needs to render the schedule truthfully. */
 function schedulePayload() {
   const config = cronConfig;
@@ -5198,6 +5536,16 @@ function schedulePayload() {
     const key = jobKey(j);
     const next = nextRunAt(j, now, zone);
     return {
+      // A collector must survive a GET → edit → PUT round trip in the page, so
+      // every field the schedule tab does not understand is still carried.
+      ...(j.kind === 'fetch'
+        ? {
+            kind: 'fetch',
+            series: j.series,
+            select: j.select ?? '',
+            request: j.request ?? null,
+          }
+        : {}),
       agent: j.agent,
       at: j.at,
       days: j.days ?? null,
@@ -5216,6 +5564,9 @@ function schedulePayload() {
     source: cronConfigSource,
     configured: Boolean(config),
     enabled: config?.enabled !== false,
+    // Declarations travel with the schedule, so the Data tab can list them
+    // without a second request.
+    series: config?.series ?? [],
     // The kill switch outranks the schedule, and so does a paused one: the page
     // must not print "Firing on schedule" over a schedule that cannot fire.
     running:
@@ -5263,6 +5614,34 @@ async function cronTick() {
 
     // The roster is read ONCE per tick and shares the hub session this process
     // already owns — never a second one, which would rotate the refresh family.
+    //
+    // COLLECTORS RUN FIRST AND WITHOUT IT. A plain HTTPS call needs no roster, so
+    // a hub outage must not stop the numbers from being collected — that was the
+    // one failure mode this split exists to avoid.
+    let started = 0;
+    const fetchDue = due.filter((entry) => entry.job.kind === 'fetch');
+    for (const entry of fetchDue) {
+      if (started >= MAX_JOBS_PER_TICK) break;
+      if (state.count >= MAX_JOBS_PER_DAY) break;
+      const res = await runCollector(entry.job);
+      state.slots[entry.key] = entry.slot;
+      state.count += 1;
+      if (!res.ok) {
+        state.errors[entry.key] = String(res.error ?? 'collector failed');
+        console.log(`[cron] ${entry.job.at} ${entry.job.series} — ${res.error}`);
+        continue;
+      }
+      started += 1;
+      delete state.errors[entry.key];
+      console.log(`[cron] ${entry.job.at} ${entry.job.series} <- ${JSON.stringify(res.sample?.value)}`);
+    }
+
+    const agentDue = due.filter((entry) => entry.job.kind !== 'fetch');
+    if (!agentDue.length) {
+      writeCronState(state);
+      return;
+    }
+
     const roster = await hubAgentRoster(undefined);
     if (roster.error) {
       // Nothing is marked as run: a hub that is down must cost a retry, not the
@@ -5271,8 +5650,7 @@ async function cronTick() {
       return;
     }
 
-    let started = 0;
-    for (const entry of due) {
+    for (const entry of agentDue) {
       if (started >= MAX_JOBS_PER_TICK) break;
       if (state.count >= MAX_JOBS_PER_DAY) break;
       const wanted = entry.job.agent.toLowerCase();
@@ -5351,6 +5729,9 @@ server.listen(PORT, () => {
   if (DOC_LISTEN_PORT > 0) startDocServer(DOC_LISTEN_PORT);
   // Fire-and-forget: the drift check must never delay or fail the boot.
   void checkFilesSchemaDrift();
+  // Samples are read before the clock starts, so the first tick cannot append to
+  // a series list it has not seen yet (which would overwrite the file).
+  loadMetrics();
   // Started LAST, so the port is accepting before a schedule can broadcast a run.
   startAgentCron();
 });

@@ -53,9 +53,9 @@ export function minuteOfDay(at) {
   return m ? Number(m[1]) * 60 + Number(m[2]) : null;
 }
 
-/** A job's stable identity: the agent plus the time it is pinned to. */
+/** A job's stable identity: the agent (or the series, for a collector) and its time. */
 export function jobKey(job) {
-  return `${String(job?.agent ?? '').trim().toLowerCase()}|${String(job?.at ?? '').trim()}`;
+  return `${String(job?.agent ?? job?.series ?? '').trim().toLowerCase()}|${String(job?.at ?? '').trim()}`;
 }
 
 /**
@@ -124,6 +124,60 @@ export function parseCronConfig(raw) {
   const jobs = [];
   const problems = [];
   for (const [i, j] of jobsIn.entries()) {
+    // A job is either an LLM run (the default, unchanged) or a COLLECTOR: a plain
+    // HTTP call whose response is stored as a metric. The second kind exists so a
+    // number can be collected on a schedule without paying a model to fetch it.
+    const kind = String(j?.kind ?? 'agent').trim().toLowerCase();
+    if (kind === 'fetch') {
+      const series = String(j?.series ?? '').trim().toLowerCase();
+      if (!series) {
+        problems.push(`job ${i}: kind "fetch" has no series`);
+        continue;
+      }
+      const at = String(j?.at ?? '').trim();
+      const minutes = minuteOfDay(at);
+      if (minutes === null) {
+        problems.push(`job ${i} (${series}): at "${at}" is not HH:MM`);
+        continue;
+      }
+      const req = j?.request && typeof j.request === 'object' ? j.request : {};
+      const url = String(req.url ?? '').trim();
+      if (!/^https:\/\//i.test(url)) {
+        problems.push(`job ${i} (${series}): request.url must be https://`);
+        continue;
+      }
+      const method = String(req.method ?? 'GET').trim().toUpperCase();
+      if (!['GET', 'POST', 'PUT'].includes(method)) {
+        problems.push(`job ${i} (${series}): method "${method}" is not GET, POST or PUT`);
+        continue;
+      }
+      const days = Array.isArray(j?.days)
+        ? j.days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+        : null;
+      if (j?.days !== undefined && j?.days !== null && !days?.length) {
+        problems.push(`job ${i} (${series}): days ${JSON.stringify(j.days)} names no real weekday`);
+        continue;
+      }
+      jobs.push({
+        kind: 'fetch',
+        series,
+        // Which value inside the response body to keep. Empty = the whole body.
+        select: String(j?.select ?? '').trim().slice(0, 120),
+        request: {
+          url,
+          method,
+          // Both are authored as JSON TEXT, exactly like a REST tool's fields, so
+          // the collector and the agent tool cannot disagree about the shape.
+          headers: String(req.headers ?? '').trim(),
+          bodyTemplate: String(req.bodyTemplate ?? '').trim(),
+        },
+        at,
+        minutes,
+        days: days && days.length ? days : null,
+        enabled: j?.enabled !== false,
+      });
+      continue;
+    }
     const agent = String(j?.agent ?? j?.agentId ?? '').trim();
     const at = String(j?.at ?? '').trim();
     if (!agent) {
@@ -169,6 +223,11 @@ export function parseCronConfig(raw) {
       graceMinutes: Number.isFinite(Number(body.graceMinutes))
         ? Math.max(0, Math.min(180, Number(body.graceMinutes)))
         : DEFAULT_GRACE_MINUTES,
+      // Series DECLARATIONS travel with the schedule: it is the document that is
+      // already durable, so a deployment keeps its schema even while the samples
+      // themselves wait for a real table. Validated by metrics.mjs, which owns
+      // those rules — this only carries them.
+      series: Array.isArray(body.series) ? body.series.filter((s) => s && typeof s === 'object') : [],
       jobs,
     },
     problems,
@@ -295,6 +354,9 @@ export function describeCron(config) {
   const zone = config.timeZone ?? DEFAULT_TIME_ZONE;
   const jobs = (config.jobs ?? []).filter((j) => j.enabled !== false);
   if (!jobs.length) return `0 jobs (${zone})`;
-  const names = jobs.slice(0, 6).map((j) => `${j.at} ${j.agent}`).join(', ');
+  const names = jobs
+    .slice(0, 6)
+    .map((j) => `${j.at} ${j.kind === 'fetch' ? `${j.series} (fetch)` : j.agent}`)
+    .join(', ');
   return `${jobs.length} job${jobs.length === 1 ? '' : 's'} (${zone}): ${names}${jobs.length > 6 ? ', …' : ''}`;
 }

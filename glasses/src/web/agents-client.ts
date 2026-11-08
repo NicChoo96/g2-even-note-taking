@@ -223,6 +223,14 @@ export function runTool(args: {
 /** One scheduled run, as the relay sees it. */
 export interface ScheduleJob {
   agent: string;
+  /** `'fetch'` marks a collector: a plain HTTPS call with no model in it. */
+  kind?: 'agent' | 'fetch';
+  /** Collectors only: the series this job feeds. */
+  series?: string;
+  /** Collectors only: the JSON path into the response body. */
+  select?: string;
+  /** Collectors only: the request as authored. */
+  request?: { url: string; method: string; headers?: string; bodyTemplate?: string } | null;
   /** `HH:MM` on the relay's clock, in `timeZone`. */
   at: string;
   /** `0`=Sunday … `6`=Saturday; `null` means every day. */
@@ -287,8 +295,20 @@ export async function fetchSchedule(): Promise<ScheduleState | null> {
 export async function saveSchedule(patch: {
   enabled?: boolean;
   timeZone?: string;
-  jobs: Array<{ agent: string; at: string; days?: number[] | null; ask?: string; enabled?: boolean }>;
-}): Promise<ScheduleState> {
+  /** Series declarations travel with the schedule; they are configuration. */
+  series?: Array<{ key: string; label?: string; unit?: string; type?: 'number' | 'string' }>;
+  jobs: Array<{
+    agent?: string;
+    kind?: 'agent' | 'fetch';
+    series?: string;
+    select?: string;
+    request?: { url: string; method: string; headers?: string; bodyTemplate?: string };
+    at: string;
+    days?: number[] | null;
+    ask?: string;
+    enabled?: boolean;
+  }>;
+}): Promise<ScheduleState & { series?: unknown[] }> {
   try {
     const res = await fetch(`${API_BASE}/api/agent/schedule`, {
       method: 'PUT',

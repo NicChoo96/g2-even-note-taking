@@ -2736,3 +2736,134 @@ p.empty {
 .doc-row .pick-box {
   margin-left: 8px;
 }
+
+/* ── Data tab ─────────────────────────────────────────────────────────────
+   Read like a dashboard, not a form. Cards first (what is happening), the
+   collector form second (how to add one) — the inverse of the rest of the app,
+   because this page is read far more often than it is edited. */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 10px 0 18px;
+}
+
+.metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+}
+
+.metric-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.metric-label {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-unit {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 5px;
+}
+
+.metric-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+}
+
+.metric-x:hover { color: var(--danger, #e5484d); }
+
+/* The number is the point: large, tabular, and never a raw float. */
+.metric-value {
+  font-size: 26px;
+  font-weight: 650;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.metric-delta {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.metric-delta.up { color: var(--ok, #30a46c); }
+.metric-delta.down { color: var(--danger, #e5484d); }
+
+.spark { width: 100%; height: 34px; display: block; }
+.spark polyline { stroke: var(--accent); }
+.spark.down polyline { stroke: var(--danger, #e5484d); }
+
+.metric-foot {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+.warn-inline { color: var(--warn, #d9a300); }
+
+.collector-form {
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  padding: 12px 14px 14px;
+  background: var(--panel);
+}
+
+.form-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.form-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 120px;
+}
+
+.form-row label.grow { flex: 1 1 260px; }
+.form-row input, .form-row select, .form-row textarea { font-size: 13px; }
+
+.day-picks { display: flex; align-items: center; gap: 4px; }
+.day-picks button { min-width: 34px; }
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.ok-line { color: var(--ok, #30a46c); font-size: 12px; }

@@ -182,8 +182,45 @@ check('a disabled schedule runs nothing', dueJobs({ ...config, enabled: false },
 check('a disabled JOB runs nothing', dueJobs({ ...config, jobs: [{ ...config.jobs[0], enabled: false }] }, tenPMUtc, {}).length, 0);
 check('dueJobs never throws on a null config', dueJobs(null, tenPMUtc, {}), []);
 
-// ── 5. the caps exist and are small enough to matter ────────────────────────
-checkTrue('per-tick cap is 1..4', MAX_JOBS_PER_TICK >= 1 && MAX_JOBS_PER_TICK <= 4);
+// ── 4b. a COLLECTOR job: a plain HTTPS call with no model in it ────────────
+// The second job kind. It exists so "collect this number every morning" does
+// not require paying a model to fetch a JSON field — and it is validated at the
+// same gate as everything else, because a collector that never fires is silent.
+const collectors = parseCronConfig({
+  jobs: [
+    {
+      kind: 'fetch',
+      series: 'sgx.dbs.price',
+      at: '09:00',
+      select: 'data.last',
+      request: { url: 'https://api.example.com/quote', method: 'GET', headers: '{"X-Api-Key":"env:K"}' },
+    },
+    { kind: 'fetch', series: 'x.y', at: '10:00', request: { url: 'http://insecure.example.com' } },
+    { kind: 'fetch', at: '11:00', request: { url: 'https://api.example.com' } },
+    { kind: 'fetch', series: 'a.b', at: '12:00', request: { url: 'https://api.example.com', method: 'DELETE' } },
+    { kind: 'fetch', series: 'a.b', at: '7:00', request: { url: 'https://api.example.com' } },
+  ],
+});
+check('a collector job is kept', collectors.config.jobs.length, 1);
+check('with its series', collectors.config.jobs[0]?.series, 'sgx.dbs.price');
+check('and its select path', collectors.config.jobs[0]?.select, 'data.last');
+check('and its method', collectors.config.jobs[0]?.request?.method, 'GET');
+check('and its header template', collectors.config.jobs[0]?.request?.headers, '{"X-Api-Key":"env:K"}');
+check('every refusal is reported, not silent', collectors.problems.length, 4);
+checkTrue('a plain http:// collector is refused', collectors.problems.some((p) => /https/.test(p)));
+checkTrue('a collector with no series is refused', collectors.problems.some((p) => /no series/.test(p)));
+checkTrue('an unsupported method is refused', collectors.problems.some((p) => /method/.test(p)));
+// The key is what the state file records, so a collector and an agent at the same
+// minute must never share one.
+check('a collector keys by series', jobKey(collectors.config.jobs[0]), 'sgx.dbs.price|09:00');
+check('an agent still keys by name', jobKey({ agent: 'Watchkeeper', at: '09:00' }), 'watchkeeper|09:00');
+check(
+  'a collector is described by its series',
+  describeCron(collectors.config),
+  '1 job (Asia/Singapore): 09:00 sgx.dbs.price (fetch)',
+);
+
+// ── 5. the caps exist and are small enough to matter ────────────────────────checkTrue('per-tick cap is 1..4', MAX_JOBS_PER_TICK >= 1 && MAX_JOBS_PER_TICK <= 4);
 checkTrue('daily cap is below a fleet of 20', MAX_JOBS_PER_DAY > 0 && MAX_JOBS_PER_DAY < 20);
 check('the version is pinned', CRON_VERSION, 1);
 
