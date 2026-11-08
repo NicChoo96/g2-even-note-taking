@@ -12,6 +12,7 @@ import { filesCapabilities } from './capabilities/files';
 import { globalCapabilities } from './capabilities/global';
 import { jevCapabilities } from './capabilities/jev';
 import { locationCapabilities } from './capabilities/location';
+import { metricsCapabilities } from './capabilities/metrics';
 import { notesCapabilities } from './capabilities/notes';
 import { searchCapabilities } from './capabilities/search';
 import { settingsCapabilities } from './capabilities/settings';
@@ -28,6 +29,10 @@ const CAPABILITIES: Capability[] = [
   // Web search, for the same shape of reason: a global that reaches OUT — to the
   // relay, which resolves the provider — rather than into the app.
   ...searchCapabilities,
+  // The dashboard numbers, for the same shape of reason: a global that reaches
+  // the relay rather than into the app. It lives on a tab, but "what is my
+  // number" must not route the wearer there to answer it.
+  ...metricsCapabilities,
   ...todoCapabilities,
   ...docsCapabilities,
   ...filesCapabilities,

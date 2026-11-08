@@ -159,7 +159,7 @@ const MANDATORY = ['say.reply', 'nav.open_page'];
  * so a turn without this global is a turn where the model is told to search and
  * given no way to.
  */
-const ALWAYS_AVAILABLE = ['jev.decide', 'location.get', 'web.search'];
+const ALWAYS_AVAILABLE = ['jev.decide', 'location.get', 'web.search', 'metrics.act'];
 
 /** Everything that leads the list: the actions this loop and the prompt assume. */
 export const RESERVED: string[] = [...MANDATORY, ...ALWAYS_AVAILABLE];

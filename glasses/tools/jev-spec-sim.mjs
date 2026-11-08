@@ -833,11 +833,15 @@ for (const [label, q, a] of [
 // worst shape a capability can have. It is `effect: 'read'`, so reserving it
 // takes nothing away from the pages.
 assert('the jev capability offers an optional rank switch to Jarvis', /name: 'rank',\s*\n\s*type: 'boolean'/.test(capSrc));
+// metrics.act joined them for the same reason, and the count is now 11. It is
+// ONE capability, not three, for a reason worth stating: `list`, `read` and
+// `write` as separate entries would spend three of the loop's twenty slots on
+// one subject, and the slots they took would come from a page's own actions.
 assert('the capability derives a ranking from the decision', /rankAnswers\(parsed\.value, reply\.answers\)/.test(capSrc));
 check(
-  'the app-wide catalog is jev.decide plus location.get and web.search and the seven nav/app actions',
+  'the app-wide catalog is jev.decide, location.get, web.search, metrics.act and the seven nav/app actions',
   ui.allCapabilities().filter((c) => c.page === ui.GLOBAL_PAGE).length,
-  10,
+  11,
 );
 
 // The invariant behind the 0.3.28 bug, stated as a test rather than a comment:

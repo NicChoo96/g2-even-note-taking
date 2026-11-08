@@ -568,11 +568,23 @@ const agentKind =
     ? 'agent'
     : null;
 assert('the agent kind is both described and executed by the relay', Boolean(agentKind));
+// The same both-halves rule, for the dashboard numbers. Derived rather than
+// typed, so deleting either branch in the relay fails HERE instead of leaving a
+// kind the client offers and the loop cannot answer.
+const metricsKind =
+  /isMetricsTool\(t\)\) return metricsToolSchema\(t\)/.test(relaySrc) &&
+  /isMetricsTool\(tool\)\) \{\s*\n?\s*const result = await runMetricsTool\(tool, args, metricToolDeps\(\)\)/.test(
+    relaySrc,
+  )
+    ? 'metrics'
+    : null;
+assert('the metrics kind is both described and executed by the relay', Boolean(metricsKind));
 const relayKinds = [
   ...HUB_TOOL_KINDS,
   RELAY_LOCATION_KIND,
   ...sourceKinds,
   ...(agentKind ? [agentKind] : []),
+  ...(metricsKind ? [metricsKind] : []),
   'web',
   'http',
 ].sort();
