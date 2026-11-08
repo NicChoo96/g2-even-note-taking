@@ -9,7 +9,7 @@
 | **Data stored** | One JSON object of ~1–8 KiB: agent names, `HH:MM` times, weekday numbers. **No secrets, no tokens, no personal data.** |
 | **Who writes** | The relay (Railway) only. The hub never writes it. |
 | **Who reads** | The relay, once at boot and once per save. Not per run, not per minute. |
-| **Current status** | `GET /hub/relay/agent-cron` → **403 `SCOPE_DENIED`** with the relay's credential. That is the only blocker. |
+| **Current status** | **IMPLEMENTED AND VERIFIED.** A dedicated key `g2-relay` (`content:read`, `content:write`) is minted and allow-listed via `HUB_RELAY_WRITERS=g2-relay` for `agent-cron`, `agent-cron-state` and `relay-meta`; `/hub/relay/auth` stays `403` for it. Proven end to end by `glasses/tools/probe-schedule-durable.mjs` (16/16): a relay with its local file deleted boots and adopts the schedule with `source: hub`. |
 
 ---
 
@@ -151,8 +151,10 @@ That asymmetry is the whole basis of Option 1/2 in §5.
 **Option 1 — preferred: a machine owner identity for the relay.**
 Issue an owner-scoped credential for the relay process (env `G2_HUB_OWNER_TOKEN`, or make `JARVIS_FILE_USER`/`JARVIS_FILE_PWD` owner-scoped). This fixes **both** keys at once — including `auth`, whose mirror to the hub has been silently failing for the same reason, so sessions currently survive only on the relay's own disk.
 
-**Option 2 — a documented non-secret allow-list.**
+**Option 2 — a documented non-secret allow-list. ← CHOSEN AND DEPLOYED.**
 Let the relay's service account read/write a short, auditable set of keys that contain no credentials (`agent-cron`, `agent-cron-state`, `relay-meta`) while continuing to refuse `auth` with `403`. This is a narrow exception, not a general widening.
+
+As implemented: a dedicated API key named **`g2-relay`** (`content:read`, `content:write`, id `7633d8768ff34bb6a54a17404f23a8d2`) with `HUB_RELAY_WRITERS=g2-relay` in `/etc/jarvis-content.env`. It is used directly as a bearer token (no login, no refresh), so the relay cannot rotate anyone else's session out. `mcp-client` still gets `403` on relay state, which is the evidence the list is narrow rather than a blanket open.
 
 **Option 3 — a dedicated route.**
 `GET|PUT /hub/schedule`, same value contract, service-account scope. More code than Option 2 with no functional gain, but it keeps the family strictly owner-only — reasonable if that invariant matters more than the extra route.
