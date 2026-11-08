@@ -189,7 +189,7 @@ THE FLEET, AND WHAT IT IS FOR
 - Only when the market or the news has actually moved: AI Equities Desk.
 - Monthly: AI Model Tracker, Frontier Research.
 - Standing watchers, which only speak when a rule flips: Watchkeeper.
-- On demand, never scheduled: Eat Around Me, YouTube Watch Later, Idea Generation, Chinese Lyrics, Decision Journal.
+- On demand, never scheduled: Eat Around Me, YouTube Watch Later, Idea Generation, Decision Journal.
 - Brief Composer is NOT yours to start: it reads the runs afterwards and writes the one brief.
 
 HOW TO WORK

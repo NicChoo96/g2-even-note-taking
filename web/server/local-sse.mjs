@@ -4899,16 +4899,27 @@ function writeCronState(state) {
 
 /** The schedule is re-read every tick, so editing it needs no restart. */
 function readCronConfig() {
+  // TWO WAYS IN, because a file cannot reach a container:
+  //   `G2_AGENT_CRON_JSON` holds the schedule in the environment, so a deployed
+  //   relay can have one at all — the file is gitignored and a container's disk is
+  //   wiped on every deploy, so a committed-and-ignored file is a schedule that
+  //   only ever works on a laptop. If both are present the ENV wins, because that
+  //   is the one an operator can change without rebuilding an image.
+  const inline = String(process.env.G2_AGENT_CRON_JSON ?? '').trim();
   let raw;
-  try {
-    raw = readFileSync(CRON_FILE, 'utf8');
-  } catch {
-    return { skipped: 'no schedule file' };
+  if (inline) {
+    raw = inline;
+  } else {
+    try {
+      raw = readFileSync(CRON_FILE, 'utf8');
+    } catch {
+      return { skipped: 'no schedule file or G2_AGENT_CRON_JSON' };
+    }
   }
   const parsed = parseCronConfig(raw);
   if (!parsed.ok) return { skipped: `schedule refused — ${parsed.error}` };
   for (const p of parsed.problems ?? []) console.log(`[cron] ${p}`);
-  if (!parsed.config.enabled) return { skipped: 'disabled in the schedule file' };
+  if (!parsed.config.enabled) return { skipped: 'disabled in the schedule' };
   if (!parsed.config.jobs.length) return { skipped: 'no usable jobs' };
   return { config: parsed.config };
 }
@@ -5008,9 +5019,9 @@ function startAgentCron() {
   }
   const read = readCronConfig();
   if (read.skipped) {
-    // Silence unless something is misconfigured: "no schedule file" is the
+    // Silence unless something is misconfigured: "nothing configured" is the
     // normal case for a relay that has no scheduled agents.
-    if (read.skipped !== 'no schedule file') console.log(`[cron] off — ${read.skipped}`);
+    if (!read.skipped.startsWith('no schedule file')) console.log(`[cron] off — ${read.skipped}`);
     return;
   }
   console.log(`[cron] on — ${describeCron(read.config)}`);
