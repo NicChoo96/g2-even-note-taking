@@ -3163,6 +3163,9 @@ const server = createServer(async (req, res) => {
         status: 'pending',
         pairCode: randomPairCode(),
         createdAt: Date.now(),
+        // A human label, so the owner can see WHAT is asking instead of a
+        // 36-character id. Optional: an older client sends none.
+        label: String(parsed.label || '').trim().slice(0, 60) || '',
       };
       authStore.devices[deviceId] = dev;
       markAuthChanged();
@@ -3200,9 +3203,18 @@ const server = createServer(async (req, res) => {
       /* ignore */
     }
     const code = String(parsed.pairCode || '').trim().toUpperCase();
-    const dev = Object.values(authStore.devices).find(
-      (d) => d.status === 'pending' && d.pairCode === code,
-    );
+    // Approve by DEVICE ID as well as by code. The web panel now LISTS the
+    // waiting devices, so it already knows which one the owner tapped — asking
+    // them to copy a code from the lens first is friction this removes.
+    const wantedId = String(parsed.deviceId || '').trim();
+    const dev = wantedId
+      ? (() => {
+          const d = deviceById(wantedId);
+          return d && d.status === 'pending' ? d : null;
+        })()
+      : Object.values(authStore.devices).find(
+          (d) => d.status === 'pending' && d.pairCode === code,
+        );
     if (!dev) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'code not found' }));
@@ -3214,6 +3226,31 @@ const server = createServer(async (req, res) => {
     markAuthChanged();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, deviceId: dev.deviceId }));
+    return;
+  }
+
+  // Owner lists devices WAITING to be approved, so one tap finishes a pairing
+  // without anyone copying a code off the lens. Pending only — an approved
+  // device belongs in /api/devices below, and mixing the two is how a waiting
+  // device would look like a working one.
+  if (req.method === 'GET' && url.pathname === '/api/pair/pending') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    const pending = Object.values(authStore.devices)
+      .filter((d) => d.status === 'pending')
+      .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+      .map((d) => ({
+        deviceId: d.deviceId,
+        pairCode: d.pairCode,
+        label: d.label || '',
+        createdAt: d.createdAt ?? null,
+      }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, pending }));
     return;
   }
 

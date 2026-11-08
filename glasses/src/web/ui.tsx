@@ -20,7 +20,7 @@ import { bumpBootCount } from '../durable-docs';
 import './styles.css';
 
 function Gate() {
-  const { loading, authed, paired, pairing } = useAuth();
+  const { loading, authed, paired, pairing, inEvenApp } = useAuth();
   if (loading) {
     return (
       <div className="app" style={{ textAlign: 'center', padding: 60 }}>
@@ -30,6 +30,13 @@ function Gate() {
   }
   // An owner session, or the approved device it was paired as, opens the app.
   if (authed || paired) return <App />;
+  // ── INSIDE THE EVEN APP THERE IS NO SIGN-IN ──────────────────────────────
+  // Google cannot work here and never will: the package runs in a WebView whose
+  // origin is not on the OAuth client's allowlist, and Google refuses its
+  // sign-in inside an embedded WebView outright (`disallowed_useragent`).
+  // Showing the button anyway is a dead end the wearer was asked to walk into on
+  // every launch, so the package goes straight to pairing — the only door it has.
+  if (inEvenApp) return <PairScreen />;
   // Pairing is only ever shown because the user asked for it.
   return pairing ? <PairScreen /> : <LoginScreen />;
 }

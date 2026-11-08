@@ -10,7 +10,7 @@
 // The wire protocol is unchanged: a device self-registers a per-device ID,
 // shows a 6-character code, and an owner approves it from here.
 import { useEffect, useState } from 'react';
-import { useAuth } from './auth';
+import { anyOwnerToken, pairPending, useAuth, type PendingDevice } from './auth';
 
 export function DevicesPanel() {
   const {
@@ -31,6 +31,28 @@ export function DevicesPanel() {
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
+  /** Devices that have ASKED to connect and are waiting for one tap. */
+  const [waiting, setWaiting] = useState<PendingDevice[]>([]);
+
+  // Poll while this panel is open: the whole point is that the other device is
+  // sitting on its "waiting" screen, and the owner has this page in front of
+  // them. Five seconds is fast enough to feel immediate and slow enough that a
+  // forgotten tab is not chatting to the relay every second.
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      const tok = await anyOwnerToken();
+      if (!tok) return;
+      const r = await pairPending(tok.token);
+      if (alive && r.ok) setWaiting(r.pending);
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     void refreshDevices();
@@ -45,6 +67,18 @@ export function DevicesPanel() {
     if (r.ok) {
       setDone('Device approved 🎉');
       setCode('');
+    }
+  };
+
+  /** One tap on a waiting device — no code to copy. */
+  const approveWaiting = async (deviceId: string) => {
+    setBusy(true);
+    setDone(null);
+    const r = await pairDevice(deviceId);
+    setBusy(false);
+    if (r.ok) {
+      setDone('Device approved 🎉');
+      setWaiting((list) => list.filter((d) => d.deviceId !== deviceId));
     }
   };
 
@@ -90,6 +124,39 @@ export function DevicesPanel() {
         <>
           <p className="hint-line">Code for this device — approve it from any signed-in browser:</p>
           <div className="pair-code inline">{pairCode}</div>
+        </>
+      )}
+
+      {/* ── WAITING TO CONNECT ─────────────────────────────────────────────
+          The device shows a code and waits; this lists it by NAME with one
+          button. Typing six characters off a lens was the last piece of friction
+          in pairing, and it was never necessary — the thing asking is already
+          registered, it just needs a yes. */}
+      {waiting.length > 0 && (
+        <>
+          <div className="panel-label spaced">Waiting to connect</div>
+          <ul className="device-list">
+            {waiting.map((d) => (
+              <li key={d.deviceId} className="device-row">
+                <span className="device-name">📱 {d.label || 'A device'}</span>
+                <span className="device-meta">
+                  {d.pairCode ? `code ${d.pairCode}` : 'no code'}
+                  {d.createdAt ? ` · ${new Date(d.createdAt).toLocaleTimeString()}` : ''}
+                </span>
+                <button
+                  className="primary"
+                  onClick={() => void approveWaiting(d.deviceId)}
+                  disabled={busy}
+                >
+                  Approve
+                </button>
+              </li>
+            ))}
+          </ul>
+          <p className="hint-line">
+            Approve only a device you just started. Its code is shown here so you can check it
+            against the lens.
+          </p>
         </>
       )}
 

@@ -14,6 +14,7 @@
 // set" and can never be shadowed from here.
 import { useEffect, useState } from 'react';
 import { getAgents, subscribeAgents, updateAgents } from '../agents-store';
+import { forgetPastedKey, savePastedKey, setStoredRelay, storedRelay } from './access';
 import { compactMemory, getMemoryView, resetMemory, subscribeMemory, type MemoryView } from '../ai';
 import { getDurableBridge } from '../durable-docs';
 import { PROBE_STATUS_LABELS, probeLocation, type ProbeReport, type ProbeStep } from '../location/probe';
@@ -418,6 +419,15 @@ export function SettingsPanel() {
 
   return (
     <div className="settings-panel">
+
+      {/* ── This device's access ────────────────────────────────────────────
+          The package cannot use Google sign-in (the WebView origin is not on
+          the OAuth allowlist, and Google refuses embedded WebViews outright), so
+          pairing was its only door — and a pairing that has to be redone after
+          every update is not a door, it is a chore. This is the escape hatch:
+          paste the relay's address and a key ONCE, and the package opens itself
+          on every launch without the web app being involved at all. */}
+      <DeviceAccess />
       {anyEnv && (
         <p className="hint-line ok-line">
           ✓ Some values also come from the server environment. Nothing here is locked — a value
@@ -685,3 +695,100 @@ export function SettingsPanel() {
   );
 }
 
+
+/**
+ * This device's own credentials — the thing that stops the package needing the
+ * web app to pair it.
+ *
+ * Two fields, because two things decide whether the package can reach the
+ * backend at all: WHERE it is (the relay origin) and WHO it is (a key the relay
+ * already accepts — an owner session token or an approved device id; see
+ * `principalFromToken` in the relay). Both are stored on the device, so the next
+ * launch opens straight into the app.
+ *
+ * Saving RELOADS. `API_BASE` is a module constant resolved at import, so the new
+ * origin only takes effect on a fresh load; pretending otherwise would leave the
+ * field saying one thing while every request used the old address.
+ */
+function DeviceAccess() {
+  const [relay, setRelay] = useState('');
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+
+  useEffect(() => {
+    setRelay(storedRelay());
+  }, []);
+
+  const save = async () => {
+    setBusy(true);
+    const origin = setStoredRelay(relay);
+    const saved = await savePastedKey(key);
+    setBusy(false);
+    if (!origin && relay.trim()) {
+      setNote('That address is not a valid http(s) URL — nothing was saved.');
+      return;
+    }
+    if (!saved) {
+      setNote(
+        origin
+          ? `Relay saved as ${origin}. Add a key to skip pairing. Reloading…`
+          : 'Add a key to skip pairing. Reloading…',
+      );
+      // An origin change still needs a reload to reach API_BASE.
+      if (origin) setTimeout(() => window.location.reload(), 900);
+      return;
+    }
+    setNote('Saved on this device. Reloading…');
+    setTimeout(() => window.location.reload(), 900);
+  };
+
+  const forget = async () => {
+    setBusy(true);
+    await forgetPastedKey();
+    setStoredRelay('');
+    setBusy(false);
+    setNote('Cleared on this device. Reloading…');
+    setTimeout(() => window.location.reload(), 900);
+  };
+
+  return (
+    <>
+      <div className="panel-label">This device</div>
+      <p className="hint-line">
+        Paste the relay address and a key once. The app then opens by itself on every launch —
+        no pairing, and no sign-in screen, which cannot work inside this package anyway.
+      </p>
+      <label className="field-label">Relay address</label>
+      <input
+        value={relay}
+        onChange={(e) => setRelay(e.target.value)}
+        placeholder="https://g2-even-note-taking-production.up.railway.app"
+        spellCheck={false}
+        autoComplete="off"
+      />
+      <label className="field-label">Access key</label>
+      <input
+        value={key}
+        onChange={(e) => setKey(e.target.value)}
+        placeholder="paste the key once…"
+        spellCheck={false}
+        autoComplete="off"
+        type="password"
+      />
+      <p className="hint-line">
+        Use the owner token, or the id this device was paired under — the relay accepts either.
+        It is stored on this device only, and nothing is sent anywhere when you save.
+      </p>
+      <div className="docs-actions">
+        <button className="primary" onClick={() => void save()} disabled={busy}>
+          {busy ? 'Saving…' : 'Save on this device'}
+        </button>
+        <button onClick={() => void forget()} disabled={busy}>
+          Forget
+        </button>
+      </div>
+      {note && <p className="hint-line">{note}</p>}
+    </>
+  );
+}

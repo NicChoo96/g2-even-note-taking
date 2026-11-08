@@ -217,7 +217,12 @@ async function pairRequest(deviceId: string): Promise<{
     const res = await fetch(`${API_BASE}/api/pair/request`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deviceId }),
+      body: JSON.stringify({
+        deviceId,
+        // A NAME, so the web panel can say "Glasses app wants to connect"
+        // instead of showing a 36-character uuid to a human deciding a yes/no.
+        label: detectEvenApp() ? 'Glasses app' : 'Browser',
+      }),
     });
     return (await res.json()) as { ok: boolean; status?: string; pairCode?: string };
   } catch {
@@ -235,16 +240,64 @@ async function checkPairStatus(deviceId: string): Promise<{ ok: boolean; status?
   }
 }
 
-async function pairApprove(pairCode: string, sessionToken: string): Promise<{ ok: boolean; error?: string }> {
+async function pairApprove(codeOrId: string, sessionToken: string): Promise<{ ok: boolean; error?: string }> {
   try {
+    const value = String(codeOrId ?? '').trim();
     const res = await fetch(`${API_BASE}/api/pair/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
-      body: JSON.stringify({ pairCode }),
+      // BOTH spellings, because the caller may hold either. The relay prefers a
+      // `deviceId` that names a pending device and otherwise falls back to the
+      // code, so sending both cannot approve the wrong thing: a code is never a
+      // valid device id, and vice versa.
+      body: JSON.stringify({ pairCode: value.toUpperCase(), deviceId: value }),
     });
     return (await res.json()) as { ok: boolean; error?: string };
   } catch {
     return { ok: false, error: 'network error' };
+  }
+}
+
+/** A device that has ASKED to connect and is waiting for one tap. */
+export interface PendingDevice {
+  deviceId: string;
+  pairCode: string;
+  label: string;
+  createdAt: number | null;
+}
+
+/**
+ * The devices waiting for approval, so the panel can offer ONE TAP instead of a
+ * code to copy off the lens.
+ *
+ * Answers the outcome, not just the list: an empty array must not be able to
+ * mean "the request failed" — that is the bug `devicesList` already fixed, and
+ * this read has exactly the same shape.
+ */
+export async function pairPending(
+  sessionToken: string,
+): Promise<{ ok: boolean; pending: PendingDevice[]; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/pair/pending`, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    if (!res.ok) return { ok: false, pending: [], error: `HTTP ${res.status}` };
+    const j = (await res.json()) as { ok?: boolean; pending?: unknown };
+    const list = Array.isArray(j?.pending) ? j.pending : [];
+    return {
+      ok: j?.ok !== false,
+      pending: list
+        .map((d) => d as Record<string, unknown>)
+        .filter((d) => typeof d?.deviceId === 'string')
+        .map((d) => ({
+          deviceId: String(d.deviceId),
+          pairCode: String(d.pairCode ?? ''),
+          label: String(d.label ?? ''),
+          createdAt: typeof d.createdAt === 'number' ? d.createdAt : null,
+        })),
+    };
+  } catch {
+    return { ok: false, pending: [], error: 'network error' };
   }
 }
 
@@ -592,7 +645,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     async (code: string): Promise<{ ok: boolean; error?: string }> => {
       const tok = await anyOwnerToken();
       if (!tok) return { ok: false, error: 'Not signed in.' };
-      const r = await pairApprove(code.trim().toUpperCase(), tok.token);
+      // NOT upper-cased here: this may be a device id, which is case-sensitive.
+      // `pairApprove` upper-cases only the CODE half it sends.
+      const r = await pairApprove(code.trim(), tok.token);
       if (r.ok) {
         setPairError(null);
         void refreshDevices();
@@ -655,8 +710,13 @@ export function LoginScreen() {
   const [cfgError, setCfgError] = useState<string | null>(null);
   const btnRef = useRef<HTMLDivElement>(null);
 
-  // Load the Google Client ID from the relay, then render the Sign-In button.
+  // Load the Google Client ID from the relay, then render the Sign-In butto
   useEffect(() => {
+    // Never inside the Even App: the origin is not allowed and Google refuses
+    // embedded WebViews, so loading the script buys nothing and an error banner.
+    // `Gate` already routes the package to pairing; this is the belt to its
+    // braces, for any code path that renders this screen anyway.
+    if (inEvenApp) return undefined;
     let mounted = true;
     getClientId()
       .then((id) => {

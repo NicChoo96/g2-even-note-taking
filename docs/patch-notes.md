@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.62
+
+v0.3.62 - Pairing is one tap, and the glasses app no longer offers Google sign in
+
+- Inside the glasses app the Google button is gone. It could never work there, so the app now goes straight to a waiting screen instead of a button that fails.
+- A new device appears in Settings under "Waiting to connect", with its name and code. One tap approves it - no typing.
+- The app can also keep a relay address and a key you paste once, so it can open by itself.
+
 ## 0.3.61
 
 v0.3.61 - The app now shows how much it remembers between updates

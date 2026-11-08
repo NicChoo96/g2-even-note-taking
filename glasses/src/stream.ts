@@ -6,8 +6,26 @@ import type { LocationFix } from './location/spec';
 // Same-origin by default: the deployed app is served by the relay at the bare
 // root, so /api/stream resolves to the live stream next to it. Local dev
 // overrides via VITE_HUB_STREAM_URL in .env.local.
+//
+// THE THIRD SOURCE, AND WHY IT EXISTS: inside the .ehpk the page is served from
+// the app package, so "same origin" is the package itself and /api/… reaches
+// nothing. A relay origin saved from the app's own Settings (`hub:relay`) is
+// therefore preferred over same-origin, and it is read from localStorage
+// SPECIFICALLY because this constant resolves at import time — before anything
+// is allowed to await the durable (bridge) copy.
+const STORED_RELAY: string = (() => {
+  try {
+    return String(globalThis.localStorage?.getItem('hub:relay') ?? '').trim();
+  } catch {
+    return '';
+  }
+})();
+
 export const STREAM_URL: string =
-  (import.meta.env.VITE_HUB_STREAM_URL as string | undefined) ?? '/api/stream?channel=hub';
+  (import.meta.env.VITE_HUB_STREAM_URL as string | undefined) ??
+  (STORED_RELAY
+    ? `${STORED_RELAY}/api/stream?channel=hub`
+    : '/api/stream?channel=hub');
 
 // Base origin of the relay API (auth / config / stream). Same-origin by default.
 export const API_BASE: string = STREAM_URL.split('/api/')[0];

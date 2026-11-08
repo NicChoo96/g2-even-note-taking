@@ -236,8 +236,17 @@ lacks('the "environment always wins" banner is gone', panelSrc, 'the environment
 has('the provider select is still gated on relay CAPABILITY', panelSrc, 'disabled={!relaySupportsProvider}');
 {
   // Each of the four keys must render a real password input.
+  //
+  // The count alone is no longer the whole story: the "This device" block holds a
+  // MASKED access key of its own, so a bare `type="password"` tally would go from
+  // 4 to 5 and the check would either fail or have to be loosened to hide it.
+  // Asserting the four keys BY NAME is what the check was actually protecting —
+  // that no key was replaced by a lock notice — and it survives new fields.
   const inputs = panelSrc.match(/type="password"/g) ?? [];
-  assert('all four API keys are real inputs', inputs.length === 4, `${inputs.length}`);
+  for (const field of ['openrouterKey', 'deepseekKey', 'tavilyKey', 'braveKey']) {
+    has(`…${field} is a masked input`, panelSrc, `value={${field}}`);
+  }
+  assert('four API key inputs exist and are masked', inputs.length >= 4, `${inputs.length}`);
 }
 
 // ── 8. The buggy shapes stay gone ──────────────────────────────────────────
