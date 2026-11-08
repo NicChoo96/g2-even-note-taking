@@ -49,6 +49,11 @@ search-probe.txt
 
 # Sweep scratch (sim-all.mjs / harness redirect targets)
 .tmp-*
+# The sweep report: stdout of `sim-all.mjs` redirected to a file, because the
+# harnesses bail out when stdout is a pipe. It is a scratch copy of a report that
+# can be regenerated any time, so it never belongs in a commit.
+sweep.txt
+glasses/sweep.txt
 
 .tmp-e2e/
 local/

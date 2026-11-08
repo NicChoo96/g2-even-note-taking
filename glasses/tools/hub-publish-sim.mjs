@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// Hub-publish harness — the rev retry that decides whether a publish lands.
+// Hub-publish harness — the rev handshake that decides whether a page is listed.
 //
 // WHY THIS EXISTS:
-//   The document tool now publishes through `POST /hub/files`, because that is
-//   the only call that records the `file_ref` the Files page lists. The rev is
-//   the hub's write token and it travels in the BODY, so:
-//     • the FIRST attempt must carry no rev at all (an empty one is a value)
-//     • a 412 must be retried EXACTLY once, with the rev the answer names
-//     • a 412 whose body names no rev must NOT be retried — guessing a write
-//       token is how two writers start overwriting each other
-//     • a 403 must not be retried at all
-//   Getting any of those wrong turns every publish into a failed one, which is
-//   worse than the bug this replaces.
+//   This path has now failed twice in ways that looked like success, so every
+//   step of the wire contract is asserted here rather than trusted:
+//
+//     1. READ the rev first   — a write with no rev is refused `400 REV_REQUIRED`
+//                                (which is exactly what shipped, and produced a
+//                                "body stored, page not listed" warning)
+//     2. SEND it in the BODY  — not a header, not the query
+//     3. ONE stale retry      — `STALE_REV` carries the winning rev at
+//                                `details.rev`, NOT `details.current.rev`
+//     4. NEVER retry a 403 or a refusal with no rev
 //
 // Run: node tools/hub-publish-sim.mjs
 
@@ -33,123 +33,175 @@ function ok(label, cond, detail = '') {
   else failures.push(`${label}${detail ? `\n     ${detail}` : ''}`);
 }
 
-/** A fake hub client that replays a script and records what it was asked. */
-function fakeHub(replies) {
+/**
+ * A fake hub that keeps a rev, so a stale write can be simulated honestly.
+ * Replies are keyed by `${method} ${path-without-query}`.
+ */
+function fakeHub({ rev = 5, post } = {}) {
   const calls = [];
+  let current = rev;
   return {
     calls,
+    get rev() {
+      return current;
+    },
     client: {
       async call(method, path, opts = {}) {
-        calls.push({ method, path, body: JSON.parse(JSON.stringify(opts.body ?? {})) });
-        const next = replies.shift() ?? { ok: true, status: 201, text: '{"file":{}}' };
-        return next;
+        const body = opts.body ? JSON.parse(JSON.stringify(opts.body)) : undefined;
+        calls.push({ method, path, body });
+        const route = `${method} ${String(path).split('?')[0]}`;
+        if (route === 'GET /files') {
+          return { ok: true, status: 200, text: JSON.stringify({ ok: true, rev: current, items: [] }) };
+        }
+        if (route === 'POST /files' && post) return post(body, current, calls);
+        // Default: accept, and move the rev on as the hub would.
+        current += 1;
+        return {
+          ok: true,
+          status: 201,
+          text: JSON.stringify({ ok: true, rev: current, file: { id: 'doc-1', title: body?.title, version: 1 } }),
+        };
       },
     },
   };
 }
 
-const okReply = (file = { id: 'doc-1', title: 'Singapore Workday Brief', version: 1 }) => ({
-  ok: true,
-  status: 201,
-  text: JSON.stringify({ file }),
-});
+const body = { html: '<h1>Brief</h1>', title: 'Singapore Workday Brief', agent: 'Singapore Workday Brief' };
 
-// ── The body actually sent ────────────────────────────────────────────────
+// ── The handshake ────────────────────────────────────────────────────────
 {
-  const hub = fakeHub([okReply()]);
-  const res = await publishThroughHub(hub.client, {
-    html: '<h1>Brief</h1>',
-    title: 'Singapore Workday Brief',
-    agent: 'Singapore Workday Brief',
-    tags: ['daily'],
-  });
-  check('one call is made', hub.calls.length, 1);
-  check('…to POST /files', `${hub.calls[0].method} ${hub.calls[0].path}`, 'POST /files');
-  check('…carrying the body', hub.calls[0].body.html, '<h1>Brief</h1>');
-  check('…and the author', hub.calls[0].body.agent, 'Singapore Workday Brief');
-  check('…with NO rev on the first attempt', 'rev' in hub.calls[0].body, false);
+  const hub = fakeHub();
+  const res = await publishThroughHub(hub.client, body);
+  check('the first call is a READ of the rev', `${hub.calls[0].method} ${hub.calls[0].path}`, 'GET /files?limit=1');
+  check('the second call is the write', `${hub.calls[1].method} ${hub.calls[1].path}`, 'POST /files');
+  check('the rev is a NUMBER in the body', hub.calls[1].body.rev, 5);
+  check('…and the body is intact', hub.calls[1].body.html, '<h1>Brief</h1>');
+  check('…and the author survives', hub.calls[1].body.agent, 'Singapore Workday Brief');
   check('the file comes back', res.file?.id, 'doc-1');
   check('no retry was needed', res.retried, false);
 }
 
-// ── The 412 → adopt the current rev → retry once ─────────────────────────
+// ── A lost race: STALE_REV names the winner at details.rev ───────────────
 {
-  const hub = fakeHub([
-    { ok: false, status: 412, text: JSON.stringify({ error: 'stale', details: { current: { rev: 'rev-42' } } }) },
-    okReply({ id: 'doc-2', version: 1 }),
-  ]);
-  const res = await publishThroughHub(hub.client, { html: '<p>x</p>', title: 'T' });
-  check('a 412 is retried', hub.calls.length, 2);
-  check('…with the rev the refusal named', hub.calls[1].body.rev, 'rev-42');
-  check('…and the body is intact', hub.calls[1].body.html, '<p>x</p>');
-  check('the retry succeeds', res.ok, true);
-  check('…and is reported as retried', res.retried, true);
-}
-
-// A 409 is the same shape and must be handled identically.
-{
-  const hub = fakeHub([
-    { ok: false, status: 409, text: JSON.stringify({ details: { current: { rev: 'rev-9' } } }) },
-    okReply(),
-  ]);
-  const res = await publishThroughHub(hub.client, { html: '<p>x</p>' });
-  check('a 409 is retried with its rev', hub.calls[1]?.body.rev, 'rev-9');
+  const hub = fakeHub({
+    rev: 9,
+    post: (sent, current, calls) =>
+      calls.filter((c) => c.method === 'POST').length === 1
+        ? {
+            ok: false,
+            status: 409,
+            text: JSON.stringify({
+              ok: false,
+              code: 'STALE_REV',
+              // The trap: `current` is the hub STATE and has no rev of its own.
+              details: { rev: 11, current: { todos: [], docs: [], rev: null } },
+            }),
+          }
+        : { ok: true, status: 201, text: JSON.stringify({ ok: true, rev: 12, file: { id: 'doc-2' } }) },
+  });
+  const res = await publishThroughHub(hub.client, body);
+  check('a stale write is retried once', hub.calls.filter((c) => c.method === 'POST').length, 2);
+  check('…with the rev from details.rev', hub.calls[2].body.rev, 11);
   check('…and succeeds', res.ok, true);
+  check('…and reports the retry', res.retried, true);
 }
 
-// ── Refusals that must NOT be retried ────────────────────────────────────
+// ── A STALE_REV with no usable rev is NOT retried ────────────────────────
 {
-  const hub = fakeHub([{ ok: false, status: 412, text: 'not json at all' }]);
-  const res = await publishThroughHub(hub.client, { html: '<p>x</p>' });
-  check('a 412 with no readable rev is NOT retried', hub.calls.length, 1);
-  check('…and is reported as a failure', res.ok, false);
-  ok('…with the refusal text', res.error.startsWith('412'), res.error);
+  const hub = fakeHub({
+    post: () => ({
+      ok: false,
+      status: 409,
+      text: JSON.stringify({ ok: false, code: 'STALE_REV', details: { current: { rev: null } } }),
+    }),
+  });
+  const res = await publishThroughHub(hub.client, body);
+  check('a stale refusal with no rev is not retried', hub.calls.filter((c) => c.method === 'POST').length, 1);
+  check('…and fails honestly', res.ok, false);
+}
+
+// ── The exact refusal that shipped: REV_REQUIRED ─────────────────────────
+{
+  // The hub ignores our rev and demands one: nothing to retry, report the text.
+  const hub = fakeHub({
+    post: () => ({
+      ok: false,
+      status: 400,
+      text: JSON.stringify({
+        ok: false,
+        error: 'this route needs the rev you are writing against',
+        code: 'REV_REQUIRED',
+        details: { field: 'rev' },
+      }),
+    }),
+  });
+  const res = await publishThroughHub(hub.client, body);
+  check('REV_REQUIRED is not retried', hub.calls.filter((c) => c.method === 'POST').length, 1);
+  check('…and fails', res.ok, false);
+  ok('…naming the reason', res.error.includes('400') && /REV_REQUIRED/.test(res.error), res.error);
+}
+
+// ── A read that cannot supply a rev never attempts the write ────────────
+{
+  const stub = {
+    calls: [],
+    client: {
+      async call(method, path) {
+        stub.calls.push(`${method} ${path}`);
+        return { ok: false, status: 503, text: 'down' };
+      },
+    },
+  };
+  const res = await publishThroughHub(stub.client, body);
+  check('an unreadable rev means no write at all', stub.calls.length, 1);
+  check('…and fails', res.ok, false);
+  ok('…naming the read', /could not read the current revision/.test(res.error), res.error);
 }
 
 {
-  const hub = fakeHub([{ ok: false, status: 403, text: '{"error":"scope"}' }]);
-  const res = await publishThroughHub(hub.client, { html: '<p>x</p>' });
-  check('a 403 is not retried', hub.calls.length, 1);
+  // 200 but no rev in the body — treat exactly like an unreadable rev, because a
+  // write with an undefined rev is the bug we are fixing.
+  const stub = {
+    calls: [],
+    client: {
+      async call(method, path) {
+        stub.calls.push(`${method} ${path}`);
+        return { ok: true, status: 200, text: JSON.stringify({ ok: true, items: [] }) };
+      },
+    },
+  };
+  const res = await publishThroughHub(stub.client, body);
+  check('a read with no rev does not write', stub.calls.length, 1);
+  check('…and fails', res.ok, false);
+}
+
+// ── Refusals that must not be retried ───────────────────────────────────
+{
+  const hub = fakeHub({ post: () => ({ ok: false, status: 403, text: '{"code":"SCOPE_DENIED"}' }) });
+  const res = await publishThroughHub(hub.client, body);
+  check('a 403 is not retried', hub.calls.filter((c) => c.method === 'POST').length, 1);
   check('…and fails', res.ok, false);
 }
 
 {
-  // A retried 412 that fails AGAIN must stop, not loop.
-  const hub = fakeHub([
-    { ok: false, status: 412, text: JSON.stringify({ details: { current: { rev: 'r1' } } }) },
-    { ok: false, status: 412, text: JSON.stringify({ details: { current: { rev: 'r2' } } }) },
-  ]);
-  const res = await publishThroughHub(hub.client, { html: '<p>x</p>' });
-  check('a second 412 stops after one retry', hub.calls.length, 2);
-  check('…and fails honestly', res.ok, false);
-}
-
-// ── Success shapes ───────────────────────────────────────────────────────
-{
-  const hub = fakeHub([{ ok: true, status: 201, text: 'not json' }]);
-  const res = await publishThroughHub(hub.client, { html: '<p>x</p>' });
-  check('a 201 with an unparsable body is still a success', res.ok, true);
-  check('…with no file record', res.file, null);
-}
-
-{
-  const res = await publishThroughHub(null, { html: '<p>x</p>' });
+  const res = await publishThroughHub(null, body);
   check('no hub client fails without a call', res.ok, false);
   ok('…naming the hub', /hub is not configured/.test(res.error), res.error);
 }
 
-// ── An update goes down the same path, with the id ───────────────────────
+// ── An update takes the same path, with the id ──────────────────────────
 {
-  const hub = fakeHub([okReply({ id: 'doc-3', version: 2 })]);
+  const hub = fakeHub();
   const res = await publishThroughHub(hub.client, {
     id: 'doc-3',
     overwrite: true,
     html: '<p>revised</p>',
     title: 'Revised',
   });
-  check('an update posts the id', hub.calls[0].body.id, 'doc-3');
-  check('…and asks to overwrite', hub.calls[0].body.overwrite, true);
-  check('…and returns the new version', res.file.version, 2);
+  check('an update posts the id', hub.calls[1].body.id, 'doc-3');
+  check('…asks to overwrite', hub.calls[1].body.overwrite, true);
+  check('…and carries the rev', hub.calls[1].body.rev, 5);
+  check('…and returns the record', res.ok, true);
 }
 
 // ── Report ───────────────────────────────────────────────────────────────

@@ -2,6 +2,13 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.63
+
+v0.3.63 - A page an agent publishes now really does appear in Files
+
+- Saving a page asked the hub to store it without the revision the hub requires, so the entry the Files page reads was never written and the page never showed. It now reads the current revision first and sends it with the save.
+- If another device saves at the same moment, the save retries once against the newer revision instead of failing.
+
 ## 0.3.62
 
 v0.3.62 - Pairing is one tap, and the glasses app no longer offers Google sign in
