@@ -5436,6 +5436,11 @@ if (String(process.env.METRICS_API ?? '').trim()) {
       console.log(`[metrics] hub store refused — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+} else {
+  // Say it out loud, because the failure it prevents is silent: readings land on
+  // this box's disk, survive a restart, and vanish on the next deploy. A host
+  // that never says so is a host where "durable" is an assumption nobody checked.
+  console.log('[metrics] no METRICS_API — readings live on this box only (not durable across deploys)');
 }
 
 /**
