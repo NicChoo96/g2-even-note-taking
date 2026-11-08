@@ -252,10 +252,13 @@ import {
 // catch-up) is pure and asserted in tools/agent-cron-sim.mjs; the running half
 // is `cronTick` further down, which uses this process's own run engine.
 import {
+  CRON_VERSION,
   describeCron,
   dueJobs,
+  jobKey,
   MAX_JOBS_PER_DAY,
   MAX_JOBS_PER_TICK,
+  nextRunAt,
   parseCronConfig,
 } from './agent-cron.mjs';
 
@@ -271,6 +274,12 @@ import {
 // and CI never needs the file at all. Values may be quoted; `export ` prefixes
 // and `#` comments are tolerated. Nothing is ever logged.
 function loadEnvFiles() {
+  // A TEST OR A CI RUN MUST NOT INHERIT A DEVELOPER'S KEYS. This relay reads the
+  // repo's `.env.local` no matter what the working directory is, which is right
+  // for `npm start` and wrong for a harness that spawns the relay to check an
+  // endpoint — it would log in to the real gateway with real credentials and can
+  // rotate the refresh token the deployed relay is using.
+  if (String(process.env.G2_HUB_ENV ?? '') === '0') return;
   const dirs = [process.cwd(), fileURLToPath(new URL('..', import.meta.url))];
   // .env.local is read FIRST so it wins over the shared .env (Vite convention).
   for (const name of ['.env.local', '.env']) {
@@ -3667,6 +3676,112 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // ── The agent schedule ────────────────────────────────────────────────────
+  // Owner-only, because a schedule spends money unattended and names agents.
+  // The body is the WHOLE schedule every time: a per-job PATCH would need its own
+  // conflict rules, and there is exactly one editor.
+  if (url.pathname === '/api/agent/schedule' && req.method === 'GET') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    // Never answer "nothing scheduled" while the durable copy is still loading.
+    if (cronReady) await cronReady;
+    json(res, 200, schedulePayload());
+    return;
+  }
+
+  if (url.pathname === '/api/agent/schedule' && req.method === 'PUT') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    // A write must replace what is actually stored, so wait for the read.
+    if (cronReady) await cronReady;
+    let body;
+    try {
+      body = await readJsonBody(req, 32 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    // Validate FIRST and refuse the whole write: a schedule half-saved is a
+    // schedule that runs something nobody asked for.
+    const parsed = parseCronConfig(body);
+    if (!parsed.ok) {
+      json(res, 400, { ok: false, error: parsed.error ?? 'unusable schedule' });
+      return;
+    }
+    if (parsed.problems.length) {
+      json(res, 400, {
+        ok: false,
+        error: parsed.problems.join('; '),
+        problems: parsed.problems,
+      });
+      return;
+    }
+    const saved = await saveCronConfig(parsed.config);
+    console.log(`[cron] saved from the page — ${describeCron(parsed.config)}`);
+    json(res, 200, {
+      ...schedulePayload(),
+      // Said plainly rather than hidden: without this the page would claim a
+      // schedule is saved while the next deploy forgets it.
+      durable: saved.durable,
+      durableError: saved.durable ? undefined : saved.reason,
+    });
+    return;
+  }
+
+  // "Run it now" — the same run the clock would start, so the wearer can prove a
+  // prompt works without waiting until 07:00 tomorrow.
+  if (url.pathname === '/api/agent/schedule/run' && req.method === 'POST') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 4 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    const wanted = String(body?.agent ?? '').trim();
+    if (!wanted) {
+      json(res, 400, { ok: false, error: 'name an agent' });
+      return;
+    }
+    const roster = await hubAgentRoster(undefined);
+    if (roster.error) {
+      json(res, 502, { ok: false, error: roster.error });
+      return;
+    }
+    const agent = roster.agents.find(
+      (a) => String(a.name ?? '').toLowerCase() === wanted.toLowerCase() || String(a.id ?? '') === wanted,
+    );
+    if (!agent) {
+      json(res, 404, { ok: false, error: `no agent named "${wanted}" on the hub` });
+      return;
+    }
+    const tools = roster.tools.filter((t) => (agent.toolIds ?? []).includes(t.id));
+    const started = startAgentRun({
+      agent: { id: agent.id, name: agent.name, systemPrompt: agent.systemPrompt },
+      prompt: String(agent.prompt ?? '').trim(),
+      tools,
+      model: '',
+      depth: 1,
+    });
+    if (!started.ok) {
+      json(res, 502, { ok: false, error: String(started.error ?? 'run refused') });
+      return;
+    }
+    json(res, 200, { ok: true, run: started.run ?? null });
+    return;
+  }
+
   // Owner-only: store the LLM/tool keys + model in .g2-hub-secrets.json.
   // Values are write-only — the response only reports booleans.
   if (req.method === 'POST' && url.pathname === '/api/settings') {
@@ -4874,6 +4989,26 @@ const CRON_STATE_FILE =
 /** One tick a minute: the finest resolution `HH:MM` can express. */
 const CRON_TICK_MS = 60 * 1000;
 
+// THE SCHEDULE'S DURABLE HOME. `/hub/relay/{key}` is the relay-state store the
+// auth blob already uses, so a schedule survives a deploy the same way a session
+// does. It is a KEY rather than a column: the gateway treats the value as opaque
+// JSON, which is why the schedule's shape can change here without a migration.
+const SCHEDULE_HUB_PATH = '/relay/agent-cron';
+
+/** The validated schedule this process is running. `null` = nothing scheduled. */
+let cronConfig = null;
+/** Where it came from: 'hub' | 'ui' | 'file' | 'env' | 'none'. Shown on the page. */
+let cronConfigSource = 'none';
+/**
+ * Resolves once the schedule has been read from its durable home.
+ *
+ * THE ROUTES AWAIT THIS, and that matters: the load is a network call, so a page
+ * opened in the first second after a deploy would otherwise read "no schedule"
+ * and offer to save — replacing a real schedule nobody had seen yet. Same rule as
+ * the auth store: reconcile before answering.
+ */
+let cronReady = null;
+
 function readCronState() {
   try {
     const raw = readFileSync(CRON_STATE_FILE, 'utf8');
@@ -4899,29 +5034,175 @@ function writeCronState(state) {
 
 /** The schedule is re-read every tick, so editing it needs no restart. */
 function readCronConfig() {
-  // TWO WAYS IN, because a file cannot reach a container:
-  //   `G2_AGENT_CRON_JSON` holds the schedule in the environment, so a deployed
-  //   relay can have one at all — the file is gitignored and a container's disk is
-  //   wiped on every deploy, so a committed-and-ignored file is a schedule that
-  //   only ever works on a laptop. If both are present the ENV wins, because that
-  //   is the one an operator can change without rebuilding an image.
-  const inline = String(process.env.G2_AGENT_CRON_JSON ?? '').trim();
-  let raw;
-  if (inline) {
-    raw = inline;
-  } else {
+  // ONE WORKING COPY, IN MEMORY, because the schedule is now edited from the
+  // page rather than by hand — a file read on every tick would just be a slower
+  // way of agreeing with what PUT /api/agent/schedule already set.
+  //
+  // WHERE IT SURVIVES, in order: the hub (`/hub/relay/agent-cron`, durable
+  // across deploys and the copy the page wrote), the local file (a laptop, or a
+  // relay with no hub configured), then `G2_AGENT_CRON_JSON` — which is now only
+  // an escape hatch for a host whose hub is unreachable at boot, not the way
+  // anyone is expected to edit a schedule.
+  if (!cronConfig) return { skipped: 'no schedule configured' };
+  if (cronConfig.enabled === false) return { skipped: 'disabled in the schedule' };
+  if (!cronConfig.jobs.length) return { skipped: 'no jobs in the schedule' };
+  return { config: cronConfig };
+}
+
+/** What the hub stores: the validated config, with the derived fields stripped. */
+function storedSchedule(config) {
+  return {
+    version: CRON_VERSION,
+    enabled: config.enabled !== false,
+    timeZone: config.timeZone,
+    graceMinutes: config.graceMinutes,
+    jobs: (config.jobs ?? []).map((j) => ({
+      agent: j.agent,
+      at: j.at,
+      ...(j.days && j.days.length ? { days: j.days } : {}),
+      ...(j.ask ? { ask: j.ask } : {}),
+      enabled: j.enabled !== false,
+    })),
+  };
+}
+
+/** The hub caller, or null when this deployment has no gateway configured. */
+function cronHubClient() {
+  try {
+    return hubRuntime().client ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Boot-time load. The hub is the authority; the file is a working copy.
+ *
+ * A hub that is down must not stop the relay — it degrades to whatever the file
+ * or the environment says, which is exactly the behaviour that shipped before
+ * the schedule had a home.
+ */
+async function loadCronConfig() {
+  const client = cronHubClient();
+  if (client) {
     try {
-      raw = readFileSync(CRON_FILE, 'utf8');
+      const res = await client.call('GET', SCHEDULE_HUB_PATH);
+      if (Number(res?.status) === 200) {
+        const body = JSON.parse(String(res.text ?? '') || 'null');
+        const parsed = parseCronConfig(body?.value ?? null);
+        if (parsed.ok) {
+          cronConfig = parsed.config;
+          cronConfigSource = 'hub';
+          for (const p of parsed.problems) console.log(`[cron] ${p}`);
+          return;
+        }
+        console.log(`[cron] hub schedule refused — ${parsed.error ?? 'unusable'}`);
+      } else if (Number(res?.status) !== 404) {
+        console.log(`[cron] hub schedule read ${res?.status} — falling back to the file`);
+      }
     } catch {
-      return { skipped: 'no schedule file or G2_AGENT_CRON_JSON' };
+      // No answer is not a fault worth a stack trace; fall through.
     }
   }
+
+  let raw = null;
+  try {
+    raw = readFileSync(CRON_FILE, 'utf8');
+    cronConfigSource = 'file';
+  } catch {
+    const inline = String(process.env.G2_AGENT_CRON_JSON ?? '').trim();
+    if (inline) {
+      raw = inline;
+      cronConfigSource = 'env';
+    }
+  }
+  if (!raw) {
+    cronConfigSource = 'none';
+    return;
+  }
   const parsed = parseCronConfig(raw);
-  if (!parsed.ok) return { skipped: `schedule refused — ${parsed.error}` };
-  for (const p of parsed.problems ?? []) console.log(`[cron] ${p}`);
-  if (!parsed.config.enabled) return { skipped: 'disabled in the schedule' };
-  if (!parsed.config.jobs.length) return { skipped: 'no usable jobs' };
-  return { config: parsed.config };
+  if (!parsed.ok) {
+    console.log(`[cron] schedule refused — ${parsed.error}`);
+    cronConfigSource = 'none';
+    return;
+  }
+  cronConfig = parsed.config;
+  for (const p of parsed.problems) console.log(`[cron] ${p}`);
+  // The hub had nothing, so push what this process already had: otherwise the
+  // first deploy after this change would silently forget a hand-written file.
+  if (client && cronConfig.jobs.length) {
+    void saveCronConfig(cronConfig).catch(() => {});
+  }
+}
+
+/**
+ * Write the schedule everywhere it needs to be.
+ *
+ * The page must not have to care which of these succeeded: the in-memory copy is
+ * authoritative for THIS process (so a job saved a second ago is due a minute
+ * from now), the file keeps a local restart honest, and the hub is what makes it
+ * survive a deploy. `durable` reports whether the last of those landed, because
+ * a schedule that only lives in memory is exactly the bug this fixes.
+ */
+async function saveCronConfig(config) {
+  cronConfig = config;
+  cronConfigSource = 'ui';
+  try {
+    writeFileSync(CRON_FILE, `${JSON.stringify(storedSchedule(config), null, 2)}\n`);
+  } catch (err) {
+    console.log(`[cron] could not write the schedule file — ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const client = cronHubClient();
+  if (!client) return { durable: false, reason: 'no hub configured on this relay' };
+  try {
+    const res = await client.call('PUT', SCHEDULE_HUB_PATH, { body: { value: storedSchedule(config) } });
+    const status = Number(res?.status);
+    if (status === 200) return { durable: true };
+    return { durable: false, reason: `hub answered ${status || 'nothing'}` };
+  } catch (err) {
+    return { durable: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Everything the page needs to render the schedule truthfully. */
+function schedulePayload() {
+  const config = cronConfig;
+  const state = readCronState();
+  const now = Date.now();
+  const zone = config?.timeZone ?? 'Asia/Singapore';
+  const jobs = (config?.jobs ?? []).map((j) => {
+    const key = jobKey(j);
+    const next = nextRunAt(j, now, zone);
+    return {
+      agent: j.agent,
+      at: j.at,
+      days: j.days ?? null,
+      ask: j.ask ?? '',
+      enabled: j.enabled !== false,
+      // Absolute, so the page never has to do timezone arithmetic in a browser
+      // that may be in a different zone from the relay.
+      nextAt: next,
+      nextSlot: next === null ? null : new Date(next).toISOString(),
+      lastSlot: state.slots[key] ?? null,
+      lastError: state.errors[key] ?? null,
+    };
+  });
+  return {
+    ok: true,
+    source: cronConfigSource,
+    configured: Boolean(config),
+    enabled: config?.enabled !== false,
+    // The kill switch outranks the schedule, and so does a paused one: the page
+    // must not print "Firing on schedule" over a schedule that cannot fire.
+    running:
+      Boolean(config) && config.enabled !== false && String(process.env.G2_AGENT_CRON ?? '') !== '0',
+    killed: String(process.env.G2_AGENT_CRON ?? '') === '0',
+    timeZone: zone,
+    graceMinutes: config?.graceMinutes ?? 20,
+    jobs,
+    caps: { perTick: MAX_JOBS_PER_TICK, perDay: MAX_JOBS_PER_DAY },
+    serverNow: new Date(now).toISOString(),
+  };
 }
 
 let cronBusy = false;
@@ -5017,15 +5298,17 @@ function startAgentCron() {
     console.log('[cron] off (G2_AGENT_CRON=0)');
     return;
   }
-  const read = readCronConfig();
-  if (read.skipped) {
-    // Silence unless something is misconfigured: "nothing configured" is the
-    // normal case for a relay that has no scheduled agents.
-    if (!read.skipped.startsWith('no schedule file')) console.log(`[cron] off — ${read.skipped}`);
-    return;
-  }
-  console.log(`[cron] on — ${describeCron(read.config)}`);
-  console.log(`[cron]   schedule ${CRON_FILE}`);
+  // THE TIMER RUNS EVEN WITH NOTHING CONFIGURED, because the schedule is now
+  // saved from the page. A clock that only started when a file existed at boot
+  // would mean "save the schedule, then redeploy" — which is how the feature
+  // looked broken. A tick with no jobs costs one null check.
+  cronReady = loadCronConfig()
+    .then(() => {
+      const read = readCronConfig();
+      if (read.skipped) console.log(`[cron] idle — ${read.skipped} (source: ${cronConfigSource})`);
+      else console.log(`[cron] on — ${describeCron(read.config)} (source: ${cronConfigSource})`);
+    })
+    .catch(() => console.log('[cron] idle — the schedule could not be loaded'));
   const timer = setInterval(() => void cronTick(), CRON_TICK_MS);
   // A scheduled agent must never be the reason a process cannot exit.
   if (typeof timer.unref === 'function') timer.unref();

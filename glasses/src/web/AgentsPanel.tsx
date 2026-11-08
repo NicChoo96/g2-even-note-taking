@@ -54,6 +54,7 @@ import {
 } from '../types';
 import { MicButton } from './Dictate';
 import { RestToolConfig } from './ToolsPanel';
+import { AgentSchedule } from './SchedulePanel';
 import { fetchAgentStatus, type AgentStatus } from './agents-client';
 
 function useAgents(): AgentsState {
@@ -591,6 +592,10 @@ export function AgentsPanel() {
       {hubError && <p className="warn-line">⚠️ {hubError}</p>}
 
       <FleetMaintenance />
+
+      {/* The clock, next to the agents it runs: "daily" in an agent's prompt only
+          ever meant "when someone taps it" until this existed. */}
+      <AgentSchedule />
 
       <div className="agents-split">
         {/* ── master: agents + tools ─────────────────────────────────── */}

@@ -135,13 +135,18 @@ export function parseCronConfig(raw) {
       problems.push(`job ${i} (${agent}): at "${at}" is not HH:MM`);
       continue;
     }
-    const days = Array.isArray(j?.days)
-      ? j.days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+    const daysRaw = j?.days;
+    const days = Array.isArray(daysRaw)
+      ? daysRaw.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
       : null;
     // A day list that names NO real weekday is a fault, not an instruction to run
     // every day. Coercing it to daily would run an agent seven times as often as
     // the wearer asked, which is the one direction this must never guess in.
-    if (j?.days !== undefined && !days?.length) {
+    //
+    // `null` IS NOT THAT FAULT: it is the shape this module itself emits for
+    // "every day", so refusing it would make a schedule that came back from the
+    // page impossible to save back — every edit of an un-pinned job would 400.
+    if (daysRaw !== undefined && daysRaw !== null && !days?.length) {
       problems.push(`job ${i} (${agent}): days ${JSON.stringify(j.days)} names no real weekday`);
       continue;
     }
@@ -197,6 +202,91 @@ export function dueJobs(config, nowMs, lastRuns = {}) {
 /** The slot a job would record if it ran at `nowMs` (punctuation-free, for state). */
 export function slotAt(nowMs, timeZone = DEFAULT_TIME_ZONE) {
   return zonedNow(nowMs, timeZone).slot;
+}
+
+/** The wall clock in `timeZone` at instant `utcMs`, as epoch ms. */
+function wallMs(utcMs, timeZone) {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const p = Object.fromEntries(fmt.formatToParts(new Date(utcMs)).map((x) => [x.type, x.value]));
+  return Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour), Number(p.minute), Number(p.second));
+}
+
+/**
+ * The UTC instant at which the wall clock in `timeZone` reads
+ * `y-mo-d` + `minutes` past midnight.
+ *
+ * Two passes, because the offset we need is the one in force AT the answer, not
+ * the one in force at the guess — that difference is exactly the hour a DST
+ * change would otherwise lose. Singapore never shifts, but a wearer who moves
+ * the schedule to another zone must not get a quietly wrong "next run".
+ */
+export function zonedWallToUtc(y, mo, d, minutes, timeZone = DEFAULT_TIME_ZONE) {
+  const zone = String(timeZone ?? '').trim() || DEFAULT_TIME_ZONE;
+  const naive = Date.UTC(y, mo - 1, d, 0, 0, 0) + minutes * 60000;
+  let utc = naive - (wallMs(naive, zone) - naive);
+  utc = naive - (wallMs(utc, zone) - utc);
+  return utc;
+}
+
+const WEEKDAY_INDEX = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * When this job next fires, as epoch ms — `null` if it never will.
+ *
+ * WHY THIS EXISTS: without it the page can only show a schedule, not promise
+ * anything. "Daily at 07:00" is a sentence; "next 07:00, Monday" is a fact the
+ * wearer can check against the clock. A disabled job answers `null` rather than
+ * lying about a time that will never arrive.
+ *
+ * Searches eight days, so a job pinned to a single weekday is always found. The
+ * CURRENT occurrence is included only if it is still ahead: the grace window
+ * belongs to the tick, and a page that says "running now" for twenty minutes
+ * after the fact is worse than one that says tomorrow.
+ */
+export function nextRunAt(job, nowMs = Date.now(), timeZone = DEFAULT_TIME_ZONE) {
+  if (!job || job.enabled === false) return null;
+  const minutes = Number.isFinite(job.minutes) ? job.minutes : minuteOfDay(job.at);
+  if (minutes === null || minutes === undefined) return null;
+  const zone = String(timeZone ?? '').trim() || DEFAULT_TIME_ZONE;
+  const now = zonedNow(nowMs, zone);
+  const [y, mo, d] = now.date.split('-').map(Number);
+  for (let offset = 0; offset <= 8; offset += 1) {
+    // A plain UTC date is only a calendar here, so adding days is exact and no
+    // DST rule can move the DATE the way it moves a clock.
+    const day = new Date(Date.UTC(y, mo - 1, d + offset));
+    const wanted = job.days && job.days.length ? job.days : null;
+    if (wanted && !wanted.includes(day.getUTCDay())) continue;
+    const at = zonedWallToUtc(day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate(), minutes, zone);
+    if (at > nowMs) return at;
+  }
+  return null;
+}
+
+/**
+ * The next firing of every enabled job, earliest first.
+ *
+ * Sorted because the list is read as a queue ("what happens next?"), and a page
+ * that shows jobs in the order they were typed makes the wearer do that work.
+ */
+export function upcomingRuns(config, nowMs = Date.now()) {
+  if (!config) return [];
+  const zone = config.timeZone ?? DEFAULT_TIME_ZONE;
+  const out = [];
+  for (const job of config.jobs ?? []) {
+    const at = nextRunAt(job, nowMs, zone);
+    if (at === null) continue;
+    out.push({ job, at });
+  }
+  return out.sort((a, b) => a.at - b.at);
 }
 
 /** One human line describing the schedule, for the boot log. */

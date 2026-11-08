@@ -38,9 +38,12 @@ const {
   dueJobs,
   jobKey,
   minuteOfDay,
+  nextRunAt,
   parseCronConfig,
   slotAt,
+  upcomingRuns,
   zonedNow,
+  zonedWallToUtc,
   // A query string makes this a FRESH module instance, so a stale cache can
   // never make an edited schedule module look unchanged.
 } = await import(`${pathToFileURL(mod).href}?v=${Date.now()}`);
@@ -99,6 +102,19 @@ check(
   false,
 );
 check('a real day list is kept', mixed.config.jobs[1].days, [1, 3]);
+// The page reads a schedule back and saves it again, so what this module EMITS
+// has to be something it ACCEPTS. `days: null` is its own word for "every day";
+// refusing it made every edit of an un-pinned job a 400.
+check(
+  'but days:null round-trips as every day',
+  parseCronConfig({ jobs: [{ agent: 'Weather', at: '06:00', days: null }] }).problems.length,
+  0,
+);
+check(
+  'an empty day list is still refused',
+  parseCronConfig({ jobs: [{ agent: 'Weather', at: '06:00', days: [] }] }).problems.length,
+  1,
+);
 check('a disabled job is kept but marked', mixed.config.jobs[2].enabled, false);
 check('grace is clamped to an hour-based ceiling', mixed.config.graceMinutes, 180);
 check('the zone is kept', mixed.config.timeZone, 'Europe/London');
@@ -177,6 +193,48 @@ const described = describeCron(config);
 checkTrue('a real schedule names the jobs and the zone', /2 jobs \(Asia\/Singapore\): 06:00 Weather/.test(described));
 check('no schedule at all is said plainly', describeCron(null), 'no schedule');
 
+// ── 6b. WHAT THE PAGE PROMISES: the next firing ────────────────────────────
+// A schedule the wearer cannot inspect is the state this feature was stuck in.
+// These assert the answer the page prints, so "next 07:00" can be trusted or
+// caught rather than believed.
+const atSixUtc = Date.UTC(2026, 0, 5, 6, 0, 0); // Mon 5 Jan 2026, 14:00 SGT
+const sevenSgt = { agent: 'Brief', at: '07:00', minutes: 420, days: null, enabled: true };
+
+// Singapore is UTC+8, so 07:00 SGT is 23:00 UTC the day BEFORE. Getting this
+// sign wrong is a whole day of error, which is why it is asserted directly.
+check(
+  '07:00 in Singapore is 23:00 UTC the day before',
+  new Date(zonedWallToUtc(2026, 1, 6, 420, 'Asia/Singapore')).toISOString(),
+  '2026-01-05T23:00:00.000Z',
+);
+check(
+  'an already-passed time is tomorrow, not now',
+  new Date(nextRunAt(sevenSgt, atSixUtc, 'Asia/Singapore')).toISOString(),
+  '2026-01-05T23:00:00.000Z',
+);
+const afterSgtMorning = Date.UTC(2026, 0, 6, 0, 0, 0); // 08:00 SGT on the 6th
+check(
+  'a time still ahead today is today',
+  new Date(nextRunAt({ ...sevenSgt, at: '12:00', minutes: 720 }, afterSgtMorning, 'Asia/Singapore')).toISOString(),
+  '2026-01-06T04:00:00.000Z',
+);
+check(
+  'a day-pinned job finds that weekday, not the next minute',
+  new Date(nextRunAt({ ...sevenSgt, days: [0] }, atSixUtc, 'Asia/Singapore')).toISOString(),
+  '2026-01-10T23:00:00.000Z', // Sunday 11 Jan, 07:00 SGT
+);
+check('a paused job promises nothing', nextRunAt({ ...sevenSgt, enabled: false }, atSixUtc, 'Asia/Singapore'), null);
+check('a job with no usable time promises nothing', nextRunAt({ agent: 'X', at: 'oops' }, atSixUtc, 'Asia/Singapore'), null);
+const queue = upcomingRuns(
+  { timeZone: 'Asia/Singapore', jobs: [{ ...sevenSgt, at: '18:00', minutes: 1080 }, sevenSgt] },
+  atSixUtc,
+);
+// 14:00 SGT: tonight's 18:00 is sooner than tomorrow's 07:00, so the later
+// CLOCK TIME sorts first. Ordering by the time-of-day field would put 07:00 on
+// top and quietly lie about what happens next.
+check('the queue is earliest first', queue.map((r) => r.job.at), ['18:00', '07:00']);
+check('and empty for no schedule', upcomingRuns(null, atSixUtc), []);
+
 // ── 7. the relay's wiring is present and ordered ───────────────────────────
 const relay = readFileSync(resolve(here, '../../web/server/local-sse.mjs'), 'utf8');
 checkTrue('the relay imports the schedule module', /from '\.\/agent-cron\.mjs'/.test(relay));
@@ -189,6 +247,35 @@ checkTrue('an env kill switch exists', /G2_AGENT_CRON/.test(relay));
 const rosterBranch = relay.slice(relay.indexOf("roster unavailable"), relay.indexOf("roster unavailable") + 260);
 checkTrue('a missing hub roster does NOT spend the slot', rosterBranch.includes('return;') && !rosterBranch.includes('state.slots'));
 checkTrue('a run is started with the agent OWN prompt', /prompt: savedTask/.test(relay));
+
+// ── 8. the schedule has a HOME, and a control surface ──────────────────────
+// The first version read a gitignored file, so a deployed relay could never have
+// a schedule, and the only knob was an environment variable — which is how a
+// working clock came to look like a missing feature. These pin the fix.
+checkTrue(
+  'the schedule is stored on the hub, not only on disk',
+  /SCHEDULE_HUB_PATH = '\/relay\/agent-cron'/.test(relay),
+);
+checkTrue('it is read from the hub at boot', /client\.call\('GET', SCHEDULE_HUB_PATH\)/.test(relay));
+checkTrue(
+  'it is written back as a whole value',
+  /client\.call\('PUT', SCHEDULE_HUB_PATH, \{ body: \{ value: storedSchedule\(config\) \} \}\)/.test(relay),
+);
+checkTrue('the page can read it', /url\.pathname === '\/api\/agent\/schedule' && req\.method === 'GET'/.test(relay));
+checkTrue('the page can replace it', /url\.pathname === '\/api\/agent\/schedule' && req\.method === 'PUT'/.test(relay));
+checkTrue('a run can be started on demand', /'\/api\/agent\/schedule\/run'/.test(relay));
+// Owner-only: a schedule spends money unattended, so a paired device must not
+// be able to edit it.
+const putBranch = relay.slice(relay.indexOf("'/api/agent/schedule' && req.method === 'PUT'"));
+checkTrue('editing the schedule needs the owner', putBranch.slice(0, 400).includes('requireOwner'));
+// A schedule half-saved is a schedule that runs something nobody asked for.
+const validateIdx = putBranch.indexOf('parseCronConfig(body)');
+checkTrue('every job is validated before anything is written', validateIdx > 0 && validateIdx < putBranch.indexOf('saveCronConfig'));
+// The timer must not depend on a file existing at boot, or saving a schedule
+// would still need a redeploy — the exact thing that made this look broken.
+const bootFn = relay.slice(relay.indexOf('function startAgentCron()'), relay.indexOf('server.listen(PORT'));
+checkTrue('the clock starts even with nothing configured', bootFn.includes('loadCronConfig') && !/return;\s*\n\s*}\s*\n\s*const read/.test(bootFn));
+checkTrue('the kill switch is still reported, not silently obeyed', /killed:/.test(relay));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

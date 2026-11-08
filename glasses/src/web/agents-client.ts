@@ -214,3 +214,93 @@ export function runTool(args: {
 }): Promise<ToolReply> {
   return post<ToolReply>('/api/tool', args);
 }
+
+// ── The agent schedule ──────────────────────────────────────────────────────
+// The clock runs on the RELAY, not on this device, which is why a daily agent
+// fires with the glasses in a drawer and the phone asleep. The page's whole job
+// is to describe that schedule and change it.
+
+/** One scheduled run, as the relay sees it. */
+export interface ScheduleJob {
+  agent: string;
+  /** `HH:MM` on the relay's clock, in `timeZone`. */
+  at: string;
+  /** `0`=Sunday … `6`=Saturday; `null` means every day. */
+  days: number[] | null;
+  /** An extra instruction layered on the agent's own saved task. */
+  ask: string;
+  enabled: boolean;
+  /** The next firing, as epoch ms — `null` when it will never fire. */
+  nextAt: number | null;
+  /** The same instant as an ISO string, so nothing is recomputed in the browser. */
+  nextSlot: string | null;
+  /** The last slot this job actually ran, `YYYY-MM-DD HH:MM`, if it ever has. */
+  lastSlot: string | null;
+  lastError: string | null;
+}
+
+export interface ScheduleState {
+  ok: boolean;
+  /** Where the running schedule came from. `none` is a real answer, not a fault. */
+  source: 'hub' | 'ui' | 'file' | 'env' | 'none';
+  configured: boolean;
+  enabled: boolean;
+  /** True when there is a schedule AND the kill switch is not thrown. */
+  running: boolean;
+  /** `G2_AGENT_CRON=0` on the relay — the schedule exists but cannot fire. */
+  killed: boolean;
+  timeZone: string;
+  graceMinutes: number;
+  jobs: ScheduleJob[];
+  caps: { perTick: number; perDay: number };
+  serverNow: string;
+  /** Whether the save reached the hub — a schedule only in memory dies on deploy. */
+  durable?: boolean;
+  durableError?: string;
+  error?: string;
+}
+
+/** The schedule, plus when each job next fires. */
+export async function fetchSchedule(): Promise<ScheduleState | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/schedule`, { headers: authHeaders() });
+    if (!res.ok) return null;
+    return (await res.json()) as ScheduleState;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Replace the whole schedule.
+ *
+ * Whole-value on purpose: the relay validates it in one pass and either accepts
+ * every job or none, so a half-applied edit can never leave an agent firing at a
+ * time nobody chose.
+ */
+export async function saveSchedule(patch: {
+  enabled?: boolean;
+  timeZone?: string;
+  jobs: Array<{ agent: string; at: string; days?: number[] | null; ask?: string; enabled?: boolean }>;
+}): Promise<ScheduleState> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/schedule`, {
+      method: 'PUT',
+      headers: authHeaders(true),
+      body: JSON.stringify(patch),
+    });
+    const j = (await res.json().catch(() => ({}))) as ScheduleState;
+    if (!res.ok) return { ...j, ok: false, error: j?.error || `HTTP ${res.status}` };
+    return j;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    } as ScheduleState;
+  }
+}
+
+/** Start one run now — the same run the clock would start, for testing a prompt. */
+export function runAgentNow(agent: string): Promise<ToolReply> {
+  return post<ToolReply>('/api/agent/schedule/run', { agent });
+}
