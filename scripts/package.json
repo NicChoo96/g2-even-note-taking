@@ -1,0 +1,12 @@
+{
+  "name": "g2-hub-scripts",
+  "private": true,
+  "type": "module",
+  "description": "Release tooling: pack and deploy the G2 package to Even Hub",
+  "scripts": {
+    "deploy": "node hub-deploy.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.50.0"
+  }
+}
