@@ -28,6 +28,7 @@ import {
 } from '../store';
 import type { ConnStatus } from '../store';
 import { activeDoc, type HubState, type SectionId } from '../types';
+import { bootCount, loadDeviceSession } from '../durable-docs';
 import { docWords, filterDocs, orderDocs, whenLabel } from './doc-list';
 import { ThemeToggle } from './ThemeToggle';
 
@@ -123,6 +124,25 @@ export default function App() {
    */
   const orderedDocs = orderDocs(docs);
   const visibleDocs = filterDocs(orderedDocs, docQuery);
+
+  /**
+   * What the DURABLE store actually holds, read once per mount.
+   *
+   * Read from the bridge first (see durable-docs.ts), so this is the same value
+   * the package would see after a restart — not the WebView's own localStorage,
+   * which is the thing being compared against.
+   */
+  const [storage, setStorage] = useState<{ boots: number; device: string } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const [boots, deviceId] = await Promise.all([bootCount(), loadDeviceSession()]);
+      if (alive) setStorage({ boots, device: deviceId ? deviceId.slice(0, 8) : '' });
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const selectDoc = (id: string) => storeSelectDoc(id);
 
@@ -415,6 +435,15 @@ export default function App() {
 
       <footer className="app-footer">
         <span>Same URL drives the web UI and the glasses · edits broadcast live</span>
+        {/* THE PERSISTENCE MEASUREMENT. Two facts, both durable: how many times
+            this install has launched, and the device id the pairing is keyed to.
+            If both survive an .ehpk update, a package can carry its credential
+            and there is nothing to re-enter. If the count resets to 1, it cannot,
+            and the answer is a re-authentication flow rather than more storage.
+            Small and always visible on purpose — this is the thing being tested. */}
+        <span className="storage-note" title="Device storage that survives an app update">
+          {storage ? `device storage · boot #${storage.boots} · ${storage.device || 'no device id'}` : 'device storage · …'}
+        </span>
         <span>R1 ring: swipe = move · single press = toggle · double-press = exit</span>
       </footer>
     </div>

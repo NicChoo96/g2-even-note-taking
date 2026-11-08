@@ -16,6 +16,7 @@ import { createRoot } from 'react-dom/client';
 import App from './App';
 import { AuthProvider, LoginScreen, PairScreen, useAuth } from './auth';
 import { initTheme } from './theme';
+import { bumpBootCount } from '../durable-docs';
 import './styles.css';
 
 function Gate() {
@@ -40,6 +41,10 @@ export function mountUi(): void {
   // already applied it to avoid a flash; this is the half that also wires the
   // system-preference listener and keeps `color-scheme` correct.
   initTheme();
+  // Measure whether this install's DURABLE storage survives a package update —
+  // see `bumpBootCount` in ../durable-docs. Fire-and-forget: a counter must
+  // never delay a first paint.
+  void bumpBootCount();
   rootEl.dataset.mounted = '1';
   createRoot(rootEl).render(
     <React.StrictMode>

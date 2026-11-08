@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.61
+
+v0.3.61 - The app now shows how much it remembers between updates
+
+- The footer shows how many times the app has started on this device, and the device id it is paired under.
+- Update the app and look again: if the number goes up, the phone kept its memory and pairing is being lost elsewhere. If it starts again at 1, the phone forgot.
+- Nothing else changes.
+
 ## 0.3.60
 
 v0.3.60 - A published page now appears in Files, under the agent that wrote it

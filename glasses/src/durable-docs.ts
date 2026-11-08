@@ -11,6 +11,8 @@ import type { DocEntry } from './types';
 const DOCS_KEY = 'hub:docs';
 const DEVICE_KEY = 'hub:deviceId';
 const OWNER_KEY = 'hub:owner';
+/** Launch counter — the measurement described at `bumpBootCount` below. */
+const BOOT_KEY = 'hub:boots';
 
 let bridge: EvenAppBridge | null = null;
 
@@ -131,6 +133,32 @@ export async function saveDeviceSession(deviceId: string): Promise<void> {
 /** Clear the stored device session (e.g. the owner revoked this device). */
 export async function clearDeviceSession(): Promise<void> {
   await durableRemove(DEVICE_KEY);
+}
+
+/**
+ * How many times this INSTALL has been launched, counted durably.
+ *
+ * THIS IS A MEASUREMENT, NOT A FEATURE. The one fact nobody can tell from the
+ * code is whether the host's `setLocalStorage` survives an `.ehpk` UPDATE — as
+ * opposed to a WebView teardown, which it demonstrably does. That fact decides
+ * whether pairing has to be redone after every package: if the count keeps
+ * climbing across an update, storage survived and the device id (and with it the
+ * pairing) survived too; if it is back to 1, it did not, and a package cannot
+ * carry a credential at all.
+ *
+ * One counter answers it in a single release, which is cheaper than designing a
+ * re-authentication flow for a problem that may not exist.
+ */
+export async function bumpBootCount(): Promise<number> {
+  const raw = await durableGet(BOOT_KEY);
+  // Clamped so a counter nobody resets cannot grow into a surprise some day.
+  const next = Math.min(9999, (Number(raw) || 0) + 1);
+  await durableSet(BOOT_KEY, String(next));
+  return next;
+}
+
+export async function bootCount(): Promise<number> {
+  return Number(await durableGet(BOOT_KEY)) || 0;
 }
 
 /**
