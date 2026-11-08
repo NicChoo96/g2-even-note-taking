@@ -161,6 +161,13 @@ export function DataPanel() {
   const [note, setNote] = useState('');
   const [warn, setWarn] = useState('');
   const [draft, setDraft] = useState<Draft>(BLANK);
+  /** The standalone "add a series" form: four fields, no collector. */
+  const [seriesDraft, setSeriesDraft] = useState<{ key: string; label: string; unit: string; type: 'number' | 'string' }>({
+    key: '',
+    label: '',
+    unit: '',
+    type: 'number',
+  });
 
   const reload = useCallback(async () => {
     const next = await fetchMetrics();
@@ -213,26 +220,30 @@ export function DataPanel() {
     }
   };
 
-  /** Add or update the declaration in the schedule document, without a job. */
-  const declareSeries = async (): Promise<boolean> => {
+  /**
+   * Add or update a series declaration in the schedule document.
+   *
+   * Takes the fields rather than reading `draft`, because there are two callers
+   * with different inputs: the collector form (which then schedules a fetch) and
+   * the standalone form (which only declares). Factoring it here is what makes a
+   * series WITHOUT a collector possible — before this, the only way to declare one
+   * was to add a collector you might never schedule, which is a strange thing to
+   * ask of someone who just wants Jarvis to be able to record a number.
+   */
+  const putSeries = async (next: { key: string; label: string; unit: string; type: 'number' | 'string' }): Promise<boolean> => {
     const schedule = await fetchSchedule();
     if (!schedule) {
       setWarn('Could not read the schedule — sign in as the owner to configure collectors.');
       return false;
     }
-    const key = draft.key.trim().toLowerCase();
-    const next = {
-      key,
-      label: draft.label.trim() || key,
-      unit: draft.unit.trim(),
-      type: draft.type,
-    };
+    const key = next.key.trim().toLowerCase();
+    const entry = { key, label: next.label.trim() || key, unit: next.unit.trim(), type: next.type };
     const existing = (schedule as unknown as { series?: unknown[] }).series;
     const list = Array.isArray(existing) ? existing.filter((s) => (s as { key?: string }).key !== key) : [];
     const saved = await saveSchedule({
       enabled: schedule.enabled,
       timeZone: schedule.timeZone,
-      series: [...list, next],
+      series: [...list, entry],
       jobs: schedule.jobs.map((j) => jobForSave(j)),
     } as never);
     if (!saved.ok) {
@@ -240,6 +251,37 @@ export function DataPanel() {
       return false;
     }
     return true;
+  };
+
+  /** The collector form's version: declare from its own draft. */
+  const declareSeries = (): Promise<boolean> => putSeries(draft);
+
+  /**
+   * Declare a series on its own — no URL, no schedule.
+   *
+   * This is the step that makes an agent-written series possible: the tool can
+   * only write to a series that exists, and until now the only UI that created one
+   * also demanded an endpoint. The wearer still decides the key and the unit,
+   * because a series' `type` and `unit` are locked once created (a change needs a
+   * new key), and because cardinality is a human choice.
+   */
+  const declareOnly = async () => {
+    setWarn('');
+    setNote('');
+    if (!seriesDraft.key.trim()) return setWarn('Give the series a key first, e.g. sgx.dbs.price');
+    setBusy(true);
+    try {
+      const ok = await putSeries(seriesDraft);
+      if (!ok) return;
+      await reload();
+      setNote(
+        `Added ${seriesDraft.key.trim().toLowerCase()}. Nothing collects it yet — an agent can write to it, ` +
+          'or add a collector below.',
+      );
+      setSeriesDraft({ key: '', label: '', unit: '', type: 'number' });
+    } finally {
+      setBusy(false);
+    }
   };
 
   const jobForSave = (j: {
@@ -400,6 +442,63 @@ export function DataPanel() {
           />
         ))}
       </div>
+
+      {/* ── A series with no collector ───────────────────────────────────── */}
+      {/* This comes FIRST because it is the smaller decision and the one every
+          other path needs: a collector declares its own series, and an agent can
+          only write to one that already exists. */}
+      <section className="collector-form">
+        <div className="panel-label">Add a series</div>
+        <p className="hint-line">
+          For numbers nothing can fetch — something Jarvis worked out, or a figure you read somewhere. An agent can
+          then record it with the dashboard tool. <strong>Type and unit are fixed once added</strong> (a change needs
+          a new key), so pick the unit carefully.
+        </p>
+        <div className="form-row">
+          <label>
+            Series key
+            <input
+              value={seriesDraft.key}
+              onChange={(e) => setSeriesDraft((d) => ({ ...d, key: e.target.value }))}
+              placeholder="news.rate.mentions"
+            />
+          </label>
+          <label>
+            Label
+            <input
+              value={seriesDraft.label}
+              onChange={(e) => setSeriesDraft((d) => ({ ...d, label: e.target.value }))}
+              placeholder="Rate mentions"
+            />
+          </label>
+          <label>
+            Unit
+            <input
+              value={seriesDraft.unit}
+              onChange={(e) => setSeriesDraft((d) => ({ ...d, unit: e.target.value }))}
+              placeholder="count"
+            />
+          </label>
+          <label>
+            Type
+            <select
+              value={seriesDraft.type}
+              onChange={(e) => setSeriesDraft((d) => ({ ...d, type: e.target.value as 'number' | 'string' }))}
+            >
+              <option value="number">number</option>
+              <option value="string">text</option>
+            </select>
+          </label>
+        </div>
+        <button
+          className="primary"
+          onClick={() => void declareOnly()}
+          disabled={busy || !seriesDraft.key.trim()}
+          title="Add the series so an agent or a collector can write to it"
+        >
+          {busy ? 'Working…' : 'Add series'}
+        </button>
+      </section>
 
       {/* ── A new collector ─────────────────────────────────────────────── */}
       <section className="collector-form">

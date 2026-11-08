@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.66
+
+v0.3.66 - Agents can record and read the numbers on your dashboard
+
+- Eight agents now hold the dashboard tool: the five that track prices, weather and benchmarks can save the figure they found, and the three summarisers can read the history back.
+- The Data tab can add a series on its own, with no URL and no schedule, so Jarvis can record a number nothing fetches.
+- A series can be deleted together with its readings, and a reading keeps its whole source URL.
+
 ## 0.3.65
 
 v0.3.65 - Fleet health check, and a clock for scheduled agents

@@ -17,7 +17,7 @@
 // Run: node tools/metrics-sim.mjs
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -423,6 +423,18 @@ try {
     // A leftover temp directory is not a test failure.
   }
 }
+
+// ── 8. the panel can declare a series WITHOUT a collector ──────────────────
+// The tool can only write to a series that already exists, and until now the only
+// UI that created one also demanded a URL and a schedule — so "ask Jarvis to track
+// this" had no first step. These are source assertions on purpose: the behaviour
+// (a series with `jobs: []` accepting a tool write) is already proven above.
+const panelSrc = readFileSync(resolve(here, '../src/web/DataPanel.tsx'), 'utf8');
+check('one helper puts a series into the schedule', /const putSeries = async/.test(panelSrc), true);
+check('the collector form declares through it', /const declareSeries = \(\): Promise<boolean> => putSeries\(draft\)/.test(panelSrc), true);
+check('and a standalone form exists', /const declareOnly = async/.test(panelSrc), true);
+check('offered in the panel', /onClick=\{\(\) => void declareOnly\(\)\}/.test(panelSrc), true);
+check('and it needs no URL', /declareOnly[\s\S]{0,900}?No URL/.test(panelSrc) || /no collector\b/i.test(panelSrc), true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
