@@ -40,6 +40,8 @@ qr-prototype.png
 # deployment's own business (the checked-in .example.json documents its shape).
 .g2-agent-cron-state.json
 .g2-agent-cron.json
+# A paired-device credential minted by scripts/repair-agents.mjs. Never commit it.
+.tmp-e2e-repair-device.txt
 
 # Watchdog-sim test artifacts (generated/downloaded wav)
 glasses/tools/*.wav

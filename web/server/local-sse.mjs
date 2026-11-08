@@ -3218,15 +3218,22 @@ const server = createServer(async (req, res) => {
     // Approve by DEVICE ID as well as by code. The web panel now LISTS the
     // waiting devices, so it already knows which one the owner tapped — asking
     // them to copy a code from the lens first is friction this removes.
-    const wantedId = String(parsed.deviceId || '').trim();
-    const dev = wantedId
-      ? (() => {
-          const d = deviceById(wantedId);
-          return d && d.status === 'pending' ? d : null;
-        })()
-      : Object.values(authStore.devices).find(
-          (d) => d.status === 'pending' && d.pairCode === code,
-        );
+    //
+    // A DEVICE ID THAT DOES NOT NAME A PENDING ROW IS NOT AN ANSWER — it is a
+    // miss, and the code must still be tried. The app sends BOTH (the pairing
+    // form fills in both), and the device doing the approving is very often an
+    // ALREADY-APPROVED device — it is signed in, that is why it can approve. So
+    // the strict version of this resolved the approver's own approved row, failed
+    // the pending check, and answered "code not found" for a code that was
+    // sitting right there. Tappable? No: the code path was dead on every device
+    // that had ever paired.
+    const byId = wantedId ? deviceById(wantedId) : null;
+    const dev =
+      byId && byId.status === 'pending'
+        ? byId
+        : Object.values(authStore.devices).find(
+            (d) => d.status === 'pending' && code && d.pairCode === code,
+          );
     if (!dev) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'code not found' }));
