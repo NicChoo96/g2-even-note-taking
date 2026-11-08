@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.64
+
+v0.3.64 - The glasses app now reaches the hub and asks for a code as soon as it opens
+
+- Opening the package could sit on "Contacting the hub..." for ever. It was asking nobody for a code, and its hub address pointed at the package itself.
+- A fresh install now talks to the live hub, so the code appears straight away and one tap on the web approves it.
+- If the hub cannot be reached, the screen says so and lets you enter the hub address there instead of waiting silently.
+
 ## 0.3.63
 
 v0.3.63 - A page an agent publishes now really does appear in Files

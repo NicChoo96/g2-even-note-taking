@@ -1,6 +1,7 @@
 import type { AgentsState, HubState } from './types';
 import { getStreamToken, notifyAuthRejected } from './auth-token';
 import { clientId } from './client-id';
+import { DEFAULT_RELAY, inPackageWebview } from './env';
 import type { LocationFix } from './location/spec';
 
 // Same-origin by default: the deployed app is served by the relay at the bare
@@ -25,7 +26,15 @@ export const STREAM_URL: string =
   (import.meta.env.VITE_HUB_STREAM_URL as string | undefined) ??
   (STORED_RELAY
     ? `${STORED_RELAY}/api/stream?channel=hub`
-    : '/api/stream?channel=hub');
+    : // Inside a package there is no relay behind "same origin" — the page is
+      // served by the app package, so a bare `/api/stream` reaches nothing. A
+      // fresh install has no `hub:relay` yet (the wearer cannot set one before
+      // the app can talk to anything), so the LIVE relay is the default. The
+      // stored relay still overrides it, and a plain browser still gets
+      // same-origin, which is the deployed relay there.
+      inPackageWebview()
+      ? `${DEFAULT_RELAY}/api/stream?channel=hub`
+      : '/api/stream?channel=hub');
 
 // Base origin of the relay API (auth / config / stream). Same-origin by default.
 export const API_BASE: string = STREAM_URL.split('/api/')[0];

@@ -23,6 +23,8 @@ import {
   useSyncExternalStore,
 } from 'react';
 import { API_BASE } from '../stream';
+import { DEFAULT_RELAY } from '../env';
+import { setStoredRelay, storedRelay } from './access';
 import { onAuthRejected, setStreamToken } from '../auth-token';
 // Aliased: this component already has a `setPairCode` — the React state setter for
 // the pair code it fetched. Importing the publisher under the same name would be
@@ -451,6 +453,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     let timer: number | undefined;
     let approvedOnce = false;
+    let misses = 0;
 
     const tick = async () => {
       if (cancelled) return;
@@ -494,6 +497,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setPairedState(false);
           setPairStatus('pending');
           setPairCode(r.pairCode ?? null);
+          // A request that comes back with NO code did not reach a relay. Silence
+          // here used to look exactly like "still connecting" and could spin for
+          // ever, so the third failure in a row is said out loud, with the origin
+          // that failed and the one action that can fix it.
+          misses = r.pairCode ? 0 : misses + 1;
+          if (misses >= 3 && !r.pairCode) {
+            setPairError(
+              `The hub at ${API_BASE || 'this address'} is not answering. ` +
+                'Open Settings → Hub URL and enter your relay address.',
+            );
+          } else if (r.pairCode) {
+            setPairError(null);
+          }
         }
         if (!cancelled) timer = window.setTimeout(tick, 3000);
       } catch {
@@ -849,7 +865,35 @@ export function LoginScreen() {
  * cannot complete Google sign-in. The wire protocol is unchanged.
  */
 export function PairScreen() {
-  const { pairCode, pairStatus, pairError, paired, setPairing } = useAuth();
+  const { pairCode, pairStatus, pairError, paired, setPairing, inEvenApp } = useAuth();
+  // The relay address belongs HERE, not only in Settings: the package reaches
+  // Settings only after it is paired, and pairing is exactly what cannot work
+  // when the address is wrong. Without this field a bad origin is a closed loop
+  // with no exit — the wearer would have to delete the app to try again.
+  const [relay, setRelay] = useState(() => storedRelay() || DEFAULT_RELAY);
+  const [relayNote, setRelayNote] = useState<string | null>(null);
+  const saveRelay = () => {
+    const origin = setStoredRelay(relay);
+    if (!origin) {
+      setRelayNote('That is not a web address — try https://host.');
+      return;
+    }
+    if (origin === API_BASE) {
+      setRelayNote('That is the address already in use.');
+      return;
+    }
+    // `API_BASE` is a module constant resolved before anything can await, so a
+    // new origin only takes effect on a fresh load. Reloading is the honest
+    // signal that this happened, rather than pretending it applied live.
+    setRelayNote('Saved — reloading…');
+    window.setTimeout(() => {
+      try {
+        location.reload();
+      } catch {
+        /* nothing more we can do */
+      }
+    }, 400);
+  };
   return (
     <div className="app auth-screen">
       <div className="auth-top">
@@ -877,7 +921,30 @@ export function PairScreen() {
           <p style={{ color: 'var(--muted)', fontSize: 13 }}>Contacting the hub…</p>
         )}
         {pairError && <p style={{ color: 'var(--danger)', fontSize: 13 }}>{pairError}</p>}
-        {!paired && (
+        {inEvenApp && (
+          <div style={{ marginTop: 14 }}>
+            <label style={{ color: 'var(--muted)', fontSize: 12 }}>Hub address</label>
+            <input
+              value={relay}
+              onChange={(e) => setRelay(e.target.value)}
+              placeholder={DEFAULT_RELAY}
+              spellCheck={false}
+              autoCapitalize="off"
+              style={{ width: '100%', marginTop: 6 }}
+            />
+            <p style={{ marginTop: 8 }}>
+              <button className="link-btn" onClick={saveRelay}>
+                Save and reload
+              </button>
+            </p>
+            {relayNote && (
+              <p style={{ color: 'var(--muted)', fontSize: 12 }}>{relayNote}</p>
+            )}
+          </div>
+        )}
+        {/* No "back to sign in" inside the package: there is no sign-in to go
+            back to, and the link would promise a door that cannot open. */}
+        {!paired && !inEvenApp && (
           <p style={{ marginTop: 14 }}>
             <button className="link-btn" onClick={() => setPairing(false)}>
               ← Back to sign in

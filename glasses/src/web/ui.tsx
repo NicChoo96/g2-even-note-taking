@@ -11,7 +11,7 @@
 //    cannot sign in. It is OPT-IN, lives in Settings → Devices, and the login
 //    screen offers it as a fallback inside the Even App only.
 //  - No anonymous access either way.
-import React from 'react';
+import React, { useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
 import { AuthProvider, LoginScreen, PairScreen, useAuth } from './auth';
@@ -36,9 +36,26 @@ function Gate() {
   // sign-in inside an embedded WebView outright (`disallowed_useragent`).
   // Showing the button anyway is a dead end the wearer was asked to walk into on
   // every launch, so the package goes straight to pairing — the only door it has.
-  if (inEvenApp) return <PairScreen />;
+  if (inEvenApp) return <PackagePairing />;
   // Pairing is only ever shown because the user asked for it.
   return pairing ? <PairScreen /> : <LoginScreen />;
+}
+
+/**
+ * Pairing for a package, where nobody can press "pair".
+ *
+ * `PairScreen` only ASKS for a code once `pairing` is true — the request lives in
+ * the provider's effect behind that flag. Rendering the screen without starting
+ * pairing is therefore a screen that waits for an answer to a question nobody
+ * asked: it sat on "Contacting the hub…" forever, which is exactly the bug this
+ * component exists to prevent. It starts the request, and keeps it started.
+ */
+function PackagePairing() {
+  const { paired, setPairing } = useAuth();
+  useEffect(() => {
+    if (!paired) setPairing(true);
+  }, [paired, setPairing]);
+  return <PairScreen />;
 }
 
 export function mountUi(): void {
