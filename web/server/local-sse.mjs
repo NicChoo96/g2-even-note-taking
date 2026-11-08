@@ -193,6 +193,9 @@ import { hubToolSchema, isHubTool } from './hub-tools.mjs';
 // itself, over the same API the app writes through, because the relay's copy of
 // the hub state is a BOOTSTRAP and never an authority (see hub-write.mjs).
 import { applyHubTool, HUB_TOOL_COLLECTION } from './hub-write.mjs';
+// The one publish path that records what exists. Its header explains the two API
+// families and why an MCP create is not enough on its own.
+import { publishThroughHub } from './hub-publish.mjs';
 import { isLocationTool, locationToolSchema, runLocationTool } from './location-tool.mjs';
 import {
   CHILD_TIMEOUT_MS,
@@ -1051,7 +1054,19 @@ async function settlePublish(ctx) {
   };
 }
 
-async function runFilesTool(tool, args, signal) {
+/**
+ * Publish a document through the HUB, not the gateway's MCP family.
+ *
+ * The logic — including the rev retry that decides whether a publish lands —
+ * lives in ./hub-publish.mjs so a harness can drive it without a server. See its
+ * header for the two API families and why only this one records what exists.
+ */
+async function hubPublish(body, signal) {
+  const hub = hubRuntime();
+  return publishThroughHub(hub.client, body, signal);
+}
+
+async function runFilesTool(tool, args, signal, run) {
   const { client, error } = filesRuntime();
   if (!client) return `tool error: document store not configured — ${error}`;
   const action = String(args?.action ?? '').toLowerCase();
@@ -1085,10 +1100,39 @@ async function runFilesTool(tool, args, signal) {
       return renderFilesResult('session_stats', await client.stats({ signal }));
     }
     if (action === 'publish') {
+      const html = args?.html ?? args?.document ?? args?.body;
+      // THE AUTHOR IS THE AGENT THAT RAN. It used to be `args.agent` or a
+      // hard-coded 'g2-hub', so every page an agent published was credited to
+      // 'g2-hub' and filtering Files by the agent's own name found nothing —
+      // which is exactly how the wearer first noticed the page was missing.
+      const author = args?.agent || run?.agentName || DEFAULT_FILES_AGENT;
+      const viaHub = await hubPublish(
+        {
+          html,
+          title: args?.title,
+          agent: author,
+          tags: args?.tags,
+          slug: args?.slug,
+          ...(args?.id ? { id: args.id } : {}),
+          ...(args?.overwrite === true ? { overwrite: true } : {}),
+        },
+        signal,
+      );
+      if (viaHub.ok) {
+        // The hub has the body AND the reference. Read it back through the MCP
+        // family for the size/version the model is shown, so the confirmation
+        // line still reports what the gateway actually holds.
+        const id = String(viaHub.file?.id ?? args?.id ?? '').trim();
+        const doc = id ? await client.read(id, { signal }).catch(() => null) : null;
+        return confirmedWrite(client, doc ?? viaHub.file ?? { id }, 'create_session', signal);
+      }
+      // The reference is the part that makes the page show it, so a hub failure
+      // is NOT silently downgraded. Fall back to the MCP write so the body is
+      // not lost, and say plainly that the page will not list it.
       const doc = await client.create({
-        html: args?.html ?? args?.document ?? args?.body,
+        html,
         title: args?.title,
-        agent: args?.agent || DEFAULT_FILES_AGENT,
+        agent: author,
         tags: args?.tags,
         id: args?.id,
         overwrite: args?.overwrite,
@@ -1096,7 +1140,11 @@ async function runFilesTool(tool, args, signal) {
         contentType: args?.content_type ?? args?.contentType,
         signal,
       });
-      return confirmedWrite(client, doc, 'create_session', signal);
+      return (
+        `${renderFilesResult('create_session', doc)} `
+        + `WARNING: the Files-page reference could not be recorded (${viaHub.error}), `
+        + 'so the page will NOT appear in the Files list even though the body was stored.'
+      );
     }
     if (action === 'read') {
       const id = String(args?.id ?? '').trim();
@@ -1119,6 +1167,24 @@ async function runFilesTool(tool, args, signal) {
     if (action === 'update') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to update a document';
+      // An update goes through the hub too, for the same reason a publish does:
+      // the reference carries the TITLE and AUTHOR the Files page shows, and an
+      // MCP-only update leaves the registry row describing the old page.
+      const viaHub = await hubPublish(
+        {
+          id,
+          overwrite: true,
+          html: args?.html ?? args?.document ?? args?.body,
+          title: args?.title,
+          agent: args?.agent || run?.agentName || DEFAULT_FILES_AGENT,
+          tags: args?.tags,
+        },
+        signal,
+      );
+      if (viaHub.ok) {
+        const doc = await client.read(id, { signal }).catch(() => null);
+        return confirmedWrite(client, doc ?? viaHub.file ?? { id }, 'update_session', signal);
+      }
       const doc = await client.update(id, {
         html: args?.html ?? args?.document ?? args?.body,
         title: args?.title,
@@ -1128,7 +1194,11 @@ async function runFilesTool(tool, args, signal) {
         ifVersion: args?.if_version ?? args?.ifVersion,
         signal,
       });
-      return confirmedWrite(client, doc, 'update_session', signal);
+      return (
+        `${renderFilesResult('update_session', doc)} `
+        + `WARNING: the Files-page reference could not be updated (${viaHub.error}), `
+        + 'so the page may still show the previous title or author.'
+      );
     }
     if (action === 'delete' || action === 'remove') {
       const id = String(args?.id ?? '').trim();
@@ -1712,7 +1782,7 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
   // run. `ctx` is forwarded wholesale because the child's ancestry (its depth and
   // the parent's abort signal) is the only thing this branch needs from it.
   if (isAgentTool(tool)) return runAgentTool(tool, args, ctx);
-  if (isFilesTool(tool)) return runFilesTool(tool, args, signal);
+  if (isFilesTool(tool)) return runFilesTool(tool, args, signal, ctx.run);
   if (isWebTool(tool)) {
     const ws = webSearchConfig();
     if (!ws.key) return `tool error: ${ws.label} not configured — set ${ws.envVar} or save it in Settings`;

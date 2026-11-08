@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.60
+
+v0.3.60 - A published page now appears in Files, under the agent that wrote it
+
+- Pages an agent published were stored but never listed: the tool wrote the page, while Files reads a separate index only one call fills. Saving now uses that call.
+- A page is credited to the agent that wrote it, not "g2-hub", so filtering by that agent finds it.
+- Removed an Agents-page warning that named "summarise" and was never about the agent you had open.
+
 ## 0.3.59
 
 v0.3.59 - A run cannot say it saved a page that is not there

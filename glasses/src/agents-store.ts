@@ -932,8 +932,13 @@ function sessionCreateKey(localId: string): string | undefined {
  *
  * Fire-and-forget: `recordSession` is called from the run-settling path, which
  * must not block on a network round-trip, and the local row is already in place.
- * `summarise: false` because the hub would otherwise ask its own provider to
- * write a summary on every run, and it has no credential configured anyway.
+ *
+ * ⚠ `summarise` IS NOT SENT. It used to be sent as `false`, meaning "do not ask
+ * your own provider to write a summary", and the hub answered `summarise:
+ * unsupported value` to EVERY run — which the Agents panel then showed as a
+ * warning banner that had nothing to do with the agent on screen. Omitting the
+ * field is the same request with the default the app wanted, and the hub no
+ * longer refuses a session write over a preference it cannot express.
  *
  * The WHOLE transcript goes in this one call — the hub stores a create body's
  * `messages` (probed: three turns of `user`/`assistant`/`tool`, `seq` 1-3,
@@ -959,7 +964,6 @@ function mirrorSessionToHub(
       // three, so the value passes through.
       status: input.status === 'running' ? 'running' : input.status === 'error' ? 'error' : 'done',
       messages: input.messages.map(messageToHub),
-      summarise: false,
     },
     { key: sessionCreateKey(localId) },
   )
