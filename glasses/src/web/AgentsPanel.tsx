@@ -37,6 +37,8 @@ import {
   JEV_TOOL_ID,
   jevTool,
   LOCATION_TOOL_ID,
+  METRICS_TOOL_ID,
+  metricsTool,
   locationTool,
   MAX_AGENT_TOOLS,
   NOTES_TOOL_ID,
@@ -114,6 +116,9 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
    */
   const patch = (p: Partial<AgentDef>) => saveAgent(agent.id, p);
 
+  /** Why a tool could not be attached, in the wearer's words. Empty when fine. */
+  const [seedNote, setSeedNote] = useState('');
+
   const toggleTool = (id: string) => {
     const on = agent.toolIds.includes(id);
     // Attaching past the cap is refused HERE rather than at run time, where it
@@ -138,9 +143,24 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
    * here (or a spoken request, which resolves to the same kinds server-side).
    */
   const attachSeed = async (id: string, make: () => ToolDef) => {
-    if (liveToolCount(agent, state.tools) >= MAX_AGENT_TOOLS) return;
-    const toolId = getAgents().tools.some((t) => t.id === id) ? id : await createTool(toolBody(make()));
-    if (!toolId) return;
+    if (liveToolCount(agent, state.tools) >= MAX_AGENT_TOOLS) {
+      setSeedNote(`This agent already holds ${MAX_AGENT_TOOLS} tools \u2014 remove one first.`);
+      return;
+    }
+    setSeedNote('');
+    const seed = make();
+    const toolId = getAgents().tools.some((t) => t.id === id) ? id : await createTool(toolBody(seed));
+    // A refused create used to `return` here, which left the chip looking like a
+    // button that does nothing. It can genuinely be refused: the hub validates
+    // `kind` against a closed list, so a kind it does not know yet cannot be
+    // minted at all. Naming the tool is what makes that debuggable from a phone.
+    if (!toolId) {
+      setSeedNote(
+        `The catalogue would not create the ${seed.name} tool, so nothing was attached. ` +
+          'If the server does not support this tool kind yet, it has to be added there first.',
+      );
+      return;
+    }
     const live = getAgents().agents.find((a) => a.id === agent.id);
     if (!live || live.toolIds.includes(toolId)) return;
     saveAgent(agent.id, { toolIds: [...live.toolIds, toolId] });
@@ -160,6 +180,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   const addDocsToAgent = () => attachSeed(DOCS_TOOL_ID, docsTool);
   const addNotesToAgent = () => attachSeed(NOTES_TOOL_ID, notesTool);
   const addLocationToAgent = () => attachSeed(LOCATION_TOOL_ID, locationTool);
+  const addMetricsToAgent = () => attachSeed(METRICS_TOOL_ID, metricsTool);
 
   const seedChips = [
     { kind: 'web', label: 'Web search', add: addWebSearchToAgent },
@@ -169,6 +190,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
     { kind: 'docs', label: 'Docs', add: addDocsToAgent },
     { kind: 'notes', label: 'Notes', add: addNotesToAgent },
     { kind: 'location', label: 'Location', add: addLocationToAgent },
+    { kind: 'metrics', label: 'Dashboard numbers', add: addMetricsToAgent },
   ];
   const missingSeeds = seedChips.filter((s) => !state.tools.some((t) => t.kind === s.kind));
   /**
@@ -275,6 +297,7 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
             + {s.label}
           </button>
         ))}
+        {seedNote && <p className="warn-line">{seedNote}</p>}
         <button
           className="doc-chip"
           onClick={addRestToolToAgent}

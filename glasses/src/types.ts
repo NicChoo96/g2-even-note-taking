@@ -151,6 +151,7 @@ export type ToolKind =
   | 'docs'
   | 'notes'
   | 'location'
+  | 'metrics'
   | 'agent';
 /** Legacy spelling, read-only — kept so normalizing old state type-checks. */
 export type LegacyToolKind = 'tavily';
@@ -431,6 +432,8 @@ export const NOTES_TOOL_ID = 'tool-notes';
 export const LOCATION_TOOL_ID = 'tool-location';
 /** The seeded agent-running tool's id. */
 export const AGENT_TOOL_ID = 'tool-agent';
+/** The seeded metric-series tool's id. */
+export const METRICS_TOOL_ID = 'tool-metrics';
 
 /** Add, tick, rename, delete or list the wearer's tasks. */
 export function todoTool(): ToolDef {
@@ -520,6 +523,31 @@ export function locationTool(): ToolDef {
  *     never as an empty success. A caller that cannot finish must say so, because
  *     the wearer is reading a digest that looks exactly like a real one either way.
  */
+/**
+ * The numbers on the wearer's dashboard.
+ *
+ * Three properties are stated in the description because each one changes how a
+ * model should behave: the series must ALREADY exist (this tool cannot create
+ * one), a series has a fixed unit and type (so text into a number series is
+ * refused), and a repeated slot REPLACES (so re-running is safe). Without those
+ * three sentences the model treats it as a general-purpose store and either
+ * invents keys or writes "N/A" into a price series.
+ */
+export function metricsTool(): ToolDef {
+  return {
+    id: METRICS_TOOL_ID,
+    name: 'jarvis_metrics',
+    kind: 'metrics',
+    description:
+      'Read and record number series on the wearer\u2019s dashboard. `list` shows which series exist ' +
+      'with their latest value, `read` returns the history of one series, and `write` records a ' +
+      'value you computed. A series has to be declared on the Data page first \u2014 this tool cannot ' +
+      'create one \u2014 and it has a fixed unit and type, so text written into a number series is ' +
+      'refused. Writing the same slot twice replaces the earlier reading.',
+    hasToken: false,
+  };
+}
+
 export function agentTool(): ToolDef {
   return {
     id: AGENT_TOOL_ID,

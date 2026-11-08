@@ -269,11 +269,28 @@ GET    /hub/metrics/series/{key}                          → 200 / 404 (single 
 
 Until then, purging a series with data needs SQL, which is why the verification probes above clean up by prefix (`where series like 'probe.%'`).
 
+5. **GAP — the tool catalogue's `kind` enum is closed, so `jarvis_metrics` cannot be attached to an agent yet.** The relay can already EXECUTE a `metrics` tool (`web/server/metrics-tool.mjs`, reachable over `POST /api/tool`, 39/39 in `glasses/tools/metrics-tool-sim.mjs`), but an agent's toolset is `roster.tools.filter(t => agent.toolIds.includes(t.id))` — resolved against the hub catalogue and nothing else — so a tool the catalogue will not hold is a tool no agent can call. `POST /hub/tools` answers:
+
+```
+400 INVALID_ENUM  kind: unsupported value "metrics"
+    allowed: web, tavily, http, jev, files, todo, docs, notes, location
+```
+
+One entry on that list unblocks it:
+
+```
+POST /hub/tools  { "name": "jarvis_metrics", "kind": "metrics", "rev": <rev> }
+```
+
+`scripts/agent-metrics-tool.mjs` does exactly that, then attaches the tool to eight agents (writers: SG Banks Desk, AI Equities Desk, Singapore Weather, AI Model Tracker, Fleet Auditor; readers: Watchkeeper, Brief Composer, Daily Run Orchestrator) and verifies by re-reading the roster. It stops with this message rather than half-applying. The web UI's *Dashboard numbers* chip reports the same refusal in the agent editor instead of appearing to do nothing.
+
 ---
 
 ## 8. Phase 2 (only if the numbers are actually used)
 
 1. **`metric.write` as an agent tool**, so an LLM can store a reading it computed. It must go through the same validation — a model must never be able to widen a series' shape.
+
+   **BUILT, blocked only on constraint 5 above.** `web/server/metrics-tool.mjs` offers `list | read | write` and deliberately no `declare`; writes are validated by the store and its refusals are passed through verbatim, so a model cannot be told one thing by the tool and another by the endpoint; reads are bounded at 240 points and say when they were truncated. The schema is offered to a run by `toolSchemaFor` and executed by `runTool`, which is the same pair every other built-in uses — no second dispatcher.
 2. **Downsampling with a declared policy** (`mean`/`last`/`min`/`max` per series) once a chart has more points than pixels.
 3. **Anomaly flags on the sample** (`{z: 3.1}`) written by the collector, so the dashboard can mark a spike without recomputing history in the browser.
 4. **A `metric_alert` table** — "tell me when this crosses X". That is the first thing that turns a dashboard into something you act on, and it belongs here rather than in the cron document.

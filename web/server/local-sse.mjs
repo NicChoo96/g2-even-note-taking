@@ -280,6 +280,10 @@ import {
 // all-rejected batch is a 400, and a non-empty series cannot be deleted) — each
 // one found by probing the live service, not by reading a description of it.
 import { createMetricsRemote } from './metrics-remote.mjs';
+// …and the same store, as a TOOL an agent can call. Its header states the three
+// rules that keep a model from turning the dashboard into a junk drawer: it cannot
+// declare a series, writes are validated by the store, reads are bounded.
+import { isMetricsTool, metricsToolSchema, runMetricsTool } from './metrics-tool.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -1755,6 +1759,10 @@ function toolSchemaFor(t) {
   // when the run started and sent with it, because the relay cannot reach the
   // phone and a run has no way to ask mid-flight.
   if (isLocationTool(t)) return locationToolSchema(t);
+  // The dashboard's numbers. Placed with the built-ins rather than the REST
+  // fallback: this tool takes an action enum, and a free-form body would make the
+  // call shape a guess.
+  if (isMetricsTool(t)) return metricsToolSchema(t);
   // Another agent, run to completion by THIS process so its answer can be read
   // back. Placed before the REST fallback for the reason the two above are: a
   // generic free-form body is not what this tool takes, and handing the model one
@@ -1854,6 +1862,13 @@ async function runToolOnce(tool, rawArgs, signal, ctx = {}) {
   // No hub read needed and no key to check — but no second source either. A run
   // that carried no snapshot gets a refusal that says so, never coordinates.
   if (isLocationTool(tool)) return runLocationTool(tool, args, ctx.location).text;
+  // The numbers on the dashboard: declared series only, validated writes, bounded
+  // reads. `metricToolDeps()` is built per call so a store change (local file ->
+  // hub) needs no restart of anything.
+  if (isMetricsTool(tool)) {
+    const result = await runMetricsTool(tool, args, metricToolDeps());
+    return result.text;
+  }
   // Another agent, run to completion by THIS process so its answer can be handed
   // back to the caller. The only branch that starts a run of its own, and the
   // whole reason the `agent` kind exists: `agents.trigger` can already start an
@@ -4212,6 +4227,15 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // The dashboard's numbers, over the proxy — the same runner the agent loop
+      // uses, so the two cannot disagree about what a write means. Also the only
+      // way to drive the tool from a test without spending a model call.
+      if (isMetricsTool(body)) {
+        const result = await runMetricsTool(body, args, metricToolDeps());
+        json(res, 200, { ok: result.ok, result: result.text });
+        return;
+      }
+
       // A delegated intent, over the proxy. REFUSED here rather than handled,
       // and the refusal is the point: a proposal belongs to a RUN — it is a
       // record in that run's transcript that the device later claims and gates.
@@ -5589,6 +5613,85 @@ async function storeSample(sample) {
   metricStore.samples[sample.series] = trimSamples(merged.samples, series?.retention);
   saveMetrics();
   return { ok: true, where: metricsRemote ? 'relay (hub unreachable)' : 'relay', degraded: Boolean(metricsRemote), replaced: merged.replaced > 0 };
+}
+
+/**
+ * The bridge between the `metrics` TOOL and whichever store is live.
+ *
+ * Built per call, so flipping `METRICS_API` (or the hub coming back) needs no
+ * restart of anything. It deliberately exposes no `declare`: a model must not be
+ * able to create a series, and the tool says so by name when it is asked.
+ */
+function metricToolDeps() {
+  const zone = () => cronConfig?.timeZone ?? 'Asia/Singapore';
+  return {
+    async listSeries() {
+      if (metricsRemote) {
+        const res = await metricsRemote.listSeries();
+        if (!res.ok) return { ok: false, error: res.error };
+        return { ok: true, series: res.series };
+      }
+      const series = Object.values(metricStore.series).map((def) => {
+        const samples = metricStore.samples[def.key] ?? [];
+        return { ...def, count: samples.length, latest: latestOf(samples) };
+      });
+      return { ok: true, series };
+    },
+
+    async readSeries(key, limit) {
+      const def = metricStore.series[key];
+      if (metricsRemote) {
+        const res = await metricsRemote.read(key, limit);
+        if (!res.ok) return { ok: false, error: res.error };
+        return {
+          ok: true,
+          points: res.samples.map((s) => ({ ts: s.ts, value: s.value })),
+          count: res.samples.length,
+          truncated: res.truncated,
+          unit: def?.unit ?? '',
+          precision: def?.precision ?? 2,
+        };
+      }
+      const samples = metricStore.samples[key] ?? [];
+      const points = samples.slice(-limit).map((s) => ({ ts: s.ts, value: s.value }));
+      return {
+        ok: true,
+        points,
+        count: samples.length,
+        truncated: samples.length > points.length,
+        unit: def?.unit ?? '',
+        precision: def?.precision ?? 2,
+      };
+    },
+
+    async writeSample(input) {
+      const def = metricStore.series[input.series];
+      // The slot defaults to the current minute of the wearer's day, so an agent
+      // writing twice in one scheduled run REPLACES its own value rather than
+      // plotting two points for the same moment.
+      const parsed = normaliseSample(
+        {
+          series: input.series,
+          value: input.value,
+          slot: input.slot || slotAt(Date.now(), zone()),
+          source: 'agent',
+        },
+        def,
+        Date.now(),
+      );
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      const stored = await storeSample(parsed.sample);
+      if (!stored.ok) return { ok: false, error: stored.error };
+      return {
+        ok: true,
+        value: parsed.sample.value,
+        unit: def?.unit ?? '',
+        precision: def?.precision ?? 2,
+        replaced: stored.replaced,
+        where: stored.where,
+      };
+    },
+  };
 }
 
 /**
