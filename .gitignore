@@ -16,7 +16,6 @@ npm-debug.log*
 
 # Relay disk state (created at runtime by web/server/local-sse.mjs)
 .g2-hub-state.json
-
 # Local staging of the built glasses app (Docker builds its own copy)
 glasses-dist/
 
@@ -37,6 +36,10 @@ qr-prototype.png
 
 # Relay secret store (LLM + web-search keys) — NEVER commit
 .g2-hub-secrets.json
+# The scheduled-agent clock: the RUN STATE is local, and the live schedule is a
+# deployment's own business (the checked-in .example.json documents its shape).
+.g2-agent-cron-state.json
+.g2-agent-cron.json
 
 # Watchdog-sim test artifacts (generated/downloaded wav)
 glasses/tools/*.wav

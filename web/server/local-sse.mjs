@@ -246,6 +246,18 @@ import {
   isIntentTool,
   runIntentTool,
 } from './intents.mjs';
+// The CLOCK. Until this import existed nothing anywhere ran an agent on a
+// schedule: "daily" in an agent's prompt meant "when the wearer taps it". The
+// decision half (which jobs are due, in the wearer's time zone, with a bounded
+// catch-up) is pure and asserted in tools/agent-cron-sim.mjs; the running half
+// is `cronTick` further down, which uses this process's own run engine.
+import {
+  describeCron,
+  dueJobs,
+  MAX_JOBS_PER_DAY,
+  MAX_JOBS_PER_TICK,
+  parseCronConfig,
+} from './agent-cron.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -4782,6 +4794,187 @@ await loadPersistedState();
 // it degrades to the file, so a hub that is down cannot break sign-in.
 await authSync.reconcile();
 
+/**
+ * THE CLOCK — run scheduled agents with no device in the loop.
+ *
+ * WHY IT LIVES HERE
+ *   This process is the only part of the system that is awake when the phone is
+ *   in a pocket. A schedule kept in the browser would only fire when the app was
+ *   open, which is exactly the case a scheduled agent is meant to cover; and the
+ *   run engine, the tool catalogue and the hub session are all already here, so a
+ *   tick needs no new credential and cannot rotate the refresh family.
+ *
+ * WHAT IT DOES NOT DO
+ *   It does not invent agents and it does not modify them. A job names an agent
+ *   that already exists on the hub, and the run uses that agent's OWN saved
+ *   prompt and toolIds, resolved exactly as `agents.trigger` resolves them — so a
+ *   scheduled run is the same run the wearer would get from a tap, which is the
+ *   only way its output can be trusted as the agent's output.
+ *
+ * OPT-IN, THREE WAYS
+ *   No schedule file, or `"enabled": false`, or `G2_AGENT_CRON=0` → this function
+ *   returns immediately and the relay behaves exactly as it did before. An
+ *   always-on scheduler spends money while nobody is watching, so it is never on
+ *   by accident.
+ *
+ * FAILURE IS CONTAINED
+ *   Every branch is wrapped: a bad file, a missing agent, a hub that is down, a
+ *   run that will not start — each is one `[cron]` line and nothing else. The
+ *   timer is `unref`d so a test or a script importing this file can still exit.
+ */
+const CRON_FILE = process.env.AGENT_CRON_FILE || join(process.cwd(), '.g2-agent-cron.json');
+const CRON_STATE_FILE =
+  process.env.AGENT_CRON_STATE_FILE || join(process.cwd(), '.g2-agent-cron-state.json');
+/** One tick a minute: the finest resolution `HH:MM` can express. */
+const CRON_TICK_MS = 60 * 1000;
+
+function readCronState() {
+  try {
+    const raw = readFileSync(CRON_STATE_FILE, 'utf8');
+    const s = JSON.parse(raw);
+    return {
+      slots: s && typeof s.slots === 'object' && s.slots ? s.slots : {},
+      day: typeof s.day === 'string' ? s.day : '',
+      count: Number.isFinite(Number(s?.count)) ? Number(s.count) : 0,
+      errors: s && typeof s.errors === 'object' && s.errors ? s.errors : {},
+    };
+  } catch {
+    return { slots: {}, day: '', count: 0, errors: {} };
+  }
+}
+
+function writeCronState(state) {
+  try {
+    writeFileSync(CRON_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+  } catch (err) {
+    console.log(`[cron] could not save state — ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** The schedule is re-read every tick, so editing it needs no restart. */
+function readCronConfig() {
+  let raw;
+  try {
+    raw = readFileSync(CRON_FILE, 'utf8');
+  } catch {
+    return { skipped: 'no schedule file' };
+  }
+  const parsed = parseCronConfig(raw);
+  if (!parsed.ok) return { skipped: `schedule refused — ${parsed.error}` };
+  for (const p of parsed.problems ?? []) console.log(`[cron] ${p}`);
+  if (!parsed.config.enabled) return { skipped: 'disabled in the schedule file' };
+  if (!parsed.config.jobs.length) return { skipped: 'no usable jobs' };
+  return { config: parsed.config };
+}
+
+let cronBusy = false;
+
+async function cronTick() {
+  // Overlap guard: the previous tick may still be waiting on the hub.
+  if (cronBusy) return;
+  if (String(process.env.G2_AGENT_CRON ?? '') === '0') return;
+  cronBusy = true;
+  try {
+    const read = readCronConfig();
+    if (read.skipped) return;
+    const config = read.config;
+    const state = readCronState();
+    const now = Date.now();
+    const due = dueJobs(config, now, state.slots);
+    if (!due.length) return;
+
+    // The daily ceiling is re-armed by the date in the wearer's zone, not UTC.
+    const today = due[0].now.date;
+    if (state.day !== today) {
+      state.day = today;
+      state.count = 0;
+    }
+    if (state.count >= MAX_JOBS_PER_DAY) {
+      console.log(`[cron] daily ceiling ${MAX_JOBS_PER_DAY} reached — ${due.length} job(s) skipped`);
+      writeCronState(state);
+      return;
+    }
+
+    // The roster is read ONCE per tick and shares the hub session this process
+    // already owns — never a second one, which would rotate the refresh family.
+    const roster = await hubAgentRoster(undefined);
+    if (roster.error) {
+      // Nothing is marked as run: a hub that is down must cost a retry, not the
+      // wearer's morning.
+      console.log(`[cron] roster unavailable — ${roster.error}`);
+      return;
+    }
+
+    let started = 0;
+    for (const entry of due) {
+      if (started >= MAX_JOBS_PER_TICK) break;
+      if (state.count >= MAX_JOBS_PER_DAY) break;
+      const wanted = entry.job.agent.toLowerCase();
+      const agent = roster.agents.find(
+        (a) => String(a.name ?? '').toLowerCase() === wanted || String(a.id ?? '') === entry.job.agent,
+      );
+      if (!agent) {
+        // A CONFIGURATION fault, so the slot is spent: retrying every minute for
+        // the whole grace window would just repeat the same refusal.
+        state.slots[entry.key] = entry.slot;
+        state.errors[entry.key] = `no agent named "${entry.job.agent}"`;
+        console.log(`[cron] ${entry.job.at} "${entry.job.agent}" — no such agent on the hub`);
+        continue;
+      }
+      const savedTask = String(agent.prompt ?? '').trim();
+      const tools = roster.tools.filter((t) => (agent.toolIds ?? []).includes(t.id));
+      const res = startAgentRun({
+        agent: { id: agent.id, name: agent.name, systemPrompt: agent.systemPrompt },
+        prompt: savedTask,
+        // A job may add an instruction; the saved task is never replaced, for the
+        // same reason a parent's `ask` is layered rather than substituted.
+        instructions: entry.job.ask,
+        tools,
+        model: '',
+        depth: 1,
+      });
+      state.slots[entry.key] = entry.slot;
+      state.count += 1;
+      if (!res.ok) {
+        state.errors[entry.key] = String(res.error ?? 'run refused');
+        console.log(`[cron] ${entry.job.at} "${agent.name}" refused — ${res.error}`);
+        continue;
+      }
+      started += 1;
+      delete state.errors[entry.key];
+      const late = entry.lateMinutes > 0 ? ` (+${entry.lateMinutes}m late)` : '';
+      console.log(
+        `[cron] ${entry.job.at}${late} "${agent.name}" -> run ${res.run?.id ?? '?'} (${tools.length} tool${tools.length === 1 ? '' : 's'})`,
+      );
+    }
+    writeCronState(state);
+  } catch (err) {
+    console.log(`[cron] tick failed — ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    cronBusy = false;
+  }
+}
+
+function startAgentCron() {
+  if (String(process.env.G2_AGENT_CRON ?? '') === '0') {
+    console.log('[cron] off (G2_AGENT_CRON=0)');
+    return;
+  }
+  const read = readCronConfig();
+  if (read.skipped) {
+    // Silence unless something is misconfigured: "no schedule file" is the
+    // normal case for a relay that has no scheduled agents.
+    if (read.skipped !== 'no schedule file') console.log(`[cron] off — ${read.skipped}`);
+    return;
+  }
+  console.log(`[cron] on — ${describeCron(read.config)}`);
+  console.log(`[cron]   schedule ${CRON_FILE}`);
+  const timer = setInterval(() => void cronTick(), CRON_TICK_MS);
+  // A scheduled agent must never be the reason a process cannot exit.
+  if (typeof timer.unref === 'function') timer.unref();
+  void cronTick();
+}
+
 server.listen(PORT, () => {
   console.log(`[g2-hub] relay on http://0.0.0.0:${PORT}`);
   console.log(`[g2-hub]   Web:   GET  http://localhost:${PORT}/`);
@@ -4790,4 +4983,6 @@ server.listen(PORT, () => {
   if (DOC_LISTEN_PORT > 0) startDocServer(DOC_LISTEN_PORT);
   // Fire-and-forget: the drift check must never delay or fail the boot.
   void checkFilesSchemaDrift();
+  // Started LAST, so the port is accepting before a schedule can broadcast a run.
+  startAgentCron();
 });

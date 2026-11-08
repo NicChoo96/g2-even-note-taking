@@ -14,13 +14,17 @@ import {
   createTool,
   getAgents,
   getAgentsError,
+  installStarterAgents,
   recordSession,
   removeAgent as removeAgentFromStore,
+  repairAgentTools,
   saveAgent,
   subscribeAgents,
   subscribeAgentsError,
   toolBody,
 } from '../agents-store';
+import { STARTER_AGENTS } from '../agent-starters';
+import { planToolRepair } from '../agent-repair';
 import { getRuns, subscribeRuns } from '../agent-runs';
 import { startRun, stopRun } from '../stream';
 import { intentCatalog } from '../ai/intents';
@@ -318,6 +322,118 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
   );
 }
 
+/**
+ * Fleet maintenance: the two things a fleet of twenty makes visible at once.
+ *
+ * WHY IT IS A BUTTON AND NOT AN AUTOMATIC FIX
+ *   Both actions change agents the wearer owns, so both are shown as a PREVIEW
+ *   ("12 agents cannot fetch anything") and applied only when tapped. An
+ *   automatic migration of someone's own prompts and toolset is the kind of
+ *   helpfulness that is indistinguishable from damage.
+ *
+ * WHY IT IS IN THIS PANEL
+ *   These are exactly the two facts you can only see from the whole list: which
+ *   agents have no way to fetch, and which of the worthwhile ones do not exist
+ *   yet. Both write through `saveAgent`/`createAgent`, the same If-Match path
+ *   every other edit here uses — there is no second way into the hub.
+ *
+ * It renders NOTHING when there is nothing to do, which is the normal state.
+ */
+function FleetMaintenance() {
+  const state = useAgents();
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+
+  const repairs = planToolRepair(state.agents, state.tools);
+  const have = new Set(state.agents.map((a) => a.name.trim().toLowerCase()));
+  const missing = STARTER_AGENTS.filter((s) => !have.has(s.name.trim().toLowerCase()));
+
+  if (!repairs.length && !missing.length && !note) return null;
+
+  const fixTools = () => {
+    const n = repairAgentTools();
+    setNote(`Attached ${n} tool row${n === 1 ? '' : 's'} — those agents can fetch now.`);
+  };
+
+  const install = async () => {
+    setBusy(true);
+    setNote('');
+    try {
+      const res = await installStarterAgents();
+      const parts: string[] = [];
+      if (res.created.length) parts.push(`Added ${res.created.join(', ')}.`);
+      if (res.skipped.length) parts.push(`${res.skipped.length} were already there.`);
+      if (res.blocked.length) parts.push(`Blocked: ${res.blocked.join('; ')}.`);
+      setNote(parts.join(' ') || 'Nothing to install.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        border: '1px solid var(--line, #333)',
+        borderRadius: 10,
+        padding: '10px 12px',
+        marginBottom: 14,
+      }}
+    >
+      <div className="panel-label">Fleet health</div>
+
+      {repairs.length > 0 && (
+        <>
+          <p className="warn-line" style={{ marginTop: 6 }}>
+            ⚠️ {repairs.length} agent{repairs.length === 1 ? '' : 's'} hold no tool that can
+            fetch anything, so a prompt asking for current information has nothing to read it
+            with.
+          </p>
+          <p className="hint-line">
+            {repairs.slice(0, 6).map((r) => r.name).join(', ')}
+            {repairs.length > 6 ? `, +${repairs.length - 6} more` : ''}
+          </p>
+          <div className="field-toolbar">
+            <button className="primary" onClick={fixTools} disabled={busy}>
+              Attach a fetching tool to {repairs.length}
+            </button>
+          </div>
+        </>
+      )}
+
+      {missing.length > 0 && (
+        <>
+          <p className="hint-line" style={{ marginTop: 8 }}>
+            {missing.length} starter agent{missing.length === 1 ? '' : 's'} not installed:{' '}
+            {missing.map((s) => s.name).join(', ')}.
+          </p>
+          <ul className="hint-line" style={{ margin: '4px 0 6px 16px' }}>
+            {missing.map((s) => (
+              <li key={s.name}>
+                <strong>{s.name}</strong> — {s.why} <em>({s.cadence})</em>
+              </li>
+            ))}
+          </ul>
+          <div className="field-toolbar">
+            <button className="primary" onClick={install} disabled={busy}>
+              {busy ? 'Adding…' : `Add ${missing.length} starter agent${missing.length === 1 ? '' : 's'}`}
+            </button>
+          </div>
+          <p className="hint-line" style={{ marginTop: 6 }}>
+            Adding one does not schedule it. A schedule lives in the relay — see{' '}
+            <code>web/.g2-agent-cron.example.json</code>.
+          </p>
+        </>
+      )}
+
+      {note && (
+        <p className="hint-line" style={{ marginTop: 8 }}>
+          ✓ {note}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // `ToolEditor` and the catalogue's seed buttons live in `./ToolsPanel` now —
 // they are global settings, and the catalogue column that held them is what this
 // move removed. `RestToolConfig` is there too, and is what the agent page
@@ -473,6 +589,8 @@ export function AgentsPanel() {
           story of why an edit did not stick. Saying it here is the difference
           between a stale screen and a visible failure. */}
       {hubError && <p className="warn-line">⚠️ {hubError}</p>}
+
+      <FleetMaintenance />
 
       <div className="agents-split">
         {/* ── master: agents + tools ─────────────────────────────────── */}

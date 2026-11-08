@@ -38,6 +38,8 @@
 //     relay (see web/server/local-sse.mjs /api/llm). Only `llm.hasKey` (a
 //     boolean) is ever synced.
 import { publishAgents } from './stream';
+import { STARTER_AGENTS, type StarterAgent } from './agent-starters';
+import { planToolRepair } from './agent-repair';
 import { loadAgentsDurable, loadSessionsDurable, saveAgentsDurable, saveSessionsDurable } from './durable-agents';
 import {
   cloneAgent as hubCloneAgent,
@@ -492,6 +494,83 @@ export function removeAgent(id: string): void {
     settleHub(res);
     if (res.ok && res.agents) applyCatalogue(res.agents, res.tools ?? state.tools);
   });
+}
+
+// ── Fleet maintenance ────────────────────────────────────────────────────────
+//
+// Two repairs the wearer should not have to do by hand, both of which write
+// through `saveAgent`/`createAgent` — the SAME `If-Match` path the editors use,
+// so there is no second way into the hub and nothing new to get wrong.
+//
+// The DECISION of which agents need a tool is pure and lives in ./agent-repair
+// (asserted by tools/agent-repair-sim.mjs); this file only APPLIES it.
+
+/** Apply the plan. Returns how many agents were changed. */
+export function repairAgentTools(): number {
+  const plan = planToolRepair(state.agents, state.tools);
+  for (const row of plan) {
+    const agent = state.agents.find((a) => a.id === row.agentId);
+    if (!agent) continue;
+    const next = [...(agent.toolIds ?? [])];
+    for (const id of row.add) if (!next.includes(id)) next.push(id);
+    saveAgent(agent.id, { toolIds: next });
+  }
+  return plan.length;
+}
+
+/** What happened when the starter fleet was installed. */
+export interface StarterInstall {
+  created: string[];
+  /** Already present, by name. Installing twice is safe. */
+  skipped: string[];
+  /** Starters that need a tool kind this catalogue does not have. */
+  blocked: string[];
+}
+
+/**
+ * Create the starter agents that are not there yet.
+ *
+ * A starter is BLOCKED rather than created without the tools it was designed
+ * around: an agent that silently loses its ability to write a document looks
+ * exactly like an agent that works, which is the failure this whole repair
+ * exists to undo.
+ */
+export async function installStarterAgents(
+  specs: readonly StarterAgent[] = STARTER_AGENTS,
+): Promise<StarterInstall> {
+  const done: StarterInstall = { created: [], skipped: [], blocked: [] };
+  const byKind = new Map<string, string>();
+  for (const t of state.tools) if (!byKind.has(t.kind)) byKind.set(t.kind, t.id);
+  const have = new Set(state.agents.map((a) => a.name.trim().toLowerCase()));
+  for (const spec of specs) {
+    if (have.has(spec.name.trim().toLowerCase())) {
+      done.skipped.push(spec.name);
+      continue;
+    }
+    const toolIds: string[] = [];
+    let missing = '';
+    for (const kind of spec.kinds) {
+      const id = byKind.get(kind);
+      if (id) toolIds.push(id);
+      else missing = kind;
+    }
+    if (missing) {
+      done.blocked.push(`${spec.name} (no "${missing}" tool)`);
+      continue;
+    }
+    const id = await createAgent(spec.name, {
+      systemPrompt: spec.systemPrompt,
+      prompt: spec.prompt,
+      toolIds,
+    });
+    if (id) {
+      done.created.push(spec.name);
+      have.add(spec.name.trim().toLowerCase());
+    } else {
+      done.blocked.push(`${spec.name} (the hub refused the create)`);
+    }
+  }
+  return done;
 }
 
 /**

@@ -1,0 +1,25 @@
+{
+  "_readme": [
+    "Copy this to `.g2-agent-cron.json` in web/ (or point AGENT_CRON_FILE at it) to give",
+    "the fleet a clock. Nothing runs until a file like this exists AND enabled is true.",
+    "Times are HH:MM in timeZone, never UTC — Railway runs in UTC, so a schedule without",
+    "a zone would fire eight hours early for Singapore.",
+    "days is 0=Sunday..6=Saturday; omit it for every day.",
+    "The agent must ALREADY exist on the hub, by name. A job never creates or edits one.",
+    "graceMinutes lets a host that was asleep still run a slot it woke up late for;",
+    "outside that window the slot is missed and said so in the log.",
+    "Set G2_AGENT_CRON=0 in the environment to turn the clock off without touching this file."
+  ],
+  "version": 1,
+  "enabled": false,
+  "timeZone": "Asia/Singapore",
+  "graceMinutes": 20,
+  "jobs": [
+    { "agent": "Singapore Weather", "at": "06:45", "days": [1, 2, 3, 4, 5] },
+    { "agent": "AI tech news today", "at": "06:50", "days": [1, 2, 3, 4, 5] },
+    { "agent": "Singapore trending news", "at": "06:55", "days": [1, 2, 3, 4, 5] },
+    { "agent": "Singapore Bank Stocks", "at": "17:30", "days": [1, 2, 3, 4, 5] },
+    { "agent": "Singapore Workday Brief", "at": "17:45", "days": [1, 2, 3, 4, 5] },
+    { "agent": "Watchkeeper", "at": "07:05" }
+  ]
+}

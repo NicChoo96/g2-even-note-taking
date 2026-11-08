@@ -1,0 +1,194 @@
+#!/usr/bin/env node
+// SCHEDULED-AGENT harness — the decision half of the clock.
+//
+// WHY THIS EXISTS
+//   "Daily" in an agent's prompt meant nothing until this module existed: there
+//   was no cron, no interval, nowhere in the relay or the app, so every daily
+//   agent ran when the wearer tapped it. The moment a clock exists, the failure
+//   modes are all TIME: a schedule resolved in UTC fires eight hours early for a
+//   Singapore wearer; a host that was asleep at 07:00 either loses the morning or
+//   replays a week of runs; and a tick that fires twice in one minute double-runs
+//   and double-bills.
+//
+//   So this asserts the parts that are easy to get subtly wrong and impossible to
+//   notice from the outside:
+//     1. `HH:MM` is parsed strictly — "7:00" and "24:00" are refused, not guessed.
+//     2. The wall clock is the WEARER's, resolved through Intl with an explicit
+//        zone, and the day-of-week comes from the same call.
+//     3. A missed slot runs LATE inside the grace window and is dropped outside
+//        it, and a slot never runs twice.
+//     4. A malformed file returns a value the boot path can log, and never throws.
+//
+// Run: node tools/agent-cron-sim.mjs
+
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const mod = resolve(here, '../../web/server/agent-cron.mjs');
+const src = readFileSync(mod, 'utf8');
+const {
+  CRON_VERSION,
+  DEFAULT_GRACE_MINUTES,
+  DEFAULT_TIME_ZONE,
+  MAX_JOBS_PER_DAY,
+  MAX_JOBS_PER_TICK,
+  describeCron,
+  dueJobs,
+  jobKey,
+  minuteOfDay,
+  parseCronConfig,
+  slotAt,
+  zonedNow,
+  // A query string makes this a FRESH module instance, so a stale cache can
+  // never make an edited schedule module look unchanged.
+} = await import(`${pathToFileURL(mod).href}?v=${Date.now()}`);
+
+let pass = 0;
+let fail = 0;
+const check = (label, got, want) => {
+  const ok = JSON.stringify(got) === JSON.stringify(want);
+  ok ? pass++ : fail++;
+  console.log(ok ? `PASS  ${label}` : `FAIL  ${label}\n        got:  ${JSON.stringify(got)}\n        want: ${JSON.stringify(want)}`);
+};
+const checkTrue = (label, got) => check(label, got === true, true);
+
+// ── 1. strict HH:MM ─────────────────────────────────────────────────────────
+check('07:00 is 420 minutes', minuteOfDay('07:00'), 420);
+check('00:00 is zero', minuteOfDay('00:00'), 0);
+check('23:59 is the last minute', minuteOfDay('23:59'), 1439);
+check('7:00 is refused (not zero-padded)', minuteOfDay('7:00'), null);
+check('24:00 is refused', minuteOfDay('24:00'), null);
+check('07:60 is refused', minuteOfDay('07:60'), null);
+check('an empty string is refused', minuteOfDay(''), null);
+check('a number is refused', minuteOfDay(700), null);
+
+// ── 2. the file is validated, never trusted ─────────────────────────────────
+check('bad JSON is a value, not a throw', parseCronConfig('{nope').ok, false);
+check('a non-object is refused', parseCronConfig('[]').ok, false);
+check('a future version is refused', parseCronConfig({ version: 99 }).ok, false);
+
+const empty = parseCronConfig({ version: 1 });
+checkTrue('an empty file is valid', empty.ok);
+check('with no jobs', empty.config.jobs.length, 0);
+check('and the default zone', empty.config.timeZone, DEFAULT_TIME_ZONE);
+check('and the default grace', empty.config.graceMinutes, DEFAULT_GRACE_MINUTES);
+check('and enabled by default', empty.config.enabled, true);
+
+const mixed = parseCronConfig({
+  version: 1,
+  enabled: false,
+  timeZone: 'Europe/London',
+  graceMinutes: 999,
+  jobs: [
+    { agent: 'A', at: '07:00' },
+    { agent: '', at: '08:00' },
+    { agent: 'B', at: '25:00' },
+    { agent: 'C', at: '09:00', days: [9, 10] },
+    { agent: 'D', at: '10:00', days: [1, 3] },
+    { agent: 'E', at: '11:00', enabled: false },
+  ],
+});
+checkTrue('a file with problems is still usable', mixed.ok);
+check('every broken job is reported', mixed.problems.length, 3);
+check('only the usable jobs remain', mixed.config.jobs.map((j) => j.agent), ['A', 'D', 'E']);
+check(
+  'a job whose day list names no weekday is REFUSED, never made daily',
+  mixed.config.jobs.some((j) => j.agent === 'C'),
+  false,
+);
+check('a real day list is kept', mixed.config.jobs[1].days, [1, 3]);
+check('a disabled job is kept but marked', mixed.config.jobs[2].enabled, false);
+check('grace is clamped to an hour-based ceiling', mixed.config.graceMinutes, 180);
+check('the zone is kept', mixed.config.timeZone, 'Europe/London');
+check('enabled:false is kept', mixed.config.enabled, false);
+
+const negative = parseCronConfig({ version: 1, graceMinutes: -5 });
+check('a negative grace clamps to zero', negative.config.graceMinutes, 0);
+
+// ── 3. the wall clock is the WEARER's ───────────────────────────────────────
+// 22:00 UTC is 06:00 the next morning in Singapore. A getHours() implementation
+// would call this 22:00 and fire nothing all day.
+const tenPMUtc = Date.parse('2026-11-08T22:00:00Z');
+const sgt = zonedNow(tenPMUtc, 'Asia/Singapore');
+check('22:00 UTC is 06:00 in Singapore', sgt.slot.slice(11), '06:00');
+check('and on the NEXT calendar day', sgt.slot.slice(0, 10) > '2026-11-08', true);
+check('minutes agree with the slot', sgt.minutes, 360);
+// The weekday is asserted against Date.UTC rather than against Intl twice.
+const expectedDow = new Date(`${sgt.date}T00:00:00Z`).getUTCDay();
+check('the day-of-week matches the zoned date', sgt.dayOfWeek, expectedDow);
+
+const utc = zonedNow(tenPMUtc, 'UTC');
+check('the same instant in UTC is 22:00', utc.slot.slice(11), '22:00');
+check('an unknown zone falls back and says so', zonedNow(tenPMUtc, 'Mars/Olympus').zoneFault, 'Mars/Olympus');
+check('floor midnight is 00:00, not 24:00', zonedNow(Date.parse('2026-11-08T16:00:00Z'), 'Asia/Singapore').slot.slice(11), '00:00');
+
+// ── 4. which jobs are due ───────────────────────────────────────────────────
+const config = parseCronConfig({
+  version: 1,
+  timeZone: 'Asia/Singapore',
+  graceMinutes: 20,
+  jobs: [{ agent: 'Weather', at: '06:00', days: [expectedDow] }, { agent: 'Other', at: '23:00' }],
+}).config;
+
+check('at 06:00 it is due', dueJobs(config, tenPMUtc, {}).map((d) => d.job.agent), ['Weather']);
+check('and it is not late', dueJobs(config, tenPMUtc, {})[0].lateMinutes, 0);
+
+const nineteenLate = tenPMUtc + 19 * 60 * 1000;
+const late = dueJobs(config, nineteenLate, {});
+check('19 minutes late is still due (grace 20)', late.length, 1);
+check('and reports how late', late[0].lateMinutes, 19);
+
+check('21 minutes late is MISSED, not replayed', dueJobs(config, tenPMUtc + 21 * 60 * 1000, {}).length, 0);
+check('one minute early is not due', dueJobs(config, tenPMUtc - 60 * 1000, {}).length, 0);
+
+const ran = { [jobKey({ agent: 'Weather', at: '06:00' })]: slotAt(tenPMUtc, 'Asia/Singapore') };
+check('a slot that already ran does not run again', dueJobs(config, tenPMUtc, ran).length, 0);
+check('even a minute later inside the window', dueJobs(config, tenPMUtc + 60 * 1000, ran).length, 0);
+const everyDay = { ...config, jobs: [{ agent: 'Weather', at: '06:00' }] };
+const ranEveryDay = { [jobKey({ agent: 'Weather', at: '06:00' })]: slotAt(tenPMUtc, 'Asia/Singapore') };
+check(
+  'but the NEXT day is a new slot',
+  dueJobs(everyDay, tenPMUtc + 24 * 60 * 60 * 1000, ranEveryDay).length,
+  1,
+);
+check(
+  'a weekday-pinned job does NOT run on the wrong day',
+  dueJobs(config, tenPMUtc + 24 * 60 * 60 * 1000, ran).length,
+  0,
+);
+
+const otherDay = { ...config, jobs: [{ ...config.jobs[0], days: [(expectedDow + 3) % 7] }] };
+check('a job not scheduled today is not due', dueJobs(otherDay, tenPMUtc, {}).length, 0);
+check('a job with no days runs every day', dueJobs({ ...config, jobs: [{ agent: 'X', at: '06:00' }] }, tenPMUtc, {}).length, 1);
+check('a disabled schedule runs nothing', dueJobs({ ...config, enabled: false }, tenPMUtc, {}).length, 0);
+check('a disabled JOB runs nothing', dueJobs({ ...config, jobs: [{ ...config.jobs[0], enabled: false }] }, tenPMUtc, {}).length, 0);
+check('dueJobs never throws on a null config', dueJobs(null, tenPMUtc, {}), []);
+
+// ── 5. the caps exist and are small enough to matter ────────────────────────
+checkTrue('per-tick cap is 1..4', MAX_JOBS_PER_TICK >= 1 && MAX_JOBS_PER_TICK <= 4);
+checkTrue('daily cap is below a fleet of 20', MAX_JOBS_PER_DAY > 0 && MAX_JOBS_PER_DAY < 20);
+check('the version is pinned', CRON_VERSION, 1);
+
+// ── 6. the boot log says what will happen ──────────────────────────────────
+check('an empty schedule says zero jobs', describeCron({ jobs: [], timeZone: 'UTC' }), '0 jobs (UTC)');
+const described = describeCron(config);
+checkTrue('a real schedule names the jobs and the zone', /2 jobs \(Asia\/Singapore\): 06:00 Weather/.test(described));
+check('no schedule at all is said plainly', describeCron(null), 'no schedule');
+
+// ── 7. the relay's wiring is present and ordered ───────────────────────────
+const relay = readFileSync(resolve(here, '../../web/server/local-sse.mjs'), 'utf8');
+checkTrue('the relay imports the schedule module', /from '\.\/agent-cron\.mjs'/.test(relay));
+checkTrue('the relay has a tick', /async function cronTick\(/.test(relay));
+checkTrue('started after the port is open, not before', relay.indexOf('startAgentCron();') > relay.indexOf('server.listen(PORT'));
+checkTrue('the timer cannot hold the process open', /timer\.unref/.test(relay));
+checkTrue('an env kill switch exists', /G2_AGENT_CRON/.test(relay));
+// The interesting property is ORDER: a roster that cannot be read must return
+// BEFORE any slot is marked, or a hub outage silently eats the morning.
+const rosterBranch = relay.slice(relay.indexOf("roster unavailable"), relay.indexOf("roster unavailable") + 260);
+checkTrue('a missing hub roster does NOT spend the slot', rosterBranch.includes('return;') && !rosterBranch.includes('state.slots'));
+checkTrue('a run is started with the agent OWN prompt', /prompt: savedTask/.test(relay));
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);

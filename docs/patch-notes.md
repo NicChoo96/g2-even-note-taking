@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.65
+
+v0.3.65 - Fleet health check, and a clock for scheduled agents
+
+- Twelve agents lacked a tool that could fetch anything, so prompts asking for the latest news had nothing to read. The Agents page now adds one in a tap.
+- Five starter agents can be added there: a watcher that speaks only when a rule flips, a brief composer, a commitment keeper, a decision journal and a fleet auditor.
+- The relay can now run agents on a schedule, so a daily agent no longer needs the app open.
+
 ## 0.3.64
 
 v0.3.64 - The glasses app now reaches the hub and asks for a code as soon as it opens
