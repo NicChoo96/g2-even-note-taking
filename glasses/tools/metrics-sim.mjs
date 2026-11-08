@@ -387,12 +387,22 @@ try {
   check('and the reason names the collector', /collector/i.test(String(blocked.body?.error)), true);
 
   // ── 8. one live fetch, skipped when there is no egress ───────────────────
-  await call('PUT', '/api/agent/schedule', {
-    enabled: true,
-    timeZone: 'Asia/Singapore',
-    series: [{ key: 'live.check', label: 'Live check', type: 'string' }],
-    jobs: [],
+  // Through the DEDICATED declare route: a declaration used to be smuggled inside
+  // the whole schedule document, which is why this line previously sent `jobs: []`
+  // and would now be refused — correctly — by the wipe guard.
+  const declaredLive = await call('POST', '/api/metrics/series', {
+    key: 'live.check',
+    label: 'Live check',
+    type: 'string',
   });
+  check('a series can be declared on its own', declaredLive.status === 200, true);
+  // The schedule above holds ONE collector job. If declaring a series could still
+  // wipe the document, this is the assertion that would catch it.
+  check(
+    'and declaring one does not disturb the jobs',
+    Array.isArray(declaredLive.body?.collectors) && declaredLive.body.collectors.length === 1,
+    true,
+  );
   const live = await call('POST', '/api/metrics/collect', {
     series: 'live.check',
     request: { url: 'https://api.github.com/zen', method: 'GET' },

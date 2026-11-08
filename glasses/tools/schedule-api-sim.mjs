@@ -186,8 +186,26 @@ try {
     );
     check('and nothing is running while paused', paused.body?.running === false);
 
-    const cleared = await call('PUT', '/api/agent/schedule', { enabled: true, jobs: [] }, token);
-    check('every job can be removed', cleared.status === 200 && cleared.body?.jobs?.length === 0);
+    // Removing the LAST job is legitimate, but a whole-document PUT that arrives
+    // with no jobs is also exactly what an accidental overwrite looks like (it
+    // wiped a real four-job schedule once, with a 200). So it is refused unless
+    // the caller says so.
+    const wiped = await call('PUT', '/api/agent/schedule', { enabled: true, jobs: [] }, token);
+    check(
+      'an accidental wipe of the schedule is refused, not obeyed',
+      wiped.status === 409 && wiped.body?.code === 'WOULD_EMPTY_SCHEDULE',
+      `status ${wiped.status} code=${JSON.stringify(wiped.body?.code)} error=${wiped.body?.error ?? ''}`,
+    );
+    check('and it names how many runs would have gone', wiped.body?.count === 2, `count=${JSON.stringify(wiped.body?.count)}`);
+    const keptAfterWipe = await call('GET', '/api/agent/schedule', undefined, token);
+    check('and nothing was actually deleted', keptAfterWipe.body?.jobs?.length === 2);
+
+    const cleared = await call('PUT', '/api/agent/schedule', { enabled: true, jobs: [], confirmEmpty: true }, token);
+    check(
+      'every job can be removed when the caller means it',
+      cleared.status === 200 && cleared.body?.jobs?.length === 0,
+      `status ${cleared.status} error=${cleared.body?.error ?? ''}`,
+    );
   }
 } catch (err) {
   fail += 1;

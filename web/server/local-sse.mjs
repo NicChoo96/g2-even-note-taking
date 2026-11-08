@@ -3824,6 +3824,49 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Declare ONE series, without touching the jobs.
+  //
+  // This exists because a declaration used to ride inside the whole schedule
+  // document, which forced every caller to read-modify-write a document it did not
+  // care about — and a caller that forgot (a probe, a script, a migration) deleted
+  // the wearer's jobs with a 200 OK. Read-modify-write belongs HERE, where it is
+  // one function and cannot be half-done, rather than in four call sites.
+  if (url.pathname === '/api/metrics/series' && req.method === 'POST') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    if (cronReady) await cronReady;
+    let body;
+    try {
+      body = await readJsonBody(req, 16 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    const parsed = normaliseSeries(body);
+    if (!parsed.ok) {
+      json(res, 400, { ok: false, error: parsed.error });
+      return;
+    }
+    const key = parsed.series.key;
+    const others = (cronConfig?.series ?? []).filter((s) => s.key !== key);
+    const next = {
+      ...(cronConfig ?? { version: 1, enabled: false, timeZone: 'Asia/Singapore', graceMinutes: 20, jobs: [] }),
+      // JOBS ARE CARRIED, never re-sent by the caller.
+      series: [...others, { ...parsed.series, key }],
+    };
+    const saved = await saveCronConfig(next);
+    json(res, 200, {
+      ...(await metricsPayload()),
+      durable: saved.durable,
+      onDisk: saved.onDisk,
+      durableError: saved.durable ? undefined : saved.reason,
+    });
+    return;
+  }
+
   const seriesMatch = /^\/api\/metrics\/series\/([a-z0-9._-]{3,80})$/.exec(url.pathname);
   if (seriesMatch && req.method === 'DELETE') {
     const owner = requireOwner(req, url);
@@ -3924,6 +3967,25 @@ const server = createServer(async (req, res) => {
       });
       return;
     }
+    // A PUT is a WHOLE-DOCUMENT replace, so any caller that does not read first
+    // deletes everything it did not know about. That is not hypothetical: the
+    // e2e probe wrote `{series:[...], jobs: []}` over a four-job schedule and the
+    // jobs were gone with a `200 OK`. A silent wipe is indistinguishable from the
+    // schedule never existing, which is why this refuses instead of trusting every
+    // caller to read-modify-write.
+    const incomingJobs = Array.isArray(parsed.config.jobs) ? parsed.config.jobs.length : 0;
+    const storedJobs = Array.isArray(cronConfig?.jobs) ? cronConfig.jobs.length : 0;
+    if (incomingJobs === 0 && storedJobs > 0 && body?.confirmEmpty !== true) {
+      json(res, 409, {
+        ok: false,
+        code: 'WOULD_EMPTY_SCHEDULE',
+        count: storedJobs,
+        error:
+          `that would delete all ${storedJobs} scheduled run(s) — send confirmEmpty: true only if ` +
+          'that is what you meant',
+      });
+      return;
+    }
     const saved = await saveCronConfig(parsed.config);
     console.log(`[cron] saved from the page — ${describeCron(parsed.config)}`);
     json(res, 200, {
@@ -3981,7 +4043,19 @@ const server = createServer(async (req, res) => {
       json(res, 502, { ok: false, error: String(started.error ?? 'run refused') });
       return;
     }
-    json(res, 200, { ok: true, run: started.run ?? null });
+    const run = started.run;
+    // Answer FIRST, then run — the same order `/api/agent/run` uses.
+    //
+    // THIS IS THE BUG "Run now does nothing" WAS. The route used to stop at
+    // `json(res, 200, {run})`: it created the run record and returned it, and
+    // nothing ever sent a message. The record sat at "Thinking…" for ever, the
+    // page said "Started …", and the wearer had no way to tell a run that never
+    // began from one that failed — the worst of the three states, because the
+    // record looks alive. `broadcastRun` is what puts it on the agents channel
+    // the UI listens to, and `executeRun` is what actually calls the model.
+    json(res, 200, { ok: true, runId: run.id, run });
+    broadcastRun(run);
+    void executeRun(run).catch((err) => failRun(run, err));
     return;
   }
 
@@ -5205,7 +5279,15 @@ const CRON_TICK_MS = 60 * 1000;
 // auth blob already uses, so a schedule survives a deploy the same way a session
 // does. It is a KEY rather than a column: the gateway treats the value as opaque
 // JSON, which is why the schedule's shape can change here without a migration.
-const SCHEDULE_HUB_PATH = '/relay/agent-cron';
+/**
+ * Where the schedule lives on the hub.
+ *
+ * Overridable, and that is a safety feature rather than a testing convenience: a
+ * probe that points at `agent-cron` is a probe that can overwrite the wearer's
+ * real jobs, which is exactly what happened once. `G2_SCHEDULE_KEY=agent-cron-probe`
+ * puts a throwaway document beside the real one instead of on top of it.
+ */
+const SCHEDULE_HUB_PATH = `/relay/${String(process.env.G2_SCHEDULE_KEY || 'agent-cron').trim() || 'agent-cron'}`;
 
 /** The validated schedule this process is running. `null` = nothing scheduled. */
 let cronConfig = null;

@@ -80,6 +80,12 @@ try {
       METRICS_FILE: join(dir, 'metrics.json'),
       // The point of the test: readings go to the hub, not this disk.
       METRICS_API: `${hub}/hub/metrics`,
+      // THE PROBE MUST NOT OWN THE WEARER'S SCHEDULE. This run PUTs a whole
+      // schedule document (to declare its series), and a whole PUT replaces
+      // everything it does not know about — which is how a real four-job schedule
+      // was wiped with a 200 OK. A throwaway key beside the real one makes that
+      // impossible, and costs nothing.
+      G2_SCHEDULE_KEY: 'agent-cron-probe',
       G2_AGENT_CRON: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

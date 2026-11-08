@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { fetchSchedule, saveSchedule } from './agents-client';
 import {
   collectNow,
+  declareSeries as declareMetricSeries,
   deleteSeries,
   fetchMetrics,
   formatDelta,
@@ -231,25 +232,21 @@ export function DataPanel() {
    * ask of someone who just wants Jarvis to be able to record a number.
    */
   const putSeries = async (next: { key: string; label: string; unit: string; type: 'number' | 'string' }): Promise<boolean> => {
-    const schedule = await fetchSchedule();
-    if (!schedule) {
-      setWarn('Could not read the schedule — sign in as the owner to configure collectors.');
-      return false;
-    }
     const key = next.key.trim().toLowerCase();
-    const entry = { key, label: next.label.trim() || key, unit: next.unit.trim(), type: next.type };
-    const existing = (schedule as unknown as { series?: unknown[] }).series;
-    const list = Array.isArray(existing) ? existing.filter((s) => (s as { key?: string }).key !== key) : [];
-    const saved = await saveSchedule({
-      enabled: schedule.enabled,
-      timeZone: schedule.timeZone,
-      series: [...list, entry],
-      jobs: schedule.jobs.map((j) => jobForSave(j)),
-    } as never);
-    if (!saved.ok) {
-      setWarn(saved.error || 'the relay refused that series');
+    // ONE call, and it cannot touch the schedule: the relay merges the declaration
+    // into the document it already holds. Reading the schedule and writing it back
+    // here is what made a series declaration capable of deleting every job.
+    const res = await declareMetricSeries({
+      key,
+      label: next.label.trim() || key,
+      unit: next.unit.trim(),
+      type: next.type,
+    });
+    if (res.ok === false) {
+      setWarn(('error' in res && res.error) || 'the relay refused that series');
       return false;
     }
+    setMetrics(res as MetricsState);
     return true;
   };
 

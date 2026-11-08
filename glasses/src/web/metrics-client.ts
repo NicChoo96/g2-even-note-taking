@@ -116,6 +116,36 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 
 /** Remove a series and its samples. Refused by the relay while a collector uses it. */
 /**
+ * Declare or refine one series.
+ *
+ * Its own route, because a declaration used to travel inside the whole schedule
+ * document: every caller had to read the schedule, edit it and write it back, and
+ * one that forgot deleted the wearer's jobs (that is not hypothetical — a probe
+ * did it, and the hub answered 200). The relay now does the read-modify-write, so
+ * jobs cannot be collateral damage from declaring a series.
+ */
+export async function declareSeries(series: {
+  key: string;
+  label?: string;
+  unit?: string;
+  type?: 'number' | 'string';
+  precision?: number;
+}): Promise<MetricsState | { ok: false; error: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/metrics/series`, {
+      method: 'POST',
+      headers: authHeaders(true),
+      body: JSON.stringify(series),
+    });
+    const parsed = (await res.json().catch(() => ({}))) as MetricsState & { error?: string };
+    if (!res.ok) return { ok: false, error: parsed?.error || `HTTP ${res.status}` };
+    return parsed;
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Delete a series.
  *
  * `purge` deletes its READINGS too. That is a separate decision on purpose: the

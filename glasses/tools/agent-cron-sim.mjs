@@ -291,7 +291,10 @@ checkTrue('a run is started with the agent OWN prompt', /prompt: savedTask/.test
 // working clock came to look like a missing feature. These pin the fix.
 checkTrue(
   'the schedule is stored on the hub, not only on disk',
-  /SCHEDULE_HUB_PATH = '\/relay\/agent-cron'/.test(relay),
+  // The key is env-overridable now, so the literal `/relay/agent-cron` is no
+  // longer the whole story: the DEFAULT has to be agent-cron, and test keys have
+  // to be possible without editing code.
+  /SCHEDULE_HUB_PATH = `\/relay\/\$\{[^}]*G2_SCHEDULE_KEY[^}]*\}`/.test(relay) && /'agent-cron'/.test(relay),
 );
 checkTrue('it is read from the hub at boot', /client\.call\('GET', SCHEDULE_HUB_PATH\)/.test(relay));
 checkTrue(
@@ -301,6 +304,24 @@ checkTrue(
 checkTrue('the page can read it', /url\.pathname === '\/api\/agent\/schedule' && req\.method === 'GET'/.test(relay));
 checkTrue('the page can replace it', /url\.pathname === '\/api\/agent\/schedule' && req\.method === 'PUT'/.test(relay));
 checkTrue('a run can be started on demand', /'\/api\/agent\/schedule\/run'/.test(relay));
+// "Run now" created a run record and never executed it, so the page said
+// "Started …" and the record sat at Thinking… for ever. Both halves are asserted
+// because either one alone looks fine: a run nobody broadcasts is invisible, and a
+// broadcast run nobody executes is a corpse the UI keeps showing.
+const runBranch = relay.slice(relay.indexOf("'/api/agent/schedule/run'"));
+// 6000, not 2000: the route carries a long comment about exactly this bug, and a
+// slice that stops before the code it exists to find is a false FAIL.
+checkTrue('a run started from the page is BROADCAST to the clients', /broadcastRun\(run\)/.test(runBranch.slice(0, 6000)));
+checkTrue(
+  'and actually EXECUTED, with the failure routed to the run',
+  /void executeRun\(run\)\.catch\([\s\S]{0,80}?failRun\(run/.test(runBranch.slice(0, 6000)),
+);
+// A whole-document PUT from a caller that forgot to read first deletes every job
+// it did not know about. That is how a four-job schedule was wiped with a 200 OK.
+checkTrue('an accidental wipe is refused', /WOULD_EMPTY_SCHEDULE/.test(relay));
+checkTrue('and an intentional one is allowed', /confirmEmpty !== true/.test(relay));
+// The probe that caused that wipe must never be able to point at the real key.
+checkTrue('the hub key can be pointed elsewhere for tests', /G2_SCHEDULE_KEY/.test(relay));
 // Owner-only: a schedule spends money unattended, so a paired device must not
 // be able to edit it.
 const putBranch = relay.slice(relay.indexOf("'/api/agent/schedule' && req.method === 'PUT'"));

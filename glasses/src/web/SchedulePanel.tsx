@@ -85,7 +85,16 @@ export function AgentSchedule() {
     setNote('');
     setWarn('');
     try {
-      const res = await saveSchedule({ enabled: state?.enabled ?? true, timeZone: state?.timeZone, ...next });
+      // Emptying the list is allowed, but it has to be said out loud: the relay
+      // refuses a save that would drop every job, because that is also what an
+      // accidental whole-value PUT looks like.
+      const confirmEmpty = next.jobs.length === 0 && jobs.length > 0 ? true : undefined;
+      const res = await saveSchedule({
+        enabled: state?.enabled ?? true,
+        timeZone: state?.timeZone,
+        ...next,
+        ...(confirmEmpty ? { confirmEmpty } : {}),
+      });
       if (!res.ok) {
         setWarn(res.error || 'The relay refused that schedule.');
         return false;
@@ -147,7 +156,7 @@ export function AgentSchedule() {
     setWarn('');
     try {
       const res = await runAgentNow(job.agent);
-      if (res.ok) setNote(`Started ${job.agent} now — watch the Jarvis tab for the run.`);
+      if (res.ok) setNote(`Started ${job.agent} — the run appears under Agents, in the run list.`);
       else setWarn(res.error || `Could not start ${job.agent}.`);
     } finally {
       setBusy(false);

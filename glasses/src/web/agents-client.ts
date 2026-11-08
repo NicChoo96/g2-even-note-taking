@@ -308,6 +308,14 @@ export async function saveSchedule(patch: {
     ask?: string;
     enabled?: boolean;
   }>;
+  /**
+   * The relay refuses a save that would empty a non-empty schedule, because a
+   * whole-value PUT from any caller that forgot to read first deletes everything
+   * it did not know about — which is how a four-job schedule was wiped by a 200
+   * OK. Removing the last job is a legitimate thing to want, so the page says so
+   * explicitly instead of the relay having to guess.
+   */
+  confirmEmpty?: boolean;
 }): Promise<ScheduleState & { series?: unknown[] }> {
   try {
     const res = await fetch(`${API_BASE}/api/agent/schedule`, {
