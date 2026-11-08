@@ -31,6 +31,15 @@ import { activeDoc, type HubState, type SectionId } from '../types';
 import { bootCount, loadDeviceSession } from '../durable-docs';
 import { docWords, filterDocs, orderDocs, whenLabel } from './doc-list';
 import { ThemeToggle } from './ThemeToggle';
+import { SelectionBar } from './SelectionBar';
+import {
+  allSelected,
+  confirmBulk,
+  describeBulk,
+  keepExisting,
+  selectAll,
+  toggleId,
+} from './selection';
 
 const SECTION_LABELS: Record<SectionId, string> = {
   todo: 'To-Do',
@@ -80,6 +89,26 @@ export default function App() {
   /** Local tab override — lets Settings show without changing the glasses section. */
   const [tab, setTab] = useState<Tab | null>(null);
   const activeTab: Tab = tab ?? state.activeSection;
+
+  /**
+   * Multi-select, shared by the Todo and Docs tabs.
+   *
+   * `picking` is which tab is in selection mode, not a boolean: switching tabs
+   * must not leave a stale selection armed on the other list, and doing it this
+   * way makes that impossible rather than remembered.
+   */
+  const [picking, setPicking] = useState<'todo' | 'docs' | null>(null);
+  const [picked, setPicked] = useState<string[]>([]);
+  /** The line shown after a bulk delete. Empty means nothing happened yet. */
+  const [bulkNote, setBulkNote] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
+
+  const stopPicking = () => {
+    setPicking(null);
+    setPicked([]);
+  };
+
+  const pick = (id: string) => setPicked((ids) => toggleId(ids, id));
 
   // A live dot on the Jarvis tab, so an agent run started from the glasses or
   // from a confirmation prompt is visible without hunting for it.
@@ -147,7 +176,6 @@ export default function App() {
   const selectDoc = (id: string) => storeSelectDoc(id);
 
   const createDoc = () => addDoc('Untitled');
-
   const renameActiveDoc = (title: string) => {
     const id = active?.id;
     if (id) setDocTitle(id, title);
@@ -161,6 +189,58 @@ export default function App() {
   const deleteDoc = (id: string) => {
     if (!window.confirm('Delete this doc? This removes it for every device.')) return;
     removeDoc(id);
+  };
+
+  /**
+   * Bulk delete for the To-Do list.
+   *
+   * Sequential, not `Promise.all`: each delete is a hub write, and firing twelve
+   * at once is how a rate limit turns into "some of them went". Sequential also
+   * lets the summary tell the truth about which ones did not.
+   */
+  const bulkDeleteTodos = async () => {
+    const ids = keepExisting(picked, state.sections.todo.map((t) => t.id));
+    if (!ids.length) return;
+    if (
+      !window.confirm(
+        confirmBulk('task', ids.length, 'This removes them on every device, not just here.'),
+      )
+    ) {
+      return;
+    }
+    setBulkBusy(true);
+    setBulkNote('');
+    const failed: Array<{ what: string; error?: string }> = [];
+    let ok = 0;
+    for (const id of ids) {
+      const label = state.sections.todo.find((t) => t.id === id)?.text ?? id;
+      const res = await storeRemoveTask(id);
+      if (res?.ok === false) failed.push({ what: label.slice(0, 40), error: res.error });
+      else ok += 1;
+    }
+    setBulkBusy(false);
+    setBulkNote(describeBulk('Deleted', ok, failed));
+    stopPicking();
+  };
+
+  /**
+   * Bulk delete for the Docs library.
+   *
+   * `removeDoc` removes it locally and pushes the delete on its own, surfacing a
+   * hub refusal in the sync banner — so there is no per-item result to collect
+   * here, and the note says what actually happened on this device.
+   */
+  const bulkDeleteDocs = () => {
+    const ids = keepExisting(picked, docs.map((d) => d.id));
+    if (!ids.length) return;
+    if (
+      !window.confirm(confirmBulk('doc', ids.length, 'This removes them on every device, not just here.'))
+    ) {
+      return;
+    }
+    for (const id of ids) removeDoc(id);
+    setBulkNote(describeBulk('Removed', ids.length, []));
+    stopPicking();
   };
 
   const setNotes = (text: string) => storeSetNotes(text);
@@ -274,29 +354,74 @@ export default function App() {
               <span>
                 {doneCount} done · {pending} pending
               </span>
+              {state.sections.todo.length > 0 && (
+                <button
+                  onClick={() => {
+                    if (picking === 'todo') stopPicking();
+                    else {
+                      setPicked([]);
+                      setPicking('todo');
+                    }
+                  }}
+                >
+                  {picking === 'todo' ? 'Done' : 'Select'}
+                </button>
+              )}
             </div>
+            {bulkNote && <p className="hint-line">{bulkNote}</p>}
+            <SelectionBar
+              picking={picking === 'todo'}
+              count={picked.length}
+              total={state.sections.todo.length}
+              allSelected={allSelected(picked, state.sections.todo.map((t) => t.id))}
+              busy={bulkBusy}
+              deleteLabel="Delete"
+              onAll={() => setPicked(selectAll(picked, state.sections.todo.map((t) => t.id)))}
+              onClear={() => setPicked([])}
+              onDelete={() => void bulkDeleteTodos()}
+              onCancel={stopPicking}
+            />
             <ul className="todo-list">
               {state.sections.todo.length === 0 && (
                 <li className="empty">No tasks yet — add one below, or ask Jarvis.</li>
               )}
               {state.sections.todo.map((t) => (
-                <li key={t.id} className={t.done ? 'todo-item done' : 'todo-item'}>
-                  <button
-                    className="check"
-                    onClick={() => toggleTask(t.id)}
-                    aria-label={t.done ? 'Mark not done' : 'Mark done'}
-                  >
-                    {t.done ? '✓' : ''}
-                  </button>
+                <li
+                  key={t.id}
+                  className={
+                    (t.done ? 'todo-item done' : 'todo-item') +
+                    (picking === 'todo' && picked.includes(t.id) ? ' picked' : '')
+                  }
+                >
+                  {picking === 'todo' ? (
+                    <input
+                      type="checkbox"
+                      className="pick-box"
+                      checked={picked.includes(t.id)}
+                      onChange={() => pick(t.id)}
+                      aria-label={`Select ${t.text || 'task'}`}
+                    />
+                  ) : (
+                    <button
+                      className="check"
+                      onClick={() => toggleTask(t.id)}
+                      aria-label={t.done ? 'Mark not done' : 'Mark done'}
+                    >
+                      {t.done ? '✓' : ''}
+                    </button>
+                  )}
                   <input
                     className="todo-text"
                     value={t.text}
                     onChange={(e) => editTask(t.id, e.target.value)}
                     placeholder="Task…"
+                    readOnly={picking === 'todo'}
                   />
-                  <button className="icon-btn danger" onClick={() => removeTask(t.id)} aria-label="Remove task">
-                    ✕
-                  </button>
+                  {picking !== 'todo' && (
+                    <button className="icon-btn danger" onClick={() => removeTask(t.id)} aria-label="Remove task">
+                      ✕
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>
@@ -321,6 +446,20 @@ export default function App() {
               Docs library · newest first · auto-saved to storage & synced to all your devices
             </div>
 
+            {bulkNote && <p className="hint-line">{bulkNote}</p>}
+            <SelectionBar
+              picking={picking === 'docs'}
+              count={picked.length}
+              total={visibleDocs.length}
+              allSelected={allSelected(picked, visibleDocs.map((d) => d.id))}
+              busy={bulkBusy}
+              deleteLabel="Delete"
+              onAll={() => setPicked(selectAll(picked, visibleDocs.map((d) => d.id)))}
+              onClear={() => setPicked([])}
+              onDelete={bulkDeleteDocs}
+              onCancel={stopPicking}
+            />
+
             {docs.length === 0 ? (
               <div className="empty">No docs yet — create one to start writing.</div>
             ) : (
@@ -334,29 +473,65 @@ export default function App() {
                     placeholder="Filter by title or text…"
                     aria-label="Filter docs"
                   />
+                  {docs.length > 1 && (
+                    <div className="field-toolbar">
+                      <button
+                        onClick={() => {
+                          if (picking === 'docs') stopPicking();
+                          else {
+                            setPicked([]);
+                            setPicking('docs');
+                          }
+                        }}
+                      >
+                        {picking === 'docs' ? 'Done selecting' : 'Select multiple'}
+                      </button>
+                    </div>
+                  )}
                   <ul className="doc-list" aria-label="Documents">
                     {visibleDocs.length === 0 && (
                       <li className="empty">No doc matches “{docQuery.trim()}”.</li>
                     )}
                     {visibleDocs.map((d) => {
                       const words = docWords(d);
+                      const isPicked = picked.includes(d.id);
                       return (
-                        <li key={d.id} className={active?.id === d.id ? 'doc-row active' : 'doc-row'}>
-                          <button className="doc-pick" onClick={() => selectDoc(d.id)}>
+                        <li
+                          key={d.id}
+                          className={
+                            (active?.id === d.id && picking !== 'docs' ? 'doc-row active' : 'doc-row') +
+                            (isPicked ? ' picked' : '')
+                          }
+                        >
+                          {picking === 'docs' && (
+                            <input
+                              type="checkbox"
+                              className="pick-box"
+                              checked={isPicked}
+                              onChange={() => pick(d.id)}
+                              aria-label={`Select ${d.title || 'doc'}`}
+                            />
+                          )}
+                          <button
+                            className="doc-pick"
+                            onClick={() => (picking === 'docs' ? pick(d.id) : selectDoc(d.id))}
+                          >
                             <span className="doc-name">{d.title || '(untitled)'}</span>
                             <span className="doc-meta">
                               {whenLabel(d.updatedAt)}
                               {words > 0 ? ` · ${words}w` : ' · empty'}
                             </span>
                           </button>
-                          <button
-                            className="icon-btn danger"
-                            onClick={() => deleteDoc(d.id)}
-                            aria-label={`Delete ${d.title || 'doc'}`}
-                            title="Delete doc"
-                          >
-                            ✕
-                          </button>
+                          {picking !== 'docs' && (
+                            <button
+                              className="icon-btn danger"
+                              onClick={() => deleteDoc(d.id)}
+                              aria-label={`Delete ${d.title || 'doc'}`}
+                              title="Delete doc"
+                            >
+                              ✕
+                            </button>
+                          )}
                         </li>
                       );
                     })}

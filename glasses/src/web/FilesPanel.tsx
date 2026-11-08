@@ -24,6 +24,15 @@
 // there. `syncRefs` does that, and it only writes when something changed.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MicButton } from './Dictate';
+import { SelectionBar } from './SelectionBar';
+import {
+  allSelected,
+  confirmBulk,
+  describeBulk,
+  keepExisting,
+  selectAll,
+  toggleId,
+} from './selection';
 import {
   deleteFile,
   fetchDocTicket,
@@ -89,6 +98,9 @@ export function FilesPanel() {
   const [selected, setSelected] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [busy, setBusy] = useState(false);
+  /** Multi-select over the LIBRARY list only — the Deleted list has its own verbs. */
+  const [picking, setPicking] = useState(false);
+  const [picked, setPicked] = useState<string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   /** The last soft delete, offered as an inline Undo beside the notice. */
   const [undo, setUndo] = useState<{ id: string; title: string } | null>(null);
@@ -298,6 +310,45 @@ export function FilesPanel() {
     await refresh(query);
   };
 
+  /**
+   * Move every picked document to Deleted, one at a time.
+   *
+   * Sequential because each call is a gateway write: firing twelve at once is how
+   * a rate limit becomes "some of them went", and the summary could then only
+   * guess. The single-item Undo is cleared rather than left pointing at one of
+   * many — the Deleted tab is the way back from a bulk delete, and the notice says
+   * so.
+   */
+  const onBulkDelete = async () => {
+    const ids = keepExisting(picked, docs.map((d) => d.id));
+    if (!ids.length) return;
+    if (
+      !window.confirm(
+        confirmBulk('document', ids.length, 'They move to Deleted, where you can restore them.'),
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setUndo(null);
+    const failed: Array<{ what: string; error?: string }> = [];
+    let ok = 0;
+    for (const id of ids) {
+      const title = docs.find((d) => d.id === id)?.title || id;
+      const res = await deleteFile(id);
+      if (res.ok) ok += 1;
+      else failed.push({ what: title.slice(0, 40), error: res.error });
+    }
+    setBusy(false);
+    setPicked([]);
+    setPicking(false);
+    setNotice(describeBulk('Moved to Deleted', ok, failed));
+    if (selected && ids.includes(selected)) setSelected(null);
+    await refresh(query);
+  };
+
   /** Purge the stored bytes. The one delete here that cannot be undone. */
   const onPurge = async (doc: StoredDoc) => {
     if (
@@ -455,23 +506,69 @@ export function FilesPanel() {
                 : 'Configure the document store to see published documents.'}
             </div>
           ) : (
-            <ul className="agent-list files-list">
-              {docs.map((d) => (
-                <li key={d.id}>
+            <>
+              {docs.length > 1 && (
+                <div className="field-toolbar">
                   <button
-                    className={d.id === selected ? 'agent-row active files-row' : 'agent-row files-row'}
-                    onClick={() => setSelected(d.id)}
-                    title={d.url || d.id}
+                    onClick={() => {
+                      if (picking) {
+                        setPicking(false);
+                        setPicked([]);
+                      } else {
+                        setPicked([]);
+                        setPicking(true);
+                      }
+                    }}
+                    disabled={busy}
                   >
-                    <span className="agent-name">{d.title || 'Untitled'}</span>
-                    <span className="agent-meta">
-                      {d.agent || 'unknown'} · {sizeLabel(d.size)}
-                      {d.version > 1 ? ` · v${d.version}` : ''}
-                    </span>
+                    {picking ? 'Done selecting' : 'Select multiple'}
                   </button>
-                </li>
-              ))}
-            </ul>
+                </div>
+              )}
+              <SelectionBar
+                picking={picking}
+                count={picked.length}
+                total={docs.length}
+                allSelected={allSelected(picked, docs.map((d) => d.id))}
+                busy={busy}
+                deleteLabel="Move to Deleted"
+                onAll={() => setPicked(selectAll(picked, docs.map((d) => d.id)))}
+                onClear={() => setPicked([])}
+                onDelete={() => void onBulkDelete()}
+                onCancel={() => {
+                  setPicking(false);
+                  setPicked([]);
+                }}
+              />
+              <ul className="agent-list files-list">
+                {docs.map((d) => (
+                  <li key={d.id} className={picked.includes(d.id) ? 'files-row-picked' : undefined}>
+                    <button
+                      className={
+                        (d.id === selected && !picking ? 'agent-row active files-row' : 'agent-row files-row')
+                      }
+                      onClick={() => (picking ? setPicked((ids) => toggleId(ids, d.id)) : setSelected(d.id))}
+                      title={d.url || d.id}
+                    >
+                      {picking && (
+                        <input
+                          type="checkbox"
+                          className="pick-box"
+                          checked={picked.includes(d.id)}
+                          onChange={() => setPicked((ids) => toggleId(ids, d.id))}
+                          aria-label={`Select ${d.title || 'document'}`}
+                        />
+                      )}
+                      <span className="agent-name">{d.title || 'Untitled'}</span>
+                      <span className="agent-meta">
+                        {d.agent || 'unknown'} · {sizeLabel(d.size)}
+                        {d.version > 1 ? ` · v${d.version}` : ''}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
 
           {/* Publishing from the Deleted tab would write into the library the
