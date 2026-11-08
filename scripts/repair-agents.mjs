@@ -28,7 +28,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
@@ -181,7 +181,9 @@ async function putAgent(agent, patch) {
 // ── starters (optional) ────────────────────────────────────────────────────
 async function starters() {
   // Bundle the SHIPPED specs so there is one source of truth for their prompts.
-  const { build } = await import(resolve(root, 'glasses/node_modules/esbuild/lib/main.js'));
+  const { build } = await import(
+    pathToFileURL(resolve(root, 'glasses/node_modules/esbuild/lib/main.js')).href
+  );
   const out = resolve(root, '.tmp-e2e/starter-specs.mjs');
   await build({
     stdin: {
@@ -195,7 +197,7 @@ async function starters() {
     platform: 'node',
     outfile: out,
   });
-  const { STARTER_AGENTS } = await import(`file:///${out.replace(/\\/g, '/')}`);
+  const { STARTER_AGENTS } = await import(pathToFileURL(out).href);
   return STARTER_AGENTS;
 }
 

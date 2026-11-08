@@ -24,7 +24,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
@@ -166,7 +166,9 @@ log(`\nRepaired ${done}/${plan.length}`);
 
 // ── optional: the starter fleet ────────────────────────────────────────────
 if (has('starters')) {
-  const { build } = await import(resolve(root, 'glasses/node_modules/esbuild/lib/main.js'));
+  const { build } = await import(
+    pathToFileURL(resolve(root, 'glasses/node_modules/esbuild/lib/main.js')).href
+  );
   const out = resolve(root, '.tmp-e2e/starter-specs.mjs');
   await build({
     stdin: {
@@ -180,7 +182,7 @@ if (has('starters')) {
     platform: 'node',
     outfile: out,
   });
-  const { STARTER_AGENTS } = await import(`file:///${out.replace(/\\/g, '/')}`);
+  const { STARTER_AGENTS } = await import(pathToFileURL(out).href);
   const have = new Set(agents.map((a) => String(a.name).toLowerCase()));
   const byKind = new Map();
   for (const t of tools) if (!byKind.has(t.kind)) byKind.set(t.kind, t.id);
@@ -200,11 +202,26 @@ if (has('starters')) {
       log(`  block ${spec.name} — no ${missing.join(', ')} tool`);
       continue;
     }
+    // A create is guarded by the `rev` it is writing against, and every create
+    // ADVANCES that rev — so it is re-read per agent rather than taken once for
+    // the whole loop, which would make the second create fail with the first's rev.
+    const cur = await json(`${prefix}/agents`);
+    const rev = Number(cur.body?.rev);
     const res = await json(`${prefix}/agents`, {
       method: 'POST',
-      body: JSON.stringify({ name: spec.name, systemPrompt: spec.systemPrompt, prompt: spec.prompt, toolIds }),
+      body: JSON.stringify({
+        name: spec.name,
+        systemPrompt: spec.systemPrompt,
+        prompt: spec.prompt,
+        toolIds,
+        ...(Number.isFinite(rev) ? { rev } : {}),
+      }),
     });
-    log(res.ok ? `  add   ${spec.name}` : `  FAIL  ${spec.name} — ${res.status} ${String(res.body?.error ?? '').slice(0, 80)}`);
+    log(
+      res.ok
+        ? `  add   ${spec.name}`
+        : `  FAIL  ${spec.name} — ${res.status} ${String(res.body?.error ?? '').slice(0, 80)}`,
+    );
   }
 }
 
