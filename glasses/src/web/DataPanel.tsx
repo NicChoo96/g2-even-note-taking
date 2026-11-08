@@ -324,13 +324,29 @@ export function DataPanel() {
     setWarn('');
     setNote('');
     try {
-      const res = await deleteSeries(key);
+      // First attempt does NOT purge. If the series holds readings the relay
+      // answers with the count, and only then is the wearer asked the second,
+      // narrower question — "delete those too?". Destroying history has to be an
+      // answer someone gave, not a side effect of a delete button.
+      let res = await deleteSeries(key);
+      if (res.ok === false && typeof res.count === 'number') {
+        const go = window.confirm(
+          `"${key}" still holds ${res.count} reading${res.count === 1 ? '' : 's'}. ` +
+            'Delete those as well, and the series with them?',
+        );
+        if (!go) {
+          setWarn(`Left "${key}" in place with its ${res.count} reading(s).`);
+          return;
+        }
+        res = await deleteSeries(key, true);
+      }
       if (res.ok === false) {
         setWarn(('error' in res && res.error) || 'the relay refused that delete');
         return;
       }
       setMetrics(res as MetricsState);
-      setNote(`Deleted ${key}.`);
+      const gone = (res as { deleted?: number }).deleted ?? 0;
+      setNote(gone ? `Deleted ${key} and ${gone} reading${gone === 1 ? '' : 's'}.` : `Deleted ${key}.`);
     } finally {
       setBusy(false);
     }

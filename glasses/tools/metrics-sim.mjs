@@ -139,15 +139,33 @@ check(
 );
 
 check(
-  'a long URL is squeezed into the 32-char provenance field',
-  remote.toWireSample({ series: 'a.b', value: 1, source: 'https://api.github.com/repos/nodejs/node' }).source.length,
-  32,
+  'a realistic URL keeps its WHOLE path now that the field holds 500',
+  remote.toWireSample({ series: 'a.b', value: 1, source: 'https://api.github.com/repos/nodejs/node' }).source,
+  'https://api.github.com/repos/nodejs/node',
 );
 check(
-  'and keeps the host, which is what identifies the source',
-  remote.toWireSample({ series: 'a.b', value: 1, source: 'https://api.github.com/repos/nodejs/node' }).source.startsWith(
-    'api.github.com',
-  ),
+  'and the 500-char ceiling is the one the hub actually enforces',
+  remote.SOURCE_MAX,
+  500,
+);
+// The store keeps the provenance and the transport clips it — when those were two
+// numbers (300 vs 500) every reading lost the middle of its URL and nothing
+// failed. One constant now, and this is the check that notices if it is copied
+// again. The expectation is DERIVED from the input: a hardcoded length only pins
+// my arithmetic.
+const longUrl = `https://h.test/${'p'.repeat(470)}`;
+const longSourceSample = normaliseSample(
+  { series: 'a.b', value: 1, source: longUrl },
+  normaliseSeries({ key: 'a.b', label: 'A', type: 'number' }).series,
+  1,
+);
+check('the store keeps the whole URL it was given', longSourceSample.sample.source, longUrl);
+check('which is past the old 300-char clip', longSourceSample.sample.source.length > 300, true);
+check(
+  'an absurd URL is still fitted, by dropping the path and keeping the host',
+  remote
+    .toWireSample({ series: 'a.b', value: 1, source: `https://h.test/${'p'.repeat(600)}` })
+    .source.length <= 500,
   true,
 );
 
@@ -192,6 +210,65 @@ const notEmpty = await clientFor(409, {
 }).remove('a.b');
 check('a non-empty delete says how many readings', notEmpty.count, 7);
 check('and does not pretend it worked', notEmpty.ok, false);
+
+// ── 6b. the routes the backend added on 2026-11-09 ─────────────────────────
+// A stub that records every call, so the ORDER can be asserted: deleting the
+// series before its samples is the 409 this whole path exists to avoid.
+const recorder = (answer) => {
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push(`${init?.method ?? 'GET'} ${String(url).replace('http://stub/hub/metrics', '')}`);
+    const entry = typeof answer === 'function' ? answer(url, init) : answer;
+    return { status: entry.status, text: async () => (entry.body === undefined ? '' : JSON.stringify(entry.body)) };
+  };
+  const client = remote.createMetricsRemote({ baseUrl: 'http://stub/hub/metrics', token: 'k', fetchImpl: impl });
+  return { client, calls };
+};
+
+const readsOne = recorder({ status: 200, body: { ok: true, item: { key: 'a.b', label: 'A', type: 'number', unit: 'SGD', precision: 2, count: 3 } } });
+const one = await readsOne.client.get('a.b');
+check('a single declaration can be read', one.series?.unit, 'SGD');
+check('and asked for exactly that key', readsOne.calls, ['GET /series/a.b']);
+
+const missing = await recorder({ status: 404, body: { ok: false, code: 'NOT_FOUND', error: 'series not found' } });
+const gone = await missing.client.get('a.b');
+check('a missing series is a fact, not an error string', gone.notFound, true);
+
+const wipes = recorder({ status: 200, body: { ok: true, series: 'a.b', deleted: 2 } });
+const wiped = await wipes.client.removeSamples('a.b');
+check('samples can be deleted', wiped.deleted, 2);
+check('and the call always names the series', wipes.calls, ['DELETE /samples?series=a.b']);
+
+const older = recorder({ status: 200, body: { ok: true, deleted: 1 } });
+await older.client.removeSamples('a.b', 1793620800000);
+check('a cutoff travels as epoch ms', older.calls, ['DELETE /samples?series=a.b&before=1793620800000']);
+
+const idempotent = recorder({ status: 200, body: { ok: true, deleted: 0 } });
+const twice = await idempotent.client.removeSamples('a.b');
+check('a second purge is not a failure', twice, { ok: true, deleted: 0 });
+
+// The purge order is the whole point: series-first is the 409.
+const purged = recorder((url, init) =>
+  init?.method === 'DELETE' && String(url).includes('/series/')
+    ? { status: 204 }
+    : { status: 200, body: { ok: true, deleted: 5 } },
+);
+const purgedResult = await purged.client.remove('a.b', { purge: true });
+check('a purge deletes the READINGS first, then the series', purged.calls, [
+  'DELETE /samples?series=a.b',
+  'DELETE /series/a.b',
+]);
+check('and reports how many went with it', purgedResult.deleted, 5);
+
+// Without `purge` it must not touch a single reading.
+const careful = recorder((url, init) =>
+  init?.method === 'DELETE' && String(url).includes('/series/')
+    ? { status: 409, body: { ok: false, code: 'SERIES_NOT_EMPTY', details: { count: 5 } } }
+    : { status: 200, body: { ok: true, deleted: 5 } },
+);
+const carefulResult = await careful.client.remove('a.b');
+check('a plain delete never destroys readings', careful.calls, ['DELETE /series/a.b']);
+check('and asks the question instead', carefulResult.notEmpty, true);
 
 // ── 7. the REAL relay over HTTP ─────────────────────────────────────────────
 const PORT = 6200 + Math.floor(Math.random() * 60);

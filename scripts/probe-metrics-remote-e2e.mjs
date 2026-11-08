@@ -1,9 +1,10 @@
 // End to end against the LIVE hub metric store: does a collector's reading
-// actually land in the hub, and does the page read it back from there?
+// actually land in the hub, does the page read it back from there, and can a
+// series be removed together with its readings?
 //
-// Uses a `probe.` series so cleanup cannot touch anything real. The hub has no
-// route to delete samples, so the caller purges with SQL afterwards (documented
-// in the run output) — that gap is itself a finding.
+// Uses a `probe.` series and now cleans up through the API (DELETE /samples and
+// a purging DELETE /series), so a complete run leaves the hub exactly as it
+// found it. The SQL fallback printed on failure is for an interrupted run only.
 //
 // Run: node --env-file=web/.env.local scripts/probe-metrics-remote-e2e.mjs
 import { spawn } from 'node:child_process';
@@ -141,10 +142,55 @@ try {
     check('and shows the reading', dashboard.body?.series?.[0]?.count, 1);
 
     // Deleting a series with readings must be refused with the count, because the
-    // hub has no route to remove samples.
+    // hub will not drop a series that still holds samples.
     const del = await api('DELETE', `/api/metrics/series/${SERIES}`);
     check('deleting a non-empty series is refused with a reason', del.status, 409);
     check('and the reason names the readings', /reading/.test(String(del.body?.error)), String(del.body?.error));
+    check('and carries the count the page asks about', typeof del.body?.count === 'number', JSON.stringify(del.body ?? {}).slice(0, 160));
+
+    // ── the routes the backend added on 2026-11-09 ──────────────────────────
+    // Everything above this line was written against a hub that could not delete
+    // a reading. These four paths are now real, so they are proven here rather
+    // than left to a unit test with a stub.
+    const purge = await api('DELETE', `/api/metrics/series/${SERIES}?purge=1`);
+    check('a purge deletes the readings and the series', purge.status, 200, JSON.stringify(purge.body ?? {}).slice(0, 200));
+    check('and reports how many readings went', purge.body?.deleted === 1, `deleted ${purge.body?.deleted}`);
+    // Scoped to THIS key: asserting the array is empty only holds while the probe
+    // is the sole owner of the store, which stops being true the moment the
+    // wearer declares a series of their own.
+    const listedAfter = (purge.body?.series ?? []).some((s) => s.key === SERIES);
+    check('the dashboard no longer lists it', !listedAfter, `still listed: ${listedAfter}`);
+
+    // A second delete is a clean 404 path, not a 500: the page can retry safely.
+    // (`[200, 404].includes(...)` and not `check(..., [200,404], status)` — an
+    // array is always truthy, which is a check that cannot fail.)
+    const again = await api('DELETE', `/api/metrics/series/${SERIES}`);
+    check('deleting it twice is not an error worth alarming anyone about', [200, 404].includes(again.status), `status ${again.status}`);
+
+    // The widened `source`: a 483-char URL must survive the round trip in full,
+    // because provenance that has lost its path cannot say where a number came
+    // from.
+    const longUrl = `https://example.test/collect${'/segment'.repeat(50)}?a=1`;
+    const declared2 = await api('PUT', '/api/agent/schedule', {
+      enabled: true,
+      timeZone: 'Asia/Singapore',
+      series: [{ key: SERIES, label: 'Probe', unit: 'u', type: 'number', precision: 2 }],
+      jobs: [],
+    });
+    check('the series is re-declared for the provenance check', declared2.status === 200, String(declared2.body?.error ?? ''));
+    const bigWrite = await api('POST', '/api/metrics/samples', {
+      samples: [{ series: SERIES, value: 1.25, slot: '2026-11-09 11:00', source: longUrl }],
+    });
+    check('a 483-char source is accepted', bigWrite.body?.accepted?.length === 1, JSON.stringify(bigWrite.body?.rejected ?? '').slice(0, 160));
+    const back = await api('GET', '/api/metrics');
+    // `provenance` is a rendered line ("2026-11-09 09:00 · URL"), not an object —
+    // reading `.source` off it silently yields ''.
+    const storedSource = String(back.body?.series?.[0]?.provenance ?? '');
+    check('and the whole URL is what came back', storedSource.length >= 400, `got ${storedSource.length} chars`);
+    check('including the path, which is what identifies the reading', storedSource.includes('/segment'), storedSource.slice(0, 80));
+
+    const finalPurge = await api('DELETE', `/api/metrics/series/${SERIES}?purge=1`);
+    check('and the probe cleans up after itself through the API', finalPurge.status, 200);
   } else {
     const err = String(collected.body?.error ?? '');
     if (/fetch failed|ENOTFOUND|EAI_AGAIN|timed out/i.test(err)) {
@@ -167,8 +213,11 @@ try {
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
-console.log(`\nCLEANUP (the hub has no sample-delete route):`);
-console.log(`  ssh root@${hub.replace(/^https?:\/\//, '')} 'sqlite3 /var/lib/jarvis-content/hub.sqlite3 "`);
-console.log(`    delete from metric_sample where series like \\'probe.%\\';`);
-console.log(`    delete from metric_series where key like \\'probe.%\\';"'`);
+console.log('\nThe probe now purges through the API, so no SQL cleanup is needed.');
+if (fail) {
+  console.log(`If a run was interrupted, sweep any residue with:`);
+  console.log(`  ssh root@${hub.replace(/^https?:\/\//, '')} 'sqlite3 /var/lib/jarvis-content/hub.sqlite3 "`);
+  console.log(`    delete from metric_sample where series like \'probe.%\';`);
+  console.log(`    delete from metric_series where key like \'probe.%\';"'`);
+}
 process.exit(fail ? 1 : 0);

@@ -10,7 +10,7 @@
 | **Who writes** | The relay's clock (`kind: 'fetch'` collector jobs) and, later, agents through `metric.write`. |
 | **Who reads** | The relay (dashboard), the glasses (one number at a time), agents (their own history). |
 | **Relay identity** | The same API key already minted for relay state (`g2-relay`, `content:read`, `content:write`). Add the two namespaces to the same allow-list mechanism (`HUB_RELAY_WRITERS` or its successor). |
-| **Status** | **IMPLEMENTED AND LIVE** (commit `eb2cd82`, schema v2). The relay talks to it when `METRICS_API` is set; verified end to end by `scripts/probe-metrics-remote-e2e.mjs` (12/12) including a real HTTPS collector whose reading landed in the hub. Two live-only constraints and one gap are recorded in §7. |
+| **Status** | **IMPLEMENTED AND LIVE** (commit `eb2cd82`, schema v2; extended 2026-11-09). The relay talks to it when `METRICS_API` is set; verified end to end by `scripts/probe-metrics-remote-e2e.mjs` (**22/22**) including a real HTTPS collector whose reading landed in the hub, a purging delete, and a 426-char provenance URL surviving the round trip. The second changeset added `DELETE /samples`, `GET /series/{key}`, `kind: 'metrics'` on `/hub/tools` and a 500-char `source` — so §7's three gaps are now closed and kept only as history. |
 
 ---
 
@@ -118,7 +118,7 @@ Rules:
 * `value` for a `string` series: stored in `value_text` as given (≤ 500 chars).
 * `ts` absent → server `now()`. `ts` given → must be within ±365 days, else `400`.
 * `slot`, when present, must match `^[A-Za-z0-9:._-]{1,32}$` — **a space is refused**. The relay's own slot format is `YYYY-MM-DD HH:MM`, so it crosses the wire as `YYYY-MM-DDTHH:MM` and is translated back by the adapter (`metrics-remote.mjs`).
-* `source`, when present, is **at most 32 characters**. The relay sends `host + path`, truncated; a longer value takes the whole reading down with `samples[0].source must be at most 32 characters`. See §7 for why this costs provenance.
+* `source`, when present, is **at most 500 characters** (widened 2026-11-09; it was 32, which cost every reading the middle of its URL). The relay sends the URL whole and only shortens it past that limit, because an oversized value takes the whole reading down with `samples[0].source must be at most 500 characters`. See §7.2 for the measurement.
 * No `slot` → plain append (a point in time, not a scheduled reading).
 * Duplicate `slot` → **UPDATE** the existing row (`value`, `ts`, `source`, `run_id`), and report it in `accepted` with `replaced: true`.
 * Request body cap: 256 KiB, `413 TOO_LARGE` above it.
@@ -237,7 +237,9 @@ Acceptance checklist:
 The relay already speaks this shape; only the transport changes.
 
 * **`METRICS_API` unset (today):** samples are stored in `$G2_DATA_DIR/.g2-metrics.json`, series declarations ride `/hub/relay/agent-cron`. The Data tab says *"readings survive a restart, not a deploy"* — no hopeful silence.
-* **`METRICS_API` set to `$BASE/hub/metrics`:** the same calls go to these routes with `Authorization: Bearer $JARVIS_FILE_API_KEY`.
+* **`METRICS_API` set to `$BASE/hub/metrics`:** the same calls go to these routes with `Authorization: Bearer $JARVIS_FILE_API_KEY`. This is the mode production must run in — the local file survives a restart, not a deploy.
+
+Two things only exist on the hub path and are worth knowing when reading the code: deleting a series needs `?purge=1` to also remove its readings (see §7.4), and a single declaration can be fetched directly (`GET /hub/metrics/series/{key}` → `404` when it is gone) instead of being pattern-matched out of a list.
 
 A collector job is a cron entry and needs no backend support:
 
@@ -258,31 +260,30 @@ A collector job is a cron entry and needs no backend support:
 Found by probing the deployed service after it shipped; recorded because each one is invisible until a write fails.
 
 1. **A slot may not contain a space** (`[A-Za-z0-9:._-]{1,32}`). The relay's canonical slot is `YYYY-MM-DD HH:MM`, so the adapter translates to `T` on the way out and back on the way in. One place, tested.
-2. **`source` is capped at 32 characters.** Provenance therefore shows `host + path`, truncated — for a deep URL the path is lost. If provenance matters more than the column width, widening this to 120–200 would restore it; the relay sends it already shortened, so nothing else has to change.
+2. **`source` used to be capped at 32 characters.** Provenance showed `host + path`, truncated, so a deep URL lost the part that identifies it. **FIXED 2026-11-09 — the column now takes 500**, measured by sending 200/500/1000/2000: 500 stored verbatim, 1000 refused as `samples[0].source must be at most 500 characters`. One consequence was on the relay's side and is fixed with it: `normaliseSample` kept clipping at **300**, so the stored source was being shortened before it ever reached the hub. `SOURCE_MAX` now lives once, in `metrics.mjs`, and the transport imports it — with a harness check that the whole URL survives.
 3. **A batch where nothing was accepted answers `400`**, not `200` with all items rejected. The adapter treats it as per-item outcomes, which is what it means; a caller that treats it as a transport error will retry a permanently invalid payload.
-4. **GAP — samples cannot be deleted, so a series with readings can never be removed.** `DELETE /hub/metrics/series/{key}` answers `409 SERIES_NOT_EMPTY` with `details.count`, and there is no `DELETE /samples` route (`DELETE /hub/metrics/samples?series=` → 404). The consequence is visible in the UI: the Data tab's delete button refuses with *"the hub still holds N reading(s) … and has no route to delete them"*. Two small routes would close it:
+4. **GAP (CLOSED 2026-11-09) — samples could not be deleted, so a series with readings could never be removed.** `DELETE /hub/metrics/series/{key}` answers `409 SERIES_NOT_EMPTY` with `details.count`, and there was no route to delete samples. The backend added both routes, and probing them fixed the behaviour in detail:
 
 ```
-DELETE /hub/metrics/samples?series={key}[&before={ts}]   → 204, {deleted: n}
-GET    /hub/metrics/series/{key}                          → 200 / 404 (single declaration)
+DELETE /hub/metrics/samples?series={key}[&before={ts}]  → 200 {ok, series, before, deleted: n}
+GET    /hub/metrics/series/{key}                         → 200 {ok, item} / 404 NOT_FOUND
 ```
 
-Until then, purging a series with data needs SQL, which is why the verification probes above clean up by prefix (`where series like 'probe.%'`).
+* `series` is **mandatory** — a call without it is refused `VALIDATION_ERROR`, which is the difference between a delete and a wipe.
+* Idempotent: a second call answers `deleted: 0`, so a retry after a timeout cannot report a failure someone would act on.
+* `before` filters on **`ts`**, not on `slot` — a sample written without `ts` gets the server's clock, so it is never older than a cutoff just because its slot says so.
 
-5. **GAP — the tool catalogue's `kind` enum is closed, so `jarvis_metrics` cannot be attached to an agent yet.** The relay can already EXECUTE a `metrics` tool (`web/server/metrics-tool.mjs`, reachable over `POST /api/tool`, 39/39 in `glasses/tools/metrics-tool-sim.mjs`), but an agent's toolset is `roster.tools.filter(t => agent.toolIds.includes(t.id))` — resolved against the hub catalogue and nothing else — so a tool the catalogue will not hold is a tool no agent can call. `POST /hub/tools` answers:
+The relay now deletes in the only order that works — readings first, then the declaration — and only when asked: `DELETE /api/metrics/series/{key}?purge=1`. Without `purge` it answers `409` with the count, and the Data tab turns that into a second, narrower question ("delete those N readings as well?"). Destroying history has to be an answer the wearer gave, not a side effect of pressing delete.
 
-```
-400 INVALID_ENUM  kind: unsupported value "metrics"
-    allowed: web, tavily, http, jev, files, todo, docs, notes, location
-```
-
-One entry on that list unblocks it:
+5. **GAP (CLOSED 2026-11-09) — the tool catalogue's `kind` enum was closed, so `jarvis_metrics` could not be attached to an agent.** `POST /hub/tools` refused `kind: "metrics"` with `400 INVALID_ENUM` against a list of nine, and a run resolves an agent's toolset as `roster.tools.filter(t => agent.toolIds.includes(t.id))` — against the hub catalogue and nothing else — so no agent could hold a tool the catalogue would not store. The backend added `metrics` to that enum, and the tool is now live:
 
 ```
-POST /hub/tools  { "name": "jarvis_metrics", "kind": "metrics", "rev": <rev> }
+metrics   58df5769-2255-4fd4-8b01-c854f026a12b   jarvis_metrics
 ```
 
-`scripts/agent-metrics-tool.mjs` does exactly that, then attaches the tool to eight agents (writers: SG Banks Desk, AI Equities Desk, Singapore Weather, AI Model Tracker, Fleet Auditor; readers: Watchkeeper, Brief Composer, Daily Run Orchestrator) and verifies by re-reading the roster. It stops with this message rather than half-applying. The web UI's *Dashboard numbers* chip reports the same refusal in the agent editor instead of appearing to do nothing.
+`scripts/agent-metrics-tool.mjs --apply` created the row and attached it to eight agents, then verified by **re-reading the roster** rather than trusting the writes: writers SG Banks Desk, AI Equities Desk, Singapore Weather, AI Model Tracker, Fleet Auditor; readers Watchkeeper, Brief Composer, Daily Run Orchestrator. Each also got a guidance block, because an attached tool with no instruction is one the model has no reason to reach for — and the block states the two rules that matter (use the keys `list` returns, never invent one; if nothing is declared, say so instead of guessing).
+
+Jarvis himself did not have to wait for any of this: `metrics.act` reaches the same relay runner over `POST /api/tool`, which is why the wearer could already ask "what is DBS at" before the enum moved.
 
 ---
 
@@ -290,7 +291,7 @@ POST /hub/tools  { "name": "jarvis_metrics", "kind": "metrics", "rev": <rev> }
 
 1. **`metric.write` as an agent tool**, so an LLM can store a reading it computed. It must go through the same validation — a model must never be able to widen a series' shape.
 
-   **BUILT, blocked only on constraint 5 above.** `web/server/metrics-tool.mjs` offers `list | read | write` and deliberately no `declare`; writes are validated by the store and its refusals are passed through verbatim, so a model cannot be told one thing by the tool and another by the endpoint; reads are bounded at 240 points and say when they were truncated. The schema is offered to a run by `toolSchemaFor` and executed by `runTool`, which is the same pair every other built-in uses — no second dispatcher.
+   **BUILT AND LIVE.** `web/server/metrics-tool.mjs` offers `list | read | write` and deliberately no `declare`; writes are validated by the store and its refusals are passed through verbatim, so a model cannot be told one thing by the tool and another by the endpoint; reads are bounded at 240 points and say when they were truncated. The schema is offered to a run by `toolSchemaFor` and executed by `runTool`, which is the same pair every other built-in uses — no second dispatcher. Attached to eight agents via `scripts/agent-metrics-tool.mjs`, and Jarvis has it as `metrics.act`.
 2. **Downsampling with a declared policy** (`mean`/`last`/`min`/`max` per series) once a chart has more points than pixels.
 3. **Anomaly flags on the sample** (`{z: 3.1}`) written by the collector, so the dashboard can mark a spike without recomputing history in the browser.
 4. **A `metric_alert` table** — "tell me when this crosses X". That is the first thing that turns a dashboard into something you act on, and it belongs here rather than in the cron document.

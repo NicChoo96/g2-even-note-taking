@@ -3840,16 +3840,24 @@ const server = createServer(async (req, res) => {
       });
       return;
     }
+    // `?purge=1` is the wearer answering "yes, delete its readings too". It is a
+    // query flag rather than the default because the hub refuses to drop a series
+    // that still holds samples, and turning that refusal into silent data
+    // destruction would be the wrong way to make a delete button feel responsive.
+    const purge = url.searchParams.get('purge') === '1';
     if (metricsRemote) {
-      const removed = await metricsRemote.remove(key);
-      if (!removed.ok) {
-        // The hub will not delete a series that still holds readings and offers no
-        // route to delete them. Say exactly that rather than "failed".
+      const removed = await metricsRemote.remove(key, { purge });
+      if (!removed.ok && !removed.notFound) {
+        // Two distinct answers now: "it still has readings, say so with the count"
+        // and "the hub refused". The first is a question for the page, the second
+        // is a fault — the old message ("has no route to delete them") described
+        // the backend as incapable, which stopped being true.
         json(res, removed.notEmpty ? 409 : 502, {
           ok: false,
+          code: removed.notEmpty ? 'SERIES_NOT_EMPTY' : 'HUB_REFUSED',
+          ...(removed.notEmpty ? { count: removed.count } : {}),
           error: removed.notEmpty
-            ? `the hub still holds ${removed.count} reading(s) for "${key}" and has no route to delete them, ` +
-              'so the series cannot be removed yet'
+            ? `"${key}" still holds ${removed.count} reading(s) — delete those too to remove the series`
             : removed.error || 'the hub refused the delete',
         });
         return;
@@ -3857,13 +3865,16 @@ const server = createServer(async (req, res) => {
       delete metricStore.series[key];
       delete metricStore.samples[key];
       saveMetrics();
-      json(res, 200, await metricsPayload());
+      // `deleted` is reported so the page can say "removed, and 12 readings with
+      // it" instead of implying the history is still there.
+      json(res, 200, { ...(await metricsPayload()), deleted: removed.deleted ?? 0 });
       return;
     }
+    const had = (metricStore.samples[key] ?? []).length;
     delete metricStore.series[key];
     delete metricStore.samples[key];
     saveMetrics();
-    json(res, 200, await metricsPayload());
+    json(res, 200, { ...(await metricsPayload()), deleted: had });
     return;
   }
 

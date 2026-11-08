@@ -135,9 +135,19 @@ if (!metricsTool) {
     }),
   });
   if (created.ok) {
-    metricsTool = created.body?.tool ?? created.body;
-    console.log(`Created the catalogue tool ${TOOL_NAME} (${metricsTool?.id ?? 'id unknown'}).\n`);
+    // The create's own body is not the authority on the id: the first version
+    // read `body.tool ?? body` and reported "created, id unknown" against a live
+    // 201 whose row was nested under `item`. So the ROSTER is re-read and the row
+    // found by kind — the same rule the verify step at the bottom uses, and the
+    // only one that cannot disagree with what a run will resolve.
     roster = await json(`${prefix}/agents`);
+    metricsTool = (roster.body?.tools ?? []).find((t) => t.name === TOOL_NAME || t.kind === 'metrics');
+    if (!metricsTool?.id) {
+      console.error('FAILED: the create answered 2xx but the catalogue has no metrics tool.');
+      console.error(`  response: ${String(created.text ?? '').slice(0, 300)}`);
+      process.exit(2);
+    }
+    console.log(`Created the catalogue tool ${TOOL_NAME} (${metricsTool.id}).\n`);
   } else if (created.body?.code === 'INVALID_ENUM') {
     // Honest stop. Half-applying this would attach an id the catalogue does not
     // have, and the agent would run with a tool it cannot call.

@@ -15,11 +15,23 @@
 //   3. A batch where NOTHING was accepted answers `400` with `details.rejected`,
 //      not `200` with per-item results. That is not a transport failure and must
 //      be read as per-item outcomes, or one bad row looks like an outage.
-//   4. `DELETE /series/{key}` refuses while samples exist (`409 SERIES_NOT_EMPTY`)
-//      and there is no route to delete samples. A series with data therefore
-//      cannot be removed through the API at all; that is reported, never retried.
+//   4. `source` holds at most 500 characters — measured by sending 200/500/1000/
+//      2000 and reading the per-item reason, which said so by name at 1000. It
+//      was 32 when this module was written, and the truncation that field forced
+//      is now only a guard against an absurd URL rather than the normal case.
+//   5. A series with readings needs its samples deleted FIRST: `DELETE /series/`
+//      answers `409 SERIES_NOT_EMPTY`. `DELETE /samples?series=` (idempotent, and
+//      only ever scoped to a named series) makes that possible, so `remove` can
+//      purge when the wearer asked for it — and must not purge when they did not.
 //
 // Zero dependencies.
+
+// ONE cap, owned by the store: a transport with its own copy is how 300 and 500
+// came to disagree in the first place. Re-exported so a caller (and the harness)
+// can ask this module what the wire limit is.
+import { SOURCE_MAX } from './metrics.mjs';
+
+export { SOURCE_MAX };
 
 /** `2026-11-09 09:00` → `2026-11-09T09:00`. The wire forbids the space. */
 export function toWireSlot(slot) {
@@ -35,16 +47,13 @@ export function fromWireSlot(slot) {
   return text.replace('T', ' ');
 }
 
-/** The hub's `source` column holds at most 32 characters (probed, not guessed). */
-export const SOURCE_MAX = 32;
-
 /**
- * A URL squeezed into the hub's provenance field.
+ * A URL fitted into the hub's provenance field.
  *
  * Host first, because the host is what identifies the source; the path is the
- * part that has to give when the field runs out. A silent 300-char send is
- * rejected outright (`samples[0].source must be at most 32 characters`), which
- * takes the whole reading down over a cosmetic field.
+ * part that has to give when the field runs out. An oversized send is rejected
+ * outright, which takes the whole reading down over a cosmetic field — so this
+ * stays a guard even though 500 characters now fits every real URL.
  */
 export function shortSource(source) {
   const text = String(source ?? '').trim();
@@ -140,6 +149,30 @@ export function createMetricsRemote({ baseUrl, token, fetchImpl = fetch, timeout
     }
   }
 
+  /**
+   * Delete readings for ONE series.
+   *
+   * `series` is mandatory on the route — a call without it is refused
+   * (`VALIDATION_ERROR`), which is the difference between a delete and a wipe.
+   * Idempotent: a second call answers `deleted: 0`, so a retry after a timeout
+   * cannot report a failure the wearer would act on.
+   *
+   * A closure rather than a method on the returned object, because `remove`
+   * below calls it: `this.removeSamples(...)` would break the moment a caller
+   * destructures the client, and that is exactly the kind of bug that only shows
+   * up in the one code path nobody exercises.
+   */
+  async function removeSamples(series, before) {
+    const qs = new URLSearchParams({ series: String(series) });
+    if (Number.isFinite(Number(before)) && Number(before) > 0) {
+      qs.set('before', String(Math.floor(Number(before))));
+    }
+    const res = await call('DELETE', `/samples?${qs.toString()}`);
+    if (res.status === 200) return { ok: true, deleted: Number(res.body?.deleted) || 0 };
+    if (res.status === 404) return { ok: false, notFound: true, deleted: 0, error: reasonOf(res) };
+    return { ok: false, deleted: 0, error: reasonOf(res), status: res.status };
+  }
+
   return {
     baseUrl: base,
 
@@ -227,18 +260,55 @@ export function createMetricsRemote({ baseUrl, token, fetchImpl = fetch, timeout
     },
 
     /**
+     * One declaration, or a clean "not found".
+     *
+     * Worth its own call now that the route exists: a 404 here is a fact ("this
+     * series is gone"), not an error string to be pattern-matched, and the
+     * delete flow needs to tell those apart.
+     */
+    async get(key) {
+      const res = await call('GET', `/series/${encodeURIComponent(String(key))}`);
+      if (res.status === 200) return { ok: true, series: fromWireSeries(res.body?.item) };
+      if (res.status === 404) return { ok: false, notFound: true, error: reasonOf(res) };
+      return { ok: false, error: reasonOf(res), status: res.status };
+    },
+
+    /**
+     * Delete readings for ONE series.
+     *
+     * `series` is mandatory on the route — a call without it is refused
+     * (`VALIDATION_ERROR`), which is the difference between a delete and a wipe.
+     * Idempotent: a second call answers `deleted: 0`, so a retry after a timeout
+     * cannot report a failure the wearer would act on.
+     */
+    removeSamples,
+
+    /**
      * Remove a declaration.
      *
-     * `notEmpty` carries the count, because the only honest next step is "delete
-     * the readings first" — and there is no route that can. Reported, not retried.
+     * The hub will not drop a series that still holds readings. `purge` is the
+     * wearer's explicit answer to "delete its N readings as well?" — and it is
+     * opt-in rather than automatic, because silently destroying history to
+     * satisfy a delete is not a favour. Without it, `notEmpty` carries the count
+     * so the page can ask.
      */
-    async remove(key) {
-      const res = await call('DELETE', `/series/${encodeURIComponent(key)}`);
-      if (res.status === 204) return { ok: true };
+    async remove(key, { purge = false } = {}) {
+      const k = String(key);
+      let deleted = 0;
+      if (purge) {
+        const wiped = await removeSamples(k);
+        if (!wiped.ok && !wiped.notFound) {
+          return { ok: false, deleted: 0, error: `could not delete the readings first: ${wiped.error}` };
+        }
+        deleted = wiped.deleted;
+      }
+      const res = await call('DELETE', `/series/${encodeURIComponent(k)}`);
+      if (res.status === 204 || res.status === 200) return { ok: true, deleted };
       if (res.body?.code === 'SERIES_NOT_EMPTY') {
         return { ok: false, notEmpty: true, count: Number(res.body?.details?.count) || 0, error: res.body?.error };
       }
-      return { ok: false, error: reasonOf(res), status: res.status };
+      if (res.status === 404) return { ok: false, notFound: true, deleted, error: reasonOf(res) };
+      return { ok: false, error: reasonOf(res), status: res.status, deleted };
     },
   };
 }

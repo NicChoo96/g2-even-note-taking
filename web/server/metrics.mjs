@@ -30,6 +30,17 @@ export const SERIES_TYPES = new Set(['number', 'string']);
 export const DEFAULT_RETENTION = 2000;
 export const MAX_RETENTION = 20000;
 
+/**
+ * How much of a URL the store keeps as provenance.
+ *
+ * The hub's column accepts 500 — measured by sending 500 (stored verbatim) and
+ * 1000 (refused, naming the limit). This was 300, a guess made while the hub
+ * still capped the field at 32; every reading kept only the front of its URL as a
+ * result. One constant, exported so the transport clips at the same limit the
+ * store keeps, instead of two numbers that drift.
+ */
+export const SOURCE_MAX = 500;
+
 const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 
 /**
@@ -65,7 +76,7 @@ export function normaliseSeries(input) {
       unit,
       precision: normalisePrecision(input.precision, type),
       cadence: String(input.cadence ?? '').trim().slice(0, 24),
-      source: String(input.source ?? '').trim().slice(0, 200),
+      source: String(input.source ?? '').trim().slice(0, SOURCE_MAX),
       retention,
     },
   };
@@ -121,7 +132,7 @@ export function normaliseSample(input, series, now = Date.now()) {
       ts,
       value,
       ...(slot ? { slot } : {}),
-      source: String(input.source ?? series.source ?? '').slice(0, 300),
+      source: String(input.source ?? series.source ?? '').slice(0, SOURCE_MAX),
       runId: String(input.runId ?? '').slice(0, 40),
     },
   };

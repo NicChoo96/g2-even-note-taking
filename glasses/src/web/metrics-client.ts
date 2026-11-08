@@ -115,15 +115,34 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 }
 
 /** Remove a series and its samples. Refused by the relay while a collector uses it. */
-export async function deleteSeries(key: string): Promise<MetricsState | { ok: false; error: string }> {
+/**
+ * Delete a series.
+ *
+ * `purge` deletes its READINGS too. That is a separate decision on purpose: the
+ * hub refuses to drop a series that still holds samples, and the page must ask
+ * rather than assume — a delete button that silently destroys history is worse
+ * than one that says what it will do. The refusal comes back as `count`, which
+ * is what the confirm message is built from.
+ *
+ * The success and failure shapes are a discriminated union on `ok` (spelled
+ * `true`/`false`, not `boolean`) so the caller can read `count` without an `in`
+ * check that TypeScript cannot narrow through.
+ */
+export type DeleteSeriesResult =
+  | (Omit<MetricsState, 'ok'> & { ok: true; deleted?: number })
+  | { ok: false; error: string; count?: number };
+
+export async function deleteSeries(key: string, purge = false): Promise<DeleteSeriesResult> {
   try {
-    const res = await fetch(`${API_BASE}/api/metrics/series/${encodeURIComponent(key)}`, {
-      method: 'DELETE',
-      headers: authHeaders(),
-    });
-    const parsed = (await res.json().catch(() => ({}))) as MetricsState & { error?: string };
-    if (!res.ok) return { ok: false, error: parsed?.error || `HTTP ${res.status}` };
-    return parsed;
+    const res = await fetch(
+      `${API_BASE}/api/metrics/series/${encodeURIComponent(key)}${purge ? '?purge=1' : ''}`,
+      { method: 'DELETE', headers: authHeaders() },
+    );
+    const parsed = (await res.json().catch(() => ({}))) as MetricsState & { error?: string; count?: number };
+    if (!res.ok) {
+      return { ok: false, error: parsed?.error || `HTTP ${res.status}`, ...(parsed?.count ? { count: parsed.count } : {}) };
+    }
+    return { ...parsed, ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
