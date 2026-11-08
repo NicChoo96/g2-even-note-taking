@@ -137,6 +137,18 @@ import {
 // matters here, because the bug it exists for is a CLAIM rather than a throw:
 // nothing errors, and the transcript looks healthy either way.
 import { auditRunClaims } from './run-claims.mjs';
+// …and the HARD gate that decides whether a claimed write actually happened, by
+// asking the document store for the two facts prose cannot fake: a new document,
+// or a higher version. Pure, so every branch is asserted without a server.
+import {
+  PUBLISH_RETRY_INSTRUCTION,
+  PUBLISH_RETRY_TURNS,
+  hasPendingPublish,
+  looksLikePublishAsk,
+  missingToolNotice,
+  publishVerdict,
+  storeIndex,
+} from './publish-gate.mjs';
 // The DOCUMENT ORIGIN — where untrusted, agent-authored pages are framed from
 // when that must not be this app's own origin. See its header for why a sandbox
 // on this origin can be neither relaxed, circumvented from inside, nor avoided
@@ -930,6 +942,113 @@ async function confirmedWrite(client, doc, runName, signal) {
     const why = err instanceof Error ? err.message : String(err);
     return `${rendered} WARNING: could not read it back (${why}), so this write is UNCONFIRMED.`;
   }
+}
+
+/**
+ * The document store as a comparable index, for the publish gate.
+ *
+ * Reads the store over its own API — the same one the Files page uses — so the
+ * answer to "did this run write anything" comes from the place the wearer will
+ * look, not from the run's own transcript. Never throws: a store that is down has
+ * to be reported as a REASON the check failed, not as a reason to skip it.
+ */
+async function storeSnapshot(signal) {
+  const { client, error } = filesRuntime();
+  if (!client) return { index: null, error: error || 'the document store is not configured' };
+  try {
+    // Wider than the tool's own page, because the document this run wrote may not
+    // be at the very top if another device wrote in the same moment.
+    const list = await client.list({ limit: 100, signal });
+    return { index: storeIndex(list), error: '' };
+  } catch (err) {
+    return { index: null, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Do not let a run finish while it claims a write the store cannot show.
+ *
+ * THIS IS THE HARD GATE. The earlier fix compared the answer to the transcript,
+ * which cannot catch the case that actually happens — a model that never calls
+ * the tool, so nothing contradicts it. This one asks the store, and it has three
+ * outcomes, all of which the wearer can act on:
+ *
+ *   confirmed    a new document or a higher version appeared during the run →
+ *                the run finishes, and the transcript records what was proved.
+ *   retry        the claim is unprovable and turns remain → the run is re-asked
+ *                to publish, with the store's own verdict as the instruction.
+ *   fail         still unprovable after the retries → the RUN FAILS. This is the
+ *                whole point: a fabricated success has to look like a failure,
+ *                not like a paragraph the wearer has to remember to distrust.
+ *
+ * A run that claims nothing is untouched, which is what keeps the gate worth
+ * reading when it does speak.
+ */
+async function settlePublish(ctx) {
+  const { run, wire, schemas, offered, signal, hasStoreTool, storeBefore, push } = ctx;
+  let text = ctx.text;
+
+  for (let attempt = 0; attempt <= PUBLISH_RETRY_TURNS; attempt++) {
+    if (run.status === 'stopped') return { ok: true, text, verified: false };
+    const after = hasStoreTool ? await storeSnapshot(signal) : { index: null, error: '' };
+    const verdict = publishVerdict({
+      text,
+      hasStoreTool,
+      before: storeBefore?.index ?? null,
+      after: after.index,
+      storeError: after.error || storeBefore?.error || '',
+      attemptsLeft: PUBLISH_RETRY_TURNS - attempt,
+      // A publish handed to the device runs after this loop, so the store
+      // genuinely has nothing yet and failing would punish a correct run.
+      pendingPublish: hasPendingPublish(run.messages),
+    });
+
+    if (verdict.outcome === 'deferred') {
+      push({ role: 'assistant', content: `[verify] ${verdict.reason}.`, at: Date.now() });
+      return { ok: true, text, verified: false };
+    }
+
+    if (verdict.outcome === 'confirmed') {
+      const evidence = verdict.evidence
+        .map((d) => `"${d.title || d.id}" v${d.version}`)
+        .join(', ');
+      push({ role: 'assistant', content: `[verified] in the document store: ${evidence}`, at: Date.now() });
+      return { ok: true, text, verified: true };
+    }
+    if (verdict.outcome === 'not-claimed') return { ok: true, text, verified: false };
+    if (verdict.outcome === 'fail') return { ok: false, reason: verdict.reason };
+
+    // ── retry ────────────────────────────────────────────────────────────
+    // Recorded in the transcript so the re-ask is visible: a run that silently
+    // spends two more turns trying again is a run the wearer cannot explain.
+    push({ role: 'assistant', content: `[verify] ${verdict.reason}; asking the run to publish.`, at: Date.now() });
+    wire.push({ role: 'user', content: PUBLISH_RETRY_INSTRUCTION });
+    const { content, toolCalls } = await llmOnce(run.model, wire, schemas, signal);
+    if (!toolCalls.length) {
+      // The model answered instead of publishing. Take its words and re-verify —
+      // a model that now says "I could not publish" must not be failed for it.
+      text = answerText(content) || text;
+      continue;
+    }
+    wire.push({ role: 'assistant', content, tool_calls: toolCalls });
+    for (const call of toolCalls) {
+      if (run.status === 'stopped') return { ok: true, text, verified: false };
+      const name = call?.function?.name ?? '';
+      const rawArgs = call?.function?.arguments ?? '{}';
+      const tool = (offered ?? []).find((t) => t.name === name);
+      const result = tool
+        ? await runToolOnce(tool, rawArgs, signal, { runId: run.id, run })
+        : `tool error: ${name} is not available for this request`;
+      wire.push({ role: 'tool', content: result, tool_call_id: call.id });
+      push({ role: 'tool', content: result, tool: name, at: Date.now() });
+    }
+  }
+
+  return {
+    ok: false,
+    reason:
+      'the document store shows no new or updated document from this run, so the publish did not happen',
+  };
 }
 
 async function runFilesTool(tool, args, signal) {
@@ -2211,6 +2330,22 @@ async function executeRun(run) {
       });
     }
     const budget = agentStepBudget();
+    // ── THE PUBLISH GATE, part 1 of 3: what the store looked like BEFORE ──────
+    // Taken only when the agent actually holds a store tool, because a run that
+    // cannot write has nothing to compare and the gate answers from the tool list
+    // alone. One list call per such run, and it is the only way to tell a document
+    // THIS run wrote from one that was already there.
+    const hasStoreTool = run.tools.some((t) => isFilesTool(t));
+    const storeBefore = hasStoreTool ? await storeSnapshot(ac.signal) : { index: null, error: '' };
+    // Part 2: tell the model the truth BEFORE it writes prose. An agent with no
+    // store tool cannot publish, and the sentence has to arrive while the model is
+    // still deciding what to say — a correction afterwards is read by nobody.
+    // Only for asks that look like they want a document, so an ordinary to-do run
+    // is not handed a capability notice it has no use for.
+    if (!hasStoreTool && looksLikePublishAsk(`${run.prompt ?? ''} ${resolved.text}`)) {
+      wire.push({ role: 'user', content: missingToolNotice() });
+      push({ role: 'assistant', content: `[tools] ${missingToolNotice()}`, at: Date.now() });
+    }
     // 0 means unlimited: the loop runs until the model answers, the wearer stops
     // it, something throws, or the progress guard below trips.
     const turnLimit = budget > 0 ? budget : Number.POSITIVE_INFINITY;
@@ -2231,12 +2366,31 @@ async function executeRun(run) {
         // was not offered. Do not end the run on it — fall through to the
         // summariser, which re-asks without any tool scaffolding.
         if (!answer && content.trim()) break;
+        // Part 3: nothing is shown, and the run is not `done`, until the store
+        // agrees. A claim it cannot prove fails the run (retrying first), which is
+        // the difference between "a paragraph you have to distrust" and "a run
+        // that visibly failed".
+        const settled = await settlePublish({
+          run,
+          text: answer || '(no answer)',
+          wire,
+          schemas,
+          offered,
+          signal: ac.signal,
+          hasStoreTool,
+          storeBefore,
+          push,
+        });
+        if (!settled.ok) {
+          failRun(run, new Error(settled.reason));
+          return;
+        }
         run.messages.push({
           role: 'assistant',
           // The answer is checked against this run's OWN tool results before it
           // is shown. A claim of a write the transcript cannot prove gains one
           // correction sentence rather than being deleted — see ./run-claims.mjs.
-          content: auditRunClaims(answer, run.messages).text || '(no answer)',
+          content: auditRunClaims(settled.text, run.messages).text || '(no answer)',
           at: Date.now(),
         });
         run.status = 'done';
@@ -2340,10 +2494,30 @@ async function executeRun(run) {
       [],
       ac.signal,
     );
+    const summary = (
+      await settlePublish({
+        run,
+        text: answerText(content),
+        wire,
+        schemas,
+        offered,
+        signal: ac.signal,
+        hasStoreTool,
+        storeBefore,
+        push,
+      })
+    );
+    // The gate governs this path too. A summarised run that claims a publish the
+    // store cannot show is a failed run, exactly like the direct-answer path —
+    // otherwise "ran out of turns" would be an escape hatch around the gate.
+    if (!summary.ok) {
+      failRun(run, new Error(summary.reason));
+      return;
+    }
     run.messages.push({
       role: 'assistant',
       content:
-        auditRunClaims(answerText(content), run.messages).text ||
+        auditRunClaims(summary.text, run.messages).text ||
         'I gathered results but could not finish the summary. Try a simpler prompt.',
       at: Date.now(),
     });

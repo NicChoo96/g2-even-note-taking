@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.59
+
+v0.3.59 - A run cannot say it saved a page that is not there
+
+- After a run says it published something, the app now asks the document store whether a new page, or a newer version, really appeared. Nothing counts as saved until the store agrees.
+- If the store shows nothing, the run is asked to publish again. If it still shows nothing, the run is marked failed and says why.
+- An agent with no Files tool is told so before it writes, so it cannot claim a publish.
+
 ## 0.3.58
 
 v0.3.58 - Docs is a list you can search, newest first
