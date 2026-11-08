@@ -2568,3 +2568,125 @@ p.empty {
   }
 }
 
+
+/* ── Docs: a library list beside the editor ────────────────────────────────
+   The page used to be a wall of title chips above one textarea. With twenty-odd
+   long, similar titles that is unreadable and, worse, unsearchable: the words
+   that tell two docs apart are in their bodies, and a chip can only show a
+   title. So it now has the same master/detail shape as Agents — a list you can
+   filter on the left, the doc you picked on the right.
+
+   Newest first is a PROPERTY OF THE LIST, not of the store: the store keeps
+   insertion order because the glasses read it that way. */
+.docs-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.docs-split {
+  display: grid;
+  /* MOBILE FIRST: one pane, in the order you need it — find a doc, then edit it.
+     The two-column split is a `min-width` upgrade below, so a phone never
+     inherits a desktop grid it has to undo. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  min-width: 0;
+}
+
+.docs-master,
+.docs-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Grid children default to min-content width, which is how a long title pushes
+   a pane wider than its box. Every child here must be allowed to shrink. */
+.docs-master > *,
+.docs-detail > * {
+  min-width: 0;
+}
+
+.docs-filter {
+  width: 100%;
+}
+
+.doc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Stacked panes: the list is a PICKER, so cap it and keep the editor — the
+     thing you actually type into — near the top of the page. */
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.doc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 48px: the same tap height as an agent row, so a phone target is real. */
+  min-height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-2);
+  padding: 4px 6px;
+}
+
+.doc-row.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.doc-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  padding: 8px;
+  cursor: pointer;
+}
+
+/* One line, ellipsised. A wrapped title makes every row a different height and
+   the list becomes a wall again. */
+.doc-name {
+  max-width: 100%;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.docs-detail .doc-textarea {
+  min-height: 320px;
+}
+
+@media (min-width: 861px) {
+  .docs-split {
+    grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
+    gap: 20px;
+  }
+
+  .doc-list {
+    max-height: none;
+    overflow: visible;
+  }
+}

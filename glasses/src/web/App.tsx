@@ -28,6 +28,7 @@ import {
 } from '../store';
 import type { ConnStatus } from '../store';
 import { activeDoc, type HubState, type SectionId } from '../types';
+import { docWords, filterDocs, orderDocs, whenLabel } from './doc-list';
 import { ThemeToggle } from './ThemeToggle';
 
 const SECTION_LABELS: Record<SectionId, string> = {
@@ -71,6 +72,10 @@ export default function App() {
   const conn = useConn();
   const { authed, email, inEvenApp, signOut } = useAuth();
   const [newTask, setNewTask] = useState('');
+  // Filter for the Docs master list. Kept here rather than in the store: it is a
+  // view of the list, not a property of the library, so it must not sync to the
+  // glasses or to another device.
+  const [docQuery, setDocQuery] = useState('');
   /** Local tab override — lets Settings show without changing the glasses section. */
   const [tab, setTab] = useState<Tab | null>(null);
   const activeTab: Tab = tab ?? state.activeSection;
@@ -111,6 +116,13 @@ export default function App() {
   // ── Docs library (multiple named docs, auto-saved + synced through the hub) ─
   const docs = state.sections.docs;
   const active = activeDoc(state);
+
+  /**
+   * Newest first, and filterable by title or body — both rules live in
+   * ./doc-list so a harness can drive them without a React tree.
+   */
+  const orderedDocs = orderDocs(docs);
+  const visibleDocs = filterDocs(orderedDocs, docQuery);
 
   const selectDoc = (id: string) => storeSelectDoc(id);
 
@@ -162,12 +174,14 @@ export default function App() {
 
   return (
     // `app-wide` widens the shell for the two-pane tabs: Agents (master list +
-    // editor), Jarvis (live timeline + action catalog) and Files (document list
-    // + sandboxed preview). The 760px reading width that suits notes/docs would
-    // squeeze all three.
+    // editor), Jarvis (live timeline + action catalog), Files (document list +
+    // sandboxed preview) and now Docs (library + editor). The 760px reading
+    // width that suits notes would squeeze all four.
     <div
       className={`app${
-        activeTab === 'agents' || activeTab === 'jarvis' || activeTab === 'files' ? ' app-wide' : ''
+        activeTab === 'agents' || activeTab === 'jarvis' || activeTab === 'files' || activeTab === 'docs'
+          ? ' app-wide'
+          : ''
       }`}
     >
       <header className="app-header">
@@ -282,66 +296,104 @@ export default function App() {
         )}
 
         {activeTab === 'docs' && (
-          <div className="docs-manager">
+          <div className="docs-panel">
             <div className="panel-label">
-              Docs library · auto-saved to storage & synced to all your devices
+              Docs library · newest first · auto-saved to storage & synced to all your devices
             </div>
 
             {docs.length === 0 ? (
               <div className="empty">No docs yet — create one to start writing.</div>
             ) : (
-              <>
-                <div className="doc-tabs" role="tablist" aria-label="Documents">
-                  {docs.map((d) => (
-                    <button
-                      key={d.id}
-                      role="tab"
-                      aria-selected={active?.id === d.id}
-                      className={active?.id === d.id ? 'doc-chip active' : 'doc-chip'}
-                      onClick={() => selectDoc(d.id)}
-                      title={d.title || '(untitled)'}
-                    >
-                      {d.title || '(untitled)'}
-                    </button>
-                  ))}
+              <div className="docs-split">
+                {/* ── master: the whole library, newest first ─────────────── */}
+                <div className="docs-master">
+                  <input
+                    className="docs-filter"
+                    value={docQuery}
+                    onChange={(e) => setDocQuery(e.target.value)}
+                    placeholder="Filter by title or text…"
+                    aria-label="Filter docs"
+                  />
+                  <ul className="doc-list" aria-label="Documents">
+                    {visibleDocs.length === 0 && (
+                      <li className="empty">No doc matches “{docQuery.trim()}”.</li>
+                    )}
+                    {visibleDocs.map((d) => {
+                      const words = docWords(d);
+                      return (
+                        <li key={d.id} className={active?.id === d.id ? 'doc-row active' : 'doc-row'}>
+                          <button className="doc-pick" onClick={() => selectDoc(d.id)}>
+                            <span className="doc-name">{d.title || '(untitled)'}</span>
+                            <span className="doc-meta">
+                              {whenLabel(d.updatedAt)}
+                              {words > 0 ? ` · ${words}w` : ' · empty'}
+                            </span>
+                          </button>
+                          <button
+                            className="icon-btn danger"
+                            onClick={() => deleteDoc(d.id)}
+                            aria-label={`Delete ${d.title || 'doc'}`}
+                            title="Delete doc"
+                          >
+                            ✕
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <button className="primary" onClick={createDoc}>
+                    + New doc
+                  </button>
                 </div>
 
-                {active && (
-                  <div className="doc-title-row">
-                    <input
-                      className="doc-title-input"
-                      value={active.title}
-                      onChange={(e) => renameActiveDoc(e.target.value)}
-                      placeholder="Doc title…"
-                    />
-                    <button
-                      className="icon-btn danger"
-                      onClick={() => deleteDoc(active.id)}
-                      aria-label="Delete doc"
-                      title="Delete doc"
-                    >
-                      🗑
-                    </button>
-                  </div>
-                )}
+                {/* ── detail: the one doc you picked ──────────────────────── */}
+                <div className="docs-detail">
+                  {!active ? (
+                    <p className="empty">Pick a doc on the left, or create one.</p>
+                  ) : (
+                    <>
+                      <div className="doc-title-row">
+                        <input
+                          className="doc-title-input"
+                          value={active.title}
+                          onChange={(e) => renameActiveDoc(e.target.value)}
+                          placeholder="Doc title…"
+                        />
+                        <button
+                          className="icon-btn danger"
+                          onClick={() => deleteDoc(active.id)}
+                          aria-label="Delete doc"
+                          title="Delete doc"
+                        >
+                          🗑
+                        </button>
+                      </div>
+                      <p className="hint-line">
+                        {whenLabel(active.updatedAt)} · {docWords(active)} words
+                      </p>
 
-                <div className="field-toolbar">
-                  <MicButton onText={appendToActiveDoc} hint="Speak → appends to this doc" />
+                      <div className="field-toolbar">
+                        <MicButton onText={appendToActiveDoc} hint="Speak → appends to this doc" />
+                      </div>
+                      <textarea
+                        className="doc-textarea"
+                        value={active.content}
+                        onChange={(e) => setActiveDocContent(e.target.value)}
+                        placeholder="Start writing… saved automatically and streamed live to your glasses."
+                      />
+                    </>
+                  )}
                 </div>
-                <textarea
-                  className="doc-textarea"
-                  value={active?.content ?? ''}
-                  onChange={(e) => setActiveDocContent(e.target.value)}
-                  placeholder="Start writing… saved automatically and streamed live to your glasses."
-                />
-              </>
+              </div>
             )}
 
-            <div className="docs-actions">
-              <button className="primary" onClick={createDoc}>
-                + New doc
-              </button>
-            </div>
+            {docs.length === 0 && (
+              <div className="docs-actions">
+                <button className="primary" onClick={createDoc}>
+                  + New doc
+                </button>
+              </div>
+            )}
           </div>
         )}
 

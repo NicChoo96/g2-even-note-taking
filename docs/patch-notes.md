@@ -2,6 +2,14 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.58
+
+v0.3.58 - Docs is a list you can search, newest first
+
+- The Docs page is now a list beside the page you are reading, instead of a wall of titles above it. Each row says how recently it changed and how long it is.
+- The filter searches titles and the text inside every document, so the words that tell two similar pages apart now find them.
+- Newest first: whatever you touched last is at the top.
+
 ## 0.3.57
 
 v0.3.57 - Runs finish the job, and cannot claim a save that did not happen
