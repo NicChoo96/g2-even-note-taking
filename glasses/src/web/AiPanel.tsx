@@ -212,9 +212,9 @@ export function AiPanel() {
             : ai.mirrored
               ? ai.status === 'confirm'
                 ? 'On the glasses · tap to answer'
-                : `On the glasses · ${ai.turn}/${ai.maxSteps}`
+                : `On the glasses · ${ai.turn}${ai.maxSteps > 0 ? `/${ai.maxSteps}` : ''}`
               : ai.status === 'running'
-                ? `Working ${ai.turn}/${ai.maxSteps}`
+                ? `Working ${ai.turn}${ai.maxSteps > 0 ? `/${ai.maxSteps}` : ''}`
                 : ai.status === 'confirm'
                   ? 'Needs a tap'
                   : ai.status === 'done'
@@ -366,14 +366,14 @@ export function AiPanel() {
           <span>Max agent steps</span>
           <input
             type="number"
-            min={1}
-            max={12}
+            min={0}
+            max={200}
             value={settings.maxSteps}
             onChange={(e) =>
-              updateAiSettings({ maxSteps: Math.max(1, Math.min(12, Number(e.target.value) || 1)) })
+              updateAiSettings({ maxSteps: Math.max(0, Math.min(200, Number(e.target.value) || 0)) })
             }
           />
-          <em>currently {aiMaxSteps()}</em>
+          <em>{aiMaxSteps() > 0 ? `currently ${aiMaxSteps()}` : 'no limit'}</em>
         </div>
       </div>
     </div>

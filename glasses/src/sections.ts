@@ -897,7 +897,9 @@ function aiFeed(ai: AiState, opts: AiFeedOpts): AiFeed {
           ? engaged
             ? 'JARVIS · done'
             : 'JARVIS · said'
-          : `JARVIS · working ${Math.max(1, ai.turn)}/${Math.max(1, ai.maxSteps)}`;
+          : ai.maxSteps > 0
+            ? `JARVIS · working ${Math.max(1, ai.turn)}/${ai.maxSteps}`
+            : `JARVIS · working ${Math.max(1, ai.turn)}`;
   // The caller has already decided whether there is anything to watch — an empty
   // queue must not change the HUD at all, and a `confirm` prompt is the one
   // screen where nothing else may compete for attention, because its tap means

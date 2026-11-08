@@ -154,7 +154,29 @@ export function mirrorableStatus(status: unknown): status is AiStatus {
 
 const LS_KEY = 'hub:ai';
 
-const DEFAULT_SETTINGS: AiSettings = { enabled: true, model: '', maxSteps: 6 };
+/**
+ * How many model turns one spoken command may take.
+ *
+ * ZERO MEANS NO LIMIT, and it is the default. It was 6, then 12; both were guesses
+ * at how long a job takes, and a guess that is too small does not fail loudly —
+ * it stops the run mid-task and asks for a closing sentence, so a half-finished
+ * command answers like a finished one. On a cheap backend the better trade is to
+ * let the run finish and stop it for a reason about what it is DOING: the loop's
+ * own progress guard ends a run that repeats the same action, and the wearer can
+ * always Stop AI.
+ */
+const MAX_STEPS_DEFAULT = 0;
+/**
+ * The ceiling for a budget the wearer sets explicitly.
+ *
+ * High rather than abolished, because this value comes from localStorage and a
+ * number input: a stuck key or a pasted value should not be able to promise a
+ * million completions. 200 is far past any real command; `0` (the default) is
+ * how you ask for no limit at all.
+ */
+const MAX_STEPS_CEILING = 200;
+
+const DEFAULT_SETTINGS: AiSettings = { enabled: true, model: '', maxSteps: MAX_STEPS_DEFAULT };
 
 let state: AiState = {
   status: 'idle',
@@ -226,7 +248,7 @@ function loadSettings(): AiSettings {
       enabled: parsed.enabled !== false,
       model: typeof parsed.model === 'string' ? parsed.model : '',
       maxSteps:
-        typeof parsed.maxSteps === 'number' && parsed.maxSteps >= 1 && parsed.maxSteps <= 12
+        typeof parsed.maxSteps === 'number' && parsed.maxSteps >= 0 && parsed.maxSteps <= MAX_STEPS_CEILING
           ? Math.floor(parsed.maxSteps)
           : DEFAULT_SETTINGS.maxSteps,
     };
@@ -271,7 +293,8 @@ export function updateAiSettings(patch: Partial<AiSettings>): void {
   // number input can otherwise hand `maxSteps` a NaN/huge value, and one spoken
   // sentence would spend dozens of model turns before answering.
   if (!Number.isFinite(next.maxSteps)) next.maxSteps = DEFAULT_SETTINGS.maxSteps;
-  next.maxSteps = Math.max(1, Math.min(12, Math.floor(next.maxSteps)));
+  // 0 is a VALUE (no limit), not an out-of-range number to be pushed up to 1.
+  next.maxSteps = Math.max(0, Math.min(MAX_STEPS_CEILING, Math.floor(next.maxSteps)));
   if (typeof next.model !== 'string') next.model = '';
   state = { ...state, settings: next };
   persistSettings();

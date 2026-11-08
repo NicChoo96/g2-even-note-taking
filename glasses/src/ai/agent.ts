@@ -119,6 +119,19 @@ const MAX_STEP_CHARS = 240;
 const MAX_ANSWER_CHARS = 8000;
 
 /**
+ * How many times the same action, with the same arguments, may repeat before the
+ * run is stopped for going in circles.
+ *
+ * This is what ends an unlimited run. It is about PROGRESS rather than length: a
+ * model calling the same capability with byte-identical arguments has learned
+ * nothing between calls, so more turns cannot help it and can only cost money.
+ * Three rather than two, because one honest retry after a transient failure is a
+ * real pattern and repeating it once proves nothing.
+ */
+const MAX_IDENTICAL_CALLS = 3;
+
+
+/**
  * Actions this loop cannot function without. They lead the list, so an answer and
  * a way to another page are always the first two tools the model reads.
  *
@@ -404,7 +417,12 @@ export interface AiRunResult {
  */
 export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
   const send = opts.llm ?? llmChat;
-  const maxSteps = Math.max(1, opts.maxSteps ?? aiMaxSteps());
+  // 0 or below means NO limit — see MAX_STEPS_DEFAULT in ./store. The loop is
+  // ended by an answer, by the wearer's Stop, by a failure, or by the progress
+  // guard below; never by a count of turns alone.
+  const maxSteps = Math.floor(opts.maxSteps ?? aiMaxSteps());
+  const unlimited = !(maxSteps > 0);
+  const turnLimit = unlimited ? Number.POSITIVE_INFINITY : maxSteps;
   const model = opts.model ?? aiModel();
   // One decision, made once, from the words themselves — a pure function of the
   // utterance, so the prompt and the reply budget below can never disagree about
@@ -458,12 +476,20 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
     return { ok, reply: spoken, changed, unreachable: false };
   };
 
-  for (let step = 0; step < maxSteps; step++) {
+  // Counted rather than inferred from `maxSteps`: the loop can also end on a
+  // `break`, and only a run that really consumed its last turn should be told it
+  // ran out of budget.
+  let stepsUsed = 0;
+  let lastCallSig = '';
+  let repeatCalls = 0;
+  let stalled = false;
+  for (let step = 0; step < turnLimit; step++) {
     // The user may have dismissed the HUD (tap / Stop AI / double-tap / leaving
     // the page) while the previous turn was in flight. Bail BEFORE spending
     // another model turn on an abandoned run.
     if (isAiAborted()) return finishRun('', false);
 
+    stepsUsed = step + 1;
     aiSetTurn(step + 1);
     let res: LlmReply;
     try {
@@ -607,14 +633,41 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
     }
 
     if (answer) return finishRun(answer);
+
+    // The progress guard, which is what actually ends an unlimited run early.
+    // The same action with the same arguments cannot produce a different result
+    // on the next turn, so three in a row is a model going in circles — stopping
+    // there costs the wearer nothing they would have gained by continuing.
+    const sig = calls
+      .map((c) => `${c.function?.name ?? ''}\u0000${c.function?.arguments ?? ''}`)
+      .join('\u0001');
+    if (sig === lastCallSig) repeatCalls += 1;
+    else {
+      lastCallSig = sig;
+      repeatCalls = 1;
+    }
+    if (repeatCalls >= MAX_IDENTICAL_CALLS) {
+      stalled = true;
+      break;
+    }
   }
 
   // Ran out of turns (or the model went quiet) without a spoken reply.
   if (answer) return finishRun(answer);
-  if (lastOk) return finishRun(lastOk);
   if (isAiAborted()) return finishRun('', false);
 
-  // One final, tool-free turn for a sentence — cheap and keeps the HUD honest.
+  // Say so on the HUD when something OTHER than the model ended the run.
+  // `lastOk` used to be returned here, BEFORE the closing turn — so a command
+  // that ran out of steps reported its last successful action as the answer and
+  // looked finished. The closing turn now gets the chance to say what is still
+  // missing; `lastOk` is only the fallback for when it cannot answer at all.
+  if (stalled) {
+    aiStep('note', `Stopped: the same action was repeated ${repeatCalls} times`);
+  } else if (!unlimited && stepsUsed >= maxSteps) {
+    aiStep('note', `Step budget reached (${maxSteps}) - the answer below may be incomplete`);
+  }
+
+  // One final, tool-free turn for the answer — cheap and keeps the HUD honest.
   //
   // `toolFreeTurn` drops the `tool_calls` / `role: 'tool'` scaffolding first,
   // because a transcript that references tools the request does not declare is
@@ -624,7 +677,9 @@ export async function runAiAgent(opts: AiRunOptions): Promise<AiRunResult> {
       model,
       messages: toolFreeTurn(
         messages,
-        'Using ONLY the results above, reply with ONE short sentence saying what you did or found. Do not call any tools.',
+        'Using ONLY the results above, reply for the user with the complete answer the work supports, '
+          + 'in plain words, and as long as it needs to be. If the task is unfinished, say exactly what is '
+          + 'still missing instead of sounding finished. Do not call any tools.',
         keep,
       ),
     });

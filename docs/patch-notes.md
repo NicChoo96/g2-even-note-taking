@@ -2,6 +2,13 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.57
+
+v0.3.57 - Runs finish the job, and cannot claim a save that did not happen
+
+- A run no longer stops after a fixed number of steps. It carries on until it answers, you stop it, or it repeats the same call, so a long task is not cut in half.
+- Saving a page now reads it back and says what it found. If a run reports a save the store never confirmed, the answer is corrected and the store's own refusal is quoted.
+
 ## 0.3.56
 
 v0.3.56 - Light and dark each stay on their own side

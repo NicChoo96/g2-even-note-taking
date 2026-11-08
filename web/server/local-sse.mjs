@@ -132,6 +132,11 @@ import {
   renderToolResult as renderFilesResult,
   renderToolBody as renderFilesBody,
 } from './jarvis-files.mjs';
+// A finished run's answer, checked against what its tools actually returned.
+// Pure, so the correction it appends can be asserted without a server — which
+// matters here, because the bug it exists for is a CLAIM rather than a throw:
+// nothing errors, and the transcript looks healthy either way.
+import { auditRunClaims } from './run-claims.mjs';
 // The DOCUMENT ORIGIN — where untrusted, agent-authored pages are framed from
 // when that must not be this app's own origin. See its header for why a sandbox
 // on this origin can be neither relaxed, circumvented from inside, nor avoided
@@ -887,6 +892,46 @@ function markAuthChanged() {
  * like the web-search and jev branches. A tool failure that took the run down
  * would throw away the rest of the agent's work.
  */
+function sizeLabel(n) {
+  const v = Number(n) || 0;
+  if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+  if (v >= 1024) return `${Math.round(v / 1024)} kB`;
+  return `${v} B`;
+}
+
+/**
+ * Turn a store write into something the model can be held to.
+ *
+ * THE BUG THIS CLOSES is not the write — it is the sentence after it. A publish
+ * answered `Published <id>` from the gateway's own response, and that is accurate
+ * about the REQUEST; what it never did was look at the store again. So a gateway
+ * that accepted a body and did not keep it produced a transcript identical to a
+ * successful one, and the wearer's only evidence was a page that was not there.
+ *
+ * One `read` after the write costs a single call and settles it. Every outcome
+ * is stated in the result text, including the unhappy ones, because the model
+ * reads this string and the wearer reads the model.
+ */
+async function confirmedWrite(client, doc, runName, signal) {
+  const rendered = renderFilesResult(runName, doc);
+  const id = String(doc?.id ?? '').trim();
+  if (!id) {
+    return `${rendered} WARNING: the gateway returned no document id, so this write is NOT confirmed.`;
+  }
+  try {
+    const back = await client.read(id, { signal });
+    if (!back || !back.id) {
+      return `${rendered} WARNING: reading it back found nothing, so treat this as NOT saved.`;
+    }
+    return (
+      `${rendered} Read back from the store: ${sizeLabel(back.size)} at version ${back.version ?? '?'}.`
+    );
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    return `${rendered} WARNING: could not read it back (${why}), so this write is UNCONFIRMED.`;
+  }
+}
+
 async function runFilesTool(tool, args, signal) {
   const { client, error } = filesRuntime();
   if (!client) return `tool error: document store not configured — ${error}`;
@@ -932,7 +977,7 @@ async function runFilesTool(tool, args, signal) {
         contentType: args?.content_type ?? args?.contentType,
         signal,
       });
-      return renderFilesResult('create_session', doc);
+      return confirmedWrite(client, doc, 'create_session', signal);
     }
     if (action === 'read') {
       const id = String(args?.id ?? '').trim();
@@ -955,18 +1000,16 @@ async function runFilesTool(tool, args, signal) {
     if (action === 'update') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to update a document';
-      return renderFilesResult(
-        'update_session',
-        await client.update(id, {
-          html: args?.html ?? args?.document ?? args?.body,
-          title: args?.title,
-          tags: args?.tags,
-          agent: args?.agent,
-          contentType: args?.content_type ?? args?.contentType,
-          ifVersion: args?.if_version ?? args?.ifVersion,
-          signal,
-        }),
-      );
+      const doc = await client.update(id, {
+        html: args?.html ?? args?.document ?? args?.body,
+        title: args?.title,
+        tags: args?.tags,
+        agent: args?.agent,
+        contentType: args?.content_type ?? args?.contentType,
+        ifVersion: args?.if_version ?? args?.ifVersion,
+        signal,
+      });
+      return confirmedWrite(client, doc, 'update_session', signal);
     }
     if (action === 'delete' || action === 'remove') {
       const id = String(args?.id ?? '').trim();
@@ -1015,15 +1058,13 @@ async function runFilesTool(tool, args, signal) {
     if (action === 'revert' || action === 'restore_revision') {
       const id = String(args?.id ?? '').trim();
       if (!id) return 'tool error: id is required to revert a document';
-      return renderFilesResult(
-        'restore_revision',
-        await client.restoreRevision(id, args?.revision, {
-          restoreMetadata: args?.restore_metadata !== false,
-          ifVersion: args?.if_version ?? args?.ifVersion,
-          subject: args?.subject,
-          signal,
-        }),
-      );
+      const doc = await client.restoreRevision(id, args?.revision, {
+        restoreMetadata: args?.restore_metadata !== false,
+        ifVersion: args?.if_version ?? args?.ifVersion,
+        subject: args?.subject,
+        signal,
+      });
+      return confirmedWrite(client, doc, 'restore_revision', signal);
     }
     if (action === 'revision_stats') {
       return renderFilesResult('revision_stats', await client.revisionStats(args?.id, { signal }));
@@ -1128,7 +1169,12 @@ function llmHeaders(cfg) {
 // Runs are transient: they are broadcast on the 'agents' channel as
 // `{ type: 'run', run }` frames and kept in a small ring for replay. The final
 // transcript is persisted by the CLIENTS as a normal session (capped at 5).
-const MAX_STEPS = 5;
+//
+// HOW LONG A RUN MAY GO ON lives in ./run-budget.mjs: no limit by default, a
+// hard budget only when `G2_AGENT_MAX_STEPS` asks for one, and a progress guard
+// that ends a run repeating the same call rather than one that simply took a
+// while. See that module's header for why the default is 0.
+import { agentStepBudget, MAX_IDENTICAL_CALLS } from './run-budget.mjs';
 // How many tools one turn is offered before the router is allowed to choose a
 // shortlist. It was 4, and that number was the bug: EVERY run carries two
 // built-in hub faculties (`jarvis_memory`, `jarvis_sessions`) beside the
@@ -2164,7 +2210,16 @@ async function executeRun(run) {
         at: Date.now(),
       });
     }
-    for (let step = 0; step < MAX_STEPS; step++) {
+    const budget = agentStepBudget();
+    // 0 means unlimited: the loop runs until the model answers, the wearer stops
+    // it, something throws, or the progress guard below trips.
+    const turnLimit = budget > 0 ? budget : Number.POSITIVE_INFINITY;
+    let turnsUsed = 0;
+    let lastCallSig = '';
+    let repeatCalls = 0;
+    let stalled = false;
+    for (let step = 0; step < turnLimit; step++) {
+      turnsUsed = step + 1;
       if (run.status === 'stopped') return;
       run.statusText = step === 0 ? 'Thinking…' : 'Reasoning…';
       broadcastRun(run);
@@ -2178,7 +2233,10 @@ async function executeRun(run) {
         if (!answer && content.trim()) break;
         run.messages.push({
           role: 'assistant',
-          content: answer || '(no answer)',
+          // The answer is checked against this run's OWN tool results before it
+          // is shown. A claim of a write the transcript cannot prove gains one
+          // correction sentence rather than being deleted — see ./run-claims.mjs.
+          content: auditRunClaims(answer, run.messages).text || '(no answer)',
           at: Date.now(),
         });
         run.status = 'done';
@@ -2225,6 +2283,21 @@ async function executeRun(run) {
         // second clip here only destroyed the record of what the model saw.
         push({ role: 'tool', content: result, tool: name, at: Date.now() });
       }
+      // The progress guard. A model with no step budget needs something to stop
+      // it, and the thing worth stopping is repetition rather than length: the
+      // same call with the same arguments cannot produce a different answer.
+      const sig = toolCalls
+        .map((c) => `${c?.function?.name ?? ''}\u0000${c?.function?.arguments ?? ''}`)
+        .join('\u0001');
+      if (sig === lastCallSig) repeatCalls += 1;
+      else {
+        lastCallSig = sig;
+        repeatCalls = 1;
+      }
+      if (repeatCalls >= MAX_IDENTICAL_CALLS) {
+        stalled = true;
+        break;
+      }
     }
     // The model kept calling tools instead of answering. Rather than failing the
     // run, ask once more for a summary of what it already gathered. (Small free
@@ -2237,11 +2310,31 @@ async function executeRun(run) {
     // agent's visible final answer.
     run.statusText = 'Summarising…';
     broadcastRun(run);
+    // Say WHY the answer is what it is. Without this line the next paragraph is
+    // indistinguishable from a run that finished on its own, which is the one
+    // thing the wearer cannot check for themselves. A run with no budget has no
+    // budget to report — only a stall is worth a line.
+    if (stalled) {
+      push({
+        role: 'assistant',
+        content:
+          `[loop] the run made the same tool call ${repeatCalls} times with the same arguments, ` +
+          'so it was stopped before the repetition became the whole answer.',
+        at: Date.now(),
+      });
+    } else if (budget > 0 && turnsUsed >= budget) {
+      push({
+        role: 'assistant',
+        content: `[budget] ${budget} model turns were not enough to finish this task; the answer below is what the run gathered so far.`,
+        at: Date.now(),
+      });
+    }
     const { content } = await llmOnce(
       run.model,
       toolFreeWire(
         wire,
-        'Using ONLY the tool results above, reply with a short plain-text summary for the user (2-3 sentences). '
+        'Using ONLY the tool results above, reply for the user with the COMPLETE answer the work supports — '
+          + 'as long as it needs to be. If the work is unfinished, say exactly what is still missing. '
           + 'Do not call any tools and do not output JSON or any markup.',
       ),
       [],
@@ -2249,7 +2342,9 @@ async function executeRun(run) {
     );
     run.messages.push({
       role: 'assistant',
-      content: answerText(content) || 'I gathered results but could not finish the summary. Try a simpler prompt.',
+      content:
+        auditRunClaims(answerText(content), run.messages).text ||
+        'I gathered results but could not finish the summary. Try a simpler prompt.',
       at: Date.now(),
     });
     run.status = 'done';
