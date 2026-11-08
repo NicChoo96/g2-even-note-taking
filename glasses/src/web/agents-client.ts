@@ -256,6 +256,12 @@ export interface ScheduleState {
   serverNow: string;
   /** Whether the save reached the hub — a schedule only in memory dies on deploy. */
   durable?: boolean;
+  /** Whether the relay's own file write landed. Survives a restart, not a deploy. */
+  onDisk?: boolean;
+  /** The file the relay wrote, shown so "saved" has a location. */
+  file?: string;
+  /** `G2_DATA_DIR` when a volume is mounted, empty otherwise. */
+  dataDir?: string;
   durableError?: string;
   error?: string;
 }

@@ -92,12 +92,19 @@ export function AgentSchedule() {
       }
       setState(res);
       if (res.durable === false) {
+        // Two different truths, so two different sentences. The useful one names
+        // the fix; a bare "not durable" would leave the same question the env var
+        // did.
         setWarn(
-          `Saved for this process only — ${res.durableError ?? 'the hub did not accept it'}. ` +
-            'It will be forgotten on the next deploy.',
+          res.onDisk
+            ? `Saved on the relay at ${res.file ?? 'its own disk'} — that survives a restart, ` +
+                `but a deploy wipes it unless the host has a mounted volume ` +
+                `(set G2_DATA_DIR to that mount). Hub not used: ${res.durableError ?? 'unknown reason'}.`
+            : `Saved in memory only — ${res.durableError ?? 'the hub did not accept it'}. ` +
+                'It will be forgotten when the relay restarts.',
         );
       } else {
-        setNote('Saved.');
+        setNote('Saved — stored on the hub, so it survives deploys.');
       }
       return true;
     } finally {

@@ -370,11 +370,22 @@ async function verifyGoogleIdToken(idToken, clientId) {
 const PORT = Number(process.env.PORT || 5174);
 // Built unified app (companion web UI + glasses) — served at the bare root.
 const GLASSES_DIST = fileURLToPath(new URL('../glasses-dist', import.meta.url));
+/**
+ * ONE DIRECTORY FOR EVERYTHING THAT MUST OUTLIVE A PROCESS.
+ *
+ * Sessions, the last-known state, the secrets and the agent schedule are all
+ * files, and a container's own filesystem is wiped on every deploy — which is
+ * how a schedule (and, once, a session) came to vanish on a push. They all sit
+ * here, so ONE mount fixes all of them: a host that mounts a volume at /data sets
+ * `G2_DATA_DIR=/data` and stops losing state. Defaults to the working directory,
+ * which is right for a laptop.
+ */
+const DATA_DIR = process.env.G2_DATA_DIR || process.cwd();
 // Last-known state is mirrored to disk so a Railway/Fly/Render restart does not
 // wipe the data. Override the path with STATE_FILE for a persistent volume.
-const STATE_FILE = process.env.STATE_FILE || join(process.cwd(), '.g2-hub-state.json');
+const STATE_FILE = process.env.STATE_FILE || join(DATA_DIR, '.g2-hub-state.json');
 // Auth store (owner sessions + approved devices) — also persisted to disk.
-const AUTH_FILE = process.env.AUTH_FILE || join(process.cwd(), '.g2-hub-auth.json');
+const AUTH_FILE = process.env.AUTH_FILE || join(DATA_DIR, '.g2-hub-auth.json');
 
 // ── The DOCUMENT ORIGIN (optional) ───────────────────────────────────────────
 // Where a stored document is FRAMED FROM, when that is not this app's origin.
@@ -546,7 +557,7 @@ loadAuthStore();
 // LLM_PROVIDER selects the backend: 'openrouter' (default) or 'deepseek'.
 // DeepSeek is OpenAI-compatible: POST https://api.deepseek.com/chat/completions
 // with `Authorization: Bearer <key>` (no attribution headers required).
-const SECRETS_FILE = process.env.SECRETS_FILE || join(process.cwd(), '.g2-hub-secrets.json');
+const SECRETS_FILE = process.env.SECRETS_FILE || join(DATA_DIR, '.g2-hub-secrets.json');
 const DEFAULT_MODEL = 'inclusionai/ling-3.0-flash-sante:free';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions';
@@ -3729,6 +3740,7 @@ const server = createServer(async (req, res) => {
       // Said plainly rather than hidden: without this the page would claim a
       // schedule is saved while the next deploy forgets it.
       durable: saved.durable,
+      onDisk: saved.onDisk,
       durableError: saved.durable ? undefined : saved.reason,
     });
     return;
@@ -4983,9 +4995,9 @@ await authSync.reconcile();
  *   run that will not start — each is one `[cron]` line and nothing else. The
  *   timer is `unref`d so a test or a script importing this file can still exit.
  */
-const CRON_FILE = process.env.AGENT_CRON_FILE || join(process.cwd(), '.g2-agent-cron.json');
+const CRON_FILE = process.env.AGENT_CRON_FILE || join(DATA_DIR, '.g2-agent-cron.json');
 const CRON_STATE_FILE =
-  process.env.AGENT_CRON_STATE_FILE || join(process.cwd(), '.g2-agent-cron-state.json');
+  process.env.AGENT_CRON_STATE_FILE || join(DATA_DIR, '.g2-agent-cron-state.json');
 /** One tick a minute: the finest resolution `HH:MM` can express. */
 const CRON_TICK_MS = 60 * 1000;
 
@@ -5147,20 +5159,32 @@ async function loadCronConfig() {
 async function saveCronConfig(config) {
   cronConfig = config;
   cronConfigSource = 'ui';
+  let onDisk = false;
   try {
     writeFileSync(CRON_FILE, `${JSON.stringify(storedSchedule(config), null, 2)}\n`);
+    onDisk = true;
   } catch (err) {
     console.log(`[cron] could not write the schedule file — ${err instanceof Error ? err.message : String(err)}`);
   }
   const client = cronHubClient();
-  if (!client) return { durable: false, reason: 'no hub configured on this relay' };
+  if (!client) return { durable: false, onDisk, reason: 'this relay has no hub configured' };
   try {
     const res = await client.call('PUT', SCHEDULE_HUB_PATH, { body: { value: storedSchedule(config) } });
     const status = Number(res?.status);
-    if (status === 200) return { durable: true };
-    return { durable: false, reason: `hub answered ${status || 'nothing'}` };
+    if (status === 200) return { durable: true, onDisk };
+    // THE REASON MATTERS MORE THAN THE STATUS. `/hub/relay/*` is owner-scoped by
+    // design, and the relay signs in with a work credential, so this is a
+    // permission answer rather than a bug — saying so is the difference between
+    // "retry later" and "go and set this up".
+    const reason =
+      status === 403
+        ? 'the gateway refuses this credential for /hub/relay (it needs the owner credential)'
+        : status === 404
+          ? 'this gateway has no /hub/relay route'
+          : `the hub answered ${status || 'nothing'}`;
+    return { durable: false, onDisk, reason };
   } catch (err) {
-    return { durable: false, reason: err instanceof Error ? err.message : String(err) };
+    return { durable: false, onDisk, reason: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -5202,6 +5226,10 @@ function schedulePayload() {
     jobs,
     caps: { perTick: MAX_JOBS_PER_TICK, perDay: MAX_JOBS_PER_DAY },
     serverNow: new Date(now).toISOString(),
+    // Where the schedule physically is. The page shows this, because "saved" with
+    // no location is how a schedule disappears on the next deploy.
+    file: CRON_FILE,
+    dataDir: process.env.G2_DATA_DIR || '',
   };
 }
 
