@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.67
+
+v0.3.67 - Sync no longer moves your screen or eats your typing
+
+- Your tab and open document now stay yours: a change from your glasses or
+another browser no longer switches pages under you.
+- A list no longer reorders the row you are editing, so the item you picked
+stays put.
+- A field keeps every letter you type. A live update now waits until you leave
+the field.
+
 ## 0.3.66
 
 v0.3.66 - Agents can record and read the numbers on your dashboard
