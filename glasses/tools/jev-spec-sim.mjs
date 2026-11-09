@@ -833,15 +833,21 @@ for (const [label, q, a] of [
 // worst shape a capability can have. It is `effect: 'read'`, so reserving it
 // takes nothing away from the pages.
 assert('the jev capability offers an optional rank switch to Jarvis', /name: 'rank',\s*\n\s*type: 'boolean'/.test(capSrc));
-// metrics.act joined them for the same reason, and the count is now 11. It is
+// metrics.act joined them for the same reason, and the count is now 12. It is
 // ONE capability, not three, for a reason worth stating: `list`, `read` and
 // `write` as separate entries would spend three of the loop's twenty slots on
 // one subject, and the slots they took would come from a page's own actions.
+//
+// metrics.declare is the twelfth, and it is a SEPARATE entry rather than a fifth
+// action on metrics.act because it is the only one of the five that changes what
+// the store IS (a unit, once set, is permanent) rather than what it holds. That
+// difference is carried by the capability's `confirm`, so it can be a
+// tap-to-accept instead of an effect gate the model learns to click through.
 assert('the capability derives a ranking from the decision', /rankAnswers\(parsed\.value, reply\.answers\)/.test(capSrc));
 check(
-  'the app-wide catalog is jev.decide, location.get, web.search, metrics.act and the seven nav/app actions',
+  'the app-wide catalog is jev.decide, location.get, web.search, metrics.act, metrics.declare and the seven nav/app actions',
   ui.allCapabilities().filter((c) => c.page === ui.GLOBAL_PAGE).length,
-  11,
+  12,
 );
 
 // The invariant behind the 0.3.28 bug, stated as a test rather than a comment:

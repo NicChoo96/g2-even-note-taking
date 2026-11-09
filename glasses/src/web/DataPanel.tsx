@@ -381,6 +381,17 @@ export function DataPanel() {
 
   const [selectedKey, setSelectedKey] = useState<string | null>(() => readStored<string | null>(LS_SELECTED, null));
   const [views, setViews] = useState<Record<string, ViewSpec>>(() => readStored<Record<string, ViewSpec>>(LS_VIEWS, {}));
+  /**
+   * The master list's filter. Client-side on purpose: the list is already in
+   * memory, so searching it must not cost a round trip or blow away the chart
+   * you are looking at — this narrows the INDEX, it does not re-query the store.
+   */
+  const [query, setQuery] = useState('');
+  /**
+   * A refresh in flight. Kept apart from `busy` because `busy` also disables the
+   * add/delete controls, and a refresh must not lock the page while it runs.
+   */
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     try {
@@ -403,6 +414,27 @@ export function DataPanel() {
     setLoading(false);
     return next;
   }, []);
+
+  /**
+   * Re-read the dashboard on demand.
+   *
+   * The page learns about new readings from the store, not from the screen, so
+   * a reading written by an agent thirty seconds ago was invisible until a full
+   * page reload — which on a phone also loses your position and your selection.
+   * This re-reads in place and keeps both.
+   */
+  const refresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await reload();
+      setWarn('');
+    } catch (err) {
+      setWarn(err instanceof Error ? err.message : 'could not refresh');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [reload, refreshing]);
 
   useEffect(() => {
     void reload();
@@ -625,8 +657,27 @@ export function DataPanel() {
     }));
 
   const series = metrics?.series ?? [];
-  const groups = useMemo(() => groupSeries(series), [series]);
-  /** The open series: the stored choice if it still exists, otherwise the first. */
+  /**
+   * The list the search bar shows. Matching key, label and unit means one box
+   * answers all three of the questions someone actually types: "the PSI
+   * numbers", "the premium one", "the one measured in SGD".
+   */
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return series;
+    return series.filter(
+      (s) =>
+        s.key.toLowerCase().includes(q) ||
+        (s.label ?? '').toLowerCase().includes(q) ||
+        (s.unit ?? '').toLowerCase().includes(q),
+    );
+  }, [series, query]);
+  const groups = useMemo(() => groupSeries(filtered), [filtered]);
+  /**
+   * The open series: the stored choice if it still exists, otherwise the first.
+   * Resolved against the FULL list, not the filtered one — typing in the search
+   * box must not silently swap the chart you are reading for a different one.
+   */
   const selected = series.find((s) => s.key === selectedKey) ?? series[0] ?? null;
   /**
    * How to draw one series. An unvisited series starts as a LINE when it holds
@@ -640,6 +691,15 @@ export function DataPanel() {
     <div className="data-panel">
       <div className="dp-head">
         <h2 className="dp-title">Data</h2>
+        <button
+          className="dp-refresh"
+          onClick={() => void refresh()}
+          disabled={refreshing || loading}
+          aria-label="Refresh the numbers from the store"
+          title="Refresh"
+        >
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
         <button
           className="dp-help-btn"
           onClick={() => setHelpDismissed((v) => !v)}
@@ -700,21 +760,54 @@ export function DataPanel() {
           history was to scroll past everything else — and a series with 200
           readings looked exactly like one with 2. */}
       <div className="data-split">
-        <aside className="metric-master" aria-label="Data points">
-          {groups.map((g) => (
-            <div key={g.prefix} className="mm-group">
-              <div className="mm-group-head">{g.prefix}</div>
-              {g.items.map((s) => (
-                <MasterRow
-                  key={s.key}
-                  series={s}
-                  active={selected?.key === s.key}
-                  onPick={() => setSelectedKey(s.key)}
-                />
-              ))}
+        <div className="metric-master-wrap">
+          {series.length > 0 && (
+            <div className="mm-search">
+              <input
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search these numbers"
+                aria-label="Search the list of numbers"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {query.trim() !== '' && (
+                <>
+                  <span className="mm-count">
+                    {filtered.length} of {series.length}
+                  </span>
+                  <button className="mm-clear" onClick={() => setQuery('')} aria-label="Clear the search">
+                    Clear
+                  </button>
+                </>
+              )}
             </div>
-          ))}
-        </aside>
+          )}
+          <aside className="metric-master" aria-label="Data points" hidden={filtered.length === 0}>
+            {groups.map((g) => (
+              <div key={g.prefix} className="mm-group">
+                <div className="mm-group-head">{g.prefix}</div>
+                {g.items.map((s) => (
+                  <MasterRow
+                    key={s.key}
+                    series={s}
+                    active={selected?.key === s.key}
+                    onPick={() => setSelectedKey(s.key)}
+                  />
+                ))}
+              </div>
+            ))}
+          </aside>
+          {filtered.length === 0 && series.length > 0 && (
+            <p className="mm-none">
+              No number matches “{query.trim()}”.{' '}
+              <button className="mm-clear" onClick={() => setQuery('')}>
+                Clear the search
+              </button>
+            </p>
+          )}
+        </div>
 
         <div className="metric-detail-wrap">
           {selected ? (

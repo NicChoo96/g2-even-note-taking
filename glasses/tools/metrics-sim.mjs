@@ -31,6 +31,7 @@ const {
   appendSamples,
   deltaOf,
   dotGet,
+  humanRejectReason,
   latestOf,
   normaliseSample,
   normaliseSeries,
@@ -461,6 +462,49 @@ check('the collector form declares through it', /const declareSeries = \(\): Pro
 check('and a standalone form exists', /const declareOnly = async/.test(panelSrc), true);
 check('offered in the panel', /onClick=\{\(\) => void declareOnly\(\)\}/.test(panelSrc), true);
 check('and it needs no URL', /declareOnly[\s\S]{0,900}?No URL/.test(panelSrc) || /no collector\b/i.test(panelSrc), true);
+
+// ── 9. reading the list: refresh, and a search that narrows it ─────────────
+// The dashboard only learned about new readings on a page RELOAD, which on a
+// phone also throws away your selection and your scroll position — so a number
+// an agent wrote a minute ago looked like it had not been written at all.
+check('the panel can re-read without a page reload', /const refresh = useCallback\(async/.test(panelSrc), true);
+check('there is a Refresh control in the header', /className="dp-refresh"[\s\S]{0,200}?onClick=\{\(\) => void refresh\(\)\}/.test(panelSrc), true);
+check('and it disables itself while running', /disabled=\{refreshing \|\| loading\}/.test(panelSrc), true);
+check(
+  'a failed refresh says so instead of nothing',
+  /catch \(err\)[\s\S]{0,120}?setWarn\(err instanceof Error \? err\.message : 'could not refresh'\)/.test(panelSrc),
+  true,
+);
+
+// The list is the index; searching it is a filter over what is already in
+// memory, so it must not re-query the store and must not move the selection.
+check('the list has a search box', /placeholder="Search these numbers"/.test(panelSrc), true);
+check('it matches the key', /s\.key\.toLowerCase\(\)\.includes\(q\)/.test(panelSrc), true);
+check('the label', /\(s\.label \?\? ''\)\.toLowerCase\(\)\.includes\(q\)/.test(panelSrc), true);
+check('and the unit', /\(s\.unit \?\? ''\)\.toLowerCase\(\)\.includes\(q\)/.test(panelSrc), true);
+check('an empty result names the search and offers a way out', /No number matches/.test(panelSrc) && /Clear the search/.test(panelSrc), true);
+check('the search bar sits outside the scrolling strip', /metric-master-wrap[\s\S]{0,900}?mm-search[\s\S]{0,1600}?className="metric-master"/.test(panelSrc), true);
+// The selection is resolved against the FULL list on purpose: typing must not
+// silently swap the chart you are reading for a different series.
+check(
+  'the open series is still found after filtering',
+  /const selected = series\.find\(\(s\) => s\.key === selectedKey\)/.test(panelSrc),
+  true,
+);
+check('and the groups are built from the filtered list', /groupSeries\(filtered\)/.test(panelSrc), true);
+
+// ── 10. a refusal is written for a person ──────────────────────────────────
+// The hub validates a BATCH, so it names the field by its position in it. That
+// index describes the array this relay built, not the reading the wearer asked
+// to store, and nobody can act on it — so it goes. The dates stay.
+check(
+  'a hub refusal loses the batch index',
+  humanRejectReason('samples[0].ts 2000-12-31T16:00:00Z is outside the accepted range'),
+  'ts 2000-12-31T16:00:00Z is outside the accepted range',
+);
+check('and keeps the reason after it', humanRejectReason('samples[12].value must be a number'), 'value must be a number');
+check('a message with no index is untouched', humanRejectReason('unknown series — declare it first'), 'unknown series — declare it first');
+check('and nothing at all is not a crash', humanRejectReason(null), '');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

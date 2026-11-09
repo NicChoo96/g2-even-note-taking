@@ -2763,6 +2763,23 @@ p.empty {
 
 .dp-help-btn:hover { color: inherit; border-color: var(--accent); }
 
+/* Refresh sits beside the title where a browser's reload would be. Same touch
+   target as the help toggle, because both are small controls on a phone. */
+.dp-refresh {
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  min-height: 36px;
+  white-space: nowrap;
+}
+
+.dp-refresh:hover:not(:disabled) { color: inherit; border-color: var(--accent); }
+.dp-refresh:disabled { opacity: 0.55; cursor: default; }
+
 /* Three steps, numbered, short enough to read on a phone without a scroll. */
 .dp-steps {
   margin: 0;
@@ -2869,6 +2886,56 @@ p.empty {
   scroll-snap-type: x proximity;
   -webkit-overflow-scrolling: touch;
 }
+
+/* The search bar lives ABOVE the scrolling strip so it never scrolls away with
+   the chips it is filtering. */
+.metric-master-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mm-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mm-search input {
+  flex: 1;
+  min-width: 0;
+  /* 16px on purpose: iOS zooms the page for any input smaller than that, and a
+     zoomed dashboard is a broken dashboard. */
+  font-size: 16px;
+  font-family: inherit;
+  padding: 8px 12px;
+  min-height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: inherit;
+}
+
+.mm-search input:focus { outline: none; border-color: var(--accent); }
+
+.mm-count { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+.mm-clear {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 6px 10px;
+  min-height: 36px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mm-clear:hover { color: inherit; border-color: var(--accent); }
+
+.mm-none { margin: 0; font-size: 13px; color: var(--muted); padding: 4px 2px; }
 
 .mm-group {
   display: flex;

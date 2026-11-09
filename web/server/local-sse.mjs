@@ -269,6 +269,7 @@ import {
   deltaOf,
   describeSample,
   dotGet,
+  humanRejectReason,
   latestOf,
   normaliseSample,
   normaliseSeries,
@@ -5775,7 +5776,7 @@ async function storeSample(sample) {
       const res = await metricsRemote.append([sample]);
       if (res.ok || res.allRejected) {
         const bad = res.rejected?.[0];
-        if (bad) return { ok: false, error: bad.error };
+        if (bad) return { ok: false, error: humanRejectReason(bad.error) };
         return { ok: true, where: 'hub', replaced: res.replaced > 0 };
       }
       // A transport/authorisation failure: fall through and keep it locally.

@@ -254,3 +254,21 @@ export function describeSample(sample) {
   const stamp = Number.isNaN(when.getTime()) ? String(sample.ts) : when.toISOString().replace('T', ' ').slice(0, 16);
   return sample.source ? `${stamp} · ${sample.source}` : stamp;
 }
+
+/**
+ * Strip the hub's batch position from a refusal it sends back.
+ *
+ * The hub validates a BATCH, so it names the offending field by where it sat:
+ * `samples[0].ts 2000-12-31T16:00:00Z is outside the accepted range…`. The index
+ * is a fact about the one-item array this relay built, not about the reading
+ * someone asked to store — it is the only part of that sentence a person can
+ * neither read nor act on, so it is removed before the reason is shown. The rest
+ * of the sentence (which field, which date, what the allowed dates are) is
+ * exactly what makes the refusal useful, so it is kept verbatim.
+ */
+export function humanRejectReason(text) {
+  return String(text ?? '')
+    .replace(/samples\[\d+\]\./g, '')
+    .replace(/^\s+/, '')
+    .trim();
+}
