@@ -528,6 +528,39 @@ export function AgentsPanel() {
   }, [myRun, myRunId, agent?.id]);
 
   /**
+   * Record runs that NO TAB started.
+   *
+   * The effect above settles a run this tab began, because it is the only one
+   * holding `myRunId`. A run the RELAY's clock started has no tab at all, so its
+   * transcript was streamed once and then dropped — the Schedule tab said "last
+   * ran 07:00" and there was nothing anywhere to read. Sessions are the history;
+   * a scheduled run belongs in it exactly as much as a tapped one.
+   *
+   * `recordSession` upserts by run id and merges, so every open tab doing this is
+   * harmless, and a run already recorded is skipped by the `known` check.
+   */
+  useEffect(() => {
+    if (!runs.length) return;
+    const known = new Set(state.sessions.map((s) => s.id));
+    for (const r of runs) {
+      if (r.status === 'running' || known.has(r.id)) continue;
+      recordSession({
+        id: r.id,
+        agentId: r.agentId,
+        title: r.title || String(r.prompt ?? '').slice(0, 48),
+        messages: (r.messages ?? []).map((m) => ({
+          role: m.role,
+          content: m.content,
+          tool: m.tool,
+          args: m.args,
+          at: m.at,
+        })),
+        status: r.status === 'done' ? 'done' : 'error',
+      });
+    }
+  }, [runs, state.sessions]);
+
+  /**
    * The hub assigns the id, so the selection can only follow the create's
    * answer. Nothing is painted optimistically here: a row with an invented id
    * would be a row that never exists upstream, and the editor would be naming

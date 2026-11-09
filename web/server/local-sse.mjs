@@ -5288,6 +5288,15 @@ const CRON_TICK_MS = 60 * 1000;
  * puts a throwaway document beside the real one instead of on top of it.
  */
 const SCHEDULE_HUB_PATH = `/relay/${String(process.env.G2_SCHEDULE_KEY || 'agent-cron').trim() || 'agent-cron'}`;
+/**
+ * Where the RUN RECORD of the schedule lives on the hub.
+ *
+ * Separate from the schedule because they have different owners and different
+ * lifetimes: the document is the wearer's configuration, this is the clock's own
+ * memory of which slots it has consumed. Derived from G2_SCHEDULE_KEY so a test
+ * that isolates the schedule also isolates the bookkeeping beside it.
+ */
+const CRON_STATE_HUB_PATH = `/relay/${String(process.env.G2_SCHEDULE_KEY || 'agent-cron').trim() || 'agent-cron'}-state`;
 
 /** The validated schedule this process is running. `null` = nothing scheduled. */
 let cronConfig = null;
@@ -5323,6 +5332,63 @@ function writeCronState(state) {
     writeFileSync(CRON_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
   } catch (err) {
     console.log(`[cron] could not save state — ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // AND TO THE HUB. Which jobs already fired is not decoration: without it a
+  // deploy inside the grace window re-fires the morning's jobs (the slots are the
+  // only thing stopping that), and "last ran 06:45" is forgotten with every
+  // redeploy — the page then claims a schedule that has never run. The file alone
+  // is a container's disk. Fire-and-forget: the tick must not wait on the network.
+  const client = cronHubClient();
+  if (client) {
+    void client
+      .call('PUT', CRON_STATE_HUB_PATH, { body: { value: state } })
+      .catch((err) => console.log(`[cron] could not save state to the hub — ${err instanceof Error ? err.message : String(err)}`));
+  }
+}
+
+/**
+ * Take the state back from the hub at boot.
+ *
+ * Local wins where it has an answer, because this process's own file is the more
+ * recent memory of a restart; the hub fills in everything the container forgot,
+ * which after a deploy is everything. Slots are unioned so a job that already ran
+ * cannot run again, and the daily counter only carries over within the same day —
+ * yesterday's count must never eat today's budget.
+ */
+async function hydrateCronState() {
+  const local = readCronState();
+  const client = cronHubClient();
+  if (!client) return local;
+  try {
+    const res = await client.call('GET', CRON_STATE_HUB_PATH);
+    const status = Number(res?.status);
+    // A 404 is an ANSWER (the hub has no state) and it is the case worth writing
+    // for: a container that still remembers this morning must hand that memory
+    // up, or the next deploy loses it again. Any other status is unknown, and
+    // unknown must not overwrite anything.
+    if (status !== 200 && status !== 404) return local;
+    const remote = status === 200 ? JSON.parse(String(res.text ?? '') || 'null')?.value : null;
+    if (status === 200 && (!remote || typeof remote !== 'object')) return local;
+    const sameDay = String(remote?.day ?? '') === String(local.day ?? '') && Boolean(local.day);
+    const state = {
+      slots: { ...(remote?.slots ?? {}), ...(local.slots ?? {}) },
+      day: sameDay ? local.day : String(local.day || remote?.day || ''),
+      count: sameDay
+        ? Math.max(Number(local.count) || 0, Number(remote?.count) || 0)
+        : Number(local.count) || 0,
+      errors: { ...(remote?.errors ?? {}), ...(local.errors ?? {}) },
+    };
+    // Both halves, so the key exists from the first boot and the page can read
+    // an honest "nothing has run yet" instead of a 404.
+    writeCronState(state);
+    const slots = Object.keys(state.slots).length;
+    console.log(
+      `[cron] state ${status === 200 ? 'restored from' : 'published to'} the hub — ${slots} slot(s), ${state.count} run(s) today`,
+    );
+    return state;
+  } catch (err) {
+    console.log(`[cron] could not read state from the hub — ${err instanceof Error ? err.message : String(err)}`);
+    return local;
   }
 }
 
@@ -6017,19 +6083,34 @@ async function cronTick() {
         model: '',
         depth: 1,
       });
-      state.slots[entry.key] = entry.slot;
-      state.count += 1;
       if (!res.ok) {
+        // The SLOT is spent (so this does not retry every minute for the whole
+        // grace window) but the DAY'S BUDGET is not: a misconfigured model would
+        // otherwise burn all twelve slots by lunchtime and leave the wearer with a
+        // morning whose schedule reports itself satisfied and did nothing —
+        // which is exactly what happened here once. Marking a slot is a claim
+        // that the run was STARTED; a refusal was not a start.
+        state.slots[entry.key] = entry.slot;
         state.errors[entry.key] = String(res.error ?? 'run refused');
         console.log(`[cron] ${entry.job.at} "${agent.name}" refused — ${res.error}`);
         continue;
       }
+      state.slots[entry.key] = entry.slot;
+      state.count += 1;
       started += 1;
       delete state.errors[entry.key];
       const late = entry.lateMinutes > 0 ? ` (+${entry.lateMinutes}m late)` : '';
       console.log(
         `[cron] ${entry.job.at}${late} "${agent.name}" -> run ${res.run?.id ?? '?'} (${tools.length} tool${tools.length === 1 ? '' : 's'})`,
       );
+      // AND ACTUALLY RUN IT. `startAgentRun` only creates the record — it does not
+      // call a model and does not tell any client the run exists. Without these
+      // two lines every scheduled run was a record that sat at "Thinking…" for
+      // ever: the Schedule tab said "last ran 07:00", the tools never touched a
+      // file, and no transcript existed to look at. Same pair `/api/agent/run`
+      // uses, in the same order.
+      broadcastRun(res.run);
+      void executeRun(res.run).catch((err) => failRun(res.run, err));
     }
     writeCronState(state);
   } catch (err) {
@@ -6049,6 +6130,7 @@ function startAgentCron() {
   // would mean "save the schedule, then redeploy" — which is how the feature
   // looked broken. A tick with no jobs costs one null check.
   cronReady = loadCronConfig()
+    .then(() => hydrateCronState())
     .then(() => {
       const read = readCronConfig();
       if (read.skipped) console.log(`[cron] idle — ${read.skipped} (source: ${cronConfigSource})`);
@@ -6058,7 +6140,10 @@ function startAgentCron() {
   const timer = setInterval(() => void cronTick(), CRON_TICK_MS);
   // A scheduled agent must never be the reason a process cannot exit.
   if (typeof timer.unref === 'function') timer.unref();
-  void cronTick();
+  // The first tick waits for the STATE too, not just the schedule: firing it
+  // immediately reads an empty slot list on a fresh container and re-runs the
+  // morning's jobs the moment a deploy lands inside the grace window.
+  void cronReady.then(() => cronTick());
 }
 
 server.listen(PORT, () => {

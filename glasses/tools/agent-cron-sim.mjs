@@ -326,6 +326,31 @@ checkTrue('the hub key can be pointed elsewhere for tests', /G2_SCHEDULE_KEY/.te
 // be able to edit it.
 const putBranch = relay.slice(relay.indexOf("'/api/agent/schedule' && req.method === 'PUT'"));
 checkTrue('editing the schedule needs the owner', putBranch.slice(0, 400).includes('requireOwner'));
+
+// ── the tick must actually RUN what it starts ──────────────────────────────
+// Found live: the Schedule tab claimed "last ran 06:45" for seven jobs, and not
+// one run existed — no session, no tool call, no file. The tick called
+// `startAgentRun` (which only creates the record) and marked the slot.
+const tickBranch = relay.slice(relay.indexOf('const agentDue'), relay.indexOf('const agentDue') + 4000);
+checkTrue('a scheduled run is broadcast to the clients', /broadcastRun\(res\.run\)/.test(tickBranch));
+checkTrue(
+  'and executed, with a failure routed to the run',
+  /void executeRun\(res\.run\)\.catch\([\s\S]{0,80}?failRun\(res\.run/.test(tickBranch),
+);
+// Order matters more than presence: the slot and the daily counter used to be
+// spent BEFORE the refusal was inspected, so a misconfigured model burned all
+// twelve slots by lunchtime and reported a satisfied schedule.
+const refusalAt = tickBranch.indexOf('if (!res.ok)');
+const countAt = tickBranch.indexOf('state.count += 1');
+checkTrue('a refusal is inspected before the budget is spent', refusalAt > 0 && refusalAt < countAt);
+
+// Which slots have fired is the only thing stopping a deploy from re-running the
+// morning, so it cannot live on a container's disk alone.
+checkTrue('the clock state is written to the hub', /PUT', CRON_STATE_HUB_PATH/.test(relay));
+checkTrue('and read back at boot', /call\('GET', CRON_STATE_HUB_PATH\)/.test(relay));
+// ...and the first tick must wait for that read, or it re-fires what it just
+// failed to remember.
+checkTrue('the first tick waits for the state, not just the schedule', /cronReady\.then\(\(\) => cronTick\(\)\)/.test(relay));
 // A schedule half-saved is a schedule that runs something nobody asked for.
 const validateIdx = putBranch.indexOf('parseCronConfig(body)');
 checkTrue('every job is validated before anything is written', validateIdx > 0 && validateIdx < putBranch.indexOf('saveCronConfig'));
