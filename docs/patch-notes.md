@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.73
+
+v0.3.73 - Old readings, and finding them
+
+- A reading can be stored at the date it happened, however far back. The store
+refused anything over a year old, which refused the past it exists to keep; only
+a future date is limited now.
+- A date it cannot hold is refused in dates, not epoch milliseconds.
+- The Data tab has Refresh, which re-reads without reloading the page.
+- A search box filters the list by name, label or unit.
+
 ## 0.3.72
 
 v0.3.72 - Recording and reading PSI works again
