@@ -25,9 +25,34 @@ import {
   type MetricsState,
 } from './metrics-client';
 import { MicButton } from './Dictate';
+import {
+  CHART_KINDS,
+  CHART_LABELS,
+  MetricChart,
+  WINDOW_KINDS,
+  WINDOW_LABELS,
+  numericPoints,
+  pointsInWindow,
+  type ChartKind,
+  type WindowKind,
+} from './metric-chart';
 
 const DAY_INITIALS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * How one series is being LOOKED AT on this device.
+ *
+ * `table` is the fifth option and is deliberately not a chart: a text series, or
+ * a wearer who wants the exact rows, gets rows. Nothing here is stored on the
+ * hub — see `useViewState`.
+ */
+type ViewKind = ChartKind | 'table';
+
+interface ViewSpec {
+  kind: ViewKind;
+  window: WindowKind;
+}
 
 function daysLabel(days: number[] | null): string {
   if (!days || !days.length || days.length === 7) return 'every day';
@@ -60,26 +85,87 @@ function Spark({ points, unit }: { points: Array<{ ts: number; value: number | s
   );
 }
 
-function MetricCard({
+/**
+ * One row of the master list: the numbers, at a glance.
+ *
+ * The list is the index and nothing else — no delete button, no form. A list you
+ * are choosing from should not also be a place you can destroy something by
+ * mis-aiming a click.
+ */
+function MasterRow({
+  series,
+  active,
+  onPick,
+}: {
+  series: MetricSeries;
+  active: boolean;
+  onPick: () => void;
+}) {
+  const leaf = series.key.split('.').pop() ?? series.key;
+  return (
+    <button
+      type="button"
+      className={active ? 'metric-master-row active' : 'metric-master-row'}
+      onClick={onPick}
+      aria-pressed={active}
+    >
+      <span className="mm-top">
+        <span className="mm-leaf" title={series.key}>{leaf}</span>
+        <span className="mm-count">{series.count}</span>
+      </span>
+      <span className="mm-value">
+        {formatValue(series, series.latest?.value ?? null)}
+        {series.unit && <span className="mm-unit">{series.unit}</span>}
+      </span>
+      {series.type === 'number' && series.points.length > 1 && <Spark points={series.points} unit={series.unit} />}
+    </button>
+  );
+}
+
+/**
+ * The detail pane: the chart, the switcher, and the actual readings.
+ *
+ * THE SWITCHER IS THE POINT. A series arrives as a column of numbers, and whether
+ * that should be read as a trend, a level, or a list of discrete events is a
+ * judgement the WEARER makes — not something the model gets to decide, and not
+ * something to lock in at creation. So the chart kind and the window live here,
+ * per series, on this device, and change nothing on the hub.
+ */
+function SeriesDetail({
   series,
   collector,
   now,
   busy,
+  view,
+  onView,
   onDelete,
 }: {
   series: MetricSeries;
   collector?: Collector;
   now: number;
   busy: boolean;
+  view: ViewSpec;
+  onView: (next: ViewSpec) => void;
   onDelete: () => void;
 }) {
-  const latestTs = series.latest?.ts ?? null;
+  const windowed = pointsInWindow(series.points, view.window, now);
+  const plotted = numericPoints(windowed);
+  const rows = [...windowed].reverse().slice(0, 60);
+
   return (
-    <article className={`metric-card view-${series.view}`}>
-      <header className="metric-head">
-        <span className="metric-label">{series.label}</span>
-        {series.unit && <span className="metric-unit">{series.unit}</span>}
-        <button className="metric-x" onClick={onDelete} disabled={busy} title="Delete this series and its samples" aria-label="Delete series">
+    <section className="metric-detail">
+      <header className="md-head">
+        <div>
+          <div className="metric-label">{series.label}</div>
+          <div className="md-key">{series.key}</div>
+        </div>
+        <button
+          className="metric-x"
+          onClick={onDelete}
+          disabled={busy}
+          title="Delete this series and its readings"
+          aria-label="Delete series"
+        >
           ✕
         </button>
       </header>
@@ -87,16 +173,85 @@ function MetricCard({
       <div className="metric-value">
         {formatValue(series, series.latest?.value ?? null)}
         {series.delta !== null && (
-          <span className={series.delta > 0 ? 'metric-delta up' : series.delta > 0 ? 'metric-delta' : 'metric-delta down'}>
+          <span className={series.delta > 0 ? 'metric-delta up' : series.delta < 0 ? 'metric-delta down' : 'metric-delta'}>
             {formatDelta(series, series.delta)}
           </span>
         )}
       </div>
 
-      {series.view === 'series' && <Spark points={series.points} unit={series.unit} />}
+      <div className="md-controls">
+        <div className="md-seg" role="group" aria-label="Chart type">
+          {CHART_KINDS.map((kind) => (
+            <button
+              key={kind}
+              className={view.kind === kind ? 'active' : ''}
+              onClick={() => onView({ ...view, kind })}
+              disabled={series.type !== 'number'}
+              aria-pressed={view.kind === kind}
+            >
+              {CHART_LABELS[kind]}
+            </button>
+          ))}
+          <button
+            className={view.kind === 'table' ? 'active' : ''}
+            onClick={() => onView({ ...view, kind: 'table' })}
+            aria-pressed={view.kind === 'table'}
+            title="Read the readings as rows"
+          >
+            Table
+          </button>
+        </div>
+        <div className="md-seg" role="group" aria-label="Time window">
+          {WINDOW_KINDS.map((w) => (
+            <button
+              key={w}
+              className={view.window === w ? 'active' : ''}
+              onClick={() => onView({ ...view, window: w })}
+              aria-pressed={view.window === w}
+            >
+              {WINDOW_LABELS[w]}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {series.type === 'number' && view.kind !== 'table' ? (
+        <MetricChart points={plotted} kind={view.kind} unit={series.unit} precision={series.precision} />
+      ) : null}
+
+      {rows.length === 0 ? (
+        <p className="hint-line">
+          No readings{view.window === 'all' ? '' : ' in this window'} yet.
+          {collector
+            ? ` The collector runs at ${collector.at}.`
+            : ' Nothing collects this one — an agent, Jarvis, or a collector can write to it.'}
+        </p>
+      ) : (
+        <>
+          <table className="metric-readings">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th className="num">Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((p, i) => (
+                <tr key={`${p.ts}-${i}`}>
+                  <td>{new Date(p.ts).toLocaleString()}</td>
+                  <td className="num">{formatValue(series, p.value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {windowed.length > rows.length && (
+            <p className="hint-line">Showing the newest {rows.length} of {windowed.length} readings in this window.</p>
+          )}
+        </>
+      )}
 
       <footer className="metric-foot">
-        <span title={series.provenance}>{sinceLabel(latestTs, now)}</span>
+        <span title={series.provenance}>{sinceLabel(series.latest?.ts ?? null, now)}</span>
         <span>{series.count} reading{series.count === 1 ? '' : 's'}</span>
         {collector ? (
           <span title={collector.url}>
@@ -104,10 +259,10 @@ function MetricCard({
             {collector.enabled ? '' : ' · paused'}
           </span>
         ) : (
-          <span className="warn-inline">manual</span>
+          <span className="warn-inline">no collector</span>
         )}
       </footer>
-    </article>
+    </section>
   );
 }
 
@@ -138,6 +293,36 @@ const BLANK: Draft = {
   at: '09:00',
   days: [],
 };
+
+/**
+ * The master list is grouped by key PREFIX, which is what makes a subject with
+ * several numbers legible: `news.rates.count` and `news.rates.sentiment` sit
+ * under one heading and read as two columns of the same table, which is the
+ * closest honest thing to "fields" this store has (a series is one field).
+ */
+function groupSeries(series: MetricSeries[]): Array<{ prefix: string; items: MetricSeries[] }> {
+  const map = new Map<string, MetricSeries[]>();
+  for (const s of series) {
+    const prefix = s.key.split('.').slice(0, -1).join('.') || 'series';
+    const list = map.get(prefix);
+    if (list) list.push(s);
+    else map.set(prefix, [s]);
+  }
+  return [...map.entries()].map(([prefix, items]) => ({ prefix, items }));
+}
+
+const LS_SELECTED = 'hub:data:selected';
+const LS_VIEWS = 'hub:data:views';
+
+/** A stored view choice, or the fallback. Private mode has no localStorage. */
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : (JSON.parse(raw) as T);
+  } catch {
+    return fallback;
+  }
+}
 
 /** `{"X-Api-Key": "env:MY_KEY"}` is the documented shape; say so when it is not. */
 function headersProblem(raw: string): string {
@@ -170,8 +355,26 @@ export function DataPanel() {
     type: 'number',
   });
 
-  const reload = useCallback(async () => {
-    const next = await fetchMetrics();
+  const [selectedKey, setSelectedKey] = useState<string | null>(() => readStored<string | null>(LS_SELECTED, null));
+  const [views, setViews] = useState<Record<string, ViewSpec>>(() => readStored<Record<string, ViewSpec>>(LS_VIEWS, {}));
+
+  useEffect(() => {
+    try {
+      if (selectedKey) localStorage.setItem(LS_SELECTED, JSON.stringify(selectedKey));
+    } catch {
+      /* private mode — the choice lasts the session */
+    }
+  }, [selectedKey]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_VIEWS, JSON.stringify(views));
+    } catch {
+      /* private mode */
+    }
+  }, [views]);
+
+  const reload = useCallback(async () => {    const next = await fetchMetrics();
     setMetrics(next);
     setLoading(false);
     return next;
@@ -398,11 +601,21 @@ export function DataPanel() {
     }));
 
   const series = metrics?.series ?? [];
+  const groups = useMemo(() => groupSeries(series), [series]);
+  /** The open series: the stored choice if it still exists, otherwise the first. */
+  const selected = series.find((s) => s.key === selectedKey) ?? series[0] ?? null;
+  /**
+   * How to draw one series. An unvisited series starts as a LINE when it holds
+   * numbers and a TABLE when it holds text, which is the only default that cannot
+   * be wrong: a text series has no axis to draw.
+   */
+  const viewOf = (s: MetricSeries): ViewSpec =>
+    views[s.key] ?? { kind: s.type === 'string' ? 'table' : 'line', window: 'all' };
 
   return (
     <div className="data-panel">
       <div className="panel-label">
-        Data · numbers collected on a schedule by plain HTTPS · no model involved
+        Data · numbers collected on a schedule, written by an agent, or recorded by Jarvis
       </div>
 
       {note && <p className="ok-line">{note}</p>}
@@ -423,21 +636,48 @@ export function DataPanel() {
       {loading && <p className="hint-line">Loading…</p>}
       {!loading && series.length === 0 && (
         <p className="hint-line">
-          No series yet. Add one below: a URL, a JSON path to the number inside the response, and a time.
+          No data points yet. Add one below: a URL and a schedule, or just a key — a series with no collector is
+          one that Jarvis, an agent, or your own script can write to.
         </p>
       )}
 
-      <div className="metric-grid">
-        {series.map((s) => (
-          <MetricCard
-            key={s.key}
-            series={s}
-            collector={collectorsBySeries.get(s.key)}
-            now={metrics?.now ?? Date.now()}
-            busy={busy}
-            onDelete={() => void removeSeries(s.key)}
-          />
-        ))}
+      {/* ── Master · detail ──────────────────────────────────────────────── */}
+      {/* The list is the index; the pane is one series read closely. Before
+          this, every series was a card of equal size, so the only way to see a
+          history was to scroll past everything else — and a series with 200
+          readings looked exactly like one with 2. */}
+      <div className="data-split">
+        <aside className="metric-master" aria-label="Data points">
+          {groups.map((g) => (
+            <div key={g.prefix} className="mm-group">
+              <div className="mm-group-head">{g.prefix}</div>
+              {g.items.map((s) => (
+                <MasterRow
+                  key={s.key}
+                  series={s}
+                  active={selected?.key === s.key}
+                  onPick={() => setSelectedKey(s.key)}
+                />
+              ))}
+            </div>
+          ))}
+        </aside>
+
+        <div className="metric-detail-wrap">
+          {selected ? (
+            <SeriesDetail
+              series={selected}
+              collector={collectorsBySeries.get(selected.key)}
+              now={metrics?.now ?? Date.now()}
+              busy={busy}
+              view={viewOf(selected)}
+              onView={(next) => setViews((v) => ({ ...v, [selected.key]: next }))}
+              onDelete={() => void removeSeries(selected.key)}
+            />
+          ) : (
+            <p className="hint-line">Nothing to show yet.</p>
+          )}
+        </div>
       </div>
 
       {/* ── A series with no collector ───────────────────────────────────── */}

@@ -180,6 +180,44 @@ const unknown = await runMetricsTool({ kind: 'metrics' }, { action: 'declare', s
 check('an unknown action is refused', unknown.ok === false, 'an unknown action was accepted');
 check('and lists the valid ones', /list, read or write/.test(text(unknown)), true);
 
+// ── 5b. A WEEK OF NEWS, one write per day ─────────────────────────────────
+// The ask this exists for: "search the news for rate-cut mentions each day this
+// week and keep the count". An agent cannot declare a series (rule 1), so the
+// wearer declares `news.rates.count` once on the Data page; the run then does ONE
+// `write` per day with the DAY as its slot. The slot is what makes a re-run safe:
+// running the same week twice replaces each day instead of doubling the chart,
+// which is the difference between a retry and a corrupted history.
+const mem = new Map();
+const weekStore = {
+  writeSample: async (input) => {
+    const key = `${input.series}@${input.slot}`;
+    const replaced = mem.has(key);
+    const value = Number(String(input.value).replace(/,/g, ''));
+    mem.set(key, { value, unit: 'mentions' });
+    return { ok: true, value, unit: 'mentions', precision: 0, replaced, where: 'hub' };
+  },
+};
+const week = ['2026-11-03', '2026-11-04', '2026-11-05', '2026-11-06', '2026-11-07', '2026-11-08', '2026-11-09'];
+let accepted = 0;
+for (const [i, day] of week.entries()) {
+  const res = await runMetricsTool(
+    { kind: 'metrics' },
+    { action: 'write', series: 'news.rates.count', value: String(300 + i), slot: day },
+    weekStore,
+  );
+  if (res.ok) accepted += 1;
+}
+check('a week of daily writes is accepted', accepted, 7);
+check('and lands as seven distinct readings', mem.size, 7);
+
+const rerun = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'write', series: 'news.rates.count', value: 307, slot: '2026-11-09' },
+  weekStore,
+);
+check('re-running one day does not add a reading', mem.size, 7);
+check('it replaces, and says so', /Replaced/.test(text(rerun)), true);
+
 // ── 6. THE REAL RELAY, through the same runner the agent loop uses ─────────
 const PORT = 6400 + Math.floor(Math.random() * 60);
 const dir = mkdtempSync(join(tmpdir(), 'g2-mtool-'));

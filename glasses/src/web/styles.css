@@ -2738,50 +2738,193 @@ p.empty {
 }
 
 /* ── Data tab ─────────────────────────────────────────────────────────────
-   Read like a dashboard, not a form. Cards first (what is happening), the
-   collector form second (how to add one) — the inverse of the rest of the app,
-   because this page is read far more often than it is edited. */
-.metric-grid {
+   Read like a dashboard, not a form: a master list of data points on the left,
+   one series read closely on the right, and the collector forms last (how to
+   add one) — the inverse of the rest of the app, because this page is read far
+   more often than it is edited. */
+.data-split {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
   gap: 12px;
+  align-items: start;
   margin: 10px 0 18px;
 }
 
-.metric-card {
+@media (max-width: 720px) {
+  .data-split { grid-template-columns: 1fr; }
+}
+
+.metric-master {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 12px 14px;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  padding: 8px;
+  background: var(--panel);
+  max-height: 460px;
+  overflow: auto;
+}
+
+.mm-group { display: flex; flex-direction: column; gap: 2px; }
+
+/* The prefix is the SUBJECT ("news.rates"); the rows beneath it are its fields. */
+.mm-group-head {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 4px 6px 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.metric-master-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  padding: 5px 7px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.metric-master-row:hover { background: var(--panel-2); }
+
+.metric-master-row.active {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+
+.mm-top { display: flex; align-items: baseline; gap: 6px; }
+
+.mm-leaf {
+  flex: 1;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-count { font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.mm-value {
+  font-size: 17px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.mm-unit { font-size: 10px; color: var(--muted); font-weight: 500; }
+
+.metric-master-row .spark { height: 20px; }
+
+/* ── the detail pane ──────────────────────────────────────────────────────── */
+.metric-detail,
+.metric-detail-wrap {
   border: 1px solid var(--border);
   border-radius: var(--radius, 12px);
   background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  padding: 12px 14px;
 }
 
-.metric-head {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
+.metric-detail { display: flex; flex-direction: column; gap: 8px; }
 
 .metric-label {
   font-size: 12px;
   letter-spacing: 0.02em;
   text-transform: uppercase;
   color: var(--muted);
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.metric-unit {
+.md-head { display: flex; align-items: flex-start; gap: 8px; }
+.md-head > div:first-child { flex: 1; min-width: 0; }
+
+.md-key {
   font-size: 11px;
   color: var(--muted);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0 5px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+
+.md-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
+
+/* A segmented control, so "which view" reads as a choice among five, not five
+   independent buttons that all look pressed. */
+.md-seg { display: flex; gap: 3px; flex-wrap: wrap; }
+
+.md-seg button {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.md-seg button:hover:not(:disabled) { color: inherit; border-color: var(--accent); }
+.md-seg button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.md-seg button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── the chart ────────────────────────────────────────────────────────────── */
+.metric-chart { width: 100%; height: auto; display: block; }
+
+.chart-grid { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; }
+.chart-tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.chart-line { stroke: var(--accent); stroke-width: 1.8; vector-effect: non-scaling-stroke; }
+.chart-area { fill: var(--accent); opacity: 0.16; }
+.chart-bar { fill: var(--accent); opacity: 0.75; }
+.chart-dot { fill: var(--accent); }
+.chart-empty { margin: 14px 0; }
+
+/* ── the readings themselves ──────────────────────────────────────────────── */
+.metric-readings {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  display: block;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.metric-readings th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border);
+  padding: 2px 4px;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+.metric-readings td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
+.metric-readings .num { text-align: right; }
 
 .metric-x {
   border: none;
