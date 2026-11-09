@@ -475,13 +475,34 @@ try {
 const relaySrc = await readFile(resolve(here, '../../web/server/local-sse.mjs'), 'utf8');
 check('the relay imports the metrics tool', /from '\.\/metrics-tool\.mjs'/.test(relaySrc), true);
 
-// THE SCOPE BUG. With the hub configured, declarations live in the schedule
-// document and `metricStore` is EMPTY, so a write that looked only at the local
-// map answered "unknown series" for a series `list` had just shown — the
-// dashboard could be read and not written to. The lookup must span both.
+// THE SCOPE BUG, twice over. Hub-mode declarations live ONLY on the hub: the
+// schedule document holds what the schedule declared, and `metricStore` is empty.
+// A lookup over those two local maps answered "unknown series" for a series
+// `list` had just shown. Resolution must reach the hub, and it must be ONE
+// function so read/write/declare cannot drift apart again.
 check(
-  'write resolves the declaration from BOTH scopes, not just the local store',
-  /async writeSample\(input\)[\s\S]{0,600}seriesDefinition\(input\.series, cronConfig\?\.series, metricStore\.series\)/.test(relaySrc),
+  'write resolves through the one shared resolver',
+  /async writeSample\(input\)[\s\S]{0,500}const def = await resolveSeries\(input\.series\)/.test(relaySrc),
+  true,
+);
+check(
+  'and that resolver asks the HUB when the local maps miss',
+  /async function resolveSeries\(key\)[\s\S]{0,500}metricsRemote\.get\(key\)/.test(relaySrc),
+  true,
+);
+check(
+  'declare uses the same resolver, so a hub series is not re-created',
+  /async function declareMetricSeries\([\s\S]*?const existing = await resolveSeries\(key\)/.test(relaySrc),
+  true,
+);
+
+// THE READ WINDOW: the hub windows `/samples` to a recent period by default, so a
+// read that did not ask `from=0` returned today and called it the history — five
+// PSI readings showed as one.
+const remoteSrc = await readFile(resolve(here, '../../web/server/metrics-remote.mjs'), 'utf8');
+check(
+  'a history read asks from the epoch, not the default window',
+  /async read\(series, limit[\s\S]*?from: '0'/.test(remoteSrc),
   true,
 );
 check(

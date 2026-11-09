@@ -192,7 +192,12 @@ export function createMetricsRemote({ baseUrl, token, fetchImpl = fetch, timeout
 
     /** Readings for one series, oldest first — what a card plots. */
     async read(series, limit = 240) {
-      const qs = new URLSearchParams({ series: String(series), limit: String(limit) });
+      // `from=0` IS NOT OPTIONAL. The hub windows `/samples` to a recent period
+      // by default, so a read asking only for `series` + `limit` returns the last
+      // day and calls it the history: a month of backfilled PSI showed as one
+      // reading. Asking from the epoch means "the newest `limit` readings this
+      // series has", which is what every caller of this means.
+      const qs = new URLSearchParams({ series: String(series), limit: String(limit), from: '0' });
       const res = await call('GET', `/samples?${qs.toString()}`);
       if (res.status !== 200) return { ok: false, error: reasonOf(res), status: res.status };
       const items = Array.isArray(res.body?.items) ? res.body.items : [];

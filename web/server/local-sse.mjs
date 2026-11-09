@@ -5816,9 +5816,8 @@ function metricToolDeps() {
     },
 
     async readSeries(key, limit) {
-      // Same two scopes as the write path — a read that reports no unit for a
-      // series `list` showed with one is the same bug wearing a different hat.
-      const def = seriesDefinition(key, cronConfig?.series, metricStore.series) ?? undefined;
+      // Same resolution as the write path, for the same reason.
+      const def = await resolveSeries(key);
       if (metricsRemote) {
         const res = await metricsRemote.read(key, limit);
         if (!res.ok) return { ok: false, error: res.error };
@@ -5844,12 +5843,12 @@ function metricToolDeps() {
     },
 
     async writeSample(input) {
-      // BOTH SCOPES, because they disagree in hub mode: the declaration lives in
-      // the schedule document (mirrored to the hub) while `metricStore` is empty,
-      // so a local-only lookup refused every write to a series `list` had just
-      // shown. See `seriesDefinition`.
-      const def =
-        seriesDefinition(input.series, cronConfig?.series, metricStore.series) ?? undefined;
+      // THE HUB IS THE TRUTH IN HUB MODE. A series created straight on the hub
+      // (which is what `declare` does) is not in `cronConfig.series` — that only
+      // holds what the SCHEDULE document declared — and `metricStore` is empty.
+      // Looking only at those two is why `list` showed six psi.* series and
+      // every write to them answered "unknown series".
+      const def = await resolveSeries(input.series);
       // The slot defaults to the current minute of the wearer's day, so an agent
       // writing twice in one scheduled run REPLACES its own value rather than
       // plotting two points for the same moment.
@@ -5896,6 +5895,29 @@ function metricToolDeps() {
 }
 
 /**
+ * Resolve a series declaration for a READ or a WRITE, wherever it actually lives.
+ *
+ * Three places can hold one, in decreasing order of authority:
+ *   1. the schedule document (`cronConfig.series`) — but only for series that the
+ *      schedule itself declared or that were mirrored there;
+ *   2. this process's `metricStore` — EMPTY whenever the hub store is configured;
+ *   3. the hub — the only place a hub-mode declaration really exists.
+ *
+ * Skipping (3) is the whole bug: `list` asks the hub and sees everything, while
+ * `write`/`read` consulted two empty local maps and refused series that were
+ * right there. Any future lookup must go through here.
+ */
+async function resolveSeries(key) {
+  const local = seriesDefinition(key, cronConfig?.series, metricStore.series);
+  if (local) return local ?? undefined;
+  if (metricsRemote?.get) {
+    const res = await metricsRemote.get(key);
+    if (res?.ok && res.series) return res.series;
+  }
+  return undefined;
+}
+
+/**
  * How many series the dashboard may hold.
  *
  * A number, not a vibe: it is what stops a model that decides every region, every
@@ -5918,7 +5940,10 @@ async function declareMetricSeries(input, { refine = false } = {}) {
   if (!parsed.ok) return { ok: false, error: parsed.error };
   const key = parsed.series.key;
   const list = cronConfig?.series ?? [];
-  const existing = list.find((s) => s.key === key);
+  // ASK THE HUB TOO, or "declare" would happily re-create a series that already
+  // exists there — replacing a unit and orphaning the readings recorded against
+  // the old one, which is the one thing a declaration must never do silently.
+  const existing = await resolveSeries(key);
   // A model naming a series that exists is TOLD what it is. It cannot rewrite
   // the unit under readings that were recorded against the old one.
   if (existing && !refine) return { ok: true, existed: true, series: existing };

@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.72
+
+v0.3.72 - Recording and reading PSI works again
+
+- A series created on the hub could be listed but never written to: one path
+asked the hub, the other looked in a local copy that is empty. Both now use the
+same lookup, including the hub.
+- Reading a series returned only the last day and called it the history, so a
+month of backfill showed as one point. It now returns the readings it has.
+
 ## 0.3.71
 
 v0.3.71 - Recording a reading works again
