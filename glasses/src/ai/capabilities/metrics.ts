@@ -235,16 +235,20 @@ export const metricsCapabilities: Capability[] = [
       const text = String(reply.result ?? '');
 
       if (!reply.ok) {
-        // The relay's own sentence, not a paraphrase: the wearer's fix depends on
-        // which of several refusals it was (undeclared series, bad value, no
-        // store configured at all).
+        // THE RELAY'S SENTENCE IS THE SUMMARY, not "numbers unavailable". When
+        // the reason only lived in `text`, the glasses rendered a box reading
+        // "Unavailable" with an empty error beneath it — technically a failure
+        // report and practically no information. One clipped line of the real
+        // reason is what the wearer can act on.
+        const reason = String(reply.error || text || 'the relay refused the call').trim();
+        const clipped = reason.length > 96 ? `${reason.slice(0, 93)}...` : reason;
         return {
           ok: false,
-          summary: 'numbers unavailable',
-          data: { action, error: reply.error ?? '', text },
+          summary: clipped,
+          data: { action, error: reason, text },
           hint:
-            `${text || reply.error || 'the relay refused the call'}. Do not invent a series, a value or ` +
-            'a reading — tell the wearer in one sentence what it said.',
+            `${reason}. Do not invent a different key, a value or a reading — tell the wearer in ` +
+            'one sentence what it said.',
         };
       }
 

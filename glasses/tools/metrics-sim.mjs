@@ -34,6 +34,7 @@ const {
   latestOf,
   normaliseSample,
   normaliseSeries,
+  seriesDefinition,
   trimSamples,
   viewKindFor,
 } = await import(`${pathToFileURL(metricsPath).href}?v=${Date.now()}`);
@@ -433,6 +434,21 @@ try {
     // A leftover temp directory is not a test failure.
   }
 }
+
+// ── 7b. finding a declaration, in hub mode ───────────────────────────────
+// THE PRODUCTION BUG: with the hub configured, declarations live in the
+// schedule document and the local `metricStore` is EMPTY. `list` asked the hub
+// and saw six series; `write` looked only at the local map, found nothing, and
+// refused with "unknown series — declare it first". A whole dashboard that
+// could be read and not written to.
+const declared = [{ key: 'psi.central', label: 'PSI central', unit: 'PSI', type: 'number' }];
+check('the declaration is found in the schedule, with an empty local store', seriesDefinition('psi.central', declared, {})?.unit, 'PSI');
+check('and in the local store when that is where it lives', seriesDefinition('psi.west', [], { 'psi.west': { key: 'psi.west', unit: 'PSI' } })?.unit, 'PSI');
+check('the schedule wins over the local copy', seriesDefinition('psi.central', declared, { 'psi.central': { key: 'psi.central', unit: 'millibars' } })?.unit, 'PSI');
+check('a key is matched case-insensitively', seriesDefinition('PSI.Central', declared, null)?.key, 'psi.central');
+check('a missing series is null, not a throw', seriesDefinition('nope.nothing', declared, {}), null);
+check('a blank key is null', seriesDefinition('', declared), null);
+check('a missing source is skipped', seriesDefinition('psi.central', undefined, declared)?.key, 'psi.central');
 
 // ── 8. the panel can declare a series WITHOUT a collector ──────────────────
 // The tool can only write to a series that already exists, and until now the only

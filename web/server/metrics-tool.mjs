@@ -230,7 +230,14 @@ export async function runMetricsTool(tool, args, deps) {
       slot: args?.slot ? String(args.slot) : '',
       ...(epoch ? { ts: epoch } : {}),
     });
-    if (!res?.ok) return { ok: false, text: res?.error ?? `could not write to "${key}"` };
+    if (!res?.ok) {
+      // NAME THE KEY. "unknown series" with no key, in a session where `list`
+      // just showed six series, is unactionable: it reads as a contradiction
+      // rather than a lookup that missed. The key is the one thing the wearer
+      // can compare against what they saw.
+      const why = String(res?.error ?? `could not write to "${key}"`);
+      return { ok: false, text: `${why} (looked up "${key}")` };
+    }
     return {
       ok: true,
       text: `${res.replaced ? 'Replaced' : 'Recorded'} ${formatNumber(res.value, res.precision)}${

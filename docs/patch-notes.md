@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.71
+
+v0.3.71 - Recording a reading works again
+
+- A series that showed on the dashboard could still refuse every new reading,
+because one side looked on the hub and the other only in memory. Both now find
+the same series.
+- A refusal says why, and says which series it looked for, instead of showing
+Unavailable with nothing behind it.
+
 ## 0.3.70
 
 v0.3.70 - Jarvis can start tracking something new

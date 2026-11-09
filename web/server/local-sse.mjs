@@ -273,6 +273,7 @@ import {
   normaliseSample,
   normaliseSeries,
   trimSamples,
+  seriesDefinition,
   viewKindFor,
 } from './metrics.mjs';
 // The hub's metric store, when one is configured. Its header lists the four wire
@@ -4321,7 +4322,15 @@ const server = createServer(async (req, res) => {
       // way to drive the tool from a test without spending a model call.
       if (isMetricsTool(body)) {
         const result = await runMetricsTool(body, args, metricToolDeps());
-        json(res, 200, { ok: result.ok, result: result.text });
+        // `error` as well as `result`: a refusal whose reason only exists in
+        // `result` reaches the caller as an empty error field, and the glasses
+        // then render the summary "Unavailable" with nothing behind it. One
+        // sentence in two fields costs nothing and makes the box say WHY.
+        json(res, 200, {
+          ok: result.ok,
+          result: result.text,
+          ...(result.ok ? {} : { error: result.text }),
+        });
         return;
       }
 
@@ -5807,7 +5816,9 @@ function metricToolDeps() {
     },
 
     async readSeries(key, limit) {
-      const def = metricStore.series[key];
+      // Same two scopes as the write path — a read that reports no unit for a
+      // series `list` showed with one is the same bug wearing a different hat.
+      const def = seriesDefinition(key, cronConfig?.series, metricStore.series) ?? undefined;
       if (metricsRemote) {
         const res = await metricsRemote.read(key, limit);
         if (!res.ok) return { ok: false, error: res.error };
@@ -5833,7 +5844,12 @@ function metricToolDeps() {
     },
 
     async writeSample(input) {
-      const def = metricStore.series[input.series];
+      // BOTH SCOPES, because they disagree in hub mode: the declaration lives in
+      // the schedule document (mirrored to the hub) while `metricStore` is empty,
+      // so a local-only lookup refused every write to a series `list` had just
+      // shown. See `seriesDefinition`.
+      const def =
+        seriesDefinition(input.series, cronConfig?.series, metricStore.series) ?? undefined;
       // The slot defaults to the current minute of the wearer's day, so an agent
       // writing twice in one scheduled run REPLACES its own value rather than
       // plotting two points for the same moment.

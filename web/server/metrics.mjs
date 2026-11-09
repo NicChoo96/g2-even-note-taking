@@ -82,6 +82,32 @@ export function normaliseSeries(input) {
   };
 }
 
+/**
+ * Find a series DECLARATION by key, across every place declarations live.
+ *
+ * The bug this exists for: `write` looked the definition up in the relay's local
+ * `metricStore` while `list` asked the HUB. With the hub configured, declarations
+ * live in the schedule document (`cronConfig.series`, mirrored to the hub) and
+ * the local map is EMPTY — so listing showed six `psi.*` series with readings and
+ * every write to them answered "unknown series". Same session, same minute,
+ * contradictory answers, and no reading could be recorded at all.
+ *
+ * Sources are tried in the caller's order of authority; the first hit wins. A
+ * missing list is skipped rather than throwing, because one of these is a plain
+ * object map and the other is an array.
+ */
+export function seriesDefinition(key, ...sources) {
+  const wanted = String(key ?? '').trim().toLowerCase();
+  if (!wanted) return null;
+  for (const source of sources) {
+    if (!source) continue;
+    const list = Array.isArray(source) ? source : Object.values(source);
+    const hit = list.find((s) => String(s?.key ?? '').toLowerCase() === wanted);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 function normalisePrecision(raw, type) {
   if (type !== 'number') return 0;
   const n = Number(raw);

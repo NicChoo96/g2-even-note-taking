@@ -474,6 +474,24 @@ try {
 // model is told about and cannot call (or vice versa).
 const relaySrc = await readFile(resolve(here, '../../web/server/local-sse.mjs'), 'utf8');
 check('the relay imports the metrics tool', /from '\.\/metrics-tool\.mjs'/.test(relaySrc), true);
+
+// THE SCOPE BUG. With the hub configured, declarations live in the schedule
+// document and `metricStore` is EMPTY, so a write that looked only at the local
+// map answered "unknown series" for a series `list` had just shown — the
+// dashboard could be read and not written to. The lookup must span both.
+check(
+  'write resolves the declaration from BOTH scopes, not just the local store',
+  /async writeSample\(input\)[\s\S]{0,600}seriesDefinition\(input\.series, cronConfig\?\.series, metricStore\.series\)/.test(relaySrc),
+  true,
+);
+check(
+  'and a refused tool call carries its reason in `error`, not only `result`',
+  // The window is unbounded on purpose: the explanatory comment between the
+  // branch and the response is long, and a fixed-offset regex would fail for
+  // the wrong reason (it did).
+  /if \(isMetricsTool\(body\)\) \{[\s\S]*?error: result\.text/.test(relaySrc),
+  true,
+);
 check(
   'the schema is offered to a run',
   /if \(isMetricsTool\(t\)\) return metricsToolSchema\(t\)/.test(relaySrc),

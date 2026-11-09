@@ -200,6 +200,21 @@ const call = async (args, answer = { ok: true, result: 'ok' }) => {
   const { res } = await call({ action: 'list' }, { ok: false, result: '', error: 'metrics are not available on this relay' });
   checkTrue('a blank refusal still names the reason', /metrics are not available/.test(res.hint));
 }
+{
+  // THE PRODUCTION SHAPE: the relay put the reason in `result` and left `error`
+  // empty. The old code summarised that as "numbers unavailable" with an empty
+  // error, so the glasses showed a box that said nothing. The summary must be
+  // the reason, and data.error must not be blank.
+  const { res } = await call(
+    { action: 'write', series: 'psi.central', value: 60 },
+    { ok: false, result: 'unknown series — declare it first (looked up "psi.central")' },
+  );
+  check('a refusal with no error field still reports', res.ok, false);
+  checkTrue('the summary IS the reason, not "Unavailable"', /unknown series/.test(res.summary));
+  checkTrue('and it is not the old placeholder', !/numbers unavailable/.test(res.summary));
+  checkTrue('data.error is populated from the text', /unknown series/.test(res.data.error));
+  checkTrue('and the hint repeats it', /unknown series/.test(res.hint));
+}
 
 // ── 5. is it actually reachable? (source invariants) ───────────────────────
 const pages = readFileSync(resolve(here, '../src/ai/pages.ts'), 'utf8');
