@@ -32,6 +32,7 @@ import type { ConnStatus } from '../store';
 import { activeDoc, type HubState, type SectionId } from '../types';
 import { bootCount, loadDeviceSession } from '../durable-docs';
 import { docWords, filterDocs, orderDocs, whenLabel } from './doc-list';
+import { useRemoteDraft } from './draft';
 import { ThemeToggle } from './ThemeToggle';
 import { SelectionBar } from './SelectionBar';
 import {
@@ -89,6 +90,34 @@ function tabLabel(id: Tab): string {
 
 function useHubState(): HubState {
   return useSyncExternalStore(subscribe, getState);
+}
+
+/**
+ * One to-do's text, drafted locally.
+ *
+ * A `/todos` nudge re-reads the whole list, so a row bound straight to hub state
+ * loses whatever was typed since the last debounce — the "it eats my letters"
+ * half of the twitch. The row owns its text while focused and adopts the hub's
+ * value again once it is not.
+ */
+function TodoText({ id, text, onCommit, readOnly }: {
+  id: string;
+  text: string;
+  onCommit: (id: string, text: string) => void;
+  readOnly: boolean;
+}) {
+  const draft = useRemoteDraft(text, (v) => onCommit(id, v));
+  return (
+    <input
+      className="todo-text"
+      value={draft.value}
+      onChange={draft.onChange}
+      onFocus={draft.onFocus}
+      onBlur={draft.onBlur}
+      placeholder="Task…"
+      readOnly={readOnly}
+    />
+  );
 }
 
 function useConn(): ConnStatus {
@@ -166,10 +195,27 @@ export default function App() {
   const active = activeDoc(state);
 
   /**
+   * Where the open doc sat in the list when it was opened.
+   *
+   * Every keystroke in the body bumps `updatedAt`, and the list is "newest
+   * first" — so without this the row you are writing into climbs to the top while
+   * you type and the list appears to shuffle itself. Pinned, it stays where you
+   * left it; the rest of the list is still live. Set during render (React's
+   * documented adjust-on-prop-change pattern) so the very first paint of a newly
+   * opened doc already uses the right stamp.
+   */
+  const [docPin, setDocPin] = useState<{ id: string; at: number } | null>(null);
+  if (active && docPin?.id !== active.id) {
+    setDocPin({ id: active.id, at: Number(active.updatedAt ?? 0) });
+  } else if (!active && docPin) {
+    setDocPin(null);
+  }
+
+  /**
    * Newest first, and filterable by title or body — both rules live in
    * ./doc-list so a harness can drive them without a React tree.
    */
-  const orderedDocs = orderDocs(docs);
+  const orderedDocs = orderDocs(docs, docPin);
   const visibleDocs = filterDocs(orderedDocs, docQuery);
 
   /**
@@ -278,6 +324,14 @@ export default function App() {
     setTab(null); // a real section clears the local Settings override
     storeSelectSection(section);
   };
+
+  // The editors below are fed by the hub, so a peer nudge or a stale-rev refresh
+  // can hand them a copy that is one debounce behind the caret. `useRemoteDraft`
+  // holds the typed text while the field has focus and adopts the server's value
+  // again once it does not — see ./draft.
+  const docTitle = useRemoteDraft(active?.title ?? '', renameActiveDoc);
+  const docBody = useRemoteDraft(active?.content ?? '', setActiveDocContent);
+  const notesDraft = useRemoteDraft(state.sections.notes, setNotes);
 
   const pending = state.sections.todo.filter((t) => !t.done).length;
   const doneCount = state.sections.todo.length - pending;
@@ -440,11 +494,10 @@ export default function App() {
                       {t.done ? '✓' : ''}
                     </button>
                   )}
-                  <input
-                    className="todo-text"
-                    value={t.text}
-                    onChange={(e) => editTask(t.id, e.target.value)}
-                    placeholder="Task…"
+                  <TodoText
+                    id={t.id}
+                    text={t.text}
+                    onCommit={editTask}
                     readOnly={picking === 'todo'}
                   />
                   {picking !== 'todo' && (
@@ -580,8 +633,10 @@ export default function App() {
                       <div className="doc-title-row">
                         <input
                           className="doc-title-input"
-                          value={active.title}
-                          onChange={(e) => renameActiveDoc(e.target.value)}
+                          value={docTitle.value}
+                          onChange={docTitle.onChange}
+                          onFocus={docTitle.onFocus}
+                          onBlur={docTitle.onBlur}
                           placeholder="Doc title…"
                         />
                         <button
@@ -602,8 +657,10 @@ export default function App() {
                       </div>
                       <textarea
                         className="doc-textarea"
-                        value={active.content}
-                        onChange={(e) => setActiveDocContent(e.target.value)}
+                        value={docBody.value}
+                        onChange={docBody.onChange}
+                        onFocus={docBody.onFocus}
+                        onBlur={docBody.onBlur}
                         placeholder="Start writing… saved automatically and streamed live to your glasses."
                       />
                     </>
@@ -630,8 +687,10 @@ export default function App() {
             </div>
             <textarea
               className="doc-textarea"
-              value={state.sections.notes}
-              onChange={(e) => setNotes(e.target.value)}
+              value={notesDraft.value}
+              onChange={notesDraft.onChange}
+              onFocus={notesDraft.onFocus}
+              onBlur={notesDraft.onBlur}
               placeholder="Quick notes / memos. Edits stream live to the glasses."
             />
           </div>

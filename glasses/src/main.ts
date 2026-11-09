@@ -181,11 +181,14 @@ async function main(): Promise<void> {
   // load has settled.
   //
   // It cannot be a default in `emptyHubState()` — the hub snapshot is
-  // authoritative for `activeSection` (`adopt()` replaces local state
-  // wholesale), so a default would be overwritten by the very first snapshot and
-  // would also fight the web companion, which legitimately writes the document
-  // it is reading into that same field. A one-shot redirect after the load is
-  // authoritative regardless of what the server stored.
+  // authoritative for the DATA (`adopt()` settles every collection on it), so a
+  // default would be overwritten by the very first snapshot. A one-shot redirect
+  // after the load is authoritative regardless of what the server stored.
+  //
+  // NOTE: `adopt()` deliberately does NOT take `activeSection`/`activeDocId` from
+  // a later snapshot — view state is seeded once and then owned by the surface.
+  // A pair therefore no longer drags each other's page around when the other one
+  // switches tabs or opens a document; only the CONTENT still syncs.
   let bootRedirected = false;
   function bootRedirect(): void {
     if (bootRedirected) return;

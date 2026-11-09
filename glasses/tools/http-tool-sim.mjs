@@ -227,7 +227,13 @@ assert(
 // ── 7. The UI can author one ────────────────────────────────────────────────
 console.log('\n§7  the panel can describe the tool');
 assert('ToolDef carries a body template', /bodyTemplate\?: string/.test(typesSrc));
-assert('the editor writes it', /patch\(\{ bodyTemplate: e\.target\.value \}\)/.test(panelSrc));
+assert(
+  // The editor writes the template through a locally-drafted field, so the write
+  // is the hook's commit rather than an inline `onChange` — the assertion is that
+  // a `bodyTemplate` PATCH exists at all, not what shape the handler has.
+  'the editor writes it',
+  /patch\(\{ bodyTemplate: v \}\)/.test(panelSrc),
+);
 assert('the editor validates it live', /is not valid JSON/.test(panelSrc));
 assert(
   'the editor tells the truth about an unparseable template',

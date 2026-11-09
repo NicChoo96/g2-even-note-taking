@@ -57,7 +57,7 @@ import {
 import { MicButton } from './Dictate';
 import { RestToolConfig } from './ToolsPanel';
 import { fetchAgentStatus, type AgentStatus } from './agents-client';
-
+import { useRemoteDraft } from './draft';
 function useAgents(): AgentsState {
   return useSyncExternalStore(subscribeAgents, getAgents);
 }
@@ -115,6 +115,15 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
    * refreshes against a record nobody else is touching.
    */
   const patch = (p: Partial<AgentDef>) => saveAgent(agent.id, p);
+
+  // These three fields are bound to a hub record that other devices can change
+  // (and that our own debounced save echoes back). A refresh that lands between
+  // two keystrokes would repaint the input from the older server copy and eat
+  // what was just typed, so the field owns its text while it has focus.
+  const name = useRemoteDraft(agent.name, (v) => patch({ name: v }));
+  const systemPrompt = useRemoteDraft(agent.systemPrompt, (v) => patch({ systemPrompt: v }));
+  const prompt = useRemoteDraft(agent.prompt, (v) => patch({ prompt: v }));
+  const model = useRemoteDraft(agent.model ?? '', (v) => patch({ model: v || undefined }));
 
   /** Why a tool could not be attached, in the wearer's words. Empty when fine. */
   const [seedNote, setSeedNote] = useState('');
@@ -238,20 +247,24 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
     <div className="agent-editor">
       <label className="field-label">Name</label>
       <input
-        value={agent.name}
-        onChange={(e) => patch({ name: e.target.value })}
+        value={name.value}
+        onChange={name.onChange}
+        onFocus={name.onFocus}
+        onBlur={name.onBlur}
         placeholder="Research assistant"
       />
 
       <label className="field-label">System prompt</label>
       <div className="field-toolbar">
-        <MicButton compact onText={(t) => patch({ systemPrompt: `${agent.systemPrompt}\n${t}`.trim() })} />
+        <MicButton compact onText={(t) => systemPrompt.onChange({ target: { value: `${systemPrompt.value}\n${t}`.trim() } })} />
       </div>
       <textarea
         className="doc-textarea"
         rows={4}
-        value={agent.systemPrompt}
-        onChange={(e) => patch({ systemPrompt: e.target.value })}
+        value={systemPrompt.value}
+        onChange={systemPrompt.onChange}
+        onFocus={systemPrompt.onFocus}
+        onBlur={systemPrompt.onBlur}
         placeholder="You are a concise research assistant. Search the web when facts are needed, then answer in 3 bullet points."
       />
 
@@ -260,13 +273,15 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
         What the glasses run when you pick this agent and choose <strong>Trigger</strong>.
       </p>
       <div className="field-toolbar">
-        <MicButton compact onText={(t) => patch({ prompt: `${agent.prompt}\n${t}`.trim() })} />
+        <MicButton compact onText={(t) => prompt.onChange({ target: { value: `${prompt.value}\n${t}`.trim() } })} />
       </div>
       <textarea
         className="doc-textarea"
         rows={3}
-        value={agent.prompt}
-        onChange={(e) => patch({ prompt: e.target.value })}
+        value={prompt.value}
+        onChange={prompt.onChange}
+        onFocus={prompt.onFocus}
+        onBlur={prompt.onBlur}
         placeholder="What is new in AI this week?"
       />
 
@@ -336,8 +351,10 @@ function AgentEditor({ agent }: { agent: AgentDef }) {
 
       <label className="field-label">Model override (blank = global)</label>
       <input
-        value={agent.model ?? ''}
-        onChange={(e) => patch({ model: e.target.value || undefined })}
+        value={model.value}
+        onChange={model.onChange}
+        onFocus={model.onFocus}
+        onBlur={model.onBlur}
         placeholder={state.llm.model}
         list="free-tool-models"
       />
@@ -467,6 +484,9 @@ export function AgentsPanel() {
   /** A refused hub write must never be silent — it is the only signal there is. */
   const hubError = useSyncExternalStore(subscribeAgentsError, getAgentsError);
   const [selected, setSelected] = useState<string | null>(null);
+  // Same rule as the Docs list: the agent whose editor is open keeps the row
+  // position it had when it was picked, instead of climbing on every keystroke.
+  const [agentPin, setAgentPin] = useState<{ id: string; at: number } | null>(null);
   const [prompt, setPrompt] = useState('');
   const [error, setError] = useState('');
   const [statusInfo, setStatusInfo] = useState<AgentStatus | null>(null);
@@ -479,6 +499,11 @@ export function AgentsPanel() {
   }, [state.updatedAt]);
 
   const agent = state.agents.find((a) => a.id === selected) ?? state.agents[0] ?? null;
+  // Adjust-on-prop-change: the pin tracks whichever agent the editor is showing,
+  // so a rename cannot reorder the row out from under the pointer.
+  if (agent && agentPin?.id !== agent.id) {
+    setAgentPin({ id: agent.id, at: Number(agent.updatedAt ?? 0) });
+  }
   const sessions = agent ? state.sessions.filter((s) => s.agentId === agent.id) : [];
   const shown: AgentSession | null =
     sessions.find((s) => s.id === openSession) ?? sessions[0] ?? null;
@@ -654,7 +679,7 @@ export function AgentsPanel() {
           <div className="panel-label">Agents</div>
           <ul className="agent-list">
             {state.agents.length === 0 && <li className="empty">No agents yet.</li>}
-            {orderedAgents(state.agents).map((a) => (
+            {orderedAgents(state.agents, agentPin).map((a) => (
               <li key={a.id} className={a.id === agent?.id ? 'agent-row active' : 'agent-row'}>
                 <button className="agent-pick" onClick={() => setSelected(a.id)}>
                   <span className="agent-name">{a.name || '(unnamed)'}</span>

@@ -53,8 +53,13 @@ export type ConnStatus = 'idle' | 'connecting' | 'open' | 'error';
 let state: HubState = loadLocal();
 const listeners = new Set<() => void>();
 // Whether the hub has answered at least once. Until it has, the cached copy is
-// all there is to paint; after it has, the hub wins every disagreement.
+// all there is to paint; after it has, the hub wins every disagreement about
+// DATA.
 let hubLoaded = false;
+// Whether a snapshot has already seeded WHICH PAGE this surface is showing. See
+// `adopt()`: only the first snapshot may do that, because after it the tab and
+// the open document belong to the person looking at the screen.
+let adoptedViewOnce = false;
 
 let conn: ConnStatus = 'idle';
 const connListeners = new Set<(s: ConnStatus) => void>();
@@ -426,12 +431,28 @@ export async function loadHub(): Promise<boolean> {
   return true;
 }
 
-/** Adopt a server snapshot wholesale. The hub wins by definition. */
+/** Adopt a server snapshot wholesale. The hub wins on DATA, never on view. */
 function adopt(snap: HubSnapshot): void {
+  // WHICH PAGE YOU ARE LOOKING AT IS NOT DATA.
+  //
+  // `activeSection`/`activeDocId` used to be adopted with everything else, so a
+  // snapshot taken on a reconnect, a stale-rev refresh or a `/files` nudge moved
+  // the reader off their tab and onto whatever row the server happened to be
+  // pointing at — the "tab switches by itself / selection twitches" report. The
+  // server legitimately stores a section (the glasses publish theirs), but that is
+  // a suggestion for a device that has not chosen yet, not an instruction to one
+  // that has.
+  //
+  // So: the FIRST snapshot seeds the view state (a fresh device opens where the
+  // last device left off) and every later snapshot leaves it alone. The tab and
+  // the open document are owned by the surface, which persists them locally.
+  const seedingView = !adoptedViewOnce;
+  adoptedViewOnce = true;
+  const keepDoc = snap.sections.docs.some((d) => d.id === state.activeDocId) ? state.activeDocId : null;
   state = {
-    activeSection: snap.activeSection,
+    activeSection: seedingView ? snap.activeSection : state.activeSection,
     sections: snap.sections,
-    activeDocId: snap.activeDocId,
+    activeDocId: seedingView ? snap.activeDocId : keepDoc,
     updatedAt: snap.updatedAt || Date.now(),
   };
   persist(state);
@@ -459,10 +480,14 @@ function wireStaleRefresh(): void {
  * Refetch ONE collection because a PEER device changed it (§2.4).
  *
  * WHY NOT JUST `loadHub()`: that read inlines every document body (63 KB across
- * the 19 documents in this deployment) and replaces `activeSection` and
- * `activeDocId` with the server's — so a peer ticking one to-do would repaint
- * the entire app and could pull the wearer out of the document they are reading.
+ * the 19 documents in this deployment) and re-adopts every collection, so a peer
+ * ticking one to-do would cost a full snapshot read to learn about one list.
  * Only the collection the nudge named is read.
+ *
+ * NOTE: `loadHub()` no longer moves the TAB or the open document — `adopt()`
+ * keeps view state local after the first snapshot — so this is now purely a cost
+ * argument, not a correctness one. It still matters: 63 KB per keystroke from a
+ * peer is load nobody asked for, and the per-collection reads are one request.
  *
  * `/files` and `/` really do fall back to the snapshot, and for one reason each:
  * a file appears in HubState as a `FileRef` and this store has no read that
@@ -531,12 +556,22 @@ export function refreshSection(path: string): void {
 function adoptDocs(metas: DocMeta[]): void {
   if (!metas.length && !getState().sections.docs.length) return;
   const have = new Map(getState().sections.docs.map((d) => [d.id, d]));
-  const docs: DocEntry[] = metas.map((m) => ({
-    id: m.id,
-    title: m.title,
-    content: typeof m.content === 'string' ? m.content : (have.get(m.id)?.content ?? ''),
-    updatedAt: m.updatedAt,
-  }));
+  const docs: DocEntry[] = metas.map((m) => {
+    const local = have.get(m.id);
+    // A TITLE IS TEXT SOMEONE MAY BE TYPING. Renaming is debounced and the list
+    // read is independent of it, so a list that arrives mid-rename still carries
+    // the OLD title and would undo the last characters. When the local row is
+    // newer than the server's, the local title is the one in flight: keep it and
+    // let the rename's own write settle the row.
+    const keepLocalTitle =
+      local !== undefined && Number(local.updatedAt ?? 0) > Number(m.updatedAt ?? 0);
+    return {
+      id: m.id,
+      title: keepLocalTitle ? local.title : m.title,
+      content: typeof m.content === 'string' ? m.content : (local?.content ?? ''),
+      updatedAt: keepLocalTitle ? local.updatedAt : m.updatedAt,
+    };
+  });
   const open = getState().activeDocId;
   commit((s) => ({
     ...s,

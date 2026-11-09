@@ -595,8 +595,14 @@ export function agentUpdatedAt(a: AgentDef): number {
 }
 
 /** Agents in the order every surface shows them: most recently updated first. */
-export function orderedAgents(agents: readonly AgentDef[]): AgentDef[] {
-  return [...agents].sort((a, b) => agentUpdatedAt(b) - agentUpdatedAt(a));
+export function orderedAgents(
+  agents: readonly AgentDef[],
+  // Same rule as `orderDocs`: the row being edited keeps the position it had
+  // when it was opened, instead of climbing to the top on every keystroke.
+  pin?: { id: string; at: number } | null,
+): AgentDef[] {
+  const of = (a: AgentDef) => (pin && a.id === pin.id ? pin.at : agentUpdatedAt(a));
+  return [...agents].sort((a, b) => of(b) - of(a));
 }
 
 export function agentById(s: AgentsState, id: string | null | undefined): AgentDef | null {

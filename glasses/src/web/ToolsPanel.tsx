@@ -42,6 +42,7 @@ import {
   type ToolDef,
 } from '../types';
 import { saveSettings } from './agents-client';
+import { useRemoteDraft } from './draft';
 
 function useAgents(): AgentsState {
   return useSyncExternalStore(subscribeAgents, getAgents);
@@ -109,6 +110,11 @@ export function ToolEditor({
    */
   const patch = (p: Partial<ToolDef>) => saveTool(tool.id, p);
 
+  // Tools are hub records, and a `/agents` nudge replaces them wholesale. These
+  // fields keep their own text while focused so a refresh cannot undo a keystroke.
+  const name = useRemoteDraft(tool.name, (v) => patch({ name: v.replace(/\s+/g, '_') }));
+  const description = useRemoteDraft(tool.description, (v) => patch({ description: v }));
+
   const method = tool.method ?? 'POST';
   /** GET puts the template in the query string; POST and PUT in the body. */
   const payloadLabel = method === 'GET' ? 'Query parameters (JSON)' : 'Request body (JSON)';
@@ -125,8 +131,10 @@ export function ToolEditor({
       <div className="tool-head">
         <input
           className="tool-name"
-          value={tool.name}
-          onChange={(e) => patch({ name: e.target.value.replace(/\s+/g, '_') })}
+          value={name.value}
+          onChange={name.onChange}
+          onFocus={name.onFocus}
+          onBlur={name.onBlur}
           placeholder="tool_name"
         />
         <select value={tool.kind} onChange={(e) => patch({ kind: e.target.value as ToolDef['kind'] })}>
@@ -157,8 +165,10 @@ export function ToolEditor({
       </div>
 
       <input
-        value={tool.description}
-        onChange={(e) => patch({ description: e.target.value })}
+        value={description.value}
+        onChange={description.onChange}
+        onFocus={description.onFocus}
+        onBlur={description.onBlur}
         placeholder="What this tool does (the model reads this to decide when to call it)"
       />
 
@@ -262,6 +272,11 @@ export function RestToolConfig({ tool }: { tool: ToolDef }) {
   const patch = (p: Partial<ToolDef>) => saveTool(tool.id, p);
   const method = tool.method ?? 'POST';
   const payloadLabel = method === 'GET' ? 'Query parameters (JSON)' : 'Request body (JSON)';
+  // A URL or a JSON body takes seconds to type and one keystroke to lose: the hub
+  // can hand back an older copy while the caret is still in the field.
+  const url = useRemoteDraft(tool.url ?? '', (v) => patch({ url: v }));
+  const headers = useRemoteDraft(tool.headers ?? '', (v) => patch({ headers: v }));
+  const bodyTemplate = useRemoteDraft(tool.bodyTemplate ?? '', (v) => patch({ bodyTemplate: v }));
   const template = readJsonObject(tool.bodyTemplate ?? '');
   const headerTemplate = readJsonObject(tool.headers ?? '');
   /** A header value can only be a string — see `parseHeaderTemplate`. */
@@ -282,8 +297,10 @@ export function RestToolConfig({ tool }: { tool: ToolDef }) {
         REST · {tool.name} — {method}
       </label>
       <input
-        value={tool.url ?? ''}
-        onChange={(e) => patch({ url: e.target.value })}
+        value={url.value}
+        onChange={url.onChange}
+        onFocus={url.onFocus}
+        onBlur={url.onBlur}
         placeholder="https://api.example.com/v1/endpoint"
       />
       <label className="inline-field">
@@ -301,8 +318,10 @@ export function RestToolConfig({ tool }: { tool: ToolDef }) {
       <textarea
         className="doc-textarea"
         rows={2}
-        value={tool.headers ?? ''}
-        onChange={(e) => patch({ headers: e.target.value })}
+        value={headers.value}
+        onChange={headers.onChange}
+        onFocus={headers.onFocus}
+        onBlur={headers.onBlur}
         placeholder={'{"X-Api-Key": "", "Accept-Language": "en"}'}
       />
       <p className={headerTemplate.error ? 'warn-line' : 'hint-line'}>
@@ -334,8 +353,10 @@ export function RestToolConfig({ tool }: { tool: ToolDef }) {
       <textarea
         className="doc-textarea"
         rows={4}
-        value={tool.bodyTemplate ?? ''}
-        onChange={(e) => patch({ bodyTemplate: e.target.value })}
+        value={bodyTemplate.value}
+        onChange={bodyTemplate.onChange}
+        onFocus={bodyTemplate.onFocus}
+        onBlur={bodyTemplate.onBlur}
         placeholder={'{"query": "", "limit": 5}'}
       />
       <p className={template.error ? 'warn-line' : 'hint-line'}>

@@ -26,9 +26,18 @@ import type { DocEntry } from '../types';
  * A row with no usable stamp sorts LAST rather than first. A missing value would
  * otherwise read as 0 (`-Infinity` in the subtraction) and sink to the bottom by
  * luck, or read as `NaN` and scramble the whole list.
+ *
+ * `pin` holds ONE row's stamp at the value it had when that row was opened. That
+ * matters because every keystroke in a body bumps `updatedAt`: without it the
+ * document you are typing into climbs to the top of the list under your cursor,
+ * which reads as the selection jumping while you write.
  */
-export function orderDocs(docs: readonly DocEntry[]): DocEntry[] {
-  return [...docs].sort((a, b) => stamp(b) - stamp(a));
+export function orderDocs(
+  docs: readonly DocEntry[],
+  pin?: { id: string; at: number } | null,
+): DocEntry[] {
+  const of = (doc: DocEntry) => (pin && doc.id === pin.id ? pin.at : stamp(doc));
+  return [...docs].sort((a, b) => of(b) - of(a));
 }
 
 function stamp(doc: DocEntry): number {
