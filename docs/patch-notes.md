@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.68
+
+v0.3.68 - Approving a glasses code works again
+
+- Tapping Approve on a waiting glasses code failed every time, so a new pair
+never connected and no device was listed. It now approves and the glasses
+connect straight away.
+- A code read off the lens still works too, on a device that is already paired
+and signed in.
+
 ## 0.3.67
 
 v0.3.67 - Sync no longer moves your screen or eats your typing

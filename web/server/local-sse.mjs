@@ -3305,6 +3305,14 @@ const server = createServer(async (req, res) => {
       /* ignore */
     }
     const code = String(parsed.pairCode || '').trim().toUpperCase();
+    // The id the panel tapped, if it sent one. THIS LINE WAS MISSING: the block
+    // below read `wantedId` while nothing had ever declared it, so every single
+    // approval threw `ReferenceError: wantedId is not defined` before it could
+    // match anything and the wearer saw "Approval failed" on a code that was
+    // sitting right there in the list. A missing `const` is invisible to the
+    // typechecker in a .mjs file and to every harness that does not POST here,
+    // which is exactly why the route is exercised by the pairing harness now.
+    const wantedId = String(parsed.deviceId || '').trim();
     // Approve by DEVICE ID as well as by code. The web panel now LISTS the
     // waiting devices, so it already knows which one the owner tapped — asking
     // them to copy a code from the lens first is friction this removes.

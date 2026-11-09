@@ -237,5 +237,23 @@ check(
   true,
 );
 
+// ── the approve route, end to end ─────────────────────────────────────────
+// THE BUG THIS GUARDS: the route matched by device id through `wantedId`, and
+// nothing ever declared it. Every approval threw `ReferenceError: wantedId is
+// not defined` before it could match ANYTHING, so the panel answered "Approval
+// failed" for a code that was sitting in its own list, on every device. Nothing
+// else could catch it: a .mjs file has no typechecker, and no harness POSTed
+// here. Verified live afterwards — request -> approve returned 200 and the
+// device polled back `approved`.
+const relaySrc = readFileSync(resolve(here, '../../web/server/local-sse.mjs'), 'utf8');
+const declAt = relaySrc.indexOf("const wantedId = String(parsed.deviceId");
+const useAt = relaySrc.indexOf('wantedId ? deviceById(wantedId)');
+checkTrue('the approve route reads the device id the panel taps', declAt > -1);
+checkTrue('and declares it BEFORE the line that uses it', declAt > -1 && useAt > declAt);
+checkTrue(
+  'the panel sends both a code and an id, so either one can match',
+  /pairCode: value\.toUpperCase\(\), deviceId: value/.test(authSrc),
+);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
