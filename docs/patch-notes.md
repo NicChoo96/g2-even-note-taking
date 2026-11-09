@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.69
+
+v0.3.69 - The Data tab is easy to read on a phone
+
+- Your numbers are now a short list you swipe, with one chart at a time, and the
+chart can switch between line, area, bar, step and a plain table.
+- Adding one is a single button with two choices instead of two forms sitting
+open. There is a working example to try before you type anything.
+- Long tab names no longer get cut off on a narrow screen.
+
 ## 0.3.68
 
 v0.3.68 - Approving a glasses code works again
