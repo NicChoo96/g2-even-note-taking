@@ -160,13 +160,12 @@ function SeriesDetail({
           <div className="md-key">{series.key}</div>
         </div>
         <button
-          className="metric-x"
+          className="dp-delete"
           onClick={onDelete}
           disabled={busy}
-          title="Delete this series and its readings"
-          aria-label="Delete series"
+          title="Delete this number and its readings"
         >
-          ✕
+          Delete
         </button>
       </header>
 
@@ -215,16 +214,15 @@ function SeriesDetail({
         </div>
       </div>
 
-      {series.type === 'number' && view.kind !== 'table' ? (
+      {series.type === 'number' && view.kind !== 'table' && plotted.length > 0 ? (
         <MetricChart points={plotted} kind={view.kind} unit={series.unit} precision={series.precision} />
       ) : null}
 
       {rows.length === 0 ? (
         <p className="hint-line">
-          No readings{view.window === 'all' ? '' : ' in this window'} yet.
-          {collector
-            ? ` The collector runs at ${collector.at}.`
-            : ' Nothing collects this one — an agent, Jarvis, or a collector can write to it.'}
+          {view.window === 'all'
+            ? 'No readings yet. Nothing feeds this one — tell Jarvis a value, or add an API collector.'
+            : 'Nothing in this time window. Try “All”.'}
         </p>
       ) : (
         <>
@@ -295,6 +293,20 @@ const BLANK: Draft = {
 };
 
 /**
+ * The example the empty state and the "no URL" form both start from.
+ *
+ * Chosen so the three fields teach the shape in one glance: a dotted key that
+ * reads as a subject (`news`) and a field (`rates.count`), a unit a person would
+ * say out loud, and a label the chart can put on an axis.
+ */
+const EXAMPLE_SERIES = {
+  key: 'news.rates.count',
+  label: 'Rate-cut mentions',
+  unit: 'mentions',
+  type: 'number' as const,
+};
+
+/**
  * The master list is grouped by key PREFIX, which is what makes a subject with
  * several numbers legible: `news.rates.count` and `news.rates.sentiment` sit
  * under one heading and read as two columns of the same table, which is the
@@ -346,6 +358,18 @@ export function DataPanel() {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [warn, setWarn] = useState('');
+  /**
+   * Which form is open, if any. `none` on load on purpose: two dense forms sat
+   * open on a phone between you and your numbers, and the only way to see the
+   * page was to scroll past them. Nothing here is needed to READ the dashboard.
+   */
+  const [addOpen, setAddOpen] = useState<'none' | 'series' | 'collector'>('none');
+  /**
+   * The three steps stay OPEN until dismissed, and on a dashboard with no
+   * readings they are the whole page — that is the case where someone needs to
+   * be told what a series is.
+   */
+  const [helpDismissed, setHelpDismissed] = useState(false);
   const [draft, setDraft] = useState<Draft>(BLANK);
   /** The standalone "add a series" form: four fields, no collector. */
   const [seriesDraft, setSeriesDraft] = useState<{ key: string; label: string; unit: string; type: 'number' | 'string' }>({
@@ -614,31 +638,60 @@ export function DataPanel() {
 
   return (
     <div className="data-panel">
-      <div className="panel-label">
-        Data · numbers collected on a schedule, written by an agent, or recorded by Jarvis
+      <div className="dp-head">
+        <h2 className="dp-title">Data</h2>
+        <button
+          className="dp-help-btn"
+          onClick={() => setHelpDismissed((v) => !v)}
+          aria-expanded={!helpDismissed}
+        >
+          {helpDismissed ? 'How this works' : 'Hide help'}
+        </button>
       </div>
+
+      {!helpDismissed && (
+        <ol className="dp-steps">
+          <li>
+            <strong>Name one number.</strong> A key like <code>news.rates.count</code> — one reading is one value of
+            that number.
+          </li>
+          <li>
+            <strong>Say where it comes from.</strong> An API fetched on a schedule, an agent doing a web search,
+            Jarvis, or your own script.
+          </li>
+          <li>
+            <strong>Pick it below and look.</strong> Line, area, bar or table — switching never changes the data.
+          </li>
+        </ol>
+      )}
 
       {note && <p className="ok-line">{note}</p>}
       {warn && <p className="warn-line">⚠️ {warn}</p>}
       {metrics?.degraded && (
         <p className="warn-line">⚠️ {metrics.error ?? 'the hub metric store is unreachable'}</p>
       )}
-      {metrics?.store?.mode === 'hub' && !metrics.degraded && (
-        <p className="hint-line">Readings are stored on the hub — they survive a deploy.</p>
-      )}
-      {metrics?.store?.mode === 'relay' && (
-        <p className="hint-line">
-          Readings are stored on the relay at {metrics.store.file ?? 'its own disk'} — they survive a restart, not a
-          deploy. Series <em>declarations</em> are stored on the hub with the schedule.
+      {metrics?.store && !metrics.degraded && (
+        <p className="dp-store">
+          {metrics.store.mode === 'hub'
+            ? 'Saved on your hub — survives redeploys.'
+            : 'Saved on this relay’s disk — survives a restart, not a redeploy.'}
         </p>
       )}
 
       {loading && <p className="hint-line">Loading…</p>}
       {!loading && series.length === 0 && (
-        <p className="hint-line">
-          No data points yet. Add one below: a URL and a schedule, or just a key — a series with no collector is
-          one that Jarvis, an agent, or your own script can write to.
-        </p>
+        <div className="dp-empty">
+          <p>No numbers yet — and you do not need an API to start.</p>
+          <button
+            className="primary"
+            onClick={() => {
+              setSeriesDraft(EXAMPLE_SERIES);
+              setAddOpen('series');
+            }}
+          >
+            Start from the example
+          </button>
+        </div>
       )}
 
       {/* ── Master · detail ──────────────────────────────────────────────── */}
@@ -680,17 +733,53 @@ export function DataPanel() {
         </div>
       </div>
 
-      {/* ── A series with no collector ───────────────────────────────────── */}
-      {/* This comes FIRST because it is the smaller decision and the one every
-          other path needs: a collector declares its own series, and an agent can
-          only write to one that already exists. */}
-      <section className="collector-form">
-        <div className="panel-label">Add a series</div>
-        <p className="hint-line">
-          For numbers nothing can fetch — something Jarvis worked out, or a figure you read somewhere. An agent can
-          then record it with the dashboard tool. <strong>Type and unit are fixed once added</strong> (a change needs
-          a new key), so pick the unit carefully.
-        </p>
+      {/* ── Add something ──────────────────────────────────────────────── */}
+      {/* ONE button, then a choice. The two forms used to sit open at the bottom
+          of the page whether or not you were adding anything, which on a phone
+          is the first thing you scroll past to reach your own numbers. */}
+      <div className="dp-add-bar">
+        <button
+          className="primary"
+          onClick={() => setAddOpen((v) => (v === 'none' ? 'series' : 'none'))}
+          aria-expanded={addOpen !== 'none'}
+        >
+          {addOpen === 'none' ? '+ Add a number' : 'Cancel'}
+        </button>
+        <span className="hint-line">Nothing fetches it? An agent or Jarvis can write to it.</span>
+      </div>
+
+      {addOpen !== 'none' && (
+        <div className="md-seg dp-mode" role="tablist" aria-label="Where the numbers come from">
+          <button
+            className={addOpen === 'series' ? 'active' : ''}
+            onClick={() => setAddOpen('series')}
+            role="tab"
+            aria-selected={addOpen === 'series'}
+          >
+            Agent or Jarvis writes it
+          </button>
+          <button
+            className={addOpen === 'collector' ? 'active' : ''}
+            onClick={() => setAddOpen('collector')}
+            role="tab"
+            aria-selected={addOpen === 'collector'}
+          >
+            Fetch from an API
+          </button>
+        </div>
+      )}
+
+      {/* The no-collector path comes FIRST: it is the smaller decision and the
+          one every other path needs, because an agent can only write to a series
+          that already exists. */}
+      {addOpen === 'series' && (
+        <section className="collector-form">
+          <div className="panel-label">One number, no URL</div>
+          <p className="hint-line">
+            Name the number once. After this, Jarvis, an agent or your own script can record readings against it — and
+            you can also write one by hand below. <strong>Unit and type are fixed afterwards</strong>, so pick the unit
+            you want to see.
+          </p>
         <div className="form-row">
           <label>
             Series key
@@ -731,19 +820,39 @@ export function DataPanel() {
           className="primary"
           onClick={() => void declareOnly()}
           disabled={busy || !seriesDraft.key.trim()}
-          title="Add the series so an agent or a collector can write to it"
+          title="Add the number so an agent or a collector can write to it"
         >
-          {busy ? 'Working…' : 'Add series'}
+          {busy ? 'Working…' : 'Add it'}
         </button>
-      </section>
+        </section>
+      )}
 
-      {/* ── A new collector ─────────────────────────────────────────────── */}
-      <section className="collector-form">
-        <div className="panel-label">Add a collector</div>
-        <p className="hint-line">
-          One series per collector. The response is read as JSON; <code>select</code> picks the number out of it
-          (<code>data.last</code>, <code>items.0.price</code>).
-        </p>
+      {addOpen === 'collector' && (
+        <section className="collector-form">
+          <div className="panel-label">Fetch one number from an API</div>
+          <p className="hint-line">
+            Point it at a JSON URL and tell it where the number lives. The relay does the fetching — your API key
+            stays on the server, never in this page.
+          </p>
+
+          <div className="dp-example-row">
+            <button
+              onClick={() => {
+                setDraft({
+                  ...BLANK,
+                  key: 'fx.sgd.usd',
+                  label: 'SGD to USD',
+                  unit: 'USD',
+                  url: 'https://api.frankfurter.app/latest?from=SGD&to=USD',
+                  select: 'rates.USD',
+                });
+                setNote('Filled in a real endpoint — press Test now to fetch one reading.');
+              }}
+            >
+              Try a working example
+            </button>
+            <span className="hint-line">Frankfurter (free, no key): asks for the SGD→USD rate.</span>
+          </div>
 
         <div className="form-row">
           <label>
@@ -803,7 +912,7 @@ export function DataPanel() {
             </select>
           </label>
           <label>
-            Select
+            Where is the number?
             <input
               value={draft.select}
               onChange={(e) => setDraft((d) => ({ ...d, select: e.target.value }))}
@@ -811,29 +920,36 @@ export function DataPanel() {
             />
           </label>
         </div>
+        <p className="dp-field-help">
+          Dotted path into the JSON, e.g. <code>data.last</code> or <code>rates.USD</code>. Leave it empty when the
+          response <em>is</em> the number.
+        </p>
 
-        <div className="form-row">
-          <label className="grow">
-            Headers (JSON)
-            <textarea
-              rows={2}
-              value={draft.headers}
-              onChange={(e) => setDraft((d) => ({ ...d, headers: e.target.value }))}
-              placeholder={'{"X-Api-Key": "env:MY_API_KEY"}'}
-            />
-          </label>
-        </div>
-        <div className="form-row">
-          <label className="grow">
-            {draft.method === 'GET' ? 'Query defaults (JSON)' : 'Body (JSON)'}
-            <textarea
-              rows={2}
-              value={draft.bodyTemplate}
-              onChange={(e) => setDraft((d) => ({ ...d, bodyTemplate: e.target.value }))}
-              placeholder={draft.method === 'GET' ? '{"symbol": "D05"}' : '{"symbol": "D05"}'}
-            />
-          </label>
-        </div>
+        <details className="dp-advanced">
+          <summary>Advanced — API key, request body</summary>
+          <div className="form-row">
+            <label className="grow">
+              Headers (only if the API needs a key)
+              <textarea
+                rows={2}
+                value={draft.headers}
+                onChange={(e) => setDraft((d) => ({ ...d, headers: e.target.value }))}
+                placeholder={'{"X-Api-Key": "env:MY_API_KEY"}'}
+              />
+            </label>
+          </div>
+          <div className="form-row">
+            <label className="grow">
+              {draft.method === 'GET' ? 'Extra query values' : 'Request body'}
+              <textarea
+                rows={2}
+                value={draft.bodyTemplate}
+                onChange={(e) => setDraft((d) => ({ ...d, bodyTemplate: e.target.value }))}
+                placeholder={'{"symbol": "D05"}'}
+              />
+            </label>
+          </div>
+        </details>
 
         <div className="form-row">
           <label>
@@ -869,7 +985,8 @@ export function DataPanel() {
           </button>
           <MicButton compact onText={(t) => setDraft((d) => ({ ...d, label: d.label || t }))} title="Dictate a label" />
         </div>
-      </section>
+        </section>
+      )}
     </div>
   );
 }

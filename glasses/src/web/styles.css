@@ -507,28 +507,37 @@ select {
    into ragged rows of five and three. Four per row is stable, and every tab
    stays visible and tappable. */
 .tabs {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 4px;
+  /* ONE scrollable row, on every width. The old layout squeezed eleven tabs into
+     a grid or into equal flex shares, so a label longer than its share was cut
+     off with an ellipsis ("Setti…") and a count disappeared entirely. A tab you
+     cannot read is not a tab. `min-width: max-content` keeps every label whole
+     and the row scrolls instead — which is what a phone expects. */
+  display: flex;
+  gap: 5px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 4px;
   box-shadow: var(--shadow-sm);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
 }
 
+.tabs::-webkit-scrollbar { display: none; }
+
 .tab {
-  padding: 9px 6px;
+  flex: 1 1 auto;
+  min-width: max-content;
+  padding: 9px 10px;
   background: transparent;
   color: var(--muted);
   border-radius: var(--radius-sm);
   font-weight: 550;
   font-size: 13px;
   line-height: 1.25;
-  min-width: 0;
   min-height: 42px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -563,32 +572,9 @@ select {
 }
 
 @media (max-width: 719px) {
-  .tabs {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  /* A count next to the label ("To-Do 23/24") is wider than a quarter of a
-     360px screen. Wrapping the count under the label keeps BOTH readable;
-     ellipsis here hid the number entirely, which is the only reason the tab
-     carries a count at all. */
-  .tab {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-wrap: wrap;
-    gap: 1px 4px;
-    padding: 8px 4px;
-    font-size: 12.5px;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    text-overflow: clip;
-  }
-
-  .tab .count {
-    margin-left: 0;
-    opacity: 0.9;
-  }
+  /* The tabs stay in ONE scrolling row (see `.tabs`): a wrapped grid put eleven
+     tabs over three rows, which is half a phone screen spent on navigation
+     instead of content. */
 
   /*
    * Touch sizing by WIDTH, not by pointer type.
@@ -2738,67 +2724,199 @@ p.empty {
 }
 
 /* ── Data tab ─────────────────────────────────────────────────────────────
-   Read like a dashboard, not a form: a master list of data points on the left,
-   one series read closely on the right, and the collector forms last (how to
-   add one) — the inverse of the rest of the app, because this page is read far
-   more often than it is edited. */
-.data-split {
-  display: grid;
-  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
-  margin: 10px 0 18px;
-}
-
-@media (max-width: 720px) {
-  .data-split { grid-template-columns: 1fr; }
-}
-
-.metric-master {
+   MOBILE FIRST, because this page is mostly read on a phone. The reading order
+   is: what this is → the numbers you have → how to add one → the forms. The
+   forms are shut until asked for; two dense forms permanently open above your
+   own data is the opposite of a dashboard. */
+.data-panel {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* A phone in landscape is ~360 CSS px wide; nothing here may need more. */
+  max-width: 100%;
+}
+
+.dp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dp-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  flex: 1;
+}
+
+.dp-help-btn {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  min-height: 36px;
+}
+
+.dp-help-btn:hover { color: inherit; border-color: var(--accent); }
+
+/* Three steps, numbered, short enough to read on a phone without a scroll. */
+.dp-steps {
+  margin: 0;
+  padding: 10px 12px 10px 30px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  background: var(--panel);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.dp-steps li { margin: 2px 0; }
+.dp-steps strong { color: inherit; }
+.dp-steps code { font-size: 12px; }
+
+.dp-store { margin: 0; font-size: 11px; color: var(--muted); }
+
+.dp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius, 12px);
+  padding: 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.dp-empty p { margin: 0; }
+
+.dp-add-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.dp-mode { margin-bottom: 2px; }
+.dp-mode button { min-height: 38px; }
+
+.dp-example-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.dp-field-help { margin: 4px 0 0; font-size: 11px; color: var(--muted); }
+
+.dp-advanced {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+
+.dp-advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+}
+
+.dp-delete {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 6px 12px;
+  min-height: 36px;
+  cursor: pointer;
+}
+
+.dp-delete:hover:not(:disabled) { color: var(--danger, #e5484d); border-color: var(--danger, #e5484d); }
+
+/* ── master · detail ──────────────────────────────────────────────────────── */
+.data-split {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  align-items: start;
+}
+
+/* On a phone the list is a row of chips you swipe, not a column that pushes the
+   chart two screens down. The scroll container is the LIST, so the page itself
+   still scrolls normally. */
+.metric-master {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius, 12px);
   padding: 8px;
   background: var(--panel);
-  max-height: 460px;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x proximity;
+  -webkit-overflow-scrolling: touch;
 }
 
-.mm-group { display: flex; flex-direction: column; gap: 2px; }
-
-/* The prefix is the SUBJECT ("news.rates"); the rows beneath it are its fields. */
-.mm-group-head {
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 4px 6px 2px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 4px;
+.mm-group {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  align-items: stretch;
 }
+
+/* The prefix heading is redundant in a horizontal strip on a phone. */
+.mm-group-head { display: none; }
 
 .metric-master-row {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  width: 100%;
+  min-width: 118px;
+  scroll-snap-align: start;
   text-align: left;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
   color: inherit;
-  padding: 5px 7px;
+  padding: 7px 9px;
   cursor: pointer;
   font: inherit;
+  min-height: 64px;
 }
 
-.metric-master-row:hover { background: var(--panel-2); }
+.metric-master-row.active { border-color: var(--accent); }
 
-.metric-master-row.active {
-  border-color: var(--accent);
-  background: var(--panel-2);
+/* …and at a real width it becomes the column the detail pane sits beside. */
+@media (min-width: 721px) {
+  .data-split { grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); }
+  .metric-master { flex-direction: column; overflow-x: visible; max-height: 460px; overflow-y: auto; }
+  .mm-group { flex-direction: column; gap: 2px; width: 100%; }
+  .mm-group-head {
+    display: block;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 4px 6px 2px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+  }
+  .metric-master-row { min-width: 0; width: 100%; border-color: transparent; background: transparent; }
+  .metric-master-row:hover { background: var(--panel-2); }
+  .metric-master-row.active { background: var(--panel-2); }
 }
 
 .mm-top { display: flex; align-items: baseline; gap: 6px; }
