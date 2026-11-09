@@ -3853,24 +3853,20 @@ const server = createServer(async (req, res) => {
       json(res, 400, { ok: false, error: 'invalid JSON' });
       return;
     }
-    const parsed = normaliseSeries(body);
-    if (!parsed.ok) {
-      json(res, 400, { ok: false, error: parsed.error });
+    // `refine: true` — a HUMAN may fix a label, unit or precision here. The
+    // metrics TOOL deliberately cannot, so both paths share the validation, the
+    // cap and the durability report without a model being able to reshape a
+    // series that already holds readings.
+    const declared = await declareMetricSeries(body, { refine: true });
+    if (!declared.ok) {
+      json(res, 400, { ok: false, error: declared.error });
       return;
     }
-    const key = parsed.series.key;
-    const others = (cronConfig?.series ?? []).filter((s) => s.key !== key);
-    const next = {
-      ...(cronConfig ?? { version: 1, enabled: false, timeZone: 'Asia/Singapore', graceMinutes: 20, jobs: [] }),
-      // JOBS ARE CARRIED, never re-sent by the caller.
-      series: [...others, { ...parsed.series, key }],
-    };
-    const saved = await saveCronConfig(next);
     json(res, 200, {
       ...(await metricsPayload()),
-      durable: saved.durable,
-      onDisk: saved.onDisk,
-      durableError: saved.durable ? undefined : saved.reason,
+      durable: declared.durable,
+      onDisk: declared.onDisk,
+      durableError: declared.durable ? undefined : declared.reason,
     });
     return;
   }
@@ -5846,6 +5842,9 @@ function metricToolDeps() {
           series: input.series,
           value: input.value,
           slot: input.slot || slotAt(Date.now(), zone()),
+          // A backfill names WHEN it happened; without this every historical
+          // reading would land at the moment the agent ran.
+          ...(input.ts ? { ts: input.ts } : {}),
           source: 'agent',
         },
         def,
@@ -5863,6 +5862,70 @@ function metricToolDeps() {
         where: stored.where,
       };
     },
+
+    /**
+     * Create a series on the model's behalf.
+     *
+     * THE CAP IS THE POINT. Without a `declare` a run that gathered a month of
+     * readings had nowhere to put them and lost the whole task; with an
+     * unbounded `declare`, "one series per thing I noticed" fills the store
+     * forever. So creation is allowed and bounded, and an existing key is
+     * REPORTED rather than rewritten — a model must not be able to rename or
+     * re-unit a series the wearer depends on.
+     */
+    async declareSeries(input) {
+      return declareMetricSeries(input);
+    },
+  };
+}
+
+/**
+ * How many series the dashboard may hold.
+ *
+ * A number, not a vibe: it is what stops a model that decides every region, every
+ * day and every measure deserves its own series. The wearer can raise it by
+ * deleting what they do not want; nothing else may.
+ */
+const MAX_SERIES = 100;
+
+/**
+ * Create one series, or report the one that already exists.
+ *
+ * SHARED BY THE TOOL AND THE ROUTE. `POST /api/metrics/series` lets a human
+ * refine a declaration (label, unit, precision); the tool may only CREATE,
+ * because a model "refining" a series is a model changing what the wearer's
+ * history means. Both go through this function so the validation, the cap and
+ * the durability report cannot drift apart.
+ */
+async function declareMetricSeries(input, { refine = false } = {}) {
+  const parsed = normaliseSeries(input);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const key = parsed.series.key;
+  const list = cronConfig?.series ?? [];
+  const existing = list.find((s) => s.key === key);
+  // A model naming a series that exists is TOLD what it is. It cannot rewrite
+  // the unit under readings that were recorded against the old one.
+  if (existing && !refine) return { ok: true, existed: true, series: existing };
+  if (!existing && list.length >= MAX_SERIES) {
+    return {
+      ok: false,
+      error: `the dashboard already holds ${list.length} series (max ${MAX_SERIES}) — delete one before adding another`,
+    };
+  }
+  const next = {
+    ...(cronConfig ?? { version: 1, enabled: false, timeZone: 'Asia/Singapore', graceMinutes: 20, jobs: [] }),
+    // JOBS ARE CARRIED, never re-sent: declaring a series must not be able to
+    // delete the schedule (it did once, from a probe, with a 200 OK).
+    series: [...list.filter((s) => s.key !== key), parsed.series],
+  };
+  const saved = await saveCronConfig(next);
+  return {
+    ok: true,
+    existed: Boolean(existing),
+    series: parsed.series,
+    durable: saved.durable,
+    onDisk: saved.onDisk,
+    reason: saved.reason,
   };
 }
 

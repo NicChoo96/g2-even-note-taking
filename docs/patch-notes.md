@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.70
+
+v0.3.70 - Jarvis can start tracking something new
+
+- Ask for a number nothing tracks yet and Jarvis proposes the series itself: key,
+label and unit, accepted with one tap. No trip to the Data page first.
+- Agents can create one mid-run too, so a job that gathers a month of readings
+ends with them stored instead of lost.
+- A backfilled reading is stored at the time it happened, not the time the run
+ran.
+
 ## 0.3.69
 
 v0.3.69 - The Data tab is easy to read on a phone

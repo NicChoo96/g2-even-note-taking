@@ -63,6 +63,95 @@ const isAction = (v: unknown): v is MetricsAction =>
 
 export const metricsCapabilities: Capability[] = [
   {
+    /**
+     * Create a series — the one action that changes what the dashboard IS.
+     *
+     * WHY IT IS ITS OWN CAPABILITY AND NOT AN `action` OF `metrics.act`:
+     *   the gate that makes this safe is per-capability (`confirm`), so folding
+     *   it in would either strip the confirmation from declaring or add one to
+     *   every read. Separate entries keep "record a number I already track"
+     *   frictionless and make "start tracking a new thing" an explicit,
+     *   accepted decision — the same shape as `agents expose`, where the model
+     *   proposes and the wearer taps.
+     *
+     * WHY THE GATE IS RIGHT RATHER THAN PEDANTIC: a series' unit and type are
+     * fixed once created, and its readings are kept for months. A model that
+     * guessed "psi.west" as text, or one-per-day, would be stuck with it. One
+     * tap is nothing against a month of history in the wrong shape.
+     */
+    name: 'metrics.declare',
+    page: GLOBAL_PAGE,
+    effect: 'write',
+    confirm: true,
+    title: 'Track a new number',
+    description:
+      'Create a dashboard series so a number can be recorded from now on. Use it when the wearer asks ' +
+      'you to track or chart something that `metrics act` list does not already show — including ' +
+      '"collect this for a month", where the series must exist before the readings can be stored. ' +
+      'Send a dotted lowercase key (psi.west, news.rates.count), a short label, the unit, and whether ' +
+      'a reading is a number or text. The unit and type are permanent, so choose them for the whole ' +
+      'history, not for today. After it succeeds, write the readings with action "write".',
+    params: [
+      {
+        name: 'series',
+        type: 'string',
+        required: true,
+        description: 'The key, dotted and lowercase: "psi.west". One series per measure, never per day.',
+      },
+      {
+        name: 'label',
+        type: 'string',
+        description: 'Shown on the dashboard: "PSI west". Defaults to the key.',
+      },
+      {
+        name: 'unit',
+        type: 'string',
+        description: 'Short unit: "PSI", "SGD", "mentions". Cannot be changed later.',
+      },
+      {
+        name: 'valueType',
+        type: 'enum',
+        values: ['number', 'string'],
+        fallback: 'number',
+        description: 'What one reading is. Default number.',
+      },
+      {
+        name: 'cadence',
+        type: 'string',
+        description: 'Optional hint: "daily", "hourly". Advisory only.',
+      },
+    ],
+    run: async (args) => {
+      const send: Record<string, unknown> = {
+        action: 'declare',
+        series: args.series ?? '',
+        label: args.label ?? '',
+        unit: args.unit ?? '',
+        valueType: args.valueType ?? 'number',
+      };
+      if (args.cadence !== undefined && String(args.cadence).trim() !== '') send.cadence = args.cadence;
+
+      const reply = await runTool({ kind: 'metrics', toolId: METRICS_TOOL_ID, args: send });
+      const text = String(reply.result ?? '');
+      if (!reply.ok) {
+        return {
+          ok: false,
+          summary: 'could not create it',
+          data: { error: reply.error ?? '', text },
+          hint:
+            `${text || reply.error || 'the relay refused the call'}. Do not invent a different key and ` +
+            'retry in a loop — tell the wearer in one sentence what it said.',
+        };
+      }
+      const firstLine = text.split('\n')[0].trim();
+      return {
+        ok: true,
+        summary: firstLine.length > 96 ? `${firstLine.slice(0, 93)}...` : firstLine || 'created',
+        data: { text },
+      };
+    },
+  },
+  {
     name: 'metrics.act',
     page: GLOBAL_PAGE,
     effect: 'write',
@@ -105,7 +194,16 @@ export const metricsCapabilities: Capability[] = [
         name: 'slot',
         type: 'string',
         description:
-          'For write: optional identity of the reading, such as its date. The same slot replaces.',
+          'For write: the reading\u2019s identity, such as its date. The same slot replaces instead of ' +
+          'appending, so re-running a day is safe.',
+      },
+      {
+        name: 'at',
+        type: 'string',
+        description:
+          'For write: when the reading was taken (ISO like 2026-10-08T13:00+08:00, or epoch ms). ' +
+          'Omit only for a reading taken now. A backfill without it stacks a month of points at one ' +
+          'instant, so always send it when recording history.',
       },
     ],
     run: async (args) => {
@@ -126,6 +224,10 @@ export const metricsCapabilities: Capability[] = [
         send.value = args.value ?? '';
         if (args.slot !== undefined && args.slot !== null && String(args.slot).trim() !== '') {
           send.slot = args.slot;
+        }
+        // Backfill: the relay passes this straight to the store.
+        if (args.at !== undefined && args.at !== null && String(args.at).trim() !== '') {
+          send.at = args.at;
         }
       }
 

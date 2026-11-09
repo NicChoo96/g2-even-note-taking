@@ -78,9 +78,15 @@ export { __calls, __setReply } from './web/agents-client.ts';
 });
 const { metricsCapabilities, METRICS_TEXT_CHARS, __calls, __setReply } = await import(pathToFileURL(outfile).href);
 
-// ── 1. one capability, not three ───────────────────────────────────────────
-check('exactly one capability', metricsCapabilities.length, 1);
-const cap = metricsCapabilities[0];
+// ── 1. two capabilities: act freely, declare behind a tap ──────────────
+// They are deliberately separate: the confirmation gate is per-capability, so
+// folding `declare` into `act` would either strip the tap from creating a series
+// or add one to every read.
+check('two capabilities', metricsCapabilities.length, 2);
+const cap = metricsCapabilities.find((c) => c.name === 'metrics.act');
+const declareCap = metricsCapabilities.find((c) => c.name === 'metrics.declare');
+checkTrue('act exists', Boolean(cap));
+checkTrue('declare exists', Boolean(declareCap));
 check('named for the subject', cap.name, 'metrics.act');
 check('it is app-wide', cap.page, 'global');
 // It can WRITE numbers the wearer keeps, so calling it a read would be a lie to
@@ -88,11 +94,30 @@ check('it is app-wide', cap.page, 'global');
 check('classified as a write', cap.effect, 'write');
 check('and not gated behind a tap', cap.confirm, undefined);
 
+// Creating a schema IS gated: unit and type are permanent and the readings are
+// kept for months, so the wearer taps to accept what the model proposes.
+check('declare is app-wide too', declareCap.page, 'global');
+check('declare is a write', declareCap.effect, 'write');
+check('and it IS gated behind a tap', declareCap.confirm, true);
+check(
+  'declare asks for the schema, not just a key',
+  declareCap.params.map((p) => p.name),
+  ['series', 'label', 'unit', 'valueType', 'cadence'],
+);
+checkTrue('the key is required', declareCap.params.find((p) => p.name === 'series').required);
+checkTrue(
+  'and the description says the unit is permanent',
+  /permanent/i.test(declareCap.description),
+);
+
 // ── 2. the arguments the model is offered ──────────────────────────────────
 const byName = new Map(cap.params.map((p) => [p.name, p]));
 check('the actions are exactly the relay', byName.get('action').values, ['list', 'read', 'write']);
 checkTrue('action is required', byName.get('action').required);
-check('series, limit, value and slot exist', [...byName.keys()], ['action', 'series', 'limit', 'value', 'slot']);
+check('series, limit, value, slot and at exist', [...byName.keys()], ['action', 'series', 'limit', 'value', 'slot', 'at']);
+// `at` is what makes a backfill possible: without it a month of readings would
+// all be stamped with the moment the run happened.
+checkTrue('and at explains the cost of leaving it out', /backfill/i.test(byName.get('at').description));
 check('limit defaults to 30', byName.get('limit').fallback, 30);
 // A model told nothing about placeholders writes "N/A" into a price series.
 checkTrue('the value description refuses placeholders', /N\/A/.test(byName.get('value').description));

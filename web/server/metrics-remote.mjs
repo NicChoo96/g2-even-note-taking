@@ -78,6 +78,10 @@ export function toWireSample(sample) {
     series: sample.series,
     // A number series must carry a number; a text series must carry a string.
     value: typeof sample.value === 'number' ? sample.value : String(sample.value ?? ''),
+    // WHEN the reading was taken. Omitted means "now" on the hub, which is right
+    // for a live collector and wrong for a backfill — one missing field turns a
+    // month of readings into a single spike at the moment the run happened.
+    ...(Number.isFinite(Number(sample.ts)) && Number(sample.ts) > 0 ? { ts: Number(sample.ts) } : {}),
     ...(sample.slot ? { slot: toWireSlot(sample.slot) } : {}),
     ...(sample.source ? { source: shortSource(sample.source) } : {}),
   };

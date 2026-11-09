@@ -48,8 +48,12 @@ const schema = metricsToolSchema({});
 is('the schema is a function call', schema.type, 'function');
 is('with the agreed name', schema.function.name, METRICS_TOOL_NAME);
 const fn = schema.function.parameters;
-is('three actions only', fn.properties.action.enum, ['list', 'read', 'write']);
-is('and no way to declare a series', fn.properties.action.enum.includes('declare') || 'declare' in fn.properties, false);
+is('four actions, and declare is one of them', fn.properties.action.enum, ['list', 'read', 'declare', 'write']);
+is(
+  'declare takes the schema fields, not just a key',
+  ['label', 'unit', 'valueType', 'cadence'].filter((k) => k in fn.properties),
+  ['label', 'unit', 'valueType', 'cadence'],
+);
 is('unknown arguments are refused by the schema', fn.additionalProperties, false);
 
 // ── 2. list ─────────────────────────────────────────────────────────────────
@@ -58,8 +62,8 @@ const emptyList = await runMetricsTool(
   { action: 'list' },
   { listSeries: async () => ({ ok: true, series: [] }) },
 );
-check('an empty dashboard is said plainly', /No metric series exist/.test(text(emptyList)), true);
-check('and explains that the tool cannot create one', /cannot create one/.test(text(emptyList)), true);
+check('an empty dashboard is said plainly', /Nothing is tracked yet/.test(text(emptyList)), true);
+check('and says how to create one', /declare/.test(text(emptyList)), true);
 
 const listText = text(
   await runMetricsTool(
@@ -175,10 +179,113 @@ const replaced = await runMetricsTool(
 );
 check('a repeated slot is reported as a replacement', /Replaced/.test(text(replaced)), true);
 
+// ── 4a. backfill: a reading is stamped with WHEN it happened ──────────────
+// "Build me a month of PSI" fails silently without this: every reading would be
+// stored at the instant the run happened, and the chart would be one spike
+// instead of a month. The slot is the identity; `at` is the time.
+let backfilled = null;
+const withTime = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'write', series: 'psi.west', value: 154, slot: '2026-10-08T13:00', at: '2026-10-08T13:00+08:00' },
+  {
+    writeSample: async (input) => {
+      backfilled = input;
+      return { ok: true, value: 154, unit: 'PSI', precision: 2, replaced: false, where: 'hub' };
+    },
+  },
+);
+is('a backfilled write carries its own time', backfilled?.ts, Date.parse('2026-10-08T13:00+08:00'));
+check('and still reaches the store', withTime.ok, true);
+
+const withoutTime = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'write', series: 'psi.west', value: 61 },
+  { writeSample: async (input) => ({ ok: true, value: input.value, unit: 'PSI', precision: 2, where: 'hub' }) },
+);
+check('a write with no time sends none, so the store stamps "now"', withoutTime.ok, true);
+
+check(
+  'an unreadable time is refused instead of silently becoming now',
+  (
+    await runMetricsTool(
+      { kind: 'metrics' },
+      { action: 'write', series: 'psi.west', value: 1, at: 'last tuesday' },
+      { writeSample: async () => ({ ok: true, value: 1, where: 'hub' }) },
+    )
+  ).ok === false,
+  true,
+);
+
+// ── 4b. declare: the schema, created by the model ─────────────────────────
+// The failure this exists for: a run gathered a month of PSI readings and had
+// nowhere to put them, because a series could only be declared by a human on the
+// web first. The whole task was lost at the last step. Declaring is now allowed,
+// and the three things that keep it from becoming a mess are asserted here: the
+// model may create, it may NOT rewrite a series that exists, and a relay without
+// the capability says so rather than pretending.
+let declaredInput = null;
+const made = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'declare', series: 'psi.west', label: 'PSI west', unit: 'PSI', valueType: 'number', cadence: 'daily' },
+  {
+    declareSeries: async (input) => {
+      declaredInput = input;
+      return { ok: true, existed: false, series: { ...input, type: input.type } };
+    },
+  },
+);
+is('declare passes the key the model chose', declaredInput?.key, 'psi.west');
+is('and the unit with it', declaredInput?.unit, 'PSI');
+is('and the reading type', declaredInput?.type, 'number');
+is('and is attributed to the model, not the wearer', declaredInput?.source, 'agent');
+check('a created series is reported as created', /Created "psi\.west"/.test(text(made)), true);
+
+const already = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'declare', series: 'psi.west', unit: 'millibars' },
+  {
+    declareSeries: async () => ({
+      ok: true,
+      existed: true,
+      series: { key: 'psi.west', label: 'PSI west', unit: 'PSI', type: 'number', count: 12 },
+    }),
+  },
+);
+check('an existing series is reported, not rewritten', /already exists/.test(text(already)), true);
+check('and its real unit is quoted back', /PSI/.test(text(already)), true);
+check('so the model is not told it just made a millibar series', !/millibars/.test(text(already)), true);
+
+check(
+  'declare without a key is refused',
+  (await runMetricsTool({ kind: 'metrics' }, { action: 'declare' }, { declareSeries: async () => ({ ok: true }) })).ok === false,
+);
+check(
+  'a relay without declare says so plainly',
+  /not available/.test(text(await runMetricsTool({ kind: 'metrics' }, { action: 'declare', series: 'a.b' }, {}))),
+  true,
+);
+check(
+  'the store’s own naming rule reaches the model',
+  /must be dotted/.test(
+    text(
+      await runMetricsTool(
+        { kind: 'metrics' },
+        { action: 'declare', series: 'Not A Key' },
+        { declareSeries: async () => ({ ok: false, error: 'key "not a key" must be dotted, lowercase' }) },
+      ),
+    ),
+  ),
+  true,
+);
+
 // ── 5. unknown action ──────────────────────────────────────────────────────
-const unknown = await runMetricsTool({ kind: 'metrics' }, { action: 'declare', series: 'x.y' }, {});
+// NOT 'declare' any more — that is a real action now, and using it here made the
+// test pass for the wrong reason (it refused only because no declare dependency
+// was supplied). A test whose "unknown" input became known is a test that stopped
+// covering anything.
+const unknown = await runMetricsTool({ kind: 'metrics' }, { action: 'delete', series: 'x.y' }, {});
 check('an unknown action is refused', unknown.ok === false, 'an unknown action was accepted');
-check('and lists the valid ones', /list, read or write/.test(text(unknown)), true);
+check('and lists the valid ones', /list, read, declare or write/.test(text(unknown)), true);
 
 // ── 5b. A WEEK OF NEWS, one write per day ─────────────────────────────────
 // The ask this exists for: "search the news for rate-cut mentions each day this
@@ -278,7 +385,39 @@ try {
 
   const listEmpty = await call('POST', '/api/tool', { ...tool, args: { action: 'list' } });
   check('the proxy runs a metrics tool', listEmpty.status, 200);
-  check('and an empty dashboard is explained', /No metric series exist/.test(String(listEmpty.body?.result)), true);
+  check('and an empty dashboard is explained', /Nothing is tracked yet/.test(String(listEmpty.body?.result)), true);
+
+  // THE WHOLE POINT, over the real wire: a series that nobody declared anywhere,
+  // created by the TOOL, then written to — which is what "track this for a month"
+  // needs and what used to end with the readings having nowhere to go.
+  const declareOverHttp = await call('POST', '/api/tool', {
+    ...tool,
+    args: { action: 'declare', series: 'psi.west', label: 'PSI west', unit: 'PSI', valueType: 'number' },
+  });
+  check('the model can create a series over HTTP', declareOverHttp.body?.ok, true);
+  check('and is told it was created', /Created "psi\.west"/.test(String(declareOverHttp.body?.result)), true);
+
+  const writeNew = await call('POST', '/api/tool', {
+    ...tool,
+    args: { action: 'write', series: 'psi.west', value: 154, slot: '2026-10-08 13:00' },
+  });
+  check('and can write into the series it just made', writeNew.body?.ok, true);
+  // A number series defaults to 2 decimal places, so the confirmation reads
+  // "154.00 PSI" — the unit travelling with the value is what is being asserted.
+  check('the reading carries the unit it declared', /154\.00 PSI/.test(String(writeNew.body?.result)), true);
+
+  const declareAgain = await call('POST', '/api/tool', {
+    ...tool,
+    args: { action: 'declare', series: 'psi.west', unit: 'millibars' },
+  });
+  check('declaring it again does not rewrite the unit', /already exists/.test(String(declareAgain.body?.result)), true);
+  check('and the original unit is what comes back', /PSI/.test(String(declareAgain.body?.result)), true);
+
+  const dashPsi = await call('GET', '/api/metrics');
+  const psi = (dashPsi.body?.series ?? []).find((s) => s.key === 'psi.west');
+  check('the new series is on the dashboard', Boolean(psi), true);
+  check('with its reading in place', psi?.count, 1);
+  check('and its declared unit', psi?.unit, 'PSI');
 
   // Declare through the schedule, then write through the TOOL.
   await call('PUT', '/api/agent/schedule', {
