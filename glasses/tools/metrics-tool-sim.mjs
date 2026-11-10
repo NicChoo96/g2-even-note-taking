@@ -136,6 +136,94 @@ await runMetricsTool(
 );
 check('an absurd limit is clamped', clampedLimit, MAX_READ_POINTS);
 
+// ── 3b. attributes beside the value, joined on the slot ────────────────────
+// A reading holds ONE value (the store refuses a second field), so a project
+// name kept next to a price lives in its own text series at the same slot. The
+// join is the whole point of that shape and is invisible from the read: the
+// caller asks for the price and has no idea the sibling exists.
+const attributeDeps = {
+  listSeries: async () => ({
+    ok: true,
+    series: [
+      { key: 'tengah.bto.4room', label: 'BTO 4-room', type: 'number', unit: 'SGD', count: 2, precision: 2 },
+      { key: 'tengah.bto.4room.project', label: 'Project', type: 'string', unit: '', count: 2, precision: 0 },
+      { key: 'tengah.bto.4room.estate', label: 'Estate', type: 'string', unit: '', count: 1, precision: 0 },
+    ],
+  }),
+  readSeries: async (key) => {
+    if (key === 'tengah.bto.4room') {
+      return {
+        ok: true,
+        unit: 'SGD',
+        precision: 2,
+        count: 2,
+        points: [
+          { ts: 1793491200000, slot: '2026-11', value: 339000 },
+          { ts: 1796083200000, slot: '2026-12', value: 350000 },
+        ],
+      };
+    }
+    if (key === 'tengah.bto.4room.project') {
+      return {
+        ok: true,
+        precision: 0,
+        count: 2,
+        points: [
+          { ts: 1793491200000, slot: '2026-11', value: 'Plantation Dew' },
+          { ts: 1796083200000, slot: '2026-12', value: 'Garden Vale' },
+        ],
+      };
+    }
+    return { ok: true, precision: 0, count: 1, points: [{ ts: 1793491200000, slot: '2026-11', value: 'Tengah' }] };
+  },
+};
+
+const joined = await runMetricsTool({ kind: 'metrics' }, { action: 'read', series: 'tengah.bto.4room' }, attributeDeps);
+const joinedText = text(joined);
+check('a read joins the sibling text series onto the row', /339,000\.00 SGD · project=Plantation Dew/.test(joinedText), joinedText);
+check('…for every slot that has one', /350,000\.00 SGD · project=Garden Vale/.test(joinedText), joinedText);
+check('…and every attribute, not just the first', /project=Plantation Dew · estate=Tengah/.test(joinedText), joinedText);
+check('the join says where the attributes came from', /joined from tengah\.bto\.4room\.project, tengah\.bto\.4room\.estate/.test(joinedText), joinedText);
+check('a text series is NOT read as a number', /Plantation Dew/.test(joinedText) && !/NaN/.test(joinedText), joinedText);
+
+// A slot with no attribute simply has none — never an empty `project=`.
+const partial = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'read', series: 'tengah.bto.4room' },
+  {
+    ...attributeDeps,
+    readSeries: async (key) =>
+      key === 'tengah.bto.4room'
+        ? { ok: true, unit: 'SGD', precision: 2, count: 1, points: [{ ts: 1796083200000, slot: '2026-12', value: 350000 }] }
+        : { ok: true, precision: 0, count: 1, points: [{ ts: 1793491200000, slot: '2026-11', value: 'Tengah' }] },
+  },
+);
+check('a slot without the attribute adds nothing', /350,000\.00 SGD\n/.test(`${text(partial)}\n`) || !/estate=/.test(text(partial)), text(partial));
+
+// A broken sibling must not fail the read it decorates.
+const resilient = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'read', series: 'tengah.bto.4room' },
+  {
+    ...attributeDeps,
+    readSeries: async (key) => {
+      if (key === 'tengah.bto.4room') {
+        return { ok: true, unit: 'SGD', precision: 2, count: 1, points: [{ ts: 1793491200000, slot: '2026-11', value: 339000 }] };
+      }
+      throw new Error('the sibling read exploded');
+    },
+  },
+);
+check('a broken attribute does not sink the read', resilient.ok && /339,000\.00 SGD/.test(text(resilient)), text(resilient));
+
+// A series with no siblings reads exactly as it did before.
+const noSiblings = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'read', series: 'psi.west' },
+  { listSeries: async () => ({ ok: true, series: [{ key: 'psi.west', type: 'number' }] }), readSeries: async () => ({ ok: true, unit: 'PSI', precision: 2, count: 1, points: [{ ts: 1793491200000, slot: '2026-11', value: 49 }] }) },
+);
+check('a series with no siblings is unchanged', text(noSiblings), '"psi.west" — 1 of 1 reading(s):\n2026-11-01 00:00  49.00 PSI');
+
 // ── 4. write ───────────────────────────────────────────────────────────────
 const writeNoValue = await runMetricsTool(
   { kind: 'metrics' },

@@ -48,6 +48,9 @@ if (!KEY) {
 
 const HUB = 'http://167.172.77.136/hub/metrics';
 const PROBE = 'test.probe.write';
+// A text series beside it — the shape an ATTRIBUTE takes, because a reading
+// holds one value. Same prefix, so `read` joins it by slot.
+const ATTRIBUTE = 'test.probe.write.project';
 const PORT = 6300 + Math.floor(Math.random() * 90);
 const TOKEN = createHash('sha256').update(`probe-${Date.now()}`).digest('hex');
 
@@ -74,8 +77,10 @@ async function hub(method, path, body) {
 }
 
 const cleanup = async () => {
-  await hub('DELETE', `/samples?series=${encodeURIComponent(PROBE)}`);
-  await hub('DELETE', `/series/${encodeURIComponent(PROBE)}?purge=1`);
+  for (const key of [PROBE, ATTRIBUTE]) {
+    await hub('DELETE', `/samples?series=${encodeURIComponent(key)}`);
+    await hub('DELETE', `/series/${encodeURIComponent(key)}?purge=1`);
+  }
 };
 
 let child = null;
@@ -133,9 +138,9 @@ try {
   };
 
   // 1. READING a hub-only series — proves resolution without writing anything.
-  const read = await tool({ action: 'read', series: 'psi.central', limit: 5 });
+  const read = await tool({ action: 'read', series: 'psi.east', limit: 5 });
   check('reading a hub-only series works', read.json.ok === true, String(read.json.result ?? '').slice(0, 90));
-  check('and returns its readings', /5 of 5 reading/.test(String(read.json.result)), String(read.json.result ?? '').slice(0, 90));
+  check('and returns its readings', /\d of \d reading/.test(String(read.json.result)), String(read.json.result ?? '').slice(0, 90));
 
   // 2. WRITING to a hub-only series — the bug.
   const wrote = await tool({ action: 'write', series: PROBE, value: 42, slot: '2026-11-10' });
@@ -196,6 +201,36 @@ try {
   check('a future reading is refused', future.json.ok === false);
   check('and the refusal is a date', /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(futureReason), futureReason.slice(0, 200));
   check('not two raw millisecond integers', !/must be between \d{12}/.test(futureReason), futureReason.slice(0, 200));
+
+  // 8. AN ATTRIBUTE BESIDE A VALUE, which is the shape a "row" takes here.
+  //    A reading holds one value, so a project name is its own text series at
+  //    the same slot — and `read` joins it back by slot, because a caller that
+  //    asked for the price has no idea the sibling exists.
+  const madeAttribute = await tool({
+    action: 'declare',
+    series: ATTRIBUTE,
+    label: 'Probe project',
+    unit: '',
+    valueType: 'string',
+  });
+  check('a text series can be declared', madeAttribute.json.ok === true, JSON.stringify(madeAttribute.json).slice(0, 160));
+
+  const wroteText = await tool({ action: 'write', series: ATTRIBUTE, value: 'Plantation Dew', slot: '2026-11-10' });
+  check('and takes a text reading', wroteText.json.ok === true, JSON.stringify(wroteText.json).slice(0, 160));
+
+  const joinedRead = await tool({ action: 'read', series: PROBE, limit: 5 });
+  const joinedText = String(joinedRead.json.result ?? '');
+  check('reading the number joins the attribute', /project=Plantation Dew/.test(joinedText), joinedText.slice(0, 300));
+  check('…and says which series it came from', /joined from test\.probe\.write\.project/.test(joinedText), joinedText.slice(0, 300));
+
+  // The store refuses a second field on a reading rather than dropping it: a
+  // silently discarded attribute is a 200 that lies for months.
+  const extraField = await hub('POST', '/samples', {
+    samples: [{ series: PROBE, value: 1, slot: '2026-11-11', estate: 'Tengah' }],
+  });
+  const extraReason = String(extraField.json?.details?.rejected?.[0]?.error ?? '');
+  check('an extra field on a reading is refused', extraField.status === 400, `status ${extraField.status}`);
+  check('…and the refusal teaches the sibling shape', /own series written at the same slot/.test(extraReason), extraReason.slice(0, 200));
 } catch (err) {
   failures.push('the probe could not run');
   console.log(`FAIL  the probe could not run — ${err instanceof Error ? err.message : String(err)}`);

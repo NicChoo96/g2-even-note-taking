@@ -85,12 +85,15 @@ export const metricsCapabilities: Capability[] = [
     confirm: true,
     title: 'Track a new number',
     description:
-      'Create a dashboard series so a number can be recorded from now on. Use it when the wearer asks ' +
+      'Create a dashboard series so a value can be recorded from now on. Use it when the wearer asks ' +
       'you to track or chart something that `metrics act` list does not already show — including ' +
       '"collect this for a month", where the series must exist before the readings can be stored. ' +
       'Send a dotted lowercase key (psi.west, news.rates.count), a short label, the unit, and whether ' +
       'a reading is a number or text. The unit and type are permanent, so choose them for the whole ' +
-      'history, not for today. After it succeeds, write the readings with action "write".',
+      'history, not for today. After it succeeds, write the readings with action "write". ' +
+      'For an ATTRIBUTE that belongs beside a number (a project name, an estate, a location), declare ' +
+      'its own text series under the same prefix — tengah.bto.4room.project — and write it at the same ' +
+      'slot as the number; the slot is the join.',
     params: [
       {
         name: 'series',
@@ -162,6 +165,10 @@ export const metricsCapabilities: Capability[] = [
       'that already exists. A series has a fixed unit and type and is declared by the wearer on the ' +
       'Data page — this cannot create one, so use `list` first and use the keys it returns exactly as ' +
       'written. Writing the same slot twice REPLACES the earlier reading, so re-recording is safe. ' +
+      'A SERIES HOLDS ONE VALUE PER SLOT: to keep an attribute beside a number (an estate name, a ' +
+      'project, a location), write it to its own text series at the SAME slot — e.g. ' +
+      'tengah.bto.4room.project — and read both; the slot is the join. Sending an extra field on a ' +
+      'reading is refused, never stored. ' +
       'Use it whenever a question is about a tracked number ("how is DBS", "what did I record ' +
       'yesterday") or when the wearer tells you one to keep.',
     params: [
@@ -187,8 +194,8 @@ export const metricsCapabilities: Capability[] = [
         name: 'value',
         type: 'string',
         description:
-          'For write: the reading. A number for a number series; anything non-numeric is refused by the ' +
-          'store. Never send a placeholder such as "N/A".',
+          'For write: the reading. A number for a number series; the text itself for a series ' +
+          'declared as text (up to 500 characters). Never send a placeholder such as "N/A".',
       },
       {
         name: 'slot',

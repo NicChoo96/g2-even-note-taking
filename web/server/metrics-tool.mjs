@@ -44,12 +44,18 @@ export function metricsToolSchema() {
     function: {
       name: METRICS_TOOL_NAME,
       description:
-        'Read, create and record NUMBER SERIES the wearer keeps on their dashboard. `list` shows ' +
+        'Read, create and record the dashboard series the wearer keeps. `list` shows ' +
         'what exists and its latest value, `read` returns one series\u2019 history, `declare` creates a ' +
         'series so something new can be tracked, and `write` records a value. Declare ONE well-named ' +
         'series per measure (not one per day), because the unit and type are fixed once created and a ' +
         'total cap applies. Values are stored with the scheduled slot, so writing twice for the same ' +
-        'slot replaces rather than duplicates.',
+        'slot replaces rather than duplicates.\n\n' +
+        'A SERIES HOLDS ONE VALUE PER SLOT. A number series takes numbers; a series declared with ' +
+        'valueType "string" takes text (up to 500 characters) and is shown as a table. An ATTRIBUTE ' +
+        'that belongs beside a number \u2014 an estate name, a project, a location \u2014 is its own ' +
+        'series at the same slot: declare "tengah.bto.4room.project" as a string series and write it ' +
+        'for the same slot as the price, then read both and join them by slot. Sending an extra field ' +
+        'on a reading is REFUSED, never stored.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -75,7 +81,10 @@ export function metricsToolSchema() {
           valueType: {
             type: 'string',
             enum: ['number', 'string'],
-            description: 'For declare: what one reading IS. Default number. Fixed afterwards.',
+            description:
+              'For declare: what one reading IS. Default number. Fixed afterwards. Use "string" for ' +
+              'an attribute that sits beside a number (a project, an estate, a location): give it its ' +
+              'own key under the same prefix, e.g. tengah.bto.4room.project.',
           },
           cadence: {
             type: 'string',
@@ -88,8 +97,9 @@ export function metricsToolSchema() {
           value: {
             type: 'string',
             description:
-              'For write: the reading. Send a number for a number series. A value with thousands ' +
-              'separators is accepted; anything non-numeric is refused.',
+              'For write: the reading. A number for a number series (thousands separators are ' +
+              'accepted); for a series declared as a string, the text itself, up to 500 characters. ' +
+              'Anything the series type cannot hold is refused \u2014 never send a placeholder like "N/A".',
           },
           slot: {
             type: 'string',
@@ -109,6 +119,60 @@ export function metricsToolSchema() {
       },
     },
   };
+}
+
+/**
+ * The text series that hang under `key.` — a project name beside a price.
+ *
+ * A reading carries ONE value (see the tool description), so an attribute is a
+ * sibling series written at the same slot: `tengah.bto.4room.project`. Nothing
+ * links the two except the slot, and a caller that does not know the sibling
+ * exists will never ask for it — so `read` fetches them and joins on the slot.
+ *
+ * Never fatal: an attribute is a bonus, and a read that fails because a bonus
+ * could not be fetched would be a worse answer than one without it.
+ */
+async function siblingAttributes(key, list, read, limit) {
+  if (!list || !read) return [];
+  let series = [];
+  try {
+    const res = await list();
+    series = Array.isArray(res?.series) ? res.series : [];
+  } catch {
+    return [];
+  }
+  const prefix = `${key}.`;
+  const names = series
+    .filter((s) => s && typeof s.key === 'string' && s.key.startsWith(prefix) && s.type === 'string')
+    .map((s) => s.key)
+    .slice(0, 4);
+  const out = [];
+  for (const name of names) {
+    try {
+      const res = await read(name, limit);
+      if (!res?.ok) continue;
+      const bySlot = new Map();
+      for (const p of Array.isArray(res.points) ? res.points : []) {
+        const text = p?.value === undefined || p?.value === null ? '' : String(p.value).trim();
+        if (p?.slot && text) bySlot.set(p.slot, text);
+      }
+      if (bySlot.size) out.push({ key: name, leaf: name.slice(prefix.length), bySlot });
+    } catch {
+      /* skip this attribute */
+    }
+  }
+  return out;
+}
+
+/** `project=Plantation Dew · estate=Tengah` for one reading, or `''`. */
+function attributesAt(attrs, point) {
+  if (!point?.slot || !attrs.length) return '';
+  const parts = [];
+  for (const a of attrs) {
+    const value = a.bySlot.get(point.slot);
+    if (value) parts.push(`${a.leaf}=${value}`);
+  }
+  return parts.join(' · ');
 }
 
 /**
@@ -160,13 +224,28 @@ export async function runMetricsTool(tool, args, deps) {
     const points = Array.isArray(res.points) ? res.points : [];
     if (!points.length) return { ok: true, text: `"${key}" has no readings yet.` };
     const unit = res.unit ? ` ${res.unit}` : '';
-    const rows = points.map((p) => `${new Date(p.ts).toISOString().slice(0, 16).replace('T', ' ')}  ${formatNumber(p.value, res.precision)}${unit}`);
+    // ATTRIBUTES THAT SIT BESIDE THE VALUE. A reading holds one value, so a
+    // project name kept next to a price lives in its own series at the same
+    // slot. Joining them is the entire point of that shape — and it is exactly
+    // the step a caller forgets, because it is invisible from here: the answer
+    // says "339000" and the estate is in another series nobody asked for. So
+    // the join happens here, keyed on the slot, and each row comes back whole.
+    const attrs = await siblingAttributes(key, list, read, limit);
+    const rows = points.map((p) => {
+      const when = `${new Date(p.ts).toISOString().slice(0, 16).replace('T', ' ')}  ${formatNumber(p.value, res.precision)}${unit}`;
+      const extra = attributesAt(attrs, p);
+      return extra ? `${when} · ${extra}` : when;
+    });
+    const attrNote = attrs.length
+      ? `\n(attributes joined from ${attrs.map((a) => a.key).join(', ')} by slot)`
+      : '';
     return {
       ok: true,
       text:
         `"${key}" — ${points.length} of ${res.count ?? points.length} reading(s)` +
         `${res.truncated ? ' (newest only; ask for a smaller range if you need older ones)' : ''}:\n` +
-        rows.join('\n'),
+        rows.join('\n') +
+        attrNote,
     };
   }
 

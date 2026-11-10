@@ -5824,7 +5824,11 @@ function metricToolDeps() {
         if (!res.ok) return { ok: false, error: res.error };
         return {
           ok: true,
-          points: res.samples.map((s) => ({ ts: s.ts, value: s.value })),
+          // `slot` is carried out because it is the reading's IDENTITY: it is
+          // what two series have in common when one holds the price and the
+          // other holds the project at the same launch. Dropping it here made
+          // every cross-series question unanswerable from the tool's answer.
+          points: res.samples.map((s) => ({ ts: s.ts, value: s.value, ...(s.slot ? { slot: s.slot } : {}) })),
           count: res.samples.length,
           truncated: res.truncated,
           unit: def?.unit ?? '',
@@ -5832,7 +5836,7 @@ function metricToolDeps() {
         };
       }
       const samples = metricStore.samples[key] ?? [];
-      const points = samples.slice(-limit).map((s) => ({ ts: s.ts, value: s.value }));
+      const points = samples.slice(-limit).map((s) => ({ ts: s.ts, value: s.value, ...(s.slot ? { slot: s.slot } : {}) }));
       return {
         ok: true,
         points,
