@@ -125,11 +125,32 @@ export interface RecordsState {
 export async function fetchRecords(): Promise<RecordsState | null> {
   try {
     const res = await fetch(`${API_BASE}/api/records`, { headers: authHeaders() });
-    if (!res.ok) return null;
+    if (!res.ok) return failedRecords(res);
     return (await res.json()) as RecordsState;
-  } catch {
-    return null;
+  } catch (err) {
+    return failedRecords(err);
   }
+}
+
+/** Same rule as `failedMetrics`: a refusal is reported, never drawn as "no tables". */
+function failedRecords(reason: unknown): RecordsState {
+  const error =
+    reason instanceof Response
+      ? `${reason.status} ${reason.statusText || 'refused'}`
+      : reason instanceof Error
+        ? reason.message
+        : String(reason);
+  return {
+    ok: false,
+    objects: [],
+    now: Date.now(),
+    store: { mode: 'relay', durable: false },
+    degraded: true,
+    error:
+      /\b401\b/.test(error)
+        ? PAIRED_NOT_SIGNED_IN
+        : `could not read the tables: ${error}`,
+  };
 }
 
 export type RecordsResult = (Omit<RecordsState, 'ok'> & { ok: true; deletedRecords?: number; deleted?: number }) | { ok: false; error: string; count?: number };
@@ -200,14 +221,61 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<T>
   }
 }
 
+/**
+ * What the wearer is told when the relay refuses because this surface is a paired
+ * device rather than a signed-in owner.
+ *
+ * ONE sentence, deliberately shared by both stores: the panel draws the warning
+ * per store, and two wordings for one cause read as two different faults.
+ */
+export const PAIRED_NOT_SIGNED_IN =
+  'this device is paired, not signed in - the relay refused your data (401). ' +
+  'Paste the owner key in Settings, or sign in as the owner in a browser.';
+
+/**
+ * Read the dashboard.
+ *
+ * A REFUSAL IS NOT AN EMPTY STORE. This used to `return null` for every non-OK
+ * answer, and the page draws `null` as "No numbers yet — and you do not need an
+ * API to start". Inside the .ehpk the relay answered 401 (the package holds a
+ * paired-device credential, and these reads were owner-only), so the wearer saw
+ * an inviting empty dashboard while the same account showed eight series in the
+ * browser. A whole afternoon went into looking for a backend that was not
+ * missing. The status is now carried through as `degraded` + the relay's own
+ * sentence, which the panel already renders as a warning line.
+ */
 export async function fetchMetrics(): Promise<MetricsState | null> {
   try {
     const res = await fetch(`${API_BASE}/api/metrics`, { headers: authHeaders() });
-    if (!res.ok) return null;
+    if (!res.ok) return failedMetrics(res);
     return (await res.json()) as MetricsState;
-  } catch {
-    return null;
+  } catch (err) {
+    return failedMetrics(err);
   }
+}
+
+/** The same shape the panel draws for a store it could not reach, so a 401 says
+ *  WHY instead of rendering as an empty dashboard. */
+function failedMetrics(reason: unknown): MetricsState {
+  const error =
+    reason instanceof Response
+      ? `${reason.status} ${reason.statusText || 'refused'}`
+      : reason instanceof Error
+        ? reason.message
+        : String(reason);
+  return {
+    ok: false,
+    series: [],
+    collectors: [],
+    updatedAt: null,
+    now: Date.now(),
+    store: { mode: 'relay', durable: false },
+    degraded: true,
+    error:
+      /\b401\b/.test(error)
+        ? PAIRED_NOT_SIGNED_IN
+        : `could not read the dashboard: ${error}`,
+  };
 }
 
 export interface CollectorDraft {

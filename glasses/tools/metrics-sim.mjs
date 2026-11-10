@@ -277,11 +277,16 @@ check('and asks the question instead', carefulResult.notEmpty, true);
 const PORT = 6200 + Math.floor(Math.random() * 60);
 const dir = mkdtempSync(join(tmpdir(), 'g2-metrics-'));
 const TOKEN = createHash('sha256').update(`m-${Date.now()}`).digest('hex');
+// THE PAIRED DEVICE. This is the credential the .ehpk actually holds: Google
+// sign-in cannot run in its WebView, so a packaged app authenticates with an
+// approved device ID (see auth.tsx). Both reads were owner-only, which is why the
+// Data tab came up blank on the glasses and full in a browser.
+const DEVICE = `sim-device-${Date.now()}`;
 writeFileSync(
   join(dir, 'auth.json'),
   JSON.stringify({
     sessions: { [createHash('sha256').update(TOKEN).digest('hex')]: { email: 'probe@example.test', createdAt: Date.now() } },
-    devices: {},
+    devices: { [DEVICE]: { status: 'approved', label: 'sim glasses', createdAt: Date.now() } },
     revoked: {},
   }),
 );
@@ -301,6 +306,21 @@ const env = {
 for (const k of ['JARVIS_FILE_URL', 'JARVIS_FILE_USER', 'JARVIS_FILE_PWD', 'JARVIS_FILE_API_KEY']) delete env[k];
 
 let child = null;
+const callAs = async (token, method, path, body) => {
+  const res = await fetch(`http://127.0.0.1:${PORT}${path}`, {
+    method,
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let parsed = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = null;
+  }
+  return { status: res.status, body: parsed };
+};
 const call = async (method, path, body) => {
   const res = await fetch(`http://127.0.0.1:${PORT}${path}`, {
     method,
@@ -334,6 +354,20 @@ try {
 
   const empty = await call('GET', '/api/metrics');
   check('a fresh relay has no series', empty.status === 200 && empty.body?.series?.length, 0);
+
+  // ── 7a. WHO MAY READ: the boundary the glasses depends on ───────────────
+  // A paired device must be able to open the Data tab it ships with, and it must
+  // NOT be able to change the store. Both halves are asserted, because the bug
+  // was that only the second half was true.
+  const devMetrics = await callAs(DEVICE, 'GET', '/api/metrics');
+  check('an approved device can READ the dashboard', devMetrics.status, 200);
+  const devRecords = await callAs(DEVICE, 'GET', '/api/records');
+  check('…and the tables', devRecords.status, 200);
+  const devWrite = await callAs(DEVICE, 'POST', '/api/metrics/series', { key: 'dev.probe', label: 'x' });
+  check('…but still cannot WRITE a series', devWrite.status, 401);
+  const anonMetrics = await callAs(null, 'GET', '/api/metrics');
+  check('an unpaired caller reads nothing', anonMetrics.status, 401);
+  check('…and is told how to get in', /device pairing required/.test(String(anonMetrics.body?.error)), true);
 
   // An undeclared series cannot receive data — the rule, over HTTP.
   const refused = await call('POST', '/api/metrics/samples', { series: 'nope.nothing', value: 1 });

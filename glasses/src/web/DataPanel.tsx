@@ -1552,7 +1552,10 @@ export function DataPanel() {
       {metrics?.degraded && (
         <p className="warn-line">⚠️ {metrics.error ?? 'the hub metric store is unreachable'}</p>
       )}
-      {records?.degraded && (
+      {/* One cause must not read as two faults: both stores refuse for the same
+          reason on a paired device, so the second line is suppressed when it is
+          the same sentence. */}
+      {records?.degraded && records.error !== metrics?.error && (
         <p className="warn-line">⚠️ {records.error ?? 'the hub table store is unreachable'}</p>
       )}
       {metrics?.store && !metrics.degraded && (
@@ -1564,7 +1567,10 @@ export function DataPanel() {
       )}
 
       {loading && <p className="hint-line">Loading…</p>}
-      {!loading && series.length === 0 && tables.length === 0 && (
+      {/* A REFUSED read is not an empty dashboard. Offering "Start from the
+          example" over a 401 invites the wearer to build something the relay has
+          already said it will not store. */}
+      {!loading && !metrics?.degraded && series.length === 0 && tables.length === 0 && (
         <div className="dp-empty">
           <p>No numbers yet — and you do not need an API to start.</p>
           <button

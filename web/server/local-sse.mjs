@@ -3737,12 +3737,20 @@ const server = createServer(async (req, res) => {
   }
 
   // ── Metrics ───────────────────────────────────────────────────────────────
-  // Owner-only for the same reason the schedule is: a series is configuration,
+  // READING is owner OR an approved device. It was owner-only, and that made the
+  // Data tab blank inside the .ehpk: the package cannot do Google sign-in in its
+  // WebView, so it authenticates as a paired device (see auth.tsx — "an owner
+  // session always wins, otherwise the device ID"), and a paired device got 401
+  // on exactly the two reads that page makes. The stream and the agent routes
+  // already accept a device, so the same credential could start a run that WROTE
+  // a reading but could not open the dashboard to see it. Reads are not a
+  // mutation; a device the owner approved may look at the wearer's own numbers.
+  // WRITES stay owner-only for the original reason: a series is configuration,
   // and writing one spends network requests on the wearer's behalf.
   if (url.pathname === '/api/metrics' && req.method === 'GET') {
-    const owner = requireOwner(req, url);
+    const owner = requirePrincipal(req, url);
     if (!owner) {
-      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      json(res, 401, { ok: false, error: 'owner sign-in or device pairing required' });
       return;
     }
     if (cronReady) await cronReady;
@@ -3986,10 +3994,14 @@ const server = createServer(async (req, res) => {
   // the relay is the only thing that can reach the hub (the page cannot —
   // `cors_origins` is empty). The shapes mirror `/hub/records` so the tool and
   // the page describe the same store.
+  //
+  // READING is owner OR an approved device, for the reason spelled out at the
+  // metrics GET above: a paired package must be able to open the Data tab it
+  // ships with. Every write below this line stays owner-only.
   if (url.pathname === '/api/records' && req.method === 'GET') {
-    const owner = requireOwner(req, url);
+    const owner = requirePrincipal(req, url);
     if (!owner) {
-      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      json(res, 401, { ok: false, error: 'owner sign-in or device pairing required' });
       return;
     }
     json(res, 200, await recordsPayload());
