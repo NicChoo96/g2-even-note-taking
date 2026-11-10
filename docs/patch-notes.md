@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.80
+
+v0.3.80 - Filter a table, and let Jarvis clear up
+
+- A table now has a filter row: choose values from a dropdown, or set a From and
+To date range, and the chart, the rows and the count all follow.
+- Jarvis can delete again: one reading, one row, or a whole series or table it no
+longer needs. Every deletion asks you first, and a series holding readings says
+how many will go before it does.
+- A table created under a name a series already uses says so, once.
+
 ## 0.3.79
 
 v0.3.79 - Keep rows, not just numbers
