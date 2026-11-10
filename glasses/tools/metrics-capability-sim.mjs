@@ -108,7 +108,8 @@ const forgetCap = metricsCapabilities.find((c) => c.name === 'metrics.forget');
 checkTrue('forget exists', Boolean(forgetCap));
 check('forget is app-wide', forgetCap.page, 'global');
 check('forget is gated behind a tap', forgetCap.confirm, true);
-check('forget takes the series and the slot', forgetCap.params.filter((p) => p.required).map((p) => p.name), ['series', 'slot']);
+check('forget takes the series, and then a slot OR a row key', forgetCap.params.filter((p) => p.required).map((p) => p.name), ['series']);
+check('…so a row can be named instead of a reading', forgetCap.params.map((p) => p.name), ['series', 'slot', 'key']);
 check('and says nothing can bring a reading back', /recover/i.test(forgetCap.description), true);
 
 __setReply({ ok: true, result: 'Deleted reading "2023-10-15" from "tengah.bto.4room"; 1 reading(s) removed.' });
@@ -119,14 +120,19 @@ check('…naming one reading', forgetCall.args.slot, '2023-10-15');
 check('…and never a cutoff', 'before' in forgetCall.args, false);
 
 __setReply({ ok: false, error: 'a delete needs a slot', result: '' });
-const forgetFailed = await forgetCap.run({ series: 'tengah.bto.4room', slot: '' });
+const forgetNothing = await forgetCap.run({ series: 'tengah.bto.4room', slot: '' });
+check('a forget with nothing named is refused', forgetNothing.ok, false);
+check('…locally, before the relay is asked', /slot/.test(String(forgetNothing.hint)), true);
+const forgetFailed = await forgetCap.run({ series: 'tengah.bto.4room', slot: '2023-10-15' });
 check('a refused forget is not a success', forgetFailed.ok, false);
 check('…and repeats the relay sentence', /needs a slot/.test(String(forgetFailed.summary)), true);
 check(
-  'declare asks for the schema, not just a key',
+  'declare asks for the shape, not just a key',
   declareCap.params.map((p) => p.name),
-  ['series', 'label', 'unit', 'valueType', 'cadence'],
+  ['kind', 'series', 'label', 'unit', 'valueType', 'cadence', 'fields', 'strict'],
 );
+check('…and can declare a TABLE, not only a series', declareCap.params.find((p) => p.name === 'kind').values, ['series', 'object']);
+check('a table’s columns travel as JSON', /JSON/.test(declareCap.params.find((p) => p.name === 'fields').description), true);
 checkTrue('the key is required', declareCap.params.find((p) => p.name === 'series').required);
 checkTrue(
   'and the description says the unit is permanent',
@@ -135,9 +141,16 @@ checkTrue(
 
 // ── 2. the arguments the model is offered ──────────────────────────────────
 const byName = new Map(cap.params.map((p) => [p.name, p]));
-check('the actions are exactly the relay', byName.get('action').values, ['list', 'read', 'write']);
+check('the actions are exactly the relay’s two vocabularies', byName.get('action').values, [
+  'list',
+  'read',
+  'write',
+  'objects',
+  'object',
+  'recordWrite',
+]);
 checkTrue('action is required', byName.get('action').required);
-check('series, limit, value, slot and at exist', [...byName.keys()], ['action', 'series', 'limit', 'value', 'slot', 'at']);
+check('series, limit, value, slot, at and rows exist', [...byName.keys()], ['action', 'series', 'limit', 'value', 'slot', 'at', 'rows']);
 // `at` is what makes a backfill possible: without it a month of readings would
 // all be stamped with the moment the run happened.
 checkTrue('and at explains the cost of leaving it out', /backfill/i.test(byName.get('at').description));
@@ -169,6 +182,64 @@ const call = async (args, answer = { ok: true, result: 'ok' }) => {
 {
   const { sent } = await call({ action: 'write', series: 'sgx.dbs.price', value: 36.4, slot: '2026-11-09' });
   check('write carries value and slot', sent.args, { action: 'write', series: 'sgx.dbs.price', value: 36.4, slot: '2026-11-09' });
+}
+
+// ── 3b. the TABLE actions, forwarded the same way ────────────────────────
+// The two vocabularies must not blur HERE either: a series action must never
+// carry `records`, and a table action must never carry `value`.
+{
+  const { sent } = await call({ action: 'objects' });
+  check('objects asks the relay for the tables', sent.args.action, 'objects');
+  check('…and sends no key', 'series' in sent.args, false);
+}
+{
+  const { sent } = await call({ action: 'object', series: 'bto.launch' });
+  check('object names the table', sent.args.action, 'object');
+  check('…and a default page', sent.args.limit, 30);
+  check('…with no reading value', 'value' in sent.args, false);
+}
+{
+  const { sent } = await call({
+    action: 'recordWrite',
+    series: 'bto.launch',
+    rows: '[{"key":"2023-10-15","values":{"price":290000}}]',
+  });
+  check('recordWrite parses its rows from JSON', Array.isArray(sent.args.records), true);
+  check('…so the relay never sees the string', typeof sent.args.records, 'object');
+  check('…and the row keeps its identity', sent.args.records[0].key, '2023-10-15');
+}
+{
+  const { res, count } = await call({ action: 'recordWrite', series: 'bto.launch', rows: 'not json' });
+  check('rows that are not JSON are refused', res.ok, false);
+  check('…before the relay is called', count, 0);
+  checkTrue('…with the shape to send', /"key"/.test(String(res.hint)));
+}
+{
+  const { res, count } = await call({ action: 'recordWrite', series: 'bto.launch' });
+  check('a table write with no rows is refused', res.ok, false);
+  check('…before the relay is called', count, 0);
+}
+{
+  __calls.length = 0;
+  __setReply({ ok: true, result: 'Deleted row "2023-10-15" from "bto.launch".' });
+  await forgetCap.run({ series: 'bto.launch', key: '2023-10-15' });
+  const c = __calls[__calls.length - 1];
+  check('forget with a key removes a ROW', c.args.action, 'recordDelete');
+  check('…naming it exactly as printed', c.args.key, '2023-10-15');
+  check('…and not as a reading slot', 'slot' in c.args, false);
+}
+{
+  __calls.length = 0;
+  __setReply({ ok: true, result: 'Created table "bto.launch" (BTO launches, soft) · columns: price:number(SGD).' });
+  await declareCap.run({
+    kind: 'object',
+    series: 'bto.launch',
+    fields: '[{"key":"price","type":"number","unit":"SGD"}]',
+  });
+  const c = __calls[__calls.length - 1];
+  check('declare with kind object declares a TABLE', c.args.action, 'objectDeclare');
+  check('…and sends the columns through', c.args.fields[0].key, 'price');
+  check('…not as a series declaration', 'valueType' in c.args, false);
 }
 {
   const { sent } = await call({ action: 'write', series: 'a.b', value: 1, slot: '   ' });

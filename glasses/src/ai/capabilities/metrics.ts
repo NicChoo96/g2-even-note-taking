@@ -17,6 +17,22 @@
 //   write`), and keeps the argument names identical on both sides — so a
 //   transcript reads the same whoever produced it.
 //
+// WHY THE TABLE ACTIONS LIVE IN THE SAME THREE ENTRIES (0.3.79)
+//   The store gained a second shape: a ROW of attributes, whose columns are
+//   stored as data (an object, `bto.launch`). The obvious move — two new
+//   app-wide capabilities — is impossible without shrinking what a page can do:
+//   `MAX_TOOLS` is 20, the busiest page (agents) declares 8 of its own, and the
+//   globals already fill the remaining 12 on that page exactly. A thirteenth
+//   global evicts one of agents' own actions. So the record verbs are ACTIONS of
+//   the entries that already own this subject:
+//     · reads and row-writes → `metrics.act` (effect: 'write', no gate)
+//     · shaping a table      → `metrics.declare` (confirm: the gate is about
+//                              what a thing IS, and an object's columns are the
+//                              same permanent decision a series' type is)
+//     · removing a row       → `metrics.forget` (confirm: it destroys a row)
+//   That is also the honest split: one subject, "the wearer's stored data", with
+//   the same three friction levels it always had.
+//
 // WHY IT IS effect: 'write'
 //   The tool can alter numbers the wearer keeps, so classifying it as a read
 //   would be a lie told to the ledger. It is NOT 'irreversible': a reading is
@@ -33,11 +49,11 @@
 //   why this file and that list move together.
 //
 // IT CANNOT DECLARE A SERIES
-//   The relay's tool has no `declare` action on purpose: series cardinality is a
-//   human decision made on the Data page. So an unknown key comes back as the
-//   relay's own refusal, and this capability passes that sentence through
-//   instead of softening it. A model told "recorded" for a series that does not
-//   exist is worse than one told nothing.
+//   The relay's `declare` action is reachable only through `metrics.declare`,
+//   which is gated: series cardinality is a decision with a tap on it. So an
+//   unknown key comes back as the relay's own refusal, and this capability passes
+//   that sentence through instead of softening it. A model told "recorded" for a
+//   series that does not exist is worse than one told nothing.
 import { GLOBAL_PAGE, type Capability } from '../types';
 import { runTool } from '../../web/agents-client';
 
@@ -55,16 +71,47 @@ export const METRICS_TEXT_CHARS = 6_000;
  *  bypasses the catalogue, so there is no row to resolve. */
 const METRICS_TOOL_ID = 'tool-metrics';
 
-const ACTIONS = ['list', 'read', 'write'] as const;
+/**
+ * The actions this capability may forward.
+ *
+ * Six, in two groups, and the grouping is what keeps them from being confused:
+ * `list`/`read`/`write` address a SERIES (one number over time),
+ * `objects`/`object`/`recordWrite` address an OBJECT (a table of rows).
+ */
+const ACTIONS = ['list', 'read', 'write', 'objects', 'object', 'recordWrite'] as const;
 type MetricsAction = (typeof ACTIONS)[number];
 
 const isAction = (v: unknown): v is MetricsAction =>
   typeof v === 'string' && (ACTIONS as readonly string[]).includes(v);
 
+/**
+ * A JSON argument, however the model spelled it.
+ *
+ * `rows` and `fields` are structurally rich (arrays of objects), and this
+ * registry's parameter types are scalars — so the schema says "string" and the
+ * model sends JSON. A model that sends the array anyway is right, too; what must
+ * not happen is a silent empty write because the string did not parse.
+ */
+export function jsonArg(raw: unknown): { ok: true; value: unknown } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  if (typeof raw === 'object') return { ok: true, value: raw };
+  const text = String(raw).trim();
+  if (!text) return { ok: true, value: undefined };
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false, error: 'that is not valid JSON' };
+  }
+}
+
 export const metricsCapabilities: Capability[] = [
   {
     /**
-     * Create a series — the one action that changes what the dashboard IS.
+     * Create the SHAPE of something — a series, or a table's columns.
+     *
+     * Both are the same decision wearing different clothes: what a thing IS,
+     * fixed once and permanent afterwards (a series' type and unit, a column's
+     * type). So both sit behind one tap, and the `kind` argument picks which.
      *
      * WHY IT IS ITS OWN CAPABILITY AND NOT AN `action` OF `metrics.act`:
      *   the gate that makes this safe is per-capability (`confirm`), so folding
@@ -83,56 +130,111 @@ export const metricsCapabilities: Capability[] = [
     page: GLOBAL_PAGE,
     effect: 'write',
     confirm: true,
-    title: 'Track a new number',
+    title: 'Track something new',
     description:
-      'Create a dashboard series so a value can be recorded from now on. Use it when the wearer asks ' +
-      'you to track or chart something that `metrics act` list does not already show — including ' +
-      '"collect this for a month", where the series must exist before the readings can be stored. ' +
-      'Send a dotted lowercase key (psi.west, news.rates.count), a short label, the unit, and whether ' +
-      'a reading is a number or text. The unit and type are permanent, so choose them for the whole ' +
-      'history, not for today. After it succeeds, write the readings with action "write". ' +
-      'For an ATTRIBUTE that belongs beside a number (a project name, an estate, a location), declare ' +
-      'its own text series under the same prefix — tengah.bto.4room.project — and write it at the same ' +
-      'slot as the number; the slot is the join.',
+      'Create the SHAPE of something to track, before data goes into it. Two kinds, and they are not ' +
+      'interchangeable:\n' +
+      '\u2022 kind "series" (the default): ONE NUMBER OVER TIME. Send a dotted lowercase key ' +
+      '(psi.west, news.rates.count), a short label, the unit, and whether a reading is a number or text. ' +
+      'Use it when the thing is a single measurement you will chart. The unit and type are PERMANENT, so ' +
+      'choose them for the whole history. After it succeeds, write readings with `metrics act` write.\n' +
+      '\u2022 kind "object": A TABLE OF ROWS. Send the table key (bto.launch) and, optionally, the columns ' +
+      'as JSON: \'[{"key":"launch_date","type":"date"},{"key":"price","type":"number","unit":"SGD"}]\'. ' +
+      'Only needed to PRE-SET a column\u2019s type or unit, or to lock the table with strict so unknown ' +
+      'columns are refused \u2014 a plain `metrics act` recordWrite creates the table and its columns as ' +
+      'the values arrive. A column\u2019s type is permanent once it exists.\n' +
+      'Use the object kind when a row has several attributes (a launch with a date, a project, a price) ' +
+      'or when the same table will be read back as a list. Do not declare four sibling series to fake a ' +
+      'row \u2014 that is the shape objects replace. Ask once, then write rows; do not re-declare what ' +
+      '`metrics act` objects already shows.',
     params: [
+      {
+        name: 'kind',
+        type: 'enum',
+        values: ['series', 'object'],
+        fallback: 'series',
+        description: 'series = one number over time; object = a table of rows. Default series.',
+      },
       {
         name: 'series',
         type: 'string',
         required: true,
-        description: 'The key, dotted and lowercase: "psi.west". One series per measure, never per day.',
+        description:
+          'The key, dotted and lowercase: "psi.west" for a series, "bto.launch" for a table. ' +
+          'For a series: one series per measure, never per day.',
       },
       {
         name: 'label',
         type: 'string',
-        description: 'Shown on the dashboard: "PSI west". Defaults to the key.',
+        description: 'Shown on the dashboard: "PSI west", "BTO launches". Defaults to the key.',
       },
       {
         name: 'unit',
         type: 'string',
-        description: 'Short unit: "PSI", "SGD", "mentions". Cannot be changed later.',
+        description: 'For a series: short unit "PSI", "SGD", "mentions". Cannot be changed later.',
       },
       {
         name: 'valueType',
         type: 'enum',
         values: ['number', 'string'],
         fallback: 'number',
-        description: 'What one reading is. Default number.',
+        description: 'For a series: what one reading is. Default number.',
       },
       {
         name: 'cadence',
         type: 'string',
-        description: 'Optional hint: "daily", "hourly". Advisory only.',
+        description: 'For a series: optional hint "daily", "hourly". Advisory only.',
+      },
+      {
+        name: 'fields',
+        type: 'string',
+        description:
+          'For an object: a JSON array of columns, e.g. ' +
+          '\'[{"key":"launch_date","type":"date"},{"key":"price","type":"number","unit":"SGD"}]\'. ' +
+          'Types: text, number, bool, date. Omit to let the first writes infer them.',
+      },
+      {
+        name: 'strict',
+        type: 'boolean',
+        description:
+          'For an object: true refuses a column the table does not have, instead of adding it. ' +
+          'Leave false while gathering data.',
       },
     ],
     run: async (args) => {
-      const send: Record<string, unknown> = {
-        action: 'declare',
-        series: args.series ?? '',
-        label: args.label ?? '',
-        unit: args.unit ?? '',
-        valueType: args.valueType ?? 'number',
-      };
-      if (args.cadence !== undefined && String(args.cadence).trim() !== '') send.cadence = args.cadence;
+      const kind = args.kind === 'object' ? 'object' : 'series';
+      const send: Record<string, unknown> =
+        kind === 'object'
+          ? { action: 'objectDeclare', series: args.series ?? '', label: args.label ?? '' }
+          : {
+              action: 'declare',
+              series: args.series ?? '',
+              label: args.label ?? '',
+              unit: args.unit ?? '',
+              valueType: args.valueType ?? 'number',
+            };
+      if (kind === 'series' && args.cadence !== undefined && String(args.cadence).trim() !== '') {
+        send.cadence = args.cadence;
+      }
+      if (kind === 'object') {
+        // The columns, if any. A malformed list is refused here with the shape to
+        // send — the alternative is a table that silently gets its types inferred
+        // from whatever the first row happened to contain.
+        const fields = jsonArg(args.fields);
+        if (!fields.ok) {
+          return {
+            ok: false,
+            summary: 'fields is not JSON',
+            hint:
+              'Send fields as \'[{"key":"price","type":"number","unit":"SGD"}]\', or omit it and let the ' +
+              'first writes infer the columns.',
+          };
+        }
+        if (fields.value !== undefined) {
+          send.fields = Array.isArray(fields.value) ? fields.value : [fields.value];
+        }
+        if (args.strict === true || args.strict === 'true') send.strict = true;
+      }
 
       const reply = await runTool({ kind: 'metrics', toolId: METRICS_TOOL_ID, args: send });
       const text = String(reply.result ?? '');
@@ -158,37 +260,46 @@ export const metricsCapabilities: Capability[] = [
     name: 'metrics.act',
     page: GLOBAL_PAGE,
     effect: 'write',
-    title: 'Dashboard numbers',
+    title: 'Dashboard: numbers and tables',
     description:
-      "The digitised numbers the wearer keeps on their dashboard. `list` shows which series exist with " +
-      "their latest value; `read` returns one series' history; `write` records a value under a series " +
-      'that already exists. A series has a fixed unit and type and is declared by the wearer on the ' +
-      'Data page — this cannot create one, so use `list` first and use the keys it returns exactly as ' +
-      'written. Writing the same slot twice REPLACES the earlier reading, so re-recording is safe. ' +
-      'A SERIES HOLDS ONE VALUE PER SLOT: to keep an attribute beside a number (an estate name, a ' +
-      'project, a location), write it to its own text series at the SAME slot — e.g. ' +
-      'tengah.bto.4room.project — and read both; the slot is the join. Sending an extra field on a ' +
-      'reading is refused, never stored. ' +
-      'Use it whenever a question is about a tracked number ("how is DBS", "what did I record ' +
-      'yesterday") or when the wearer tells you one to keep.',
+      'Everything the wearer has stored, in TWO shapes \u2014 pick by what the data IS, never both.\n' +
+      '\u2022 A SERIES is ONE NUMBER OVER TIME (a share price, a PSI reading). `list` shows which exist, ' +
+      '`read` returns one series\u2019 history, `write` records a value under a series that already exists. ' +
+      'A series has a fixed unit and type and one value per slot; writing the same slot twice REPLACES it, ' +
+      'so re-recording is safe.\n' +
+      '\u2022 An OBJECT is a TABLE OF ROWS (a launch: date, flat type, project, estate, price). `objects` ' +
+      'lists the tables, `object` returns one table\u2019s rows and columns, `recordWrite` upserts rows and ' +
+      'CREATES the table on its first write \u2014 you do not have to declare anything first, because a field ' +
+      'it has not seen becomes a column automatically. The row\u2019s `key` is its identity: re-use it to ' +
+      'correct one row, and a partial write merges so a single cell can be fixed.\n' +
+      'THE RULE: a fact with more than one attribute (a date AND a project AND a price) is a ROW, so it ' +
+      'goes in an object. A single charted measurement is a SERIES. Do not keep the same row both ways \u2014 ' +
+      'four sibling series joined by slot is the old shape objects replace. If the rows are not a time ' +
+      'series at all (contacts, an inventory), that is still an object; a record with no date is legal.\n' +
+      'Use it whenever a question is about tracked data ("how is DBS", "what did I record yesterday", ' +
+      '"which launches are still unsold") or when the wearer tells you some to keep.',
     params: [
       {
         name: 'action',
         type: 'enum',
         values: [...ACTIONS],
         required: true,
-        description: 'list = what exists; read = one series history; write = record a value.',
+        description:
+          'Series: list = what exists; read = one series history; write = record a value. ' +
+          'Tables: objects = which tables exist; object = one table\u2019s rows; recordWrite = upsert rows.',
       },
       {
         name: 'series',
         type: 'string',
-        description: 'The series key, e.g. "sgx.dbs.price". Required for read and write.',
+        description:
+          'The series key ("sgx.dbs.price") \u2014 or, for object/recordWrite, the TABLE key ("bto.launch"). ' +
+          'Required for read, write, object and recordWrite.',
       },
       {
         name: 'limit',
         type: 'number',
         fallback: 30,
-        description: 'For read: how many recent points. Default 30, capped by the relay at 240.',
+        description: 'For read or object: how many recent points or rows. Default 30, capped by the relay at 240.',
       },
       {
         name: 'value',
@@ -212,21 +323,33 @@ export const metricsCapabilities: Capability[] = [
           'Omit only for a reading taken now. A backfill without it stacks a month of points at one ' +
           'instant, so always send it when recording history.',
       },
+      {
+        name: 'rows',
+        type: 'string',
+        description:
+          'For recordWrite: a JSON array of rows, e.g. ' +
+          '\'[{"key":"2023-10-15","values":{"price":290000,"project":"Garden Vale"}}]\'. ' +
+          '`key` is the row\u2019s identity (a date, an id, a name \u2014 1 to 64 characters), and `values` holds ' +
+          'the cells. A field the table does not have yet becomes a column, and the answer tells you ' +
+          'which ones it added. Max 32 rows per call. A null means "nothing for this", not zero.',
+      },
     ],
     run: async (args) => {
       const action = isAction(args.action) ? args.action : null;
       if (!action) {
         return {
           ok: false,
-          summary: 'unknown metrics action',
-          hint: `Call it with action "list", "read" or "write".`,
+          summary: 'unknown data action',
+          hint:
+            'Call it with action "list", "read" or "write" for a series, or "objects", "object" or ' +
+            '"recordWrite" for a table of rows.',
         };
       }
       // Only the arguments this action can use are forwarded, so a stale `value`
       // on a read cannot be mistaken by the relay for a write.
       const send: Record<string, unknown> = { action };
-      if (action === 'read' || action === 'write') send.series = args.series ?? '';
-      if (action === 'read') send.limit = args.limit ?? 30;
+      if (action === 'read' || action === 'write' || action === 'object') send.series = args.series ?? '';
+      if (action === 'read' || action === 'object') send.limit = args.limit ?? 30;
       if (action === 'write') {
         send.value = args.value ?? '';
         if (args.slot !== undefined && args.slot !== null && String(args.slot).trim() !== '') {
@@ -236,6 +359,32 @@ export const metricsCapabilities: Capability[] = [
         if (args.at !== undefined && args.at !== null && String(args.at).trim() !== '') {
           send.at = args.at;
         }
+      }
+      if (action === 'recordWrite') {
+        send.series = args.series ?? '';
+        // `rows` is a JSON string in the schema because this registry's parameter
+        // types are scalars. A malformed one is refused HERE, with the shape to
+        // send, rather than arriving at the relay as an empty write.
+        const rows = jsonArg(args.rows);
+        if (!rows.ok) {
+          return {
+            ok: false,
+            summary: 'rows is not JSON',
+            hint:
+              `${String(args.rows ?? '').slice(0, 80)} is not JSON. Send rows as ` +
+              '\'[{"key":"2023-10-15","values":{"price":290000,"project":"Garden Vale"}}]\'.',
+          };
+        }
+        if (rows.value === undefined) {
+          return {
+            ok: false,
+            summary: 'no rows to write',
+            hint:
+              'recordWrite needs `rows`: a JSON array of {"key": ..., "values": {...}}. Two examples: ' +
+              '\'[{"key":"2023-10-15","values":{"price":290000}}]\' for one row, or several objects for a batch.',
+          };
+        }
+        send.records = Array.isArray(rows.value) ? rows.value : [rows.value];
       }
 
       const reply = await runTool({ kind: 'metrics', toolId: METRICS_TOOL_ID, args: send });
@@ -296,34 +445,51 @@ export const metricsCapabilities: Capability[] = [
     page: GLOBAL_PAGE,
     effect: 'write',
     confirm: true,
-    title: 'Remove a reading',
+    title: 'Remove a reading or row',
     description:
-      'Delete ONE reading from a dashboard series, named by its slot (the date or label it was ' +
-      'recorded under). Use it when the wearer says a reading is wrong and should not be there, or ' +
-      'to clean up a test row — not to correct a value, which is a `metrics act` write to the same ' +
-      'slot. `read` first: every row it returns shows its slot when the slot is not simply the ' +
-      'date, and that string is what this takes. It cannot empty a series, and nothing here can ' +
-      'recover a reading once removed.',
+      'Delete ONE thing that should not be there. Two shapes, and the argument you send decides which:\n' +
+      '\u2022 a READING from a series \u2014 send `slot` (the date or label it was recorded under). Reading ' +
+      'first shows that string on any row whose slot is not simply its date.\n' +
+      '\u2022 a ROW from a table \u2014 send `key`, the row\u2019s identity exactly as `metrics act` object ' +
+      'printed it (e.g. "2023-10-15").\n' +
+      'Use it when the wearer says something is wrong and should not be there, or to clean up a test row \u2014 ' +
+      'not to CORRECT a value, which is a write: rewriting the same slot or the same row key replaces it ' +
+      'and keeps the row. It cannot empty a series or a table, and nothing here can recover what it removes.',
     params: [
       {
         name: 'series',
         type: 'string',
         required: true,
-        description: 'The series key, e.g. "tengah.bto.4room".',
+        description: 'The series key ("tengah.bto.4room") or the table key ("bto.launch").',
       },
       {
         name: 'slot',
         type: 'string',
-        required: true,
-        description: 'Which reading: its slot exactly as `read` printed it, e.g. "2023-10-15".',
+        description: 'For a series: which reading \u2014 its slot exactly as `read` printed it, e.g. "2023-10-15".',
+      },
+      {
+        name: 'key',
+        type: 'string',
+        description:
+          'For a table: which row \u2014 its key exactly as `object` printed it. Row keys are compared as ' +
+          'strings and are not normalised, so do not reformat the date.',
       },
     ],
     run: async (args) => {
-      const send: Record<string, unknown> = {
-        action: 'delete',
-        series: args.series ?? '',
-        slot: args.slot ?? '',
-      };
+      const row = String(args.key ?? '').trim();
+      const slot = String(args.slot ?? '').trim();
+      if (!row && !slot) {
+        return {
+          ok: false,
+          summary: 'nothing named to remove',
+          hint:
+            'Send `slot` to remove one reading from a series, or `key` to remove one row from a table. ' +
+            'Read it first (`metrics act` read or object) so the identity is one it printed.',
+        };
+      }
+      const send: Record<string, unknown> = row
+        ? { action: 'recordDelete', series: args.series ?? '', key: row }
+        : { action: 'delete', series: args.series ?? '', slot };
       const reply = await runTool({ kind: 'metrics', toolId: METRICS_TOOL_ID, args: send });
       const text = String(reply.result ?? '');
       if (!reply.ok) {
@@ -332,7 +498,7 @@ export const metricsCapabilities: Capability[] = [
           ok: false,
           summary: reason.length > 96 ? `${reason.slice(0, 93)}...` : reason,
           data: { error: reason, text },
-          hint: `${reason}. Do not retry with a different slot — read the series and name a row it printed.`,
+          hint: `${reason}. Do not retry with a different identity — read it and name a row it printed.`,
         };
       }
       const firstLine = text.split('\n')[0].trim();

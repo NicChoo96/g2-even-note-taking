@@ -479,19 +479,28 @@ check(
 
 // The list is the index; searching it is a filter over what is already in
 // memory, so it must not re-query the store and must not move the selection.
-check('the list has a search box', /placeholder="Search these numbers"/.test(panelSrc), true);
+// Since tables arrived the box searches BOTH stores, which is why the wording
+// is no longer "these numbers" alone.
+check('the list has a search box', /placeholder="Search these numbers and tables"/.test(panelSrc), true);
 check('it matches the key', /s\.key\.toLowerCase\(\)\.includes\(q\)/.test(panelSrc), true);
 check('the label', /\(s\.label \?\? ''\)\.toLowerCase\(\)\.includes\(q\)/.test(panelSrc), true);
 check('and the unit', /\(s\.unit \?\? ''\)\.toLowerCase\(\)\.includes\(q\)/.test(panelSrc), true);
-check('an empty result names the search and offers a way out', /No number matches/.test(panelSrc) && /Clear the search/.test(panelSrc), true);
+// A TABLE is searchable by its own identity and by its COLUMNS — a table an
+// agent created is named after its subject, and the columns are what anyone
+// would type.
+check('and a table by its key, label and columns', /t\.fields\.some\(\(f\) => f\.key\.includes\(q\)/.test(panelSrc), true);
+check('an empty result names the search and offers a way out', /Nothing matches/.test(panelSrc) && /Clear the search/.test(panelSrc), true);
 check('the search bar sits outside the scrolling strip', /metric-master-wrap[\s\S]{0,900}?mm-search[\s\S]{0,1600}?className="metric-master"/.test(panelSrc), true);
 // The selection is resolved against the FULL list on purpose: typing must not
-// silently swap the chart you are reading for a different series.
+// silently swap the chart you are reading for a different series. Since tables
+// arrived it is resolved per KIND as well, so a key shared by both stores cannot
+// open the wrong one.
 check(
   'the open series is still found after filtering',
-  /const selected = series\.find\(\(s\) => s\.key === selectedKey\)/.test(panelSrc),
+  /const selectedSeries = series\.find\(\(s\) => s\.key === selection\?\.key\)/.test(panelSrc),
   true,
 );
+check('and a table is resolved separately', /const selectedTable = tables\.find\(\(t\) => t\.key === selection\?\.key\)/.test(panelSrc), true);
 check('and the groups are built from the filtered list', /groupSeries\(filtered\)/.test(panelSrc), true);
 
 // ── 10. a refusal is written for a person ──────────────────────────────────

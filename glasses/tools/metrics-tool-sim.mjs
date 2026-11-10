@@ -48,11 +48,40 @@ const schema = metricsToolSchema({});
 is('the schema is a function call', schema.type, 'function');
 is('with the agreed name', schema.function.name, METRICS_TOOL_NAME);
 const fn = schema.function.parameters;
-is('five actions, and declare is one of them', fn.properties.action.enum, ['list', 'read', 'declare', 'write', 'delete']);
+is('ten actions: five for a series, five for a table', fn.properties.action.enum, [
+  'list',
+  'read',
+  'declare',
+  'write',
+  'delete',
+  'objects',
+  'object',
+  'objectDeclare',
+  'recordWrite',
+  'recordDelete',
+]);
+// The split is the design, not a detail: `read`/`write` address a series and
+// `object`/`recordWrite` address a table, and the description has to say which
+// is which or the model will keep a row in both.
+is(
+  'the description names both stores',
+  ['SERIES', 'OBJECT', 'TABLE'].map((w) => schema.function.description.includes(w)),
+  [true, true, true],
+);
+is(
+  'and says never to keep a row both ways',
+  schema.function.description.includes('both ways'),
+  true,
+);
 is(
   'declare takes the schema fields, not just a key',
   ['label', 'unit', 'valueType', 'cadence'].filter((k) => k in fn.properties),
   ['label', 'unit', 'valueType', 'cadence'],
+);
+is(
+  'a table write takes rows and a delete takes a row key',
+  ['records', 'fields', 'key', 'strict'].filter((k) => k in fn.properties),
+  ['records', 'fields', 'key', 'strict'],
 );
 is('unknown arguments are refused by the schema', fn.additionalProperties, false);
 
@@ -374,7 +403,8 @@ check(
 // passing because a delete with no slot is refused, which is a different rule.
 const unknown = await runMetricsTool({ kind: 'metrics' }, { action: 'append', series: 'x.y' }, {});
 check('an unknown action is refused', unknown.ok === false, 'an unknown action was accepted');
-check('and lists the valid ones', /list, read, declare, write or delete/.test(text(unknown)), true);
+check('and names both vocabularies', /list, read, declare, write, delete/.test(text(unknown)), true);
+check('…including the table actions', /objects, object, objectDeclare, recordWrite, recordDelete/.test(text(unknown)), true);
 
 // ── 4b. delete: ONE reading, named by its slot ─────────────────────────────
 // A reading is named by its slot, so that is what an edit removes. Before this
@@ -485,6 +515,7 @@ const env = {
   AGENT_CRON_FILE: join(dir, 'schedule.json'),
   AGENT_CRON_STATE_FILE: join(dir, 'cron-state.json'),
   METRICS_FILE: join(dir, 'metrics.json'),
+  RECORDS_FILE: join(dir, 'records.json'),
   G2_AGENT_CRON: '0',
 };
 for (const k of ['JARVIS_FILE_URL', 'JARVIS_FILE_USER', 'JARVIS_FILE_PWD', 'JARVIS_FILE_API_KEY', 'METRICS_API']) {
@@ -592,6 +623,89 @@ try {
     args: { action: 'read', series: 'sgx.dbs.price' },
   });
   check('a read returns the history', /1 of 1 reading/.test(String(readOverHttp.body?.result)), true);
+
+  // ── 6b. the TABLE store, over the same relay ────────────────────────────
+  // The routes the Data page uses, and the tool action the model uses, on one
+  // store — because the failure to avoid is the two of them disagreeing about
+  // whether a table exists.
+  const recordsEmpty = await call('GET', '/api/records');
+  check('the records route answers', recordsEmpty.status, 200);
+  is('…with no tables yet', (recordsEmpty.body?.objects ?? []).length, 0);
+  check('…and says where tables live', recordsEmpty.body?.store?.mode, 'relay');
+
+  const toolRows = await call('POST', '/api/tool', {
+    ...tool,
+    args: {
+      action: 'recordWrite',
+      series: 'bto.launch',
+      records: [
+        { key: '2023-10-15', values: { launch_date: '2023-10-15', price: 290000, project: 'Garden Vale' } },
+        { key: '2024-02-01', values: { launch_date: '2024-02-01', price: 410000 } },
+      ],
+    },
+  });
+  check('a model can create a table by writing a row', toolRows.body?.ok, true);
+  check('…and is told which columns it added', /Added 3 columns/.test(String(toolRows.body?.result)), true);
+
+  const afterTool = await call('GET', '/api/records');
+  const launch = (afterTool.body?.objects ?? []).find((o) => o.key === 'bto.launch');
+  check('the table is on the Data tab', Boolean(launch), true);
+  check('…with the columns the write inferred', (launch?.fields ?? []).map((f) => f.key), ['launch_date', 'price', 'project']);
+  check('…and both rows', (launch?.records ?? []).length, 2);
+  check('…newest first', launch?.records?.[0]?.key, '2024-02-01');
+  check(
+    '…and its instant came from the date column',
+    new Date(launch?.records?.[0]?.ts ?? 0).toISOString(),
+    '2024-02-01T00:00:00.000Z',
+  );
+
+  // A surgical edit: one cell of one row.
+  const patched = await call('PATCH', '/api/records/objects/bto.launch/records/2023-10-15', {
+    values: { price: 295000 },
+  });
+  check('one cell can be corrected', patched.status, 200);
+  const edited = (patched.body?.objects ?? []).find((o) => o.key === 'bto.launch');
+  const row = (edited?.records ?? []).find((r) => r.key === '2023-10-15');
+  check('…without touching the other cells', row?.values?.project, 'Garden Vale');
+  check('…and the value is the one sent', row?.values?.price, 295000);
+
+  // The page's own write route, declaring through the object route.
+  const pageWrite = await call('POST', '/api/records/objects/contact.friends/records', {
+    records: [{ key: 'ana', values: { name: 'Ana', phone: '91234567' } }],
+  });
+  check('the page can write rows too', pageWrite.status, 200);
+  const friends = (pageWrite.body?.objects ?? []).find((o) => o.key === 'contact.friends');
+  is('…and a row with no date is legal', friends?.records?.[0]?.ts, null);
+
+  const declared = await call('POST', '/api/records/objects', {
+    key: 'budget.fixed',
+    label: 'Fixed costs',
+    strict: true,
+    fields: [{ key: 'item', type: 'text' }],
+  });
+  check('the page can declare a table', declared.status, 200);
+  const strictWrite = await call('POST', '/api/records/objects/budget.fixed/records', {
+    records: [{ key: 'rent', values: { item: 'Rent', amount: 2000 } }],
+  });
+  check('a strict table refuses an unknown column', strictWrite.status, 400);
+  check('…naming the columns it has', /allowed: item/.test(String(strictWrite.body?.error)), true);
+
+  const notEmpty = await call('DELETE', '/api/records/objects/bto.launch');
+  check('a non-empty table is refused', notEmpty.status, 409);
+  check('…with the count for the confirm', notEmpty.body?.count, 2);
+
+  const rowDeleted = await call('DELETE', '/api/records/objects/bto.launch/records/2023-10-15');
+  check('one row can be deleted', rowDeleted.status, 200);
+  check('…and reports it', rowDeleted.body?.deleted, 1);
+
+  const purged = await call('DELETE', '/api/records/objects/bto.launch?purge=1');
+  check('a purge removes the table and its rows', purged.status, 200);
+  check('…reporting how many rows went', purged.body?.deletedRecords, 1);
+  is('…and the table is gone', (purged.body?.objects ?? []).some((o) => o.key === 'bto.launch'), false);
+
+  // The series store must be untouched by all of that.
+  const dashAfter = await call('GET', '/api/metrics');
+  check('the series store is untouched by the table store', (dashAfter.body?.series ?? []).length, 1);
 } catch (err) {
   fail += 1;
   console.log(`FAIL  the relay could not be driven — ${err instanceof Error ? err.message : String(err)}`);
@@ -672,6 +786,159 @@ const typesSrc = await readFile(resolve(here, '../src/types.ts'), 'utf8');
 check('the catalogue knows the kind', /kind: 'metrics'/.test(typesSrc), true);
 const panelSrc = await readFile(resolve(here, '../src/web/AgentsPanel.tsx'), 'utf8');
 check('and offers it as a chip', /addMetricsToAgent/.test(panelSrc), true);
+
+// ── 12. the TABLE actions, driven through the real local recStore ──────────────
+// The five record actions are driven against `createLocalRecords` rather than a
+// hand-written stub, so what is asserted here is the whole path a model takes:
+// the tool's parsing, the recStore's inference, and the sentence that comes back.
+const { createLocalRecords } = await import(
+  `${pathToFileURL(resolve(here, '../../web/server/records.mjs')).href}?v=${Date.now()}`
+);
+
+function recordDeps(recStore) {
+  return {
+    listObjects: async () => recStore.objects(),
+    readObject: async (key, limit) => recStore.object(key, { limit }),
+    declareObject: async (input) => {
+      const res = recStore.declare(input);
+      return res.ok ? { ok: true, created: res.created, object: res.object } : res;
+    },
+    writeRecords: async (key, rows) => {
+      // The auto-create rule lives in the relay; mirrored here so the harness
+      // exercises the same promise (“a table is created by its first write”).
+      if (!recStore.state.objects[key]) recStore.declare({ key, fields: [] });
+      return recStore.write(key, rows);
+    },
+    deleteRecord: async (key, rec) => recStore.removeRecord(key, rec),
+  };
+}
+
+const recStore = createLocalRecords();
+const recDeps = recordDeps(recStore);
+
+const noTables = await runMetricsTool({ kind: 'metrics' }, { action: 'objects' }, recDeps);
+check('an empty table store is explained', noTables.ok !== false && /No tables yet/.test(text(noTables)), true);
+check('…and points at recordWrite as the way in', /recordWrite/.test(text(noTables)), true);
+check(
+  '…and says a single number is still a series',
+  /series/.test(text(noTables)),
+  true,
+);
+
+// A first write CREATES the table, its columns, and the types from the values.
+const firstWrite = await runMetricsTool(
+  { kind: 'metrics' },
+  {
+    action: 'recordWrite',
+    series: 'bto.launch',
+    records: [{ key: '2023-10-15', values: { date: '2023-10-15', price: 290000, project: 'Garden Vale' } }],
+  },
+  recDeps,
+);
+check('recordWrite accepts rows without a declaration', firstWrite.ok !== false, text(firstWrite));
+check('…and says the table was created by the write', /created by this write/.test(text(firstWrite)), true);
+check('…and names every column it inferred', /Added 3 columns/.test(text(firstWrite)), true);
+check('…with their inferred types', /date \(date\)/.test(text(firstWrite)) && /price \(number\)/.test(text(firstWrite)), true);
+is('the row is stored', recStore.state.records['bto.launch']['2023-10-15'].values.price, 290000);
+is(
+  'and its instant comes from the date field',
+  new Date(recStore.state.records['bto.launch']['2023-10-15'].ts).toISOString(),
+  '2023-10-15T00:00:00.000Z',
+);
+
+// A SECOND write with a new field grows the schema, and the receipt says so.
+const grew = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'recordWrite', series: 'bto.launch', records: [{ key: '2024-02-01', values: { date: '2024-02-01', estate: 'Tengah' } }] },
+  recDeps,
+);
+check('a later row can add a column', /Added a column: estate \(text\)/.test(text(grew)), true);
+is('the schema kept both rows\u2019 columns', recStore.state.objects['bto.launch'].fields.length, 4);
+
+// A NEAR-DUPLICATE name is not refused — it is reported by name, which is the
+// only containment a soft schema has.
+const slipped = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'recordWrite', series: 'bto.launch', records: [{ key: '2024-03-01', values: { estates: 'Yishun' } }] },
+  recDeps,
+);
+check('a typo-shaped column is reported', /one slip away from the existing column "estate"/.test(text(slipped)), true);
+check('…and tells the model what to do about it', /re-send the row with that field name/.test(text(slipped)), true);
+
+// READING the table: every row, its key, and its cells.
+const readBack = await runMetricsTool({ kind: 'metrics' }, { action: 'object', series: 'bto.launch' }, recDeps);
+check('object reads the table', readBack.ok !== false, text(readBack));
+check('…naming the columns and their types', /columns: date:date/.test(text(readBack)), true);
+check('…and printing each row\u2019s identity', /2023-10-15/.test(text(readBack)), true);
+check(
+  '…with the cells beside it',
+  /price=290,000\.00/.test(text(readBack)),
+  text(readBack),
+);
+const missingTable = await runMetricsTool({ kind: 'metrics' }, { action: 'object', series: 'nope.thing' }, recDeps);
+check('reading a table that does not exist says so', missingTable.ok === false, true);
+check('…and names the action that would create it', /recordWrite` would create/.test(text(missingTable)), text(missingTable));
+
+// DECLARING: a type change is refused with the fix, not an invitation to retry.
+const locked = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'objectDeclare', series: 'bto.launch', fields: [{ key: 'price', type: 'text' }] },
+  recDeps,
+);
+check('a column type cannot change', locked.ok === false, true);
+check('…and the refusal names the stored type', /stored as number/.test(text(locked)), true);
+const recDeclared = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'objectDeclare', series: 'sgx.board', label: 'SGX board', fields: [{ key: 'counter', type: 'text' }, { key: 'px', type: 'number', unit: 'SGD' }] },
+  recDeps,
+);
+check('objectDeclare creates a table', /Created table "sgx.board"/.test(text(recDeclared)), true);
+check('…and says whether an unknown column is refused', /will be added automatically/.test(text(recDeclared)), true);
+check(
+  'declare accepts columns as a JSON string too',
+  /Created table "fx.rates"/.test(
+    text(await runMetricsTool({ kind: 'metrics' }, { action: 'objectDeclare', series: 'fx.rates', fields: '[{"key":"pair","type":"text"}]' }, recDeps)),
+  ),
+  true,
+);
+
+// DELETING a row needs the key, and never the whole table.
+const recNoKey = await runMetricsTool({ kind: 'metrics' }, { action: 'recordDelete', series: 'bto.launch' }, recDeps);
+check('a row delete without a key is refused', recNoKey.ok === false, true);
+check('…and says it will not clear a table', /will not clear a table/.test(text(recNoKey)), true);
+const recRemoved = await runMetricsTool({ kind: 'metrics' }, { action: 'recordDelete', series: 'bto.launch', key: '2024-03-01' }, recDeps);
+check('a row delete names the row it removed', /Deleted row "2024-03-01"/.test(text(recRemoved)), true);
+is('…and only that row', Object.keys(recStore.state.records['bto.launch']).length, 2);
+const recGone = await runMetricsTool({ kind: 'metrics' }, { action: 'recordDelete', series: 'bto.launch', key: '2024-03-01' }, recDeps);
+check('deleting it twice is a 404-shaped answer', recGone.ok === false, true);
+check('…telling the model how to find a real key', /Read the table with action "object"/.test(text(recGone)), true);
+
+// The tool must also survive a model that sends rows as a JSON STRING.
+const asString = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'recordWrite', series: 'contact.friends', records: '[{"key":"ana","values":{"name":"Ana","phone":"91234567"}}]' },
+  recDeps,
+);
+check('rows sent as a JSON string are parsed', asString.ok !== false, text(asString));
+check('…and the row lands', /Wrote 1 row/.test(text(asString)), true);
+const notJson = await runMetricsTool({ kind: 'metrics' }, { action: 'recordWrite', series: 'x.y', records: 'nope' }, recDeps);
+check('rows that are not JSON are refused', notJson.ok === false, true);
+check('…with the shape to send', /array of \{key, values\}/.test(text(notJson)), true);
+
+// A STRICT table refuses a column it does not have, naming the ones it does.
+recStore.declare({ key: 'budget.fixed', fields: [{ key: 'item', type: 'text' }], strict: true });
+const strictRefused = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'recordWrite', series: 'budget.fixed', records: [{ key: 'rent', values: { item: 'Rent', amount: 2000 } }] },
+  recDeps,
+);
+check('a strict table refuses an unknown column', strictRefused.ok === false, true);
+check('…naming the columns it does have', /allowed: item/.test(text(strictRefused)), true);
+
+// The listing shows both shapes, with columns, so the model can choose.
+const recListed = await runMetricsTool({ kind: 'metrics' }, { action: 'objects' }, recDeps);
+check('objects lists every table', /- bto\.launch/.test(text(recListed)) && /budget\.fixed, strict\)/.test(text(recListed)), text(recListed));
+check('…with each table\u2019s columns', /columns: date:date/.test(text(recListed)), true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

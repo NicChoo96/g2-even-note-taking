@@ -2865,7 +2865,11 @@ p.empty {
 /* ── master · detail ──────────────────────────────────────────────────────── */
 .data-split {
   display: grid;
-  grid-template-columns: 1fr;
+  /* `minmax(0, 1fr)`, NOT `1fr`. A bare `1fr` is `minmax(auto, 1fr)`, and the
+     `auto` minimum is the track's MIN-CONTENT width — which for a five-column
+     table is the whole table. That is what made a phone scroll sideways instead
+     of scrolling the table inside its own box. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   align-items: start;
 }
@@ -3360,3 +3364,52 @@ p.empty {
 }
 
 .ok-line { color: var(--ok, #30a46c); font-size: 12px; }
+
+/* ── tables (records) ──────────────────────────────────────────────────────
+   A table is the second shape in the Data tab: rows whose columns are data.
+   It reuses the readings table and only adds what a row needs — its identity,
+   its date, and a pair of verbs per row. */
+.mm-table-meta { font-size: 11px; color: var(--muted); }
+
+.mm-table-cols {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Wider than the readings table: a row has as many columns as the wearer's data
+   has fields, and squeezing them is how a table stops being readable. `100%`
+   plus the readings table's own `overflow: auto` is what turns "too many
+   columns" into a horizontal scroll INSIDE the table rather than a page that
+   slides sideways on a phone. */
+.record-table { max-height: 360px; max-width: 100%; }
+.record-table th { white-space: nowrap; }
+
+.rec-key { white-space: nowrap; }
+.rec-key .rec-when { display: block; font-size: 10px; color: var(--muted); }
+
+.rec-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.rec-actions button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 6px;
+  margin-left: 4px;
+}
+.rec-actions button:hover { color: var(--fg, inherit); }
+
+.record-table tr.editing { background: color-mix(in srgb, var(--fg, #fff) 6%, transparent); }
+.record-table tr.editing input,
+.record-table tr.editing select {
+  width: 100%;
+  min-width: 64px;
+  font-size: 12px;
+  padding: 2px 4px;
+}

@@ -76,6 +76,130 @@ function authHeaders(json = false): Record<string, string> {
   return h;
 }
 
+// ── Tables (records) ─────────────────────────────────────────────────────────
+// The second store, beside the series one. A series is one number over time; a
+// table is ROWS whose columns are declared as data, so a column can appear
+// without a migration. The page draws both, and the only thing they share is the
+// relay they are fetched from.
+
+export interface RecordField {
+  key: string;
+  label: string;
+  type: 'text' | 'number' | 'bool' | 'date';
+  unit: string;
+  precision: number;
+}
+
+export interface RecordRow {
+  /** The row's identity. Compared as a string by the store, never normalised. */
+  key: string;
+  values: Record<string, unknown>;
+  /** The row's place in time — `null` when the row has no date, which is legal. */
+  ts: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface RecordTable {
+  key: string;
+  label: string;
+  /** Strict tables REFUSE a column they do not have; soft ones infer it. */
+  strict: boolean;
+  fields: RecordField[];
+  count: number;
+  latestTs: number | null;
+  records: RecordRow[];
+  total: number;
+  error?: string;
+}
+
+export interface RecordsState {
+  ok: boolean;
+  objects: RecordTable[];
+  now: number;
+  store: { mode: 'hub' | 'relay'; api?: string; file?: string; durable: boolean };
+  degraded?: boolean;
+  error?: string;
+}
+
+export async function fetchRecords(): Promise<RecordsState | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/records`, { headers: authHeaders() });
+    if (!res.ok) return null;
+    return (await res.json()) as RecordsState;
+  } catch {
+    return null;
+  }
+}
+
+export type RecordsResult = (Omit<RecordsState, 'ok'> & { ok: true; deletedRecords?: number; deleted?: number }) | { ok: false; error: string; count?: number };
+
+/** Upsert rows. The table is created by its first write — same rule as the tool. */
+export function writeRows(
+  key: string,
+  records: Array<{ key: string; values: Record<string, unknown> }>,
+): Promise<RecordsResult> {
+  return post<RecordsResult>(`/api/records/objects/${encodeURIComponent(key)}/records`, { records });
+}
+
+/** Merge into one row: the surgical edit — one cell, one row. */
+export function patchRow(
+  key: string,
+  rec: string,
+  values: Record<string, unknown>,
+): Promise<RecordsResult> {
+  return send<RecordsResult>('PATCH', `/api/records/objects/${encodeURIComponent(key)}/records/${encodeURIComponent(rec)}`, { values });
+}
+
+/** Delete ONE row. The table itself is a separate, purging decision. */
+export function deleteRow(key: string, rec: string): Promise<RecordsResult> {
+  return send<RecordsResult>('DELETE', `/api/records/objects/${encodeURIComponent(key)}/records/${encodeURIComponent(rec)}`);
+}
+
+/**
+ * Delete a table.
+ *
+ * `purge` deletes its ROWS too, and it is a second decision on purpose: the store
+ * refuses to drop a table that still holds rows, and the page must ask rather
+ * than assume. The refusal comes back as `count`, which is what the confirm
+ * message is built from.
+ */
+export function deleteTable(key: string, purge = false): Promise<RecordsResult> {
+  return send<RecordsResult>('DELETE', `/api/records/objects/${encodeURIComponent(key)}${purge ? '?purge=1' : ''}`);
+}
+
+/** Declare a table, or add columns to one. Merging only ever ADDS a column. */
+export function declareTable(input: {
+  key: string;
+  label?: string;
+  strict?: boolean;
+  fields?: Array<Partial<RecordField> & { key: string; type: RecordField['type'] }>;
+}): Promise<RecordsResult> {
+  return post<RecordsResult>('/api/records/objects', input);
+}
+
+async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: authHeaders(body !== undefined),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    const parsed = (await res.json().catch(() => ({}))) as T & { error?: string; count?: number };
+    if (!res.ok) {
+      return {
+        ...parsed,
+        ok: false,
+        error: parsed?.error || `HTTP ${res.status}`,
+        ...(typeof parsed?.count === 'number' ? { count: parsed.count } : {}),
+      } as T;
+    }
+    return parsed;
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) } as T;
+  }
+}
+
 export async function fetchMetrics(): Promise<MetricsState | null> {
   try {
     const res = await fetch(`${API_BASE}/api/metrics`, { headers: authHeaders() });

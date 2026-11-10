@@ -286,6 +286,11 @@ import { createMetricsRemote } from './metrics-remote.mjs';
 // rules that keep a model from turning the dashboard into a junk drawer: it cannot
 // declare a series, writes are validated by the store, reads are bounded.
 import { isMetricsTool, metricsToolSchema, runMetricsTool } from './metrics-tool.mjs';
+// RECORDS: rows whose columns live in another table. The rules are pure and
+// mirrored from the hub's `jarviscs/hub/records.py`; the local store here is what
+// a relay with no hub serves, so both modes answer with the same shape.
+import { createLocalRecords, normaliseObject } from './records.mjs';
+import { createRecordsRemote, recordsBaseFrom } from './records-remote.mjs';
 
 // ── Local env file loader (zero dependencies) ────────────────────────────────
 // Lets ONE gitignored file hold every key for local development, so nothing has
@@ -3976,6 +3981,180 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // ── Records: tables whose columns are data ────────────────────────────────
+  // Owner-only, like every other write here: a table is the wearer's data, and
+  // the relay is the only thing that can reach the hub (the page cannot —
+  // `cors_origins` is empty). The shapes mirror `/hub/records` so the tool and
+  // the page describe the same store.
+  if (url.pathname === '/api/records' && req.method === 'GET') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    json(res, 200, await recordsPayload());
+    return;
+  }
+
+  if (url.pathname === '/api/records/objects' && req.method === 'POST') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 16 * 1024);
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid JSON' });
+      return;
+    }
+    // The declaration's own validation runs first so a bad key or type is a
+    // sentence about the field, not a hub round trip.
+    const parsed = normaliseObject(body);
+    if (!parsed.ok) {
+      json(res, 400, { ok: false, error: parsed.error });
+      return;
+    }
+    const declared = await recordsDeclare({ ...parsed.object, ...(body.strict === undefined ? {} : { strict: body.strict }) });
+    if (!declared.ok) {
+      json(res, declared.shapeLocked ? 409 : 400, {
+        ok: false,
+        code: declared.code ?? (declared.shapeLocked ? 'FIELD_SHAPE_LOCKED' : 'REFUSED'),
+        error: declared.error || 'the store refused that declaration',
+      });
+      return;
+    }
+    json(res, 200, { ...(await recordsPayload()), object: declared.object, created: declared.created === true });
+    return;
+  }
+
+  const objectMatch = /^\/api\/records\/objects\/([a-z0-9._-]{3,200})(\/records)?(\/(.+))?$/.exec(url.pathname);
+  if (objectMatch) {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    const key = decodeURIComponent(objectMatch[1]).toLowerCase();
+    const isCollection = Boolean(objectMatch[2]);
+    const recRaw = objectMatch[4] ? decodeURIComponent(objectMatch[4]) : '';
+
+    // PATCH one row: the surgical edit — one field, one row.
+    if (isCollection && recRaw && req.method === 'PATCH') {
+      let body;
+      try {
+        body = await readJsonBody(req, 16 * 1024);
+      } catch {
+        json(res, 400, { ok: false, error: 'invalid JSON' });
+        return;
+      }
+      if (!body?.values || typeof body.values !== 'object' || Array.isArray(body.values)) {
+        json(res, 400, { ok: false, error: 'values must be an object of field → value' });
+        return;
+      }
+      const updated = await recordsPatchRow(key, recRaw, body.values);
+      if (!updated.ok) {
+        json(res, updated.notFound ? 404 : 400, { ok: false, error: updated.error || 'the store refused that change' });
+        return;
+      }
+      json(res, 200, { ...(await recordsPayload()), object: key, record: updated.record, addedFields: updated.addedFields ?? [] });
+      return;
+    }
+
+    // DELETE one row. Addressed, never "clear the table" — the object itself is
+    // what `?purge=1` on the object route is for.
+    if (isCollection && recRaw && req.method === 'DELETE') {
+      const removed = await recordsRemoveRow(key, recRaw);
+      if (!removed.ok) {
+        json(res, removed.notFound ? 404 : 400, { ok: false, error: removed.error || 'the store refused that delete' });
+        return;
+      }
+      json(res, 200, { ...(await recordsPayload()), object: key, key: recRaw, deleted: removed.deleted ?? 1 });
+      return;
+    }
+
+    // POST rows: upsert. The table is created by its first write.
+    if (isCollection && !recRaw && req.method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch {
+        json(res, 400, { ok: false, error: 'invalid JSON' });
+        return;
+      }
+      const rows = Array.isArray(body?.records) ? body.records : body?.key ? [body] : null;
+      if (!rows) {
+        json(res, 400, { ok: false, error: 'send {records: [{key, values}]}' });
+        return;
+      }
+      const written = await recordsWrite(key, rows);
+      if (!written.ok) {
+        const rejected = Array.isArray(written.rejected) ? written.rejected : [];
+        // THE PER-ITEM SENTENCE WINS. "no row was accepted" is the receipt for a
+        // batch; the thing the caller can act on is which field was refused and
+        // why ("allowed: item"), and it is in the first rejection.
+        const why = rejected.length ? `${rejected[0].field}: ${rejected[0].error}` : String(written.error ?? '');
+        json(res, 400, {
+          ok: false,
+          ...(written.code ? { code: written.code } : {}),
+          error: why || 'no row was accepted',
+          ...(rejected.length ? { rejected } : {}),
+        });
+        return;
+      }
+      json(res, 200, {
+        ...(await recordsPayload()),
+        object: key,
+        accepted: written.accepted,
+        addedFields: written.addedFields ?? [],
+        rejected: written.rejected ?? [],
+      });
+      return;
+    }
+
+    // PATCH the object: label, strict, add/drop columns.
+    if (!isCollection && req.method === 'PATCH') {
+      let body;
+      try {
+        body = await readJsonBody(req, 16 * 1024);
+      } catch {
+        json(res, 400, { ok: false, error: 'invalid JSON' });
+        return;
+      }
+      const patched = await recordsPatch(key, body ?? {});
+      if (!patched.ok) {
+        json(res, patched.notFound ? 404 : 400, {
+          ok: false,
+          code: patched.code ?? 'REFUSED',
+          error: patched.error || 'the store refused that change',
+        });
+        return;
+      }
+      json(res, 200, { ...(await recordsPayload()), object: patched.object, rewritten: patched.rewritten ?? 0 });
+      return;
+    }
+
+    // DELETE the object. `?purge=1` is the wearer answering "and its rows?".
+    if (!isCollection && req.method === 'DELETE') {
+      const purge = url.searchParams.get('purge') === '1';
+      const removed = await recordsRemove(key, { purge });
+      if (!removed.ok) {
+        json(res, removed.notEmpty ? 409 : removed.notFound ? 404 : 502, {
+          ok: false,
+          code: removed.notEmpty ? 'OBJECT_NOT_EMPTY' : 'REFUSED',
+          ...(removed.notEmpty ? { count: removed.count } : {}),
+          error: removed.notEmpty
+            ? `"${key}" still holds ${removed.count} row(s) — delete those too, or keep the table`
+            : removed.error || 'the store refused the delete',
+        });
+        return;
+      }
+      json(res, 200, { ...(await recordsPayload()), object: key, deletedRecords: removed.deletedRecords ?? 0 });
+      return;
+    }
+  }
+
   // ── The agent schedule ────────────────────────────────────────────────────
   // Owner-only, because a schedule spends money unattended and names agents.
   // The body is the WHOLE schedule every time: a per-job PATCH would need its own
@@ -5692,6 +5871,143 @@ function saveMetrics() {
   return true;
 }
 
+// ── Record store (tables whose columns are data) ─────────────────────────────
+// The second store, beside the series one and sharing nothing with it. A series
+// is one value at one time; a record is a ROW, and its columns live in the
+// object's own declaration, so a write can add one without a migration.
+const RECORDS_FILE = process.env.RECORDS_FILE || join(DATA_DIR, '.g2-records.json');
+
+/**
+ * Where tables live.
+ *
+ * DERIVED FROM `METRICS_API` unless `RECORDS_API` says otherwise: the hub mounts
+ * both routers under the same prefix (`/hub/metrics`, `/hub/records`), so a
+ * second required variable would be one more thing to forget on a deploy — and
+ * forgetting it fails quietly, with tables that look empty rather than broken.
+ */
+let recordsRemote = null;
+const recordsApi = String(process.env.RECORDS_API ?? '').trim() || recordsBaseFrom(process.env.METRICS_API);
+if (recordsApi) {
+  const token = String(process.env.JARVIS_FILE_API_KEY || '').trim();
+  if (!token) {
+    console.log('[records] a records API is set but JARVIS_FILE_API_KEY is not — staying on the local file');
+  } else {
+    try {
+      recordsRemote = createRecordsRemote({ baseUrl: recordsApi, token });
+      console.log(`[records] hub store: ${recordsRemote.baseUrl}`);
+    } catch (err) {
+      console.log(`[records] hub store refused — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+} else {
+  console.log('[records] no METRICS_API — tables live on this box only (not durable across deploys)');
+}
+
+/** `{version, objects: {key: {...}}, records: {object: {recKey: {...}}}}`. */
+let recordsDoc = { version: 1, objects: {}, records: {}, updatedAt: 0 };
+let recordsLocal = createLocalRecords(recordsDoc);
+
+function loadRecords() {
+  try {
+    const raw = JSON.parse(readFileSync(RECORDS_FILE, 'utf8'));
+    if (!raw || typeof raw !== 'object') return;
+    recordsDoc = {
+      version: 1,
+      objects: raw.objects && typeof raw.objects === 'object' ? raw.objects : {},
+      records: raw.records && typeof raw.records === 'object' ? raw.records : {},
+      updatedAt: Number(raw.updatedAt) || 0,
+    };
+    // The local store holds a reference to the document's maps, so it is rebuilt
+    // rather than re-pointed: a reload must not leave the old store writing into
+    // an object nobody reads any more.
+    recordsLocal = createLocalRecords(recordsDoc);
+  } catch {
+    /* absence is normal: a fresh box has no tables yet */
+  }
+}
+
+function saveRecords() {
+  recordsDoc.updatedAt = Date.now();
+  try {
+    writeFileSync(RECORDS_FILE, JSON.stringify(recordsDoc));
+  } catch (err) {
+    console.log(`[records] could not save — ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * One accessor per record operation, choosing the live store.
+ *
+ * Both stores answer with the hub's shapes, so every caller below — the tool,
+ * the page's routes — is written once. `writeRecords` is the only one that adds a
+ * rule of its own: A TABLE IS CREATED BY ITS FIRST WRITE, which is the "schema on
+ * the fly" promise. It lives here rather than in either store so the AI and the
+ * Data page cannot disagree about whether an undeclared table is an error.
+ */
+async function recordsList() {
+  return recordsRemote ? recordsRemote.objects() : { ok: true, objects: recordsLocal.objects().objects };
+}
+
+async function recordsGet(key, limit = 50) {
+  return recordsRemote ? recordsRemote.object(key, limit) : recordsLocal.object(key, { limit });
+}
+
+async function recordsDeclare(input) {
+  if (recordsRemote) return recordsRemote.declare(input);
+  const res = recordsLocal.declare(input);
+  if (res.ok) saveRecords();
+  return res;
+}
+
+async function recordsPatch(key, change) {
+  if (recordsRemote) return recordsRemote.patch(key, change);
+  const res = recordsLocal.patch(key, change);
+  if (res.ok) saveRecords();
+  return res;
+}
+
+async function recordsRemove(key, { purge = false } = {}) {
+  if (recordsRemote) return recordsRemote.remove(key, { purge });
+  const res = recordsLocal.remove(key, { purge });
+  if (res.ok) saveRecords();
+  return res;
+}
+
+async function recordsRead(key, opts) {
+  return recordsRemote ? recordsRemote.readRecords(key, opts) : recordsLocal.read(key, opts);
+}
+
+async function recordsWrite(key, rows) {
+  // CREATE ON FIRST WRITE. Asking a model to declare a table before it knows
+  // which columns the data has was the whole reason the schema lives in a row.
+  const existing = await recordsGet(key, 1);
+  if (!existing.ok) {
+    if (!existing.notFound) return existing;
+    const made = await recordsDeclare({ key, fields: [] });
+    if (!made.ok) return made;
+  }
+  if (recordsRemote) return recordsRemote.writeRecords(key, rows);
+  const res = recordsLocal.write(key, rows);
+  saveRecords();
+  return res;
+}
+
+async function recordsPatchRow(key, rec, values) {
+  if (recordsRemote) return recordsRemote.patchRecord(key, rec, values);
+  const res = recordsLocal.patchRecord(key, rec, values);
+  if (res.ok) saveRecords();
+  return res;
+}
+
+async function recordsRemoveRow(key, rec) {
+  if (recordsRemote) return recordsRemote.removeRecord(key, rec);
+  const res = recordsLocal.removeRecord(key, rec);
+  if (res.ok) saveRecords();
+  return res;
+}
+
 /**
  * Adopt the schedule's declarations, refusing anything that would violate the
  * additive-only rule: a unit or type change needs a NEW series (`foo.v2`),
@@ -5968,6 +6284,46 @@ function metricToolDeps() {
       saveMetrics();
       return { ok: true, deleted: all.length - keep.length };
     },
+
+    // ── The table store, for the same tool ────────────────────────────────
+    // The tool declares these as five more actions rather than a new tool kind:
+    // the hub's `tool.kind` enum is closed, and "the wearer's data" is one
+    // subject — splitting it would spend two of the loop's tool slots on it.
+    async listObjects() {
+      const res = await recordsList();
+      if (!res.ok) return { ok: false, error: res.error };
+      return { ok: true, objects: res.objects };
+    },
+
+    async readObject(key, limit) {
+      const res = await recordsGet(key, limit);
+      if (!res.ok) return { ok: false, notFound: res.notFound, error: res.error };
+      return { ok: true, object: res.object, records: res.records, total: res.total };
+    },
+
+    async declareObject(input) {
+      const res = await recordsDeclare(input);
+      if (!res.ok) return res;
+      return { ok: true, created: res.created, object: res.object };
+    },
+
+    async writeRecords(key, rows) {
+      const res = await recordsWrite(key, rows);
+      if (!res.ok) return res;
+      return {
+        ok: true,
+        accepted: res.accepted,
+        records: res.records,
+        addedFields: res.addedFields,
+        rejected: res.rejected,
+      };
+    },
+
+    async deleteRecord(key, rec) {
+      const res = await recordsRemoveRow(key, rec);
+      if (!res.ok) return { ok: false, notFound: res.notFound, error: res.error };
+      return { ok: true, deleted: res.deleted };
+    },
   };
 }
 
@@ -6123,6 +6479,40 @@ async function metricsPayload() {
     now: Date.now(),
     // Said out loud: without a real store these samples do not survive a deploy.
     store: { mode: 'relay', file: METRICS_FILE, durable: false },
+  };
+}
+
+/**
+ * What the Data tab renders for the second store: every table, with its columns
+ * and its newest rows.
+ *
+ * Rows come along in the same call for the same reason a series' points do — the
+ * page shows a table as soon as it is picked, and a second round trip to learn
+ * whether it is empty is a round trip nobody budgets for. Bounded per object, so
+ * one large table cannot make the page cost megabytes.
+ */
+async function recordsPayload() {
+  const listed = await recordsList();
+  const objects = [];
+  if (listed.ok) {
+    for (const item of listed.objects) {
+      const page = await recordsRead(item.key, { limit: 240, sort: 'ts', order: 'desc' });
+      objects.push({
+        ...item,
+        records: page.ok ? page.records : [],
+        total: page.ok ? page.total : item.count,
+        ...(page.ok ? {} : { error: page.error }),
+      });
+    }
+  }
+  return {
+    ok: listed.ok !== false,
+    objects,
+    now: Date.now(),
+    store: recordsRemote
+      ? { mode: 'hub', api: recordsRemote.baseUrl, durable: true }
+      : { mode: 'relay', file: RECORDS_FILE, durable: false },
+    ...(listed.ok ? {} : { degraded: true, error: `the hub record store is unreachable — ${listed.error ?? 'no answer'}` }),
   };
 }
 
@@ -6351,6 +6741,9 @@ server.listen(PORT, () => {
   // Samples are read before the clock starts, so the first tick cannot append to
   // a series list it has not seen yet (which would overwrite the file).
   loadMetrics();
+  // Tables live in their own file, and are read here for the same reason: a write
+  // must not land on top of a document that was never loaded.
+  loadRecords();
   // Started LAST, so the port is accepting before a schedule can broadcast a run.
   startAgentCron();
 });

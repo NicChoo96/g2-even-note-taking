@@ -15,14 +15,22 @@ import { fetchSchedule, saveSchedule } from './agents-client';
 import {
   collectNow,
   declareSeries as declareMetricSeries,
+  deleteRow as deleteTableRow,
   deleteSeries,
+  deleteTable,
   fetchMetrics,
+  fetchRecords,
   formatDelta,
   formatValue,
+  patchRow,
   sinceLabel,
   type Collector,
   type MetricSeries,
   type MetricsState,
+  type RecordField,
+  type RecordRow,
+  type RecordTable,
+  type RecordsState,
 } from './metrics-client';
 import { MicButton } from './Dictate';
 import {
@@ -63,6 +71,27 @@ interface ViewSpec {
    * in localStorage; nothing about it is a property of the store.
    */
   fields?: string[];
+  /**
+   * For a TABLE: which numeric column is plotted.
+   *
+   * A row has several numbers and only one can be the y axis, so the choice is
+   * the wearer's and is remembered per table with the rest of the view. Absent
+   * means "the first numeric column", which is a default rather than a claim
+   * about which number matters.
+   */
+  field?: string;
+}
+
+/**
+ * What is open in the detail pane.
+ *
+ * The two stores are separate, so the selection says which one it means — a
+ * series and a table may share a key without the page silently swapping one for
+ * the other.
+ */
+interface Selection {
+  kind: 'series' | 'object';
+  key: string;
 }
 
 function daysLabel(days: number[] | null): string {
@@ -129,6 +158,46 @@ function MasterRow({
         {series.unit && <span className="mm-unit">{series.unit}</span>}
       </span>
       {series.type === 'number' && series.points.length > 1 && <Spark points={series.points} unit={series.unit} />}
+    </button>
+  );
+}
+
+/**
+ * One row of the master list for a TABLE.
+ *
+ * A table and a series sit in the same index because they are both "the wearer's
+ * data" — but a table says what it has rather than showing a number, because
+ * "3 rows · 5 columns" is the only true one-line summary of a table. The columns
+ * are named, so a table created by an agent is identifiable without opening it.
+ */
+function TableMasterRow({
+  table,
+  active,
+  onPick,
+}: {
+  table: RecordTable;
+  active: boolean;
+  onPick: () => void;
+}) {
+  const columns = table.fields.map((f) => f.label || f.key).join(', ');
+  return (
+    <button
+      type="button"
+      className={active ? 'metric-master-row active' : 'metric-master-row'}
+      onClick={onPick}
+      aria-pressed={active}
+    >
+      <span className="mm-top">
+        <span className="mm-leaf" title={table.key}>{table.label || table.key}</span>
+        <span className="mm-count">{table.count}</span>
+      </span>
+      <span className="mm-table-meta">
+        {table.fields.length} column{table.fields.length === 1 ? '' : 's'}
+        {table.strict ? ' · strict' : ''}
+      </span>
+      <span className="mm-table-cols" title={columns}>
+        {columns || 'no columns yet'}
+      </span>
     </button>
   );
 }
@@ -333,6 +402,333 @@ function SeriesDetail({
   );
 }
 
+/** One cell, rendered with its column's own unit and precision. */
+function cellText(field: RecordField, value: unknown): string {
+  if (value === null || value === undefined || value === '') return '';
+  if (field.type === 'number') {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return String(value);
+    const digits = Math.max(0, Math.min(6, field.precision ?? 2));
+    const [whole, frac] = n.toFixed(digits).split('.');
+    const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return `${frac ? `${grouped}.${frac}` : grouped}${field.unit ? ` ${field.unit}` : ''}`;
+  }
+  if (field.type === 'bool') return value ? 'yes' : 'no';
+  return String(value);
+}
+
+/**
+ * When the row sits in time — only when the row key does not already say it.
+ *
+ * A listing keyed by its own date (`2023-10-15`) would otherwise print the same
+ * day twice in the first column: once as the identity, once as the instant. The
+ * line is kept when the key says nothing about time OR when the instant comes
+ * from a different column, because then it is information rather than an echo.
+ */
+function rowWhen(row: RecordRow): string {
+  if (typeof row.ts !== 'number') return '';
+  const day = new Date(row.ts).toISOString().slice(0, 10);
+  if (row.key.slice(0, 10) === day) return '';
+  return new Date(row.ts).toLocaleDateString();
+}
+
+/**
+ * One TABLE, read closely: its rows as a real table, and any numeric column as a
+ * chart.
+ *
+ * WHY THE CHART AND THE TABLE ARE THE SAME VIEW.
+ *   A row is several numbers and one of them can be the y axis, so the axis is a
+ *   CHOICE (the chips above the table) rather than a property of the table. The
+ *   tooltip then reads the chosen number's row and shows the rest of its cells —
+ *   which is the multi-dimensional tooltip this store exists to make honest: it
+ *   is the row itself, not four series that happen to share a slot.
+ *
+ * WHY EDITING IS INLINE.
+ *   A row can be wrong in one cell, and a correction should not mean re-typing
+ *   the row. The form sends only what it changed, and the store merges it.
+ */
+function TableDetail({
+  table,
+  view,
+  busy,
+  onView,
+  onDelete,
+  onDeleteRow,
+  onSaveRow,
+}: {
+  table: RecordTable;
+  view: ViewSpec;
+  busy: boolean;
+  onView: (next: ViewSpec) => void;
+  onDelete: () => void;
+  onDeleteRow: (rowKey: string) => void;
+  onSaveRow: (rowKey: string, values: Record<string, unknown>) => Promise<boolean>;
+}) {
+  /** The row being edited, and its draft text per column. */
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+
+  const numeric = table.fields.filter((f) => f.type === 'number');
+  const chartField =
+    view.field && numeric.some((f) => f.key === view.field) ? view.field : (numeric[0]?.key ?? '');
+  const field = table.fields.find((f) => f.key === chartField);
+  /**
+   * Only rows with a place in time can be plotted, and `slot` carries the ROW KEY
+   * so the chart's tooltip can find that row's other cells. A row with no date is
+   * legal in this store; it simply has no x position, and the table still shows it.
+   */
+  const points = table.records
+    .filter((r) => typeof r.ts === 'number')
+    .map((r) => ({ ts: r.ts as number, value: r.values[chartField] as number | string, slot: r.key }));
+  const plotted = numericPoints(points);
+  const choices = windowChoices(plotted);
+  const activeWindow = choices.some((c) => c.value === view.window) ? view.window : 'all';
+  // The window is measured on the rows' own instants, then narrowed to the ones
+  // that hold a number — a row whose cell is text has no y position, and the
+  // chart says so by leaving it out rather than by plotting a zero.
+  const windowed = numericPoints(pointsInWindow(points, activeWindow));
+  /** The other columns, keyed by ROW KEY — every cell of the row, in the tooltip. */
+  const attributes: AttributeSeries[] = table.fields
+    .filter((f) => f.key !== chartField)
+    .map((f) => {
+      const bySlot = new Map<string, string>();
+      for (const r of table.records) {
+        const text = cellText(f, r.values[f.key]);
+        if (text) bySlot.set(r.key, text);
+      }
+      return { key: f.key, label: f.label || f.key, bySlot };
+    })
+    .filter((a) => a.bySlot.size > 0);
+
+  const startEdit = (row: RecordRow) => {
+    const next: Record<string, string> = {};
+    for (const f of table.fields) {
+      const v = row.values[f.key];
+      next[f.key] = v === null || v === undefined ? '' : String(v);
+    }
+    setDraft(next);
+    setEditing(row.key);
+  };
+
+  const save = async (row: RecordRow) => {
+    const values: Record<string, unknown> = {};
+    for (const f of table.fields) {
+      const text = draft[f.key] ?? '';
+      const was = row.values[f.key];
+      const before = was === null || was === undefined ? '' : String(was);
+      if (text === before) continue;
+      if (f.type === 'number') {
+        // Blank is not zero: a cleared number is left alone rather than stored as 0.
+        if (text.trim() === '') continue;
+        values[f.key] = Number(text.replace(/,/g, '').trim());
+      } else if (f.type === 'bool') {
+        values[f.key] = /^(true|yes|on|1)$/i.test(text.trim());
+      } else {
+        values[f.key] = text;
+      }
+    }
+    if (!Object.keys(values).length) {
+      setEditing(null);
+      return true;
+    }
+    setSaving(true);
+    try {
+      const ok = await onSaveRow(row.key, values);
+      if (ok) setEditing(null);
+      return ok;
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const columns = table.fields;
+
+  return (
+    <section className="metric-detail">
+      <header className="md-head">
+        <div>
+          <div className="metric-label">{table.label}</div>
+          <div className="md-key">
+            {table.key} · table{table.strict ? ' · strict' : ''}
+          </div>
+        </div>
+        <button className="dp-delete" onClick={onDelete} disabled={busy} title="Delete this table and its rows">
+          Delete
+        </button>
+      </header>
+
+      <div className="md-controls">
+        {numeric.length > 0 && (
+          <div className="md-seg" role="group" aria-label="Which column to chart">
+            {numeric.map((f) => (
+              <button
+                key={f.key}
+                className={chartField === f.key ? 'active' : ''}
+                onClick={() => onView({ ...view, field: f.key })}
+                aria-pressed={chartField === f.key}
+                title={`Plot ${f.label || f.key}`}
+              >
+                {f.label || f.key}
+              </button>
+            ))}
+          </div>
+        )}
+        {numeric.length > 0 && (
+          <div className="md-seg" role="group" aria-label="Chart type">
+            {CHART_KINDS.map((kind) => (
+              <button
+                key={kind}
+                className={view.kind === kind ? 'active' : ''}
+                onClick={() => onView({ ...view, kind })}
+                aria-pressed={view.kind === kind}
+              >
+                {CHART_LABELS[kind]}
+              </button>
+            ))}
+            <button
+              className={view.kind === 'table' ? 'active' : ''}
+              onClick={() => onView({ ...view, kind: 'table' })}
+              aria-pressed={view.kind === 'table'}
+              title="Just the rows"
+            >
+              Table
+            </button>
+          </div>
+        )}
+        {numeric.length > 0 && view.kind !== 'table' && choices.length > 1 && (
+          <div className="md-seg" role="group" aria-label="Time window">
+            {choices.map((c) => (
+              <button
+                key={String(c.value)}
+                className={activeWindow === c.value ? 'active' : ''}
+                onClick={() => onView({ ...view, window: c.value })}
+                aria-pressed={activeWindow === c.value}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {numeric.length === 0 && (
+        <p className="hint-line">
+          No numeric column yet, so there is nothing to chart. The rows are below.
+        </p>
+      )}
+      {numeric.length > 0 && view.kind !== 'table' && plotted.length > 1 && field ? (
+        <MetricChart
+          points={windowed}
+          kind={view.kind as ChartKind}
+          unit={field.unit}
+          precision={field.precision}
+          attributes={attributes}
+        />
+      ) : null}
+      {numeric.length > 0 && view.kind !== 'table' && plotted.length === 1 ? (
+        <p className="hint-line">
+          One dated row — {cellText(field as RecordField, plotted[0].value)}. A chart needs two.
+        </p>
+      ) : null}
+      {numeric.length > 0 && view.kind !== 'table' && plotted.length === 0 ? (
+        <p className="hint-line">
+          No row has a date, so this column has no place on a time axis. It reads as a table below.
+        </p>
+      ) : null}
+
+      {table.records.length === 0 ? (
+        <p className="hint-line">
+          No rows yet. Jarvis or an agent can add them — a new column appears as the values do.
+        </p>
+      ) : (
+        <>
+          <table className="metric-readings record-table">
+            <thead>
+              <tr>
+                <th>Row</th>
+                {columns.map((f) => (
+                  <th key={f.key} className={f.type === 'number' ? 'num' : ''} title={`${f.key}: ${f.type}`}>
+                    {f.label || f.key}
+                  </th>
+                ))}
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {table.records.map((row) => (
+                <tr key={row.key} className={editing === row.key ? 'editing' : ''}>
+                  <td className="rec-key">
+                    <span title={row.key}>{row.key}</span>
+                    {rowWhen(row) && <span className="rec-when">{rowWhen(row)}</span>}
+                  </td>
+                  {columns.map((f) => (
+                    <td key={f.key} className={f.type === 'number' ? 'num' : ''}>
+                      {editing === row.key ? (
+                        f.type === 'bool' ? (
+                          <select
+                            value={draft[f.key] ?? ''}
+                            onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+                            aria-label={f.label || f.key}
+                          >
+                            <option value="true">yes</option>
+                            <option value="false">no</option>
+                          </select>
+                        ) : (
+                          <input
+                            value={draft[f.key] ?? ''}
+                            onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+                            inputMode={f.type === 'number' ? 'decimal' : undefined}
+                            aria-label={f.label || f.key}
+                          />
+                        )
+                      ) : (
+                        cellText(f, row.values[f.key])
+                      )}
+                    </td>
+                  ))}
+                  <td className="rec-actions">
+                    {editing === row.key ? (
+                      <>
+                        <button onClick={() => void save(row)} disabled={saving}>
+                          {saving ? 'Saving…' : 'Save'}
+                        </button>
+                        <button onClick={() => setEditing(null)} disabled={saving}>
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={() => startEdit(row)} disabled={busy} title="Edit this row">
+                          Edit
+                        </button>
+                        <button onClick={() => onDeleteRow(row.key)} disabled={busy} title="Delete this row">
+                          Del
+                        </button>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {table.total > table.records.length && (
+            <p className="hint-line">
+              Showing the newest {table.records.length} of {table.total} rows.
+            </p>
+          )}
+        </>
+      )}
+
+      <footer className="metric-foot">
+        <span>{table.count} row{table.count === 1 ? '' : 's'}</span>
+        <span>{table.fields.length} column{table.fields.length === 1 ? '' : 's'}</span>
+        <span>{table.strict ? 'refuses new columns' : 'new columns appear as data arrives'}</span>
+      </footer>
+    </section>
+  );
+}
+
 interface Draft {
   key: string;
   label: string;
@@ -423,6 +819,14 @@ function headersProblem(raw: string): string {
 
 export function DataPanel() {
   const [metrics, setMetrics] = useState<MetricsState | null>(null);
+  /**
+   * The second store: tables whose columns are data.
+   *
+   * Fetched with the metrics rather than on demand, because the master list shows
+   * both at once — a table you cannot see is a table the wearer will not know
+   * Jarvis created.
+   */
+  const [records, setRecords] = useState<RecordsState | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
@@ -448,7 +852,22 @@ export function DataPanel() {
     type: 'number',
   });
 
-  const [selectedKey, setSelectedKey] = useState<string | null>(() => readStored<string | null>(LS_SELECTED, null));
+  /**
+   * What is open in the detail pane.
+   *
+   * Stored as `{kind, key}` since tables arrived: the two stores are separate, and
+   * a plain string cannot say which one it meant. A string from before this
+   * version is read as a series, so nobody's remembered selection is lost.
+   */
+  const [selection, setSelection] = useState<Selection | null>(() => {
+    const raw = readStored<string | { kind?: string; key?: string } | null>(LS_SELECTED, null);
+    if (!raw) return null;
+    if (typeof raw === 'string') return { kind: 'series', key: raw };
+    if (raw && typeof raw.key === 'string' && raw.key) {
+      return { kind: raw.kind === 'object' ? 'object' : 'series', key: raw.key };
+    }
+    return null;
+  });
   const [views, setViews] = useState<Record<string, ViewSpec>>(() => readStored<Record<string, ViewSpec>>(LS_VIEWS, {}));
   /**
    * The master list's filter. Client-side on purpose: the list is already in
@@ -464,11 +883,11 @@ export function DataPanel() {
 
   useEffect(() => {
     try {
-      if (selectedKey) localStorage.setItem(LS_SELECTED, JSON.stringify(selectedKey));
+      if (selection) localStorage.setItem(LS_SELECTED, JSON.stringify(selection));
     } catch {
       /* private mode — the choice lasts the session */
     }
-  }, [selectedKey]);
+  }, [selection]);
 
   useEffect(() => {
     try {
@@ -478,8 +897,13 @@ export function DataPanel() {
     }
   }, [views]);
 
-  const reload = useCallback(async () => {    const next = await fetchMetrics();
+  const reload = useCallback(async () => {
+    // BOTH stores, in one round of round trips: the master list shows numbers and
+    // tables together, and a page that drew one before the other would visibly
+    // reflow every time it refreshed.
+    const [next, recs] = await Promise.all([fetchMetrics(), fetchRecords()]);
     setMetrics(next);
+    if (recs) setRecords(recs);
     setLoading(false);
     return next;
   }, []);
@@ -719,6 +1143,83 @@ export function DataPanel() {
     }
   };
 
+  /**
+   * Delete a table.
+   *
+   * The same two-step the series delete uses, for the same reason: the store will
+   * not drop a table that still holds rows, and the page must ASK rather than
+   * assume. The refusal carries the count, which is what the second question is
+   * built from — destroying rows has to be an answer someone gave.
+   */
+  const removeTable = async (key: string) => {
+    if (!window.confirm(`Delete table "${key}"? A table with rows is refused until you say otherwise.`)) return;
+    setBusy(true);
+    setWarn('');
+    setNote('');
+    try {
+      let res = await deleteTable(key);
+      if (res.ok === false && typeof res.count === 'number') {
+        const go = window.confirm(
+          `"${key}" still holds ${res.count} row${res.count === 1 ? '' : 's'}. ` +
+            'Delete those as well, and the table with them?',
+        );
+        if (!go) {
+          setWarn(`Left "${key}" in place with its ${res.count} row(s).`);
+          return;
+        }
+        res = await deleteTable(key, true);
+      }
+      if (res.ok === false) {
+        setWarn(res.error || 'the relay refused that delete');
+        return;
+      }
+      setRecords(res as RecordsState);
+      if (selection?.kind === 'object' && selection.key === key) setSelection(null);
+      const gone = res.deletedRecords ?? 0;
+      setNote(gone ? `Deleted ${key} and ${gone} row${gone === 1 ? '' : 's'}.` : `Deleted ${key}.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Correct one row's cells. Only what changed is sent; the store merges it. */
+  const saveRow = async (tableKey: string, rowKey: string, values: Record<string, unknown>): Promise<boolean> => {
+    setWarn('');
+    setNote('');
+    setBusy(true);
+    try {
+      const res = await patchRow(tableKey, rowKey, values);
+      if (res.ok === false) {
+        setWarn(res.error || 'the relay refused that change');
+        return false;
+      }
+      setRecords(res as RecordsState);
+      setNote(`Updated "${rowKey}".`);
+      return true;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Remove one row. The table and its columns stay. */
+  const removeRow = async (tableKey: string, rowKey: string) => {
+    if (!window.confirm(`Delete row "${rowKey}" from "${tableKey}"?`)) return;
+    setBusy(true);
+    setWarn('');
+    setNote('');
+    try {
+      const res = await deleteTableRow(tableKey, rowKey);
+      if (res.ok === false) {
+        setWarn(res.error || 'the relay refused that delete');
+        return;
+      }
+      setRecords(res as RecordsState);
+      setNote(`Deleted row "${rowKey}".`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const toggleDay = (day: number) =>
     setDraft((d) => ({
       ...d,
@@ -726,6 +1227,7 @@ export function DataPanel() {
     }));
 
   const series = metrics?.series ?? [];
+  const tables = records?.objects ?? [];
   /**
    * The list the search bar shows. Matching key, label and unit means one box
    * answers all three of the questions someone actually types: "the PSI
@@ -741,13 +1243,27 @@ export function DataPanel() {
         (s.unit ?? '').toLowerCase().includes(q),
     );
   }, [series, query]);
+  /** The same search over tables: key, label, and the columns' names. */
+  const filteredTables = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return tables;
+    return tables.filter(
+      (t) =>
+        t.key.toLowerCase().includes(q) ||
+        (t.label ?? '').toLowerCase().includes(q) ||
+        t.fields.some((f) => f.key.includes(q) || (f.label ?? '').toLowerCase().includes(q)),
+    );
+  }, [tables, query]);
   const groups = useMemo(() => groupSeries(filtered), [filtered]);
   /**
-   * The open series: the stored choice if it still exists, otherwise the first.
-   * Resolved against the FULL list, not the filtered one — typing in the search
-   * box must not silently swap the chart you are reading for a different one.
+   * The open thing: the stored choice if it still exists, otherwise the first
+   * series. Resolved against the FULL lists, not the filtered ones — typing in
+   * the search box must not silently swap the chart you are reading.
    */
-  const selected = series.find((s) => s.key === selectedKey) ?? series[0] ?? null;
+  const selectedSeries = series.find((s) => s.key === selection?.key) ?? null;
+  const selectedTable = tables.find((t) => t.key === selection?.key) ?? null;
+  const openSeries = selection?.kind === 'object' ? null : (selectedSeries ?? series[0] ?? null);
+  const openTable = selection?.kind === 'object' ? selectedTable : null;
   /**
    * How to draw one series. An unvisited series starts as a LINE when it holds
    * numbers and a TABLE when it holds text, which is the only default that cannot
@@ -767,6 +1283,34 @@ export function DataPanel() {
     // Nothing chosen yet: pick the kind the READINGS ask for. A launch priced
     // once a quarter is a bar, not a line through a slope nobody measured.
     return { kind: s.type === 'string' ? 'table' : defaultKind(s.points), window: 'all' };
+  };
+
+  /**
+   * How to draw one TABLE.
+   *
+   * A table has no type of its own, so the default comes from its rows: the kind
+   * its dated rows ask for, and the first numeric column. A table with no dated
+   * row has nothing to plot and opens as the table it is.
+   */
+  const viewOfTable = (t: RecordTable): ViewSpec => {
+    const numeric = t.fields.filter((f) => f.type === 'number');
+    const dated = t.records.filter((r) => typeof r.ts === 'number');
+    const stored = views[t.key];
+    if (stored) {
+      return {
+        kind: stored.kind,
+        window: normaliseWindow(stored.window),
+        ...(stored.field ? { field: stored.field } : {}),
+      };
+    }
+    const points = numeric.length
+      ? dated.map((r) => ({ ts: r.ts as number, value: Number(r.values[numeric[0].key]), slot: r.key }))
+      : [];
+    return {
+      kind: points.length > 1 ? defaultKind(points) : 'table',
+      window: 'all',
+      ...(numeric[0] ? { field: numeric[0].key } : {}),
+    };
   };
 
   /**
@@ -833,6 +1377,9 @@ export function DataPanel() {
       {metrics?.degraded && (
         <p className="warn-line">⚠️ {metrics.error ?? 'the hub metric store is unreachable'}</p>
       )}
+      {records?.degraded && (
+        <p className="warn-line">⚠️ {records.error ?? 'the hub table store is unreachable'}</p>
+      )}
       {metrics?.store && !metrics.degraded && (
         <p className="dp-store">
           {metrics.store.mode === 'hub'
@@ -842,7 +1389,7 @@ export function DataPanel() {
       )}
 
       {loading && <p className="hint-line">Loading…</p>}
-      {!loading && series.length === 0 && (
+      {!loading && series.length === 0 && tables.length === 0 && (
         <div className="dp-empty">
           <p>No numbers yet — and you do not need an API to start.</p>
           <button
@@ -864,21 +1411,21 @@ export function DataPanel() {
           readings looked exactly like one with 2. */}
       <div className="data-split">
         <div className="metric-master-wrap">
-          {series.length > 0 && (
+          {(series.length > 0 || tables.length > 0) && (
             <div className="mm-search">
               <input
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search these numbers"
-                aria-label="Search the list of numbers"
+                placeholder="Search these numbers and tables"
+                aria-label="Search the list of numbers and tables"
                 autoComplete="off"
                 spellCheck={false}
               />
               {query.trim() !== '' && (
                 <>
                   <span className="mm-count">
-                    {filtered.length} of {series.length}
+                    {filtered.length + filteredTables.length} of {series.length + tables.length}
                   </span>
                   <button className="mm-clear" onClick={() => setQuery('')} aria-label="Clear the search">
                     Clear
@@ -887,7 +1434,11 @@ export function DataPanel() {
               )}
             </div>
           )}
-          <aside className="metric-master" aria-label="Data points" hidden={filtered.length === 0}>
+          <aside
+            className="metric-master"
+            aria-label="Data points"
+            hidden={filtered.length === 0 && filteredTables.length === 0}
+          >
             {groups.map((g) => (
               <div key={g.prefix} className="mm-group">
                 <div className="mm-group-head">{g.prefix}</div>
@@ -895,16 +1446,32 @@ export function DataPanel() {
                   <MasterRow
                     key={s.key}
                     series={s}
-                    active={selected?.key === s.key}
-                    onPick={() => setSelectedKey(s.key)}
+                    active={openSeries?.key === s.key}
+                    onPick={() => setSelection({ kind: 'series', key: s.key })}
                   />
                 ))}
               </div>
             ))}
+            {filteredTables.length > 0 && (
+              <div className="mm-group">
+                {/* Its own heading, not mixed with the series: the two stores
+                    answer different questions, and the heading is what tells the
+                    wearer which kind of thing they are looking at. */}
+                <div className="mm-group-head">tables</div>
+                {filteredTables.map((t) => (
+                  <TableMasterRow
+                    key={t.key}
+                    table={t}
+                    active={openTable?.key === t.key}
+                    onPick={() => setSelection({ kind: 'object', key: t.key })}
+                  />
+                ))}
+              </div>
+            )}
           </aside>
-          {filtered.length === 0 && series.length > 0 && (
+          {filtered.length === 0 && filteredTables.length === 0 && (series.length > 0 || tables.length > 0) && (
             <p className="mm-none">
-              No number matches “{query.trim()}”.{' '}
+              Nothing matches “{query.trim()}”.{' '}
               <button className="mm-clear" onClick={() => setQuery('')}>
                 Clear the search
               </button>
@@ -913,16 +1480,26 @@ export function DataPanel() {
         </div>
 
         <div className="metric-detail-wrap">
-          {selected ? (
+          {openTable ? (
+            <TableDetail
+              table={openTable}
+              busy={busy}
+              view={viewOfTable(openTable)}
+              onView={(next) => setViews((v) => ({ ...v, [openTable.key]: next }))}
+              onDelete={() => void removeTable(openTable.key)}
+              onDeleteRow={(rowKey) => void removeRow(openTable.key, rowKey)}
+              onSaveRow={(rowKey, values) => saveRow(openTable.key, rowKey, values)}
+            />
+          ) : openSeries ? (
             <SeriesDetail
-              series={selected}
-              collector={collectorsBySeries.get(selected.key)}
+              series={openSeries}
+              collector={collectorsBySeries.get(openSeries.key)}
               now={metrics?.now ?? Date.now()}
               busy={busy}
-              view={viewOf(selected)}
-              onView={(next) => setViews((v) => ({ ...v, [selected.key]: next }))}
-              onDelete={() => void removeSeries(selected.key)}
-              attributes={attributesFor(selected)}
+              view={viewOf(openSeries)}
+              onView={(next) => setViews((v) => ({ ...v, [openSeries.key]: next }))}
+              onDelete={() => void removeSeries(openSeries.key)}
+              attributes={attributesFor(openSeries)}
             />
           ) : (
             <p className="hint-line">Nothing to show yet.</p>

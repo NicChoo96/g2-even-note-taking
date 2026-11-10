@@ -5,6 +5,17 @@
 // these headlines mention rates"). This tool is the other half: the model stores
 // what it worked out, under a series that was already declared.
 //
+// TWO STORES, AND THE MODEL MUST NOT CONFUSE THEM.
+//   A SERIES is one number at one time (`sgx.dbs.price`, 900 readings). It
+//   charts, it is cheap, and it holds ONE value per slot.
+//   An OBJECT is a table of ROWS (`bto.launch`: date, flat_type, project,
+//   estate, price). Its columns are stored as data, so a write can add one.
+//   Before 0.3.79 the second shape was faked as four sibling series joined by
+//   slot — a convention the writer had to honour and the store could not check.
+//   The one thing worse than either store is a caller keeping a row in both, so
+//   the description below states the split once, plainly, and every action names
+//   the store it belongs to.
+//
 // THE RULES THAT KEEP AN LLM FROM MAKING A MESS:
 //   1. DECLARE IS ALLOWED NOW, BUT IT IS BOUNDED. This used to have no
 //      `declare` at all: series cardinality "never comes back down". That was a
@@ -21,9 +32,15 @@
 //      endpoint.
 //   3. READ IS BOUNDED. A model that asks for a million points gets a page and is
 //      told it was truncated, never a silent sample of the truth.
+//   4. A SOFT WRITE REPORTS ITS SCHEMA CHANGE. `recordWrite` may invent a column
+//      (that is what makes an improvised table possible); the answer names every
+//      field it added, and warns when a new name is one slip away from an
+//      existing one. Silent growth is how a typo becomes permanent.
 //
 // Pure with injected dependencies, like location-tool.mjs: a harness drives it
 // with a stub store, and nothing in here knows what a socket is.
+
+import { nearDuplicate } from './records.mjs';
 
 export const METRICS_KIND = 'metrics';
 
@@ -32,6 +49,17 @@ export const METRICS_TOOL_NAME = 'jarvis_metrics';
 
 /** How many points a single `read` may return. */
 export const MAX_READ_POINTS = 240;
+
+/** How many rows a single `object` read may return. */
+export const MAX_READ_ROWS = 120;
+
+/** The five actions that predate records — kept for one error sentence. */
+const SERIES_ACTIONS = ['list', 'read', 'declare', 'write', 'delete'];
+
+/** The five that address a table of rows. */
+const RECORD_ACTIONS = ['objects', 'object', 'objectDeclare', 'recordWrite', 'recordDelete'];
+
+export const METRICS_ACTIONS = [...SERIES_ACTIONS, ...RECORD_ACTIONS];
 
 export function isMetricsTool(t) {
   return t?.kind === METRICS_KIND;
@@ -44,38 +72,45 @@ export function metricsToolSchema() {
     function: {
       name: METRICS_TOOL_NAME,
       description:
-        'Read, create and record the dashboard series the wearer keeps. `list` shows ' +
-        'what exists and its latest value, `read` returns one series\u2019 history, `declare` creates a ' +
-        'series so something new can be tracked, `write` records a value, and `delete` removes a ' +
-        'reading. Declare ONE well-named ' +
-        'series per measure (not one per day), because the unit and type are fixed once created and a ' +
-        'total cap applies. Values are stored with the scheduled slot, so writing twice for the same ' +
-        'slot replaces rather than duplicates \u2014 which is what makes an EDIT possible: rewrite the ' +
-        'slot to correct a wrong value, delete the slot to remove a wrong reading.\n\n' +
-        'A SERIES HOLDS ONE VALUE PER SLOT. A number series takes numbers; a series declared with ' +
-        'valueType "string" takes text (up to 500 characters) and is shown as a table. An ATTRIBUTE ' +
-        'that belongs beside a number \u2014 an estate name, a project, a location \u2014 is its own ' +
-        'series at the same slot: declare "tengah.bto.4room.project" as a string series and write it ' +
-        'for the same slot as the price, then read both and join them by slot. Sending an extra field ' +
-        'on a reading is REFUSED, never stored.',
+        'Read and write the wearer\u2019s stored data. There are TWO stores and the choice is not ' +
+        'cosmetic:\n' +
+        '\u2022 A SERIES is ONE NUMBER OVER TIME (a share price, a PSI reading). Actions: `list`, `read`, ' +
+        '`declare`, `write`, `delete`. Use it when the thing you are storing is a single measurement you ' +
+        'will chart \u2014 one value per slot, unit and type fixed at declaration.\n' +
+        '\u2022 An OBJECT is a TABLE OF ROWS (a launch: date, project, estate, price). Actions: `objects`, ' +
+        '`object`, `objectDeclare`, `recordWrite`, `recordDelete`. Use it whenever a fact has MORE THAN ONE ' +
+        'ATTRIBUTE, or when the rows are not a time series at all (contacts, inventory, a list of options). ' +
+        'Its columns are stored as data: `recordWrite` creates the object on its first write and ADDS a ' +
+        'column for any field it has not seen, so you do not have to declare a schema first.\n' +
+        'NEVER keep the same row both ways. Four sibling series joined by slot was how this was faked ' +
+        'before objects existed; it cannot be filtered, sorted or validated, so a new multi-attribute row ' +
+        'belongs in an object, and a single charted number stays a series.\n\n' +
+        'Writing the same series slot twice REPLACES the earlier reading, and writing the same record key ' +
+        'twice MERGES into that row \u2014 so a partial write corrects one field, and a re-run is safe. ' +
+        'A record\u2019s values are merged unless you send `replace`. Deleting is always addressed: one ' +
+        'reading by slot, one row by its key. Nothing here can empty a whole series or table.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
           action: {
             type: 'string',
-            enum: ['list', 'read', 'declare', 'write', 'delete'],
+            enum: METRICS_ACTIONS,
             description:
-              'list = what exists; read = one series\u2019 history; declare = create a series; write = store a value; ' +
-              'delete = remove one reading (by slot) or those before a cutoff.',
+              'Series: list = what exists; read = one series\u2019 history; declare = create a series; ' +
+              'write = store a reading; delete = remove one reading (by slot) or those before a cutoff. ' +
+              'Objects: objects = what tables exist; object = one table\u2019s rows; objectDeclare = create ' +
+              'or extend a table\u2019s columns; recordWrite = upsert rows; recordDelete = remove one row.',
           },
           series: {
             type: 'string',
-            description: 'The series key, e.g. "psi.west". Required for read, declare and write.',
+            description:
+              'The series key ("psi.west") \u2014 or, for the object actions, the OBJECT key ("bto.launch"). ' +
+              'Required for every action except list and objects.',
           },
           label: {
             type: 'string',
-            description: 'For declare: the label shown on the dashboard, e.g. "PSI west".',
+            description: 'For declare/objectDeclare: the label shown on the dashboard, e.g. "PSI west".',
           },
           unit: {
             type: 'string',
@@ -95,7 +130,7 @@ export function metricsToolSchema() {
           },
           limit: {
             type: 'integer',
-            description: `How many recent points to read (max ${MAX_READ_POINTS}). Default 30.`,
+            description: `How many recent points (\`read\`) or rows (\`object\`) to return. Max ${MAX_READ_POINTS}, default 30.`,
           },
           value: {
             type: 'string',
@@ -122,6 +157,60 @@ export function metricsToolSchema() {
             description:
               'For delete: remove readings older than this (ISO date/time or epoch milliseconds). ' +
               'Use it only when clearing a range; the whole series is not deletable from here.',
+          },
+          fields: {
+            type: 'array',
+            description:
+              'For objectDeclare: the columns, in the order a table should show them. Only needed to ' +
+              'pre-set a type or a unit, or to lock a table down with strict — a plain recordWrite ' +
+              'infers columns as it goes. Type is fixed once a field exists.',
+            items: {
+              type: 'object',
+              properties: {
+                key: { type: 'string', description: 'Column name: lowercase letters, digits, underscores (price, launch_date).' },
+                type: { type: 'string', enum: ['text', 'number', 'bool', 'date'] },
+                label: { type: 'string', description: 'Column heading. Defaults to the key.' },
+                unit: { type: 'string', description: 'Shown after a number, e.g. "SGD".' },
+                precision: { type: 'integer', description: 'Decimals to show for a number. Default 2.' },
+              },
+              required: ['key', 'type'],
+            },
+          },
+          strict: {
+            type: 'boolean',
+            description:
+              'For objectDeclare: when true, writing a column this table does not have is REFUSED instead ' +
+              'of added. Leave it off (soft) while gathering data; turn it on for a table whose shape a ' +
+              'person cares about.',
+          },
+          records: {
+            type: 'array',
+            description:
+              'For recordWrite: the rows. `key` is the row\u2019s identity and is what a later correction or ' +
+              'delete names (a date, an id, a name \u2014 1-64 chars). `values` holds the cells; a field this ' +
+              'table does not have yet becomes a column. Max 32 rows per call.',
+            items: {
+              type: 'object',
+              properties: {
+                key: { type: 'string', description: 'Row identity, e.g. "2023-10-15". Re-using it updates that row.' },
+                values: {
+                  type: 'object',
+                  description: 'Cells: { price: 290000, project: "Garden Vale" }. A null means "nothing for this", not zero.',
+                  additionalProperties: true,
+                },
+                replace: {
+                  type: 'boolean',
+                  description: 'Replace the whole row instead of merging into it — the only way to clear a value.',
+                },
+              },
+              required: ['key', 'values'],
+            },
+          },
+          key: {
+            type: 'string',
+            description:
+              'For recordDelete: the row to remove \u2014 exactly the key `object` printed. There is no ' +
+              '"clear the table" here; name one row, or use the Data page.',
           },
         },
         required: ['action'],
@@ -193,12 +282,27 @@ function attributesAt(attrs, point) {
  * was empty.
  */
 export async function runMetricsTool(tool, args, deps) {
-  const action = String(args?.action ?? 'list').trim().toLowerCase();
+  // ACTION NAMES ARE MATCHED LOOSELY, SPELLED CANONICALLY.
+  // The action is lowercased here (it always was), which turns `recordWrite`
+  // into `recordwrite` — and the first version of these branches compared it to
+  // the camelCase spelling, so every table action answered "unknown action".
+  // Rather than compare against a lowercased literal (and lose the name the
+  // schema advertises), the canonical spelling is recovered: `record_write`,
+  // `recordwrite` and `recordWrite` all mean the same thing, because a model
+  // that invents a separator is not making a mistake worth failing.
+  const rawAction = String(args?.action ?? 'list').trim().toLowerCase();
+  const flat = rawAction.replace(/[_-]/g, '');
+  const action = METRICS_ACTIONS.find((name) => name.toLowerCase() === flat) ?? rawAction;
   const list = typeof deps?.listSeries === 'function' ? deps.listSeries : null;
   const read = typeof deps?.readSeries === 'function' ? deps.readSeries : null;
   const declare = typeof deps?.declareSeries === 'function' ? deps.declareSeries : null;
   const write = typeof deps?.writeSample === 'function' ? deps.writeSample : null;
   const remove = typeof deps?.deleteSamples === 'function' ? deps.deleteSamples : null;
+  const listObjects = typeof deps?.listObjects === 'function' ? deps.listObjects : null;
+  const readObject = typeof deps?.readObject === 'function' ? deps.readObject : null;
+  const declareObject = typeof deps?.declareObject === 'function' ? deps.declareObject : null;
+  const writeRows = typeof deps?.writeRecords === 'function' ? deps.writeRecords : null;
+  const dropRow = typeof deps?.deleteRecord === 'function' ? deps.deleteRecord : null;
 
   if (action === 'list') {
     if (!list) return { ok: false, text: 'metrics are not available on this relay' };
@@ -210,7 +314,9 @@ export async function runMetricsTool(tool, args, deps) {
         ok: true,
         text:
           'Nothing is tracked yet. Create the series first with action "declare" (key, label, unit), ' +
-          'then write readings to it — one series per measure, not one per day.',
+          'then write readings to it — one series per measure, not one per day. ' +
+          'If the thing to store is a ROW with several attributes rather than one number over time, ' +
+          'use `recordWrite` instead: it creates the table as it goes.',
       };
     }
     const lines = series.slice(0, 20).map((s) => {
@@ -254,7 +360,8 @@ export async function runMetricsTool(tool, args, deps) {
       return `${when}  ${value}${badge}${extra ? ` \u00b7 ${extra}` : ''}`;
     });
     const attrNote = attrs.length
-      ? `\n(attributes joined from ${attrs.map((a) => a.key).join(', ')} by slot)`
+      ? `\n(attributes joined from ${attrs.map((a) => a.key).join(', ')} by slot — that is the older shape ` +
+        'for a second attribute. New data with several attributes per row belongs in a table: `recordWrite`.)'
       : '';
     return {
       ok: true,
@@ -375,7 +482,288 @@ export async function runMetricsTool(tool, args, deps) {
     };
   }
 
-  return { ok: false, text: `unknown metrics action "${action}" — use list, read, declare, write or delete` };
+  // ── Objects: the table of rows ────────────────────────────────────────────
+  // Every branch below names the store it is about, and each answer says which
+  // store it came from, because the failure to avoid is a model that reports
+  // "recorded" after writing to the wrong one.
+
+  if (action === 'objects') {
+    if (!listObjects) return { ok: false, text: 'tables are not available on this relay' };
+    const res = await listObjects();
+    if (!res?.ok) return { ok: false, text: `could not read the tables: ${res?.error ?? 'unknown error'}` };
+    const objects = Array.isArray(res.objects) ? res.objects : [];
+    if (!objects.length) {
+      return {
+        ok: true,
+        text:
+          'No tables yet. `recordWrite` creates one on its first row: send the object key (e.g. ' +
+          '"bto.launch") and the rows, and each field in the values becomes a column. Use a table when ' +
+          'a fact has more than one attribute; a single charted number is a series (`list`).',
+      };
+    }
+    const lines = objects.slice(0, 20).map((o) => {
+      const cols = (Array.isArray(o.fields) ? o.fields : [])
+        .map((f) => `${f.key}:${f.type}${f.unit ? `(${f.unit})` : ''}`)
+        .join(', ');
+      const n = Number(o.count) || 0;
+      return (
+        `- ${o.key} (${o.label}${o.strict ? ', strict' : ''}): ${n} row${n === 1 ? '' : 's'}` +
+        `${cols ? ` · columns: ${cols}` : ' · no columns yet'}`
+      );
+    });
+    const more = objects.length > 20 ? `\n(+${objects.length - 20} more tables)` : '';
+    return { ok: true, text: `Tables:\n${lines.join('\n')}${more}` };
+  }
+
+  if (action === 'object') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    if (!key) return { ok: false, text: 'object needs a table key, e.g. "bto.launch"' };
+    if (!readObject) return { ok: false, text: 'tables are not available on this relay' };
+    const limitRaw = Number(args?.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(MAX_READ_ROWS, Math.floor(limitRaw)) : 30;
+    const res = await readObject(key, limit);
+    if (!res?.ok) {
+      return {
+        ok: false,
+        text: res?.notFound
+          ? `there is no table "${key}" yet. \`objects\` lists the ones that exist; \`recordWrite\` would create this one.`
+          : `could not read "${key}": ${res?.error ?? 'unknown error'}`,
+      };
+    }
+    const fields = Array.isArray(res.object?.fields) ? res.object.fields : [];
+    const rows = Array.isArray(res.records) ? res.records : [];
+    const columns = fields.length
+      ? fields.map((f) => `${f.key}:${f.type}${f.unit ? `(${f.unit})` : ''}`).join(', ')
+      : 'none yet';
+    if (!rows.length) {
+      return { ok: true, text: `"${key}" (${res.object?.label ?? key}) has no rows yet. Columns: ${columns}.` };
+    }
+    const body = rows.map((row) => {
+      // The row key is printed even when it duplicates the date: it is the
+      // identity `recordDelete` and a correction take, and a caller that never
+      // saw it would have to guess a string the store compares exactly.
+      const when = typeof row.ts === 'number' ? `${new Date(row.ts).toISOString().slice(0, 16).replace('T', ' ')}  ` : '';
+      const cells = fields
+        .filter((f) => row.values?.[f.key] !== undefined && row.values[f.key] !== null && row.values[f.key] !== '')
+        .map((f) => `${f.key}=${formatCell(f, row.values[f.key])}`);
+      return `${when}${row.key}${cells.length ? ` · ${cells.join(' · ')}` : ''}`;
+    });
+    const total = Number(res.total) || rows.length;
+    return {
+      ok: true,
+      text:
+        `"${key}" (${res.object?.label ?? key}) — ${rows.length} of ${total} row(s) · columns: ${columns}` +
+        `${res.truncated ? ' (newest only; ask for a smaller range if you need older ones)' : ''}:\n` +
+        body.join('\n'),
+    };
+  }
+
+  if (action === 'objectDeclare') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    if (!key) return { ok: false, text: 'objectDeclare needs a table key, e.g. "bto.launch"' };
+    if (!declareObject) return { ok: false, text: 'tables are not available on this relay' };
+    const parsed = normaliseFieldsArg(args?.fields);
+    if (!parsed.ok) return { ok: false, text: parsed.error };
+    const res = await declareObject({
+      key,
+      label: String(args?.label ?? '').trim(),
+      fields: parsed.fields,
+      ...(args?.strict === undefined ? {} : { strict: args.strict === true || args.strict === 'true' }),
+    });
+    if (!res?.ok) {
+      // A type change is the one refusal with a fix that is not a retry: the
+      // stored values are what conflict, so the answer must name the new field
+      // name rather than invite the caller to try again.
+      if (res?.shapeLocked) {
+        const stored = res.current ? `${res.current.type}` : 'a different type';
+        return {
+          ok: false,
+          text:
+            `${res.error ?? 'that field already has a different type'} — it is stored as ${stored}. ` +
+            'Send the value as that type, or write it under a new field name.',
+        };
+      }
+      return { ok: false, text: res?.error ?? `could not declare "${key}"` };
+    }
+    const fields = Array.isArray(res.object?.fields) ? res.object.fields : [];
+    const columns = fields.map((f) => `${f.key}:${f.type}${f.unit ? `(${f.unit})` : ''}`).join(', ') || 'none yet';
+    return {
+      ok: true,
+      text:
+        `${res.created ? 'Created' : 'Extended'} table "${key}" (${res.object?.label ?? key}` +
+        `${res.object?.strict ? ', strict' : ', soft'}) · columns: ${columns}. ` +
+        (res.object?.strict
+          ? 'A field that is not listed here will be REFUSED.'
+          : 'A field that is not listed here will be added automatically.'),
+    };
+  }
+
+  if (action === 'recordWrite') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    if (!key) return { ok: false, text: 'recordWrite needs a table key, e.g. "bto.launch"' };
+    if (!writeRows) return { ok: false, text: 'tables are not available on this relay' };
+    const parsed = normaliseRowsArg(args?.records);
+    if (!parsed.ok) return { ok: false, text: parsed.error };
+    // THE COLUMNS BEFORE THE WRITE. The receipt names what was added, but a name
+    // that is one slip from an existing one ("estate" vs "estates") is only
+    // visible against the schema as it was, and that warning is the whole
+    // containment for a soft write.
+    let prior = [];
+    let existed = false;
+    if (readObject) {
+      try {
+        const before = await readObject(key, 1);
+        if (before?.ok) {
+          existed = true;
+          prior = Array.isArray(before.object?.fields) ? before.object.fields : [];
+        }
+      } catch {
+        /* the warning is a bonus; the write is the point */
+      }
+    }
+    const res = await writeRows(key, parsed.rows);
+    if (!res?.ok) {
+      const rejected = Array.isArray(res?.rejected) ? res.rejected : [];
+      const why = rejected.length
+        ? rejected
+            .slice(0, 4)
+            .map((r) => `${r.field || `records[${r.index}]`}: ${r.error}`)
+            .join('; ')
+        : String(res?.error ?? 'the store refused the write');
+      // A STRICT TABLE'S REFUSAL DOES NOT CARRY THE COLUMN LIST — the hub says
+      // "not part of this object" and stops. That sentence is unactionable on
+      // its own, so the columns this tool read a moment ago are appended here:
+      // the caller can then fix the name instead of guessing at it.
+      const unknownField = rejected.some((r) => r.code === 'UNKNOWN_FIELD');
+      const columns = unknownField && prior.length
+        ? ` — this table has: ${prior.map((f) => `${f.key} (${f.type})`).join(', ')}. ` +
+          'Re-send the row with one of those names, or use objectDeclare to add a column.'
+        : '';
+      return { ok: false, text: `could not write to "${key}": ${why}${columns}` };
+    }
+    const added = Array.isArray(res.addedFields) ? res.addedFields : [];
+    const inserted = (res.records ?? []).filter((r) => r.action === 'inserted').length;
+    const updated = (res.records ?? []).length - inserted;
+    const parts = [`Wrote ${res.accepted ?? parsed.rows.length} row(s) to "${key}"`];
+    if (inserted) parts.push(`${inserted} new`);
+    if (updated) parts.push(`${updated} updated`);
+    if (!existed) parts.push('the table and its columns were created by this write');
+    const lines = [`${parts.join(' · ')}.`];
+    if (added.length) {
+      lines.push(
+        `Added ${added.length === 1 ? 'a column' : `${added.length} columns`}: ` +
+          added.map((f) => `${f.key} (${f.type})`).join(', ') +
+          ' — it was not in the table, so its type came from the value you sent.',
+      );
+      const slips = added
+        .map((f) => [f.key, nearDuplicate(prior, f.key)])
+        .filter(([, near]) => near);
+      for (const [key2, near] of slips) {
+        lines.push(
+          `WARNING: "${key2}" is one slip away from the existing column "${near}". If you meant "${near}", ` +
+            `re-send the row with that field name and tell the wearer about the extra column "${key2}".`,
+        );
+      }
+    }
+    const rejected = Array.isArray(res.rejected) ? res.rejected : [];
+    if (rejected.length) {
+      lines.push(
+        `Refused ${rejected.length} row(s): ` +
+          rejected.slice(0, 4).map((r) => `${r.field || `records[${r.index}]`}: ${r.error}`).join('; '),
+      );
+    }
+    return { ok: true, text: lines.join('\n') };
+  }
+
+  if (action === 'recordDelete') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    const rec = String(args?.key ?? '').trim();
+    if (!key) return { ok: false, text: 'recordDelete needs a table key, e.g. "bto.launch"' };
+    // ONE ROW, NAMED. There is deliberately no "clear the table" verb here: a
+    // model that can empty a table in one call will eventually do it by accident,
+    // and the Data page has that button behind a confirmation.
+    if (!rec) {
+      return {
+        ok: false,
+        text:
+          'recordDelete needs the row key as `key` — exactly the string `object` printed. ' +
+          'It removes ONE row and will not clear a table; read it first and name what should go.',
+      };
+    }
+    if (!dropRow) return { ok: false, text: 'deleting rows is not available on this relay' };
+    const res = await dropRow(key, rec);
+    if (!res?.ok) {
+      return {
+        ok: false,
+        text: res?.notFound
+          ? `"${key}" has no row "${rec}". Read the table with action "object" and use a key it printed — ` +
+            'row keys are compared as strings and are not normalised.'
+          : res?.error ?? `could not delete that row from "${key}"`,
+      };
+    }
+    return { ok: true, text: `Deleted row "${rec}" from "${key}".` };
+  }
+
+  return {
+    ok: false,
+    text:
+      `unknown metrics action "${action}" — series actions are ${SERIES_ACTIONS.join(', ')}; ` +
+      `table actions are ${RECORD_ACTIONS.join(', ')}`,
+  };
+}
+
+/**
+ * The `records` argument, however the model spelled it.
+ *
+ * A tool schema asks for an array of objects, but providers differ: some emit
+ * the array, some emit a JSON string. Both mean the same thing, and failing a
+ * write over the encoding would teach the model nothing useful — so a string is
+ * parsed once here and the error names the shape when it is neither.
+ */
+function normaliseRowsArg(raw) {
+  let value = raw;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return { ok: false, error: 'recordWrite needs `records`: an array of {key, values} (or an object when writing one row)' };
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return { ok: false, error: '`records` is a string but not JSON — send an array of {key, values}' };
+    }
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) value = [value];
+  if (!Array.isArray(value) || !value.length) {
+    return { ok: false, error: 'recordWrite needs `records`: a non-empty array of {key, values}' };
+  }
+  return { ok: true, rows: value };
+}
+
+/** The `fields` argument for objectDeclare: array, object, or a JSON string. */
+function normaliseFieldsArg(raw) {
+  let value = raw;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return { ok: true, fields: [] };
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return { ok: false, error: '`fields` is a string but not JSON — send an array of {key, type}' };
+    }
+  }
+  if (value === undefined || value === null) return { ok: true, fields: [] };
+  if (value && typeof value === 'object' && !Array.isArray(value)) value = [value];
+  if (!Array.isArray(value)) return { ok: false, error: '`fields` must be an array of {key, type}' };
+  return { ok: true, fields: value };
+}
+
+/** One cell, rendered with the field's own unit and precision. */
+function formatCell(field, value) {
+  if (value === null || value === undefined) return '';
+  if (field.type === 'number') {
+    return `${formatNumber(value, field.precision)}${field.unit ? ` ${field.unit}` : ''}`;
+  }
+  if (field.type === 'bool') return value ? 'yes' : 'no';
+  return String(value);
 }
 
 /** Group thousands, keep the series' precision. Never a bare float in front of a model. */
