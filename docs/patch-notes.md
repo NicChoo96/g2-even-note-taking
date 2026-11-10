@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.79
+
+v0.3.79 - Keep rows, not just numbers
+
+- The Data tab lists tables beside your numbers: columns appear as data arrives,
+so a launch holds its date, flat type, project and price as one row.
+- Jarvis and your agents can add, correct and delete rows; changing one cell
+leaves the rest of that row alone.
+- Chart any numeric column, and tap a point to see that row's other values.
+- Deleting a table that still holds rows asks first.
+
 ## 0.3.78
 
 v0.3.78 - Fix or remove one reading
