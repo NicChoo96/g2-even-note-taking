@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.74
+
+v0.3.74 - Any date, and filters built from the numbers
+
+- A reading is stored at the day it happened, however long ago: there is no
+window on the past, and only a future date is refused.
+- A value that is really seconds is named as such, with the value it should be.
+- The time filter is built from the series: its ranges are fractions of the span,
+measured back from the newest reading, so an old series reads instead of
+nothing.
+
 ## 0.3.73
 
 v0.3.73 - Old readings, and finding them
