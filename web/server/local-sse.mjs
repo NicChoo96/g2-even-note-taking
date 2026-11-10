@@ -6324,6 +6324,41 @@ function metricToolDeps() {
       if (!res.ok) return { ok: false, notFound: res.notFound, error: res.error };
       return { ok: true, deleted: res.deleted };
     },
+
+    /**
+     * Remove a whole SERIES, and its readings when `purge` says so.
+     *
+     * Without `purge` a series that still holds readings is refused WITH THE
+     * COUNT — that number is the whole point of the two-step, because it is what
+     * the caller has to tell the wearer before asking to lose the history.
+     */
+    async deleteSeries(key, { purge = false } = {}) {
+      if (metricsRemote) {
+        const res = await metricsRemote.remove(key, { purge });
+        if (res.ok) return { ok: true, deleted: Number(res.deleted) || 0 };
+        if (res.notEmpty) return { ok: false, notEmpty: true, count: Number(res.count) || 0 };
+        if (res.notFound) return { ok: false, notFound: true, error: res.error };
+        return { ok: false, error: res.error || 'the hub refused the delete' };
+      }
+      if (!metricStore.series[key] && !(metricStore.samples[key] ?? []).length) {
+        return { ok: false, notFound: true, error: `there is no series "${key}"` };
+      }
+      const had = (metricStore.samples[key] ?? []).length;
+      if (had && !purge) return { ok: false, notEmpty: true, count: had };
+      delete metricStore.series[key];
+      delete metricStore.samples[key];
+      saveMetrics();
+      return { ok: true, deleted: had };
+    },
+
+    /** Remove a whole TABLE, and its rows when `purge` says so. Same two-step. */
+    async deleteTable(key, { purge = false } = {}) {
+      const res = await recordsRemove(key, { purge });
+      if (res.ok) return { ok: true, deletedRecords: Number(res.deletedRecords) || 0 };
+      if (res.notEmpty) return { ok: false, notEmpty: true, count: Number(res.count) || 0 };
+      if (res.notFound) return { ok: false, notFound: true, error: res.error };
+      return { ok: false, error: res.error || 'the store refused the delete' };
+    },
   };
 }
 

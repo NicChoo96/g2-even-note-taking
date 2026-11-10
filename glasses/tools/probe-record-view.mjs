@@ -102,7 +102,7 @@ const body = (editing) =>
     return `<tr class="${editing === r.key ? 'editing' : ''}"><td class="rec-key"><span>${r.key}</span>${when}</td>${cells}${actions}</tr>`;
   }).join('');
 
-const fixture = (css, editing = null) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
+const fixture = (css, editing = null, openPanel = false) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>record view probe</title><style>${css}</style></head>
 <body>
 <div class="app app-wide app-data">
@@ -136,6 +136,29 @@ const fixture = (css, editing = null) => `<!doctype html><html lang="en"><head><
             <div class="md-controls">
               <div class="md-seg" role="group" aria-label="Which column to chart"><button class="active">Price</button></div>
               <div class="md-seg" role="group" aria-label="Chart type"><button class="active">Line</button><button>Area</button><button>Bar</button><button>Step</button><button>Table</button></div>
+            </div>
+            <div class="rec-filters" role="group" aria-label="Filter the rows">
+              <details class="rec-filter active"${openPanel ? ' open' : ''}>
+                <summary><span class="rec-filter-name">Flat type</span><span class="rec-filter-value">4-room</span></summary>
+                <div class="rec-filter-panel">
+                  <input type="search" placeholder="Search flat type" aria-label="Search Flat type values">
+                  <div class="rec-filter-list" role="group" aria-label="Flat type values">
+                    <label class="rec-filter-opt"><input type="checkbox"><span>All</span><em>3</em></label>
+                    <label class="rec-filter-opt"><input type="checkbox" checked><span>4-room</span><em>2</em></label>
+                    <label class="rec-filter-opt"><input type="checkbox"><span>5-room</span><em>1</em></label>
+                  </div>
+                </div>
+              </details>
+              <details class="rec-filter">
+                <summary><span class="rec-filter-name">Projects</span><span class="rec-filter-value">All</span></summary>
+                <div class="rec-filter-panel"><div class="rec-filter-list"><label class="rec-filter-opt"><input type="checkbox"><span>All</span><em>3</em></label></div></div>
+              </details>
+              <div class="rec-range">
+                <label><span>From</span><input type="date" value="2018-11-01"></label>
+                <label><span>To</span><input type="date" value="2026-11-09"></label>
+              </div>
+              <button class="mm-clear">Clear</button>
+              <span class="rec-filter-summary">2 of 3 rows · 2018-11-01 to 2026-11-09</span>
             </div>
             <svg class="metric-chart" viewBox="0 0 640 200" role="img" aria-label="line chart">
               <polyline class="chart-line" fill="none" points="52,150 300,90 620,40"></polyline>
@@ -193,6 +216,19 @@ try {
       chips: [...document.querySelectorAll('.md-seg[aria-label="Which column to chart"] button')].map(
         (b) => `${b.textContent.trim()}${b.classList.contains('active') ? ' (active)' : ''}`,
       ),
+      filterChips: [...document.querySelectorAll('.rec-filter > summary')].map((el) =>
+        [...el.querySelectorAll('span')].map((sp) => sp.textContent.trim()).join(' '),
+      ),
+      filterActive: (() => {
+        const on = document.querySelector('.rec-filter.active > summary');
+        return on ? [...on.querySelectorAll('span')].map((sp) => sp.textContent.trim()).join(' ') : '';
+      })(),
+      rangeValues: [...document.querySelectorAll('.rec-range input')].map((i) => i.value),
+      filterSummary: document.querySelector('.rec-filter-summary')?.textContent?.trim() ?? '',
+      filterOverflow: (() => {
+        const row = document.querySelector('.rec-filters');
+        return row ? row.scrollWidth - row.clientWidth : 0;
+      })(),
     };
   });
 
@@ -207,6 +243,11 @@ try {
   check('the page never scrolls sideways', desktop.pageOverflow <= 1, true);
   check('there is a chip per numeric column, one active', desktop.chips, ['Price (active)']);
   check('the table is wide enough to be a table', desktop.tableBox.w > 400, true);
+  check('a filter chip per filterable column', desktop.filterChips, ['Flat type 4-room', 'Projects All']);
+  check('the active one is marked', desktop.filterActive, 'Flat type 4-room');
+  check('a custom range reads back as dates', desktop.rangeValues, ['2018-11-01', '2026-11-09']);
+  check('the count says how many rows survived', desktop.filterSummary, '2 of 3 rows \u00b7 2018-11-01 to 2026-11-09');
+  check('the filter row does not widen the pane', desktop.filterOverflow <= 1, true);
 
   // ── the inline editor ──────────────────────────────────────────────────
   const editing = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -241,11 +282,38 @@ try {
       tableScrolls: table.scrollWidth > table.clientWidth,
       paneOverflow: pane.scrollWidth - pane.clientWidth,
       rowCount: table.querySelectorAll('tbody tr').length,
+      wide: [...document.querySelectorAll('*')]
+        .map((el) => ({ el, r: el.getBoundingClientRect() }))
+        .filter(({ r }) => r.width > 0 && r.right > window.innerWidth + 1)
+        .slice(0, 6)
+        .map(({ el, r }) => `${el.tagName}.${el.className || ''} right=${Math.round(r.right)} w=${Math.round(r.width)}`),
     };
   });
+  if (phoneState.pageOverflow > 1) console.log('        widest:', phoneState.wide.join(' | '));
   check('a phone does not scroll sideways', phoneState.pageOverflow <= 1, true);
   check('the table scrolls inside its own box instead', phoneState.tableScrolls, true);
   check('all rows are rendered', phoneState.rowCount, 3);
+
+  // An open panel anchored to a chip near the right edge is the classic way a
+  // phone ends up scrolling sideways, so the open state is measured too — the
+  // panel becomes a viewport sheet under 720px for exactly this reason.
+  const phoneOpen = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });
+  await phoneOpen.setContent(fixture(css, null, true), { waitUntil: 'load' });
+  await phoneOpen.screenshot({ path: join(outDir, 'phone-filter-open.png'), fullPage: false });
+  const openState = await phoneOpen.evaluate(() => {
+    const panel = document.querySelector('.rec-filter-panel');
+    const box = panel.getBoundingClientRect();
+    return {
+      visible: box.width > 0 && box.height > 0,
+      pageOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      insideViewport: box.left >= 0 && box.right <= window.innerWidth + 1,
+      options: panel.querySelectorAll('.rec-filter-opt').length,
+    };
+  });
+  check('an open filter panel is visible', openState.visible, true);
+  check('…with every option', openState.options, 3);
+  check('…and it stays inside the viewport', openState.insideViewport, true);
+  check('…so the page still does not scroll sideways', openState.pageOverflow <= 1, true);
 
   console.log(`\nscreenshots: ${outDir}`);
 } finally {

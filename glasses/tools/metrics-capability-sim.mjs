@@ -109,7 +109,8 @@ checkTrue('forget exists', Boolean(forgetCap));
 check('forget is app-wide', forgetCap.page, 'global');
 check('forget is gated behind a tap', forgetCap.confirm, true);
 check('forget takes the series, and then a slot OR a row key', forgetCap.params.filter((p) => p.required).map((p) => p.name), ['series']);
-check('…so a row can be named instead of a reading', forgetCap.params.map((p) => p.name), ['series', 'slot', 'key']);
+check('…and covers every shape there is', forgetCap.params.map((p) => p.name), ['what', 'series', 'slot', 'key', 'purge']);
+check('…with reading as the default scope', forgetCap.params.find((p) => p.name === 'what').values, ['reading', 'row', 'series', 'table']);
 check('and says nothing can bring a reading back', /recover/i.test(forgetCap.description), true);
 
 __setReply({ ok: true, result: 'Deleted reading "2023-10-15" from "tengah.bto.4room"; 1 reading(s) removed.' });
@@ -240,6 +241,48 @@ const call = async (args, answer = { ok: true, result: 'ok' }) => {
   check('declare with kind object declares a TABLE', c.args.action, 'objectDeclare');
   check('…and sends the columns through', c.args.fields[0].key, 'price');
   check('…not as a series declaration', 'valueType' in c.args, false);
+}
+
+// ── 3c. removing a whole SHAPE ───────────────────────────────────────────
+// The capability is the only road to it, and the road has a tap on it. A model
+// that merges a series into a table can now clear the old series — but not
+// without the wearer, and not without learning how much history is at stake.
+{
+  __calls.length = 0;
+  __setReply({ ok: false, error: '"tengah.bto.4room" still holds 12 readings. Nothing was deleted.', result: '"tengah.bto.4room" still holds 12 readings. Nothing was deleted. Send purge:true …' });
+  const refused = await forgetCap.run({ what: 'series', series: 'tengah.bto.4room' });
+  const c = __calls[__calls.length - 1];
+  check('a whole series is removed through the tool', c.args.action, 'seriesDelete');
+  check('…without purge on the first ask', c.args.purge, false);
+  check('the refusal is not a success', refused.ok, false);
+  checkTrue('…and the count reaches the model', /12 readings/.test(String(refused.summary)), String(refused.summary));
+  checkTrue(
+    '…with the next step spelled out',
+    /Tell the wearer that number, then call this again with purge:true/.test(String(refused.hint)),
+    String(refused.hint),
+  );
+}
+{
+  __calls.length = 0;
+  __setReply({ ok: true, result: 'Deleted the series "tengah.bto.4room" and its 12 readings.' });
+  const done = await forgetCap.run({ what: 'series', series: 'tengah.bto.4room', purge: true });
+  const c = __calls[__calls.length - 1];
+  check('purge travels on the second ask', c.args.purge, true);
+  checkTrue('…and the deletion is reported', done.ok === true && /Deleted the series/.test(String(done.summary)), String(done.summary));
+}
+{
+  __calls.length = 0;
+  __setReply({ ok: true, result: 'Deleted the table "bto.launch" and its 26 rows.' });
+  await forgetCap.run({ what: 'table', series: 'bto.launch', purge: true });
+  const c = __calls[__calls.length - 1];
+  check('a whole table is removed through the tool', c.args.action, 'tableDelete');
+  check('…taking its rows', c.args.purge, true);
+}
+{
+  __calls.length = 0;
+  const empty = await forgetCap.run({ what: 'table', series: 'bto.launch' });
+  check('a table delete without purge is still a purge:false ask', __calls[0].args.purge, false);
+  checkTrue('…which is exactly the count-first step', empty.ok === true);
 }
 {
   const { sent } = await call({ action: 'write', series: 'a.b', value: 1, slot: '   ' });

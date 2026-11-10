@@ -3413,3 +3413,138 @@ p.empty {
   font-size: 12px;
   padding: 2px 4px;
 }
+
+/* ── table filters (Excel's filter row, in the store's vocabulary) ──────────
+   A row of disclosures: the summary is the chip, the panel is the value list.
+   `<details>` is used so keyboard and Escape work for free; the only thing
+   needed here is the look and the list's own scrolling. */
+.rec-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+
+.rec-filter { position: relative; }
+
+.rec-filter > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-soft, inherit);
+  max-width: 220px;
+}
+.rec-filter > summary::-webkit-details-marker { display: none; }
+.rec-filter > summary:hover { border-color: var(--border-strong, var(--border)); }
+/* A summary cannot hold a block child, so the caret is drawn, not typed. */
+.rec-filter > summary::after {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 4px solid currentColor;
+  opacity: 0.55;
+  position: relative;
+  top: -1px;
+}
+
+.rec-filter.active > summary {
+  border-color: var(--accent, #8a98fb);
+  color: var(--accent-strong, var(--accent, #8a98fb));
+}
+
+.rec-filter-name { color: var(--muted); }
+.rec-filter-value { font-weight: 600; }
+
+.rec-filter-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 200px;
+  max-width: 280px;
+  padding: 8px;
+  border: 1px solid var(--border-strong, var(--border));
+  border-radius: 10px;
+  background: var(--panel, #14161d);
+  box-shadow: var(--shadow, 0 12px 30px rgba(0, 0, 0, 0.45));
+}
+
+.rec-filter-panel input[type='search'] {
+  width: 100%;
+  margin-bottom: 6px;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.rec-filter-list { max-height: 220px; overflow: auto; }
+
+.rec-filter-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rec-filter-opt > span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rec-filter-opt > em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.rec-filter-opt input[type='checkbox'] { width: 15px; height: 15px; }
+
+/* WRAPS, because two date inputs are ~360px together and a 390px phone has
+   ~330px of pane: on one line they push the page sideways instead of the
+   second one dropping below the first. */
+.rec-range { display: inline-flex; flex-wrap: wrap; gap: 6px; max-width: 100%; }
+.rec-range label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.rec-range input[type='date'] {
+  font-size: 11px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  min-width: 0;
+}
+
+.rec-filter-summary { font-size: 11px; color: var(--muted); }
+
+/* A panel anchored with `left: 0` to a chip near the right edge runs off a
+   phone. Under 720px it becomes a bottom-ish sheet pinned to the viewport, which
+   also puts every value within thumb reach. */
+@media (max-width: 719px) {
+  .rec-filter-panel {
+    position: fixed;
+    top: auto;
+    bottom: 12px;
+    left: 10px;
+    right: 10px;
+    max-width: none;
+    max-height: 60vh;
+  }
+  .rec-filter-list { max-height: 40vh; }
+  .rec-filters { gap: 5px; }
+}

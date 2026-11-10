@@ -36,6 +36,14 @@
 //      (that is what makes an improvised table possible); the answer names every
 //      field it added, and warns when a new name is one slip away from an
 //      existing one. Silent growth is how a typo becomes permanent.
+//   5. CREATING AND DESTROYING ARE SYMMETRICAL. A store you can build but not
+//      clear is a store that accumulates wreckage: a model that merges three
+//      series into a table could leave the three behind for ever. So there is a
+//      delete for every shape — one reading, one row, one series, one table —
+//      and `purge` is a separate argument because removing a container and
+//      destroying its history are different decisions. A WHOLE series or table
+//      is only ever deleted from behind the wearer's confirmation (the
+//      `metrics.forget` capability), never from a bare tool call.
 //
 // Pure with injected dependencies, like location-tool.mjs: a harness drives it
 // with a stub store, and nothing in here knows what a socket is.
@@ -59,7 +67,16 @@ const SERIES_ACTIONS = ['list', 'read', 'declare', 'write', 'delete'];
 /** The five that address a table of rows. */
 const RECORD_ACTIONS = ['objects', 'object', 'objectDeclare', 'recordWrite', 'recordDelete'];
 
-export const METRICS_ACTIONS = [...SERIES_ACTIONS, ...RECORD_ACTIONS];
+/**
+ * The two that remove a whole container.
+ *
+ * Apart from the five above on purpose: they are not about a row or a reading,
+ * they are about the SHAPE itself, and `purge` decides whether the contents go
+ * with it. Reachable only through the confirmation-gated capability.
+ */
+const DESTROY_ACTIONS = ['seriesDelete', 'tableDelete'];
+
+export const METRICS_ACTIONS = [...SERIES_ACTIONS, ...RECORD_ACTIONS, ...DESTROY_ACTIONS];
 
 export function isMetricsTool(t) {
   return t?.kind === METRICS_KIND;
@@ -100,7 +117,9 @@ export function metricsToolSchema() {
               'Series: list = what exists; read = one series\u2019 history; declare = create a series; ' +
               'write = store a reading; delete = remove one reading (by slot) or those before a cutoff. ' +
               'Objects: objects = what tables exist; object = one table\u2019s rows; objectDeclare = create ' +
-              'or extend a table\u2019s columns; recordWrite = upsert rows; recordDelete = remove one row.',
+              'or extend a table\u2019s columns; recordWrite = upsert rows; recordDelete = remove one row. ' +
+              'Whole shapes: seriesDelete = remove a series; tableDelete = remove a table. Those two ' +
+              'need `purge` to take the readings or rows with them.',
           },
           series: {
             type: 'string',
@@ -212,6 +231,13 @@ export function metricsToolSchema() {
               'For recordDelete: the row to remove \u2014 exactly the key `object` printed. There is no ' +
               '"clear the table" here; name one row, or use the Data page.',
           },
+          purge: {
+            type: 'boolean',
+            description:
+              'For seriesDelete/tableDelete: true removes the readings or rows inside it as well. ' +
+              'Omit it and the call is refused while the container still holds anything, with the ' +
+              'count \u2014 which is the honest way to find out how much history is at stake.',
+          },
         },
         required: ['action'],
       },
@@ -303,6 +329,8 @@ export async function runMetricsTool(tool, args, deps) {
   const declareObject = typeof deps?.declareObject === 'function' ? deps.declareObject : null;
   const writeRows = typeof deps?.writeRecords === 'function' ? deps.writeRecords : null;
   const dropRow = typeof deps?.deleteRecord === 'function' ? deps.deleteRecord : null;
+  const dropSeries = typeof deps?.deleteSeries === 'function' ? deps.deleteSeries : null;
+  const dropTable = typeof deps?.deleteTable === 'function' ? deps.deleteTable : null;
 
   if (action === 'list') {
     if (!list) return { ok: false, text: 'metrics are not available on this relay' };
@@ -587,14 +615,20 @@ export async function runMetricsTool(tool, args, deps) {
     }
     const fields = Array.isArray(res.object?.fields) ? res.object.fields : [];
     const columns = fields.map((f) => `${f.key}:${f.type}${f.unit ? `(${f.unit})` : ''}`).join(', ') || 'none yet';
+    const notes = [];
+    if (res.created) {
+      const clash = await seriesWithKey(list, key);
+      if (clash) notes.push(clashLine(key, clash));
+    }
     return {
       ok: true,
       text:
         `${res.created ? 'Created' : 'Extended'} table "${key}" (${res.object?.label ?? key}` +
-        `${res.object?.strict ? ', strict' : ', soft'}) · columns: ${columns}. ` +
+        `${res.object?.strict ? ', strict' : ', soft'}) \u00b7 columns: ${columns}. ` +
         (res.object?.strict
           ? 'A field that is not listed here will be REFUSED.'
-          : 'A field that is not listed here will be added automatically.'),
+          : 'A field that is not listed here will be added automatically.') +
+        (notes.length ? `\n${notes.join('\n')}` : ''),
     };
   }
 
@@ -648,8 +682,13 @@ export async function runMetricsTool(tool, args, deps) {
     if (inserted) parts.push(`${inserted} new`);
     if (updated) parts.push(`${updated} updated`);
     if (!existed) parts.push('the table and its columns were created by this write');
-    const lines = [`${parts.join(' · ')}.`];
-    if (added.length) {
+    const lines = [`${parts.join(' · ')}.`];    // A NEW TABLE UNDER A KEY A SERIES ALREADY USES. It is legal (two stores) and
+    // it is the mess a merge leaves behind, so it is said once, here, where the
+    // duplicate is born.
+    if (!existed) {
+      const clash = await seriesWithKey(list, key);
+      if (clash) lines.push(clashLine(key, clash));
+    }    if (added.length) {
       lines.push(
         `Added ${added.length === 1 ? 'a column' : `${added.length} columns`}: ` +
           added.map((f) => `${f.key} (${f.type})`).join(', ') +
@@ -704,11 +743,79 @@ export async function runMetricsTool(tool, args, deps) {
     return { ok: true, text: `Deleted row "${rec}" from "${key}".` };
   }
 
+  if (action === 'seriesDelete') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    if (!key) return { ok: false, text: 'seriesDelete needs a series key, e.g. "tengah.bto.4room"' };
+    if (!dropSeries) return { ok: false, text: 'deleting a series is not available on this relay' };
+    const purge = args?.purge === true || args?.purge === 'true';
+    const res = await dropSeries(key, { purge });
+    if (!res?.ok) {
+      // A series that still holds readings is a QUESTION, not a failure: the
+      // count is what tells the caller how much history the purge decision is
+      // about, and it is the number a confirmation prompt should carry.
+      if (res?.notEmpty) {
+        return {
+          ok: false,
+          text:
+            `"${key}" still holds ${res.count} reading${res.count === 1 ? '' : 's'}. Nothing was deleted. ` +
+            'Send purge:true to delete the series AND those readings, but only when the wearer has ' +
+            'agreed to lose the history \u2014 tell them the count first.',
+        };
+      }
+      return {
+        ok: false,
+        text: res?.notFound
+          ? `there is no series "${key}" any more. \`list\` shows what exists.`
+          : res?.error ?? `could not delete "${key}"`,
+      };
+    }
+    const gone = Number(res.deleted) || 0;
+    return {
+      ok: true,
+      text:
+        `Deleted the series "${key}"` +
+        (gone ? ` and its ${gone} reading${gone === 1 ? '' : 's'}.` : '. It held no readings.') +
+        ' Tables are a separate store and were not touched.',
+    };
+  }
+
+  if (action === 'tableDelete') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    if (!key) return { ok: false, text: 'tableDelete needs a table key, e.g. "bto.launch"' };
+    if (!dropTable) return { ok: false, text: 'deleting a table is not available on this relay' };
+    const purge = args?.purge === true || args?.purge === 'true';
+    const res = await dropTable(key, { purge });
+    if (!res?.ok) {
+      if (res?.notEmpty) {
+        return {
+          ok: false,
+          text:
+            `"${key}" still holds ${res.count} row${res.count === 1 ? '' : 's'}. Nothing was deleted. ` +
+            'Send purge:true to delete the table AND those rows, but only when the wearer has agreed.',
+        };
+      }
+      return {
+        ok: false,
+        text: res?.notFound
+          ? `there is no table "${key}" any more. \`objects\` shows what exists.`
+          : res?.error ?? `could not delete "${key}"`,
+      };
+    }
+    const gone = Number(res.deletedRecords) || 0;
+    return {
+      ok: true,
+      text:
+        `Deleted the table "${key}"` +
+        (gone ? ` and its ${gone} row${gone === 1 ? '' : 's'}.` : '. It held no rows.') +
+        ' Series are a separate store and were not touched.',
+    };
+  }
+
   return {
     ok: false,
     text:
-      `unknown metrics action "${action}" — series actions are ${SERIES_ACTIONS.join(', ')}; ` +
-      `table actions are ${RECORD_ACTIONS.join(', ')}`,
+      `unknown metrics action "${action}" \u2014 series actions are ${SERIES_ACTIONS.join(', ')}; ` +
+      `table actions are ${RECORD_ACTIONS.join(', ')}; whole-shape actions are ${DESTROY_ACTIONS.join(', ')}`,
   };
 }
 
@@ -765,6 +872,36 @@ function formatCell(field, value) {
   if (field.type === 'bool') return value ? 'yes' : 'no';
   return String(value);
 }
+
+/**
+ * The SERIES that already answers to this key, or null.
+ *
+ * The two stores are separate, so one key can name both — and after a merge that
+ * is exactly what happens: the table is built from a series that is still there,
+ * so `tengah.bto.4room` becomes a series AND a table until one is removed. The
+ * caller cannot see that from either read, so creation says it out loud, once,
+ * at the moment the duplicate appears.
+ */
+async function seriesWithKey(listFn, key) {
+  if (!listFn) return null;
+  try {
+    const res = await listFn();
+    const series = Array.isArray(res?.series) ? res.series : [];
+    return series.find((s) => String(s?.key ?? '').toLowerCase() === key) ?? null;
+  } catch {
+    return null; // the warning is a bonus; the write already succeeded
+  }
+}
+
+function clashLine(key, clash) {
+  const n = Number(clash?.count) || 0;
+  return (
+    `WARNING: a SERIES also uses the key "${key}"${n ? ` (${n} reading${n === 1 ? '' : 's'})` : ''}. ` +
+    'They are different stores, so that name now answers to two shapes. If this table replaces that ' +
+    'series, remove it with seriesDelete (the wearer has to approve it); otherwise pick a different key.'
+  );
+}
+
 
 /** Group thousands, keep the series' precision. Never a bare float in front of a model. */
 function formatNumber(value, precision) {

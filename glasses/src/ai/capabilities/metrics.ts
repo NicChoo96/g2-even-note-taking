@@ -427,35 +427,57 @@ export const metricsCapabilities: Capability[] = [
   },
   {
     /**
-     * Remove ONE reading — the missing half of "record a number".
+     * Remove something that should not be there — one reading, one row, or a
+     * whole series or table.
      *
      * WHY IT NEEDS ITS OWN CAPABILITY. `metrics.act write` can correct a value,
-     * because the same slot replaces. It cannot remove a reading that should not
-     * exist at all, and until this existed a single mistyped launch sat in the
-     * middle of a history with no verb that could reach it: the only deletes
-     * were "every reading" and "every reading older than X", and neither can
-     * take out one row from 2023.
+     * because the same slot replaces. It cannot remove data that should not exist
+     * at all, and until this existed a single mistyped launch sat in the middle of
+     * a history with no verb that could reach it.
      *
-     * WHY `confirm`. Destructive and irreversible: a deleted reading is gone,
-     * and nothing else in this app can bring it back. Tap-to-accept costs the
-     * wearer one gesture on a rare operation and is the difference between a
-     * correction and a lost number.
+     * WHY WHOLE SHAPES ARE HERE TOO. Creating and destroying were not
+     * symmetrical: a model could merge three series into a table and then had no
+     * way to remove the three, so every merge left the wreckage behind — and a
+     * table sharing its key with the series it replaced made that name ambiguous
+     * for ever. So `what: series|table` exists, and it exists HERE, where a tap
+     * stands between the model and the destruction.
+     *
+     * WHY `confirm`. Destructive and irreversible: nothing else in this app can
+     * bring back a deleted reading, row, series or table. Tap-to-accept costs one
+     * gesture on a rare operation.
+     *
+     * WHY A NON-EMPTY SERIES TAKES TWO CALLS. The first is refused with the COUNT,
+     * which is what the wearer has to be told before agreeing to lose the history;
+     * the second sends `purge` and raises a second prompt that says so. Two taps
+     * for "delete this and its 400 readings" is the right number.
      */
     name: 'metrics.forget',
     page: GLOBAL_PAGE,
     effect: 'write',
     confirm: true,
-    title: 'Remove a reading or row',
+    title: 'Remove data',
     description:
-      'Delete ONE thing that should not be there. Two shapes, and the argument you send decides which:\n' +
-      '\u2022 a READING from a series \u2014 send `slot` (the date or label it was recorded under). Reading ' +
-      'first shows that string on any row whose slot is not simply its date.\n' +
-      '\u2022 a ROW from a table \u2014 send `key`, the row\u2019s identity exactly as `metrics act` object ' +
-      'printed it (e.g. "2023-10-15").\n' +
-      'Use it when the wearer says something is wrong and should not be there, or to clean up a test row \u2014 ' +
-      'not to CORRECT a value, which is a write: rewriting the same slot or the same row key replaces it ' +
-      'and keeps the row. It cannot empty a series or a table, and nothing here can recover what it removes.',
+      'Delete something that should not be there. `what` decides the scale:\n' +
+      '\u2022 "reading" (default): one reading from a series — send `slot`, the date or label it was ' +
+      'recorded under. `metrics act` read prints it on any row whose slot is not simply its date.\n' +
+      '\u2022 "row": one row from a table — send `key`, exactly as `metrics act` object printed it.\n' +
+      '\u2022 "series": the WHOLE series, readings included — send only `series`. Called without ' +
+      '`purge` it refuses while readings remain and reports the count; tell the wearer that number, ' +
+      'then call again with `purge: true`. This is how a series that has been merged into a table is ' +
+      'cleaned up, so a merge need not leave the old series behind.\n' +
+      '\u2022 "table": the WHOLE table, rows included, by the same two steps.\n' +
+      'It cannot CORRECT a value — that is a write to the same slot or row key, which keeps the row. ' +
+      'Nothing here can recover what it removes, so name the exact thing: read it first.',
     params: [
+      {
+        name: 'what',
+        type: 'enum',
+        values: ['reading', 'row', 'series', 'table'],
+        fallback: 'reading',
+        description:
+          'reading = one reading (needs slot); row = one table row (needs key); series = the whole ' +
+          'series; table = the whole table. Default reading.',
+      },
       {
         name: 'series',
         type: 'string',
@@ -465,47 +487,84 @@ export const metricsCapabilities: Capability[] = [
       {
         name: 'slot',
         type: 'string',
-        description: 'For a series: which reading \u2014 its slot exactly as `read` printed it, e.g. "2023-10-15".',
+        description: 'For what=reading: which reading — its slot exactly as `read` printed it, e.g. "2023-10-15".',
       },
       {
         name: 'key',
         type: 'string',
         description:
-          'For a table: which row \u2014 its key exactly as `object` printed it. Row keys are compared as ' +
+          'For what=row: which row — its key exactly as `object` printed it. Row keys are compared as ' +
           'strings and are not normalised, so do not reformat the date.',
+      },
+      {
+        name: 'purge',
+        type: 'boolean',
+        description:
+          'For what=series|table: true also deletes the readings or rows inside. Omit it first to be ' +
+          'refused with the count, so the wearer can be told how much history is at stake.',
       },
     ],
     run: async (args) => {
       const row = String(args.key ?? '').trim();
       const slot = String(args.slot ?? '').trim();
-      if (!row && !slot) {
-        return {
-          ok: false,
-          summary: 'nothing named to remove',
-          hint:
-            'Send `slot` to remove one reading from a series, or `key` to remove one row from a table. ' +
-            'Read it first (`metrics act` read or object) so the identity is one it printed.',
-        };
+      const series = String(args.series ?? '').trim();
+      const purge = args.purge === true || args.purge === 'true';
+      // AN ARGUMENT THAT NAMES THE SHAPE DECIDES IT. A caller that sends `key`
+      // means a row, and one that sends `slot` means a reading — so `what` only has
+      // to be stated when the scale is larger than the identity it carries, or when
+      // the caller wants to be explicit. Defaulting to `reading` regardless would
+      // refuse a perfectly clear "row 2023-10-15" for want of a word.
+      const asked = String(args.what ?? '').trim().toLowerCase();
+      const what = asked || (row ? 'row' : 'reading');
+
+      let send: Record<string, unknown>;
+      if (what === 'series' || what === 'table') {
+        send = { action: what === 'series' ? 'seriesDelete' : 'tableDelete', series, purge };
+      } else if (what === 'row') {
+        if (!row) {
+          return {
+            ok: false,
+            summary: 'no row named',
+            hint: 'what=row needs `key`: the row identity exactly as `metrics act` object printed it.',
+          };
+        }
+        send = { action: 'recordDelete', series, key: row };
+      } else {
+        if (!slot) {
+          return {
+            ok: false,
+            summary: 'no reading named',
+            hint:
+              'what=reading needs `slot`. Use what=series to remove the whole series, or read it first ' +
+              'so the slot is one it printed.',
+          };
+        }
+        send = { action: 'delete', series, slot };
       }
-      const send: Record<string, unknown> = row
-        ? { action: 'recordDelete', series: args.series ?? '', key: row }
-        : { action: 'delete', series: args.series ?? '', slot };
+
       const reply = await runTool({ kind: 'metrics', toolId: METRICS_TOOL_ID, args: send });
       const text = String(reply.result ?? '');
       if (!reply.ok) {
         const reason = String(reply.error || text || 'the relay refused the call').trim();
+        const clipped = reason.length > 96 ? `${reason.slice(0, 93)}...` : reason;
+        // A REFUSAL THAT IS REALLY A QUESTION is passed through with its
+        // instruction intact: the relay's sentence carries the count, and the only
+        // useful next step is the same call with purge once the wearer agrees.
+        const waitForCount = /still holds/i.test(reason);
         return {
           ok: false,
-          summary: reason.length > 96 ? `${reason.slice(0, 93)}...` : reason,
-          data: { error: reason, text },
-          hint: `${reason}. Do not retry with a different identity — read it and name a row it printed.`,
+          summary: clipped,
+          data: { what, error: reason, text },
+          hint: waitForCount
+            ? `${reason} Tell the wearer that number, then call this again with purge:true if they agree.`
+            : `${reason}. Do not retry with a different identity — read it and name something it printed.`,
         };
       }
       const firstLine = text.split('\n')[0].trim();
       return {
         ok: true,
         summary: firstLine.length > 96 ? `${firstLine.slice(0, 93)}...` : firstLine || 'removed',
-        data: { text },
+        data: { what, text },
       };
     },
   },

@@ -48,7 +48,7 @@ const schema = metricsToolSchema({});
 is('the schema is a function call', schema.type, 'function');
 is('with the agreed name', schema.function.name, METRICS_TOOL_NAME);
 const fn = schema.function.parameters;
-is('ten actions: five for a series, five for a table', fn.properties.action.enum, [
+is('twelve actions: five series, five table, two whole-shape', fn.properties.action.enum, [
   'list',
   'read',
   'declare',
@@ -59,6 +59,8 @@ is('ten actions: five for a series, five for a table', fn.properties.action.enum
   'objectDeclare',
   'recordWrite',
   'recordDelete',
+  'seriesDelete',
+  'tableDelete',
 ]);
 // The split is the design, not a detail: `read`/`write` address a series and
 // `object`/`recordWrite` address a table, and the description has to say which
@@ -706,6 +708,39 @@ try {
   // The series store must be untouched by all of that.
   const dashAfter = await call('GET', '/api/metrics');
   check('the series store is untouched by the table store', (dashAfter.body?.series ?? []).length, 1);
+
+  // ── 6c. deleting a WHOLE series, over the wire ──────────────────────────
+  // The verb the model said it did not have. It has to exist, it has to refuse
+  // while readings remain (with the count), and it has to be able to finish.
+  await call('POST', '/api/tool', {
+    ...tool,
+    args: { action: 'declare', series: 'tengah.bto.cleanup', label: 'Cleanup probe', unit: 'SGD', valueType: 'number' },
+  });
+  for (const [slot, value] of [['2023-10-15', 1], ['2023-11-15', 2]]) {
+    await call('POST', '/api/tool', {
+      ...tool,
+      args: { action: 'write', series: 'tengah.bto.cleanup', value, slot },
+    });
+  }
+  const notPurged = await call('POST', '/api/tool', { ...tool, args: { action: 'seriesDelete', series: 'tengah.bto.cleanup' } });
+  check('a whole series is refused while it holds readings', notPurged.body?.ok === false, JSON.stringify(notPurged.body).slice(0, 160));
+  check('…and the count is in the sentence', /still holds 2 readings/.test(String(notPurged.body?.result)), String(notPurged.body?.result ?? '').slice(0, 160));
+  const stillThere = await call('GET', '/api/metrics');
+  check('…and nothing was deleted', (stillThere.body?.series ?? []).some((s) => s.key === 'tengah.bto.cleanup'), true);
+
+  const purgedSeries = await call('POST', '/api/tool', {
+    ...tool,
+    args: { action: 'seriesDelete', series: 'tengah.bto.cleanup', purge: true },
+  });
+  check('with purge the series goes', purgedSeries.body?.ok !== false, JSON.stringify(purgedSeries.body).slice(0, 160));
+  check('…reporting the readings that went with it', /and its 2 readings/.test(String(purgedSeries.body?.result)), String(purgedSeries.body?.result ?? ''));
+  const afterPurge = await call('GET', '/api/metrics');
+  check(
+    '…and it is gone from the dashboard',
+    (afterPurge.body?.series ?? []).some((s) => s.key === 'tengah.bto.cleanup') === false,
+    JSON.stringify((afterPurge.body?.series ?? []).map((s) => s.key)),
+  );
+  check('…leaving the other series alone', (afterPurge.body?.series ?? []).length, 1);
 } catch (err) {
   fail += 1;
   console.log(`FAIL  the relay could not be driven — ${err instanceof Error ? err.message : String(err)}`);
@@ -939,6 +974,97 @@ check('…naming the columns it does have', /allowed: item/.test(text(strictRefu
 const recListed = await runMetricsTool({ kind: 'metrics' }, { action: 'objects' }, recDeps);
 check('objects lists every table', /- bto\.launch/.test(text(recListed)) && /budget\.fixed, strict\)/.test(text(recListed)), text(recListed));
 check('…with each table\u2019s columns', /columns: date:date/.test(text(recListed)), true);
+// ── 13. removing a whole shape — the half that was missing ─────────────────
+// Creating and destroying were not symmetrical: a model could merge three series
+// into a table and then had no verb to remove the three, so the old series stayed
+// for ever under a name the table now also used.
+{
+  let asked = null;
+  const deps2 = {
+    ...recordDeps(createLocalRecords()),
+    deleteSeries: async (key, opts) => {
+      asked = { key, ...opts };
+      return opts.purge
+        ? { ok: true, deleted: 12 }
+        : { ok: false, notEmpty: true, count: 12 };
+    },
+  };
+  const refused = await runMetricsTool({ kind: 'metrics' }, { action: 'seriesDelete', series: 'tengah.bto.4room' }, deps2);
+  check('a series with readings is refused without purge', refused.ok === false, true);
+  check('…and the reading COUNT comes back', /still holds 12 reading/.test(text(refused)), text(refused));
+  check('…told to ask the wearer before purging', /agreed to lose the history/.test(text(refused)), true);
+  is('…and the store was asked without purge', asked, { key: 'tengah.bto.4room', purge: false });
 
+  const purged = await runMetricsTool(
+    { kind: 'metrics' },
+    { action: 'seriesDelete', series: 'tengah.bto.4room', purge: true },
+    deps2,
+  );
+  check('with purge it deletes the series', purged.ok !== false, text(purged));
+  check('…and says how many readings went', /and its 12 readings/.test(text(purged)), true);
+  check('…and that the tables were untouched', /Tables are a separate store/.test(text(purged)), true);
+  is('…and purge reached the store', asked, { key: 'tengah.bto.4room', purge: true });
+
+  let tableAsked = null;
+  const deps3 = {
+    ...recordDeps(createLocalRecords()),
+    deleteTable: async (key, opts) => {
+      tableAsked = { key, ...opts };
+      return opts.purge ? { ok: true, deletedRecords: 26 } : { ok: false, notEmpty: true, count: 26 };
+    },
+  };
+  const tableRefused = await runMetricsTool({ kind: 'metrics' }, { action: 'tableDelete', series: 'tengah.bto.4room' }, deps3);
+  check('a table with rows is refused without purge', tableRefused.ok === false, true);
+  check('…naming the count', /still holds 26 rows/.test(text(tableRefused)), true);
+  const tableGone = await runMetricsTool(
+    { kind: 'metrics' },
+    { action: 'tableDelete', series: 'tengah.bto.4room', purge: true },
+    deps3,
+  );
+  check('with purge the table goes', /and its 26 rows/.test(text(tableGone)), true);
+  check('…and the series were untouched', /Series are a separate store/.test(text(tableGone)), true);
+  is('…and purge reached the store', tableAsked, { key: 'tengah.bto.4room', purge: true });
+
+  const missing = await runMetricsTool(
+    { kind: 'metrics' },
+    { action: 'seriesDelete', series: 'nope.thing', purge: true },
+    {
+      ...recordDeps(createLocalRecords()),
+      deleteSeries: async () => ({ ok: false, notFound: true, error: 'no' }),
+    },
+  );
+  check('a missing series says so plainly', /there is no series "nope\.thing"/.test(text(missing)), true);
+}
+
+// ── 14. a table created under a key a SERIES already uses ──────────────────
+// Legal — two stores — and exactly the mess a merge leaves behind, so creation
+// says it once. The model cannot see the duplicate from either read.
+{
+  const clashDeps = {
+    ...recordDeps(createLocalRecords()),
+    listSeries: async () => ({
+      ok: true,
+      series: [{ key: 'tengah.bto.4room', label: 'Tengah BTO 4-room', unit: 'SGD', type: 'number', count: 3 }],
+    }),
+  };
+  const wrote = await runMetricsTool(
+    { kind: 'metrics' },
+    { action: 'recordWrite', series: 'tengah.bto.4room', records: [{ key: 'r1', values: { price: 1 } }] },
+    clashDeps,
+  );
+  check('the write still succeeds', wrote.ok !== false, text(wrote));
+  check('…and the duplicate key is named', /a SERIES also uses the key "tengah\.bto\.4room"/.test(text(wrote)), text(wrote));
+  check('…with the way out', /seriesDelete/.test(text(wrote)), true);
+  // A SECOND write must not repeat it: the warning belongs to the creation.
+  const again = await runMetricsTool(
+    { kind: 'metrics' },
+    { action: 'recordWrite', series: 'tengah.bto.4room', records: [{ key: 'r2', values: { price: 2 } }] },
+    clashDeps,
+  );
+  // `check` takes a BOOLEAN, not an expected value: asserting "no warning"
+  // means negating the test, which is exactly the sort of trap this comment is
+  // here to stop the next person falling into.
+  check('…and is not repeated on every later write', !/a SERIES also uses/.test(text(again)), text(again));
+}
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

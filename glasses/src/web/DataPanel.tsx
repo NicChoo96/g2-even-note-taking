@@ -34,6 +34,20 @@ import {
 } from './metrics-client';
 import { MicButton } from './Dictate';
 import {
+  applyFilters,
+  applyRange,
+  facets,
+  fieldTitle,
+  filterCount,
+  filterLabel,
+  filterableFields,
+  rangeFromInputs,
+  rangeLabel,
+  toDateInput,
+  type RecordFilters,
+  type RecordRange,
+} from './record-view';
+import {
   CHART_KINDS,
   CHART_LABELS,
   MetricChart,
@@ -80,6 +94,16 @@ interface ViewSpec {
    * about which number matters.
    */
   field?: string;
+  /**
+   * For a TABLE: which COLUMN VALUES the view is restricted to.
+   *
+   * Excel's filter row, in the store's own vocabulary — a row survives only if it
+   * matches every restricted column. Empty is not a filter, so `{}` and absent
+   * mean "everything". Remembered with the rest of the view, per table.
+   */
+  filters?: RecordFilters;
+  /** An explicit span of dates, when the presets are not the question asked. */
+  range?: RecordRange;
 }
 
 /**
@@ -433,6 +457,75 @@ function rowWhen(row: RecordRow): string {
 }
 
 /**
+ * One column's filter, as a dropdown with a search box and checkboxes.
+ *
+ * WHY `<details>` AND NOT A POPOVER. A disclosure is keyboard-reachable, closes
+ * on Escape, and needs no outside-click listener or focus trap — three things a
+ * hand-rolled popover gets wrong, invisibly, on a phone. The search box is what
+ * the wearer asked for: with forty projects, typing two letters beats scrolling.
+ *
+ * WHY MULTI-SELECT. "4-room and 5-room" is one question about flat types, not two
+ * separate views; single-select would force a detour through "All" between them.
+ */
+function RecordFilterMenu({
+  field,
+  rows,
+  selected,
+  onChange,
+}: {
+  field: RecordField;
+  /** The UNFILTERED rows: the option list must not shrink to what is left. */
+  rows: RecordRow[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const options = facets(rows, field);
+  const q = query.trim().toLowerCase();
+  const shown = q ? options.filter((o) => o.value.toLowerCase().includes(q)) : options;
+  const toggle = (value: string) =>
+    onChange(selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value]);
+
+  return (
+    <details className={selected.length ? 'rec-filter active' : 'rec-filter'}>
+      <summary title={`Filter by ${field.key}`}>
+        <span className="rec-filter-name">{fieldTitle(field)}</span>
+        <span className="rec-filter-value">{filterLabel({ [field.key]: selected }, field)}</span>
+      </summary>
+      <div className="rec-filter-panel">
+        {options.length > 6 && (
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={`Search ${fieldTitle(field).toLowerCase()}`}
+            aria-label={`Search ${fieldTitle(field)} values`}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        )}
+        <div className="rec-filter-list" role="group" aria-label={`${fieldTitle(field)} values`}>
+          <label className="rec-filter-opt">
+            <input type="checkbox" checked={selected.length === 0} onChange={() => onChange([])} />
+            <span>All</span>
+            <em>{rows.length}</em>
+          </label>
+          {shown.slice(0, 40).map((o) => (
+            <label key={o.value} className="rec-filter-opt">
+              <input type="checkbox" checked={selected.includes(o.value)} onChange={() => toggle(o.value)} />
+              <span title={o.value}>{o.value}</span>
+              <em>{o.count}</em>
+            </label>
+          ))}
+          {shown.length > 40 && <p className="hint-line">+{shown.length - 40} more — type to narrow</p>}
+          {shown.length === 0 && <p className="hint-line">No value matches “{q}”.</p>}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+/**
  * One TABLE, read closely: its rows as a real table, and any numeric column as a
  * chart.
  *
@@ -473,17 +566,26 @@ function TableDetail({
   const chartField =
     view.field && numeric.some((f) => f.key === view.field) ? view.field : (numeric[0]?.key ?? '');
   const field = table.fields.find((f) => f.key === chartField);
+  const filters = view.filters ?? {};
+  const range = view.range;
+  /**
+   * THE ONE ROW SET. Chart, tooltip, table and counts all read from here, so the
+   * chart cannot describe rows the list does not show.
+   */
+  const matching = applyRange(applyFilters(table.records, filters), range);
   /**
    * Only rows with a place in time can be plotted, and `slot` carries the ROW KEY
    * so the chart's tooltip can find that row's other cells. A row with no date is
    * legal in this store; it simply has no x position, and the table still shows it.
    */
-  const points = table.records
+  const points = matching
     .filter((r) => typeof r.ts === 'number')
     .map((r) => ({ ts: r.ts as number, value: r.values[chartField] as number | string, slot: r.key }));
   const plotted = numericPoints(points);
   const choices = windowChoices(plotted);
-  const activeWindow = choices.some((c) => c.value === view.window) ? view.window : 'all';
+  // An explicit range IS the window, so the presets step aside rather than
+  // multiplying into "the last 3 months of 2018-2021", which nobody asked for.
+  const activeWindow = range ? 'all' : choices.some((c) => c.value === view.window) ? view.window : 'all';
   // The window is measured on the rows' own instants, then narrowed to the ones
   // that hold a number — a row whose cell is text has no y position, and the
   // chart says so by leaving it out rather than by plotting a zero.
@@ -493,13 +595,25 @@ function TableDetail({
     .filter((f) => f.key !== chartField)
     .map((f) => {
       const bySlot = new Map<string, string>();
-      for (const r of table.records) {
+      for (const r of matching) {
         const text = cellText(f, r.values[f.key]);
         if (text) bySlot.set(r.key, text);
       }
-      return { key: f.key, label: f.label || f.key, bySlot };
+      return { key: f.key, label: fieldTitle(f), bySlot };
     })
     .filter((a) => a.bySlot.size > 0);
+
+  /** The columns worth narrowing by: labels, not the numbers being plotted. */
+  const menuFields = filterableFields(table.records, table.fields);
+  /** True when the view is narrowed — a filter or an explicit range is on. */
+  const narrow = filterCount(filters) > 0 || Boolean(range);
+  const setFilter = (key: string, values: string[]) => {
+    const next: RecordFilters = { ...filters };
+    if (values.length) next[key] = values;
+    else delete next[key];
+    onView({ ...view, filters: next });
+  };
+  const clearLenses = () => onView({ ...view, filters: {}, range: undefined });
 
   const startEdit = (row: RecordRow) => {
     const next: Record<string, string> = {};
@@ -567,9 +681,9 @@ function TableDetail({
                 className={chartField === f.key ? 'active' : ''}
                 onClick={() => onView({ ...view, field: f.key })}
                 aria-pressed={chartField === f.key}
-                title={`Plot ${f.label || f.key}`}
+                title={`Plot ${fieldTitle(f)}`}
               >
-                {f.label || f.key}
+                {fieldTitle(f)}
               </button>
             ))}
           </div>
@@ -612,6 +726,56 @@ function TableDetail({
         )}
       </div>
 
+      {/* THE FILTER ROW. A table is a list of rows, and the first question about
+          a list of rows is always "which ones?" — a flat type, a project, a
+          span of dates. Without this the only lever was the y axis, so two
+          flat types drawn on one line was the view you got whether you wanted it
+          or not. */}
+      {(menuFields.length > 0 || table.records.some((r) => typeof r.ts === 'number')) && (
+        <div className="rec-filters" role="group" aria-label="Filter the rows">
+          {menuFields.map((f) => (
+            <RecordFilterMenu
+              key={f.key}
+              field={f}
+              rows={table.records}
+              selected={(filters[f.key] ?? []) as string[]}
+              onChange={(next) => setFilter(f.key, next)}
+            />
+          ))}
+          <div className="rec-range">
+            <label title="Show rows from this day">
+              <span>From</span>
+              <input
+                type="date"
+                value={toDateInput(range?.from)}
+                onChange={(e) => onView({ ...view, range: rangeFromInputs(e.target.value, toDateInput(range?.to)) })}
+              />
+            </label>
+            <label title="Show rows up to and including this day">
+              <span>To</span>
+              <input
+                type="date"
+                value={toDateInput(range?.to)}
+                onChange={(e) =>
+                  onView({ ...view, range: rangeFromInputs(toDateInput(range?.from), e.target.value) })
+                }
+              />
+            </label>
+          </div>
+          {(filterCount(filters) > 0 || range) && (
+            <button className="mm-clear" onClick={clearLenses} title="Show every row again">
+              Clear
+            </button>
+          )}
+          {(filterCount(filters) > 0 || range) && (
+            <span className="rec-filter-summary" aria-live="polite">
+              {matching.length} of {table.records.length} rows
+              {range ? ` · ${rangeLabel(range)}` : ''}
+            </span>
+          )}
+        </div>
+      )}
+
       {numeric.length === 0 && (
         <p className="hint-line">
           No numeric column yet, so there is nothing to chart. The rows are below.
@@ -641,6 +805,13 @@ function TableDetail({
         <p className="hint-line">
           No rows yet. Jarvis or an agent can add them — a new column appears as the values do.
         </p>
+      ) : matching.length === 0 ? (
+        <p className="hint-line">
+          No row matches these filters{' '}
+          <button className="mm-clear" onClick={clearLenses}>
+            Clear them
+          </button>
+        </p>
       ) : (
         <>
           <table className="metric-readings record-table">
@@ -649,14 +820,14 @@ function TableDetail({
                 <th>Row</th>
                 {columns.map((f) => (
                   <th key={f.key} className={f.type === 'number' ? 'num' : ''} title={`${f.key}: ${f.type}`}>
-                    {f.label || f.key}
+                    {fieldTitle(f)}
                   </th>
                 ))}
                 <th />
               </tr>
             </thead>
             <tbody>
-              {table.records.map((row) => (
+              {matching.map((row) => (
                 <tr key={row.key} className={editing === row.key ? 'editing' : ''}>
                   <td className="rec-key">
                     <span title={row.key}>{row.key}</span>
@@ -669,7 +840,7 @@ function TableDetail({
                           <select
                             value={draft[f.key] ?? ''}
                             onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
-                            aria-label={f.label || f.key}
+                            aria-label={fieldTitle(f)}
                           >
                             <option value="true">yes</option>
                             <option value="false">no</option>
@@ -679,7 +850,7 @@ function TableDetail({
                             value={draft[f.key] ?? ''}
                             onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
                             inputMode={f.type === 'number' ? 'decimal' : undefined}
-                            aria-label={f.label || f.key}
+                            aria-label={fieldTitle(f)}
                           />
                         )
                       ) : (
@@ -712,7 +883,7 @@ function TableDetail({
               ))}
             </tbody>
           </table>
-          {table.total > table.records.length && (
+          {!narrow && table.total > table.records.length && (
             <p className="hint-line">
               Showing the newest {table.records.length} of {table.total} rows.
             </p>
@@ -1301,6 +1472,10 @@ export function DataPanel() {
         kind: stored.kind,
         window: normaliseWindow(stored.window),
         ...(stored.field ? { field: stored.field } : {}),
+        // The lenses are part of "how this table is being looked at", so a reload
+        // must not silently drop them back to every row.
+        ...(stored.filters && Object.keys(stored.filters).length ? { filters: stored.filters } : {}),
+        ...(stored.range ? { range: stored.range } : {}),
       };
     }
     const points = numeric.length
