@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.75
+
+v0.3.75 - Data fills a desktop window
+
+- On a wide screen the Data tab now uses the window: the list of numbers is a
+wider column beside the chart, and both panes take the height that is left
+instead of stopping short and leaving the bottom of the page empty.
+- Each pane scrolls on its own, so the header, the tabs and the footer stay
+put while a long table of readings moves under them.
+- On a phone nothing moved: the numbers are still one scrolling strip.
+
 ## 0.3.74
 
 v0.3.74 - Any date, and filters built from the numbers
