@@ -2,6 +2,17 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.76
+
+v0.3.76 - A note beside a number
+
+- A reading holds one value, so a second fact about it (a project, an estate, a
+location) is stored as its own text series at the same slot; reading the number
+now joins it by slot, so the row comes back whole.
+- The store refuses an extra field on a reading instead of accepting it and then
+dropping it, and the refusal names the shape that does work.
+- Reading a series returns each slot, which is what two series have in common.
+
 ## 0.3.75
 
 v0.3.75 - Data fills a desktop window
