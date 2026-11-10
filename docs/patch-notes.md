@@ -2,6 +2,16 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.81
+
+v0.3.81 - Jarvis can find the delete
+
+- The dashboard tool still described itself as unable to empty a whole series,
+so Jarvis reported that deleting was impossible while the verb sat right there.
+It now names both delete actions and the count-first step behind them.
+- The numbers tool says plainly that it only adds and corrects, and points at
+Remove data for a whole series or table.
+
 ## 0.3.80
 
 v0.3.80 - Filter a table, and let Jarvis clear up
