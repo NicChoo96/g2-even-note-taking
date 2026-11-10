@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.78
+
+v0.3.78 - Fix or remove one reading
+
+- A reading is corrected in place by writing its slot again, and one reading
+can now be deleted by its slot, so a wrong row no longer means rebuilding the
+series.
+- A slot that is a date is used as the reading time, so a label recorded for
+2023-10-15 lands on that day instead of the moment it was typed.
+- A delete naming neither a slot nor a cutoff is refused, so no series can be
+emptied by accident.
+
 ## 0.3.77
 
 v0.3.77 - Ask a bar what it is
