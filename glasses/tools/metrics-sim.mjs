@@ -17,11 +17,11 @@
 // Run: node tools/metrics-sim.mjs
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { build } from 'esbuild';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const metricsPath = resolve(here, '../../web/server/metrics.mjs');
@@ -497,14 +497,76 @@ check('and the groups are built from the filtered list', /groupSeries\(filtered\
 // The hub validates a BATCH, so it names the field by its position in it. That
 // index describes the array this relay built, not the reading the wearer asked
 // to store, and nobody can act on it — so it goes. The dates stay.
-check(
-  'a hub refusal loses the batch index',
-  humanRejectReason('samples[0].ts 2000-12-31T16:00:00Z is outside the accepted range'),
-  'ts 2000-12-31T16:00:00Z is outside the accepted range',
-);
+check('a hub refusal loses the batch index', humanRejectReason('samples[0].ts 2000-12-31T16:00:00Z is outside the accepted range'), 'ts 2000-12-31T16:00:00Z is outside the accepted range');
 check('and keeps the reason after it', humanRejectReason('samples[12].value must be a number'), 'value must be a number');
 check('a message with no index is untouched', humanRejectReason('unknown series — declare it first'), 'unknown series — declare it first');
 check('and nothing at all is not a crash', humanRejectReason(null), '');
+
+// ── 11. the time filter is derived FROM the readings ───────────────────────
+// It used to be four fixed names (24h / 7d / 30d / All) measured back from NOW.
+// Two failures followed from that and neither is visible without looking:
+//   · an eight-year series could only reach five of its years through "All", and
+//   · a backfilled series whose newest reading is 2018 showed an EMPTY chart for
+//     every preset, because "the last 7 days" had silently become "of today".
+// A filter is a lens on the readings that exist, so both are now impossible.
+const chartPath = resolve(here, '../src/web/metric-chart.tsx');
+const chartOut = resolve(here, '.tmp-metric-window.mjs');
+await build({
+  entryPoints: [chartPath],
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  outfile: chartOut,
+  jsx: 'automatic',
+  logLevel: 'silent',
+});
+const chart = await import(`${pathToFileURL(chartOut).href}?v=${Date.now()}`);
+rmSync(chartOut, { force: true });
+
+const pt = (ts, value = 1) => ({ ts, value });
+const YEAR = 365 * 86_400_000;
+const labels = (points) => chart.windowChoices(points).map((c) => c.label);
+
+check(
+  'an 8-year series offers look-backs made from its own span',
+  labels([pt(Date.UTC(2013, 0, 1)), pt(Date.UTC(2017, 0, 1)), pt(Date.UTC(2021, 0, 1))]),
+  ['3 months', '1 year', '3 years', 'All'],
+);
+check(
+  'an 8-hour series gets hour-scale look-backs instead',
+  labels([pt(0), pt(4 * 3600e3), pt(8 * 3600e3)]),
+  ['15 min', '1 hour', 'All'],
+);
+check('two readings need no filter', labels([pt(0), pt(YEAR)]), ['All']);
+check('one reading needs no filter', labels([pt(0)]), ['All']);
+check('no readings at all is still a valid answer', labels([]), ['All']);
+// The point of deriving the list: every option is smaller than the data, so no
+// option can be "All" wearing a different label.
+check(
+  'every offered look-back is shorter than the span',
+  chart.windowChoices([pt(0), pt(YEAR), pt(2 * YEAR)]).filter((c) => c.value !== 'all').every((c) => c.value < 2 * YEAR),
+  true,
+);
+
+// The anchor is the LAST READING, which is what makes a backfilled series
+// readable. With `now` anchoring, this returned an empty chart on every preset.
+const backfilled = [pt(Date.parse('2013-01-01T00:00:00Z')), pt(Date.parse('2017-01-01T00:00:00Z')), pt(Date.parse('2018-11-04T00:00:00Z'))];
+check('a window is measured back from the newest reading, not from now', chart.pointsInWindow(backfilled, 7 * 86_400_000).length, 2);
+check('…and still contains that newest reading', chart.pointsInWindow(backfilled, 7 * 86_400_000).at(-1).ts, Date.parse('2018-11-04T00:00:00Z'));
+// ONE reading before the window opens, not the whole history: enough to start
+// the line at the left edge, not so much that "7 days" is really three years.
+check('a window keeps the reading just before it opens', chart.pointsInWindow(backfilled, 7 * 86_400_000)[0].ts, Date.parse('2017-01-01T00:00:00Z'));
+check('"all" is the whole series', chart.pointsInWindow(backfilled, 'all').length, 3);
+check('a window wider than the data keeps everything', chart.pointsInWindow(backfilled, 50 * YEAR).length, 3);
+
+// A stored view from the four-preset version is translated, not discarded.
+check('a stored 30-day window keeps its meaning', chart.normaliseWindow('30d'), 30 * 86_400e3);
+check('a stored number passes through', chart.normaliseWindow(604_800_000), 604_800_000);
+check('"all" stays "all"', chart.normaliseWindow('all'), 'all');
+check('a missing choice means all', chart.normaliseWindow(null), 'all');
+check('and so does nonsense', chart.normaliseWindow('yesterday'), 'all');
+check('zero is not a window', chart.normaliseWindow(0), 'all');
+check('nor is a negative one', chart.normaliseWindow(-5), 'all');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

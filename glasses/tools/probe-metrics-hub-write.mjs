@@ -19,8 +19,8 @@
 //   3. a genuine miss returns a NON-EMPTY error naming the key,
 //   4. the same slot twice leaves one reading (idempotency),
 //   5. backing a reading with `at` keeps its timestamp,
-//   6. a reading dated years ago is ACCEPTED (the past is data, not an error),
-//   7. and a date the store cannot hold is refused in dates, not epoch ms.
+//   6. a reading dated ANY number of years ago is accepted (no window on the past),
+//   7. a seconds value, and a future date, are refused in words.
 //
 // It touches ONLY a throwaway key (`test.probe.write`) and deletes it at the end.
 // The wearer's real series are read once and never written.
@@ -163,25 +163,39 @@ try {
   const hit = (back.json.items ?? []).find((s) => Number(s.ts) === when);
   check('a backfilled reading keeps the time it happened', Boolean(hit), `want ts=${when}, got ${JSON.stringify((back.json.items ?? []).map((s) => s.ts))}`);
 
-  // 6. A reading may be dated as far back as the store's floor.
+  // 6. ANY past date is data.
   //    The bound used to be ±365 days around NOW, which refused exactly the
   //    readings a backfill exists to store: the older the sheet, the more
   //    certainly refused. Importing 2018 was impossible and 2013 doubly so.
+  //    There is now no window on the past at all, so 1975 works too: a store for
+  //    dated readings has no business having an opinion about the year.
   const old = await tool({ action: 'write', series: PROBE, value: 1, slot: '2018-11', at: '2018-11-04T10:00+08:00' });
   check('a 2018 reading is accepted', old.json.ok === true, JSON.stringify(old.json).slice(0, 160));
+  const ancient = await tool({ action: 'write', series: PROBE, value: 2, slot: '1975-05', at: '1975-05-22T00:00+08:00' });
+  check('and so is one from 1975', ancient.json.ok === true, JSON.stringify(ancient.json).slice(0, 160));
   const oldHit = await hub('GET', `/samples?series=${encodeURIComponent(PROBE)}&from=0&limit=20`);
   check(
-    'and stored at its own date',
-    (oldHit.json.items ?? []).some((s) => Number(s.ts) === Date.parse('2018-11-04T10:00+08:00')),
+    'and both are stored at their own dates',
+    [Date.parse('2018-11-04T10:00+08:00'), Date.parse('1975-05-22T00:00+08:00')].every((ts) =>
+      (oldHit.json.items ?? []).some((s) => Number(s.ts) === ts),
+    ),
     JSON.stringify((oldHit.json.items ?? []).map((s) => s.ts)),
   );
 
-  // 7. The refusal for an impossible date names DATES, not eleven digits.
-  const refused = await tool({ action: 'write', series: PROBE, value: 1, slot: '2001-01', at: '2001-01-01T00:00+08:00' });
-  const reason = String(refused.json.error ?? '');
-  check('a pre-floor date is still refused', refused.json.ok === false);
-  check('and the refusal says the allowed dates', /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(reason), reason.slice(0, 200));
-  check('instead of two raw millisecond integers', !/must be between \d{12}/.test(reason), reason.slice(0, 200));
+  // 7. The two refusals that remain, each naming the mistake in words.
+  //    A seconds value is the one that would otherwise be stored SILENTLY and
+  //    move a reading 48 years; a future one cannot have a measurement in it.
+  const seconds = await tool({ action: 'write', series: PROBE, value: 1, slot: '2018-11b', at: 1541030400 });
+  const secondsReason = String(seconds.json.error ?? '');
+  check('a seconds value is refused', seconds.json.ok === false);
+  check('and the refusal says SECONDS', /SECONDS/.test(secondsReason), secondsReason.slice(0, 200));
+  check('and offers the fix', /multiply it by 1000/.test(secondsReason), secondsReason.slice(0, 200));
+
+  const future = await tool({ action: 'write', series: PROBE, value: 1, slot: '2030-01', at: '2030-01-01T00:00+08:00' });
+  const futureReason = String(future.json.error ?? '');
+  check('a future reading is refused', future.json.ok === false);
+  check('and the refusal is a date', /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(futureReason), futureReason.slice(0, 200));
+  check('not two raw millisecond integers', !/must be between \d{12}/.test(futureReason), futureReason.slice(0, 200));
 } catch (err) {
   failures.push('the probe could not run');
   console.log(`FAIL  the probe could not run — ${err instanceof Error ? err.message : String(err)}`);

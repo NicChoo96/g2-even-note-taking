@@ -29,10 +29,10 @@ import {
   CHART_KINDS,
   CHART_LABELS,
   MetricChart,
-  WINDOW_KINDS,
-  WINDOW_LABELS,
+  normaliseWindow,
   numericPoints,
   pointsInWindow,
+  windowChoices,
   type ChartKind,
   type WindowKind,
 } from './metric-chart';
@@ -148,7 +148,17 @@ function SeriesDetail({
   onView: (next: ViewSpec) => void;
   onDelete: () => void;
 }) {
-  const windowed = pointsInWindow(series.points, view.window, now);
+  /**
+   * The look-backs this series offers, computed from the readings themselves.
+   *
+   * A remembered choice can go stale — the series was backfilled, or the window
+   * was set when it held three points and it now holds three hundred — so a
+   * stored window that is no longer on offer falls back to "All" rather than
+   * leaving no chip lit and the chart showing something the buttons deny.
+   */
+  const choices = windowChoices(series.points);
+  const active = choices.some((c) => c.value === view.window) ? view.window : 'all';
+  const windowed = pointsInWindow(series.points, active);
   const plotted = numericPoints(windowed);
   const rows = [...windowed].reverse().slice(0, 60);
 
@@ -201,14 +211,14 @@ function SeriesDetail({
           </button>
         </div>
         <div className="md-seg" role="group" aria-label="Time window">
-          {WINDOW_KINDS.map((w) => (
+          {choices.map((c) => (
             <button
-              key={w}
-              className={view.window === w ? 'active' : ''}
-              onClick={() => onView({ ...view, window: w })}
-              aria-pressed={view.window === w}
+              key={String(c.value)}
+              className={active === c.value ? 'active' : ''}
+              onClick={() => onView({ ...view, window: c.value })}
+              aria-pressed={active === c.value}
             >
-              {WINDOW_LABELS[w]}
+              {c.label}
             </button>
           ))}
         </div>
@@ -220,9 +230,7 @@ function SeriesDetail({
 
       {rows.length === 0 ? (
         <p className="hint-line">
-          {view.window === 'all'
-            ? 'No readings yet. Nothing feeds this one — tell Jarvis a value, or add an API collector.'
-            : 'Nothing in this time window. Try “All”.'}
+          No readings yet. Nothing feeds this one — tell Jarvis a value, or add an API collector.
         </p>
       ) : (
         <>
@@ -684,8 +692,14 @@ export function DataPanel() {
    * numbers and a TABLE when it holds text, which is the only default that cannot
    * be wrong: a text series has no axis to draw.
    */
-  const viewOf = (s: MetricSeries): ViewSpec =>
-    views[s.key] ?? { kind: s.type === 'string' ? 'table' : 'line', window: 'all' };
+  const viewOf = (s: MetricSeries): ViewSpec => {
+    const stored = views[s.key];
+    // `window` may be a number, `'all'`, or one of the four old preset names —
+    // `normaliseWindow` is the one place that translation happens.
+    return stored
+      ? { kind: stored.kind, window: normaliseWindow(stored.window) }
+      : { kind: s.type === 'string' ? 'table' : 'line', window: 'all' };
+  };
 
   return (
     <div className="data-panel">

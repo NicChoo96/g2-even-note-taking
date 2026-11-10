@@ -26,34 +26,118 @@ export const CHART_LABELS: Record<ChartKind, string> = {
   step: 'Step',
 };
 
-/** How far back the detail view looks. */
-export type WindowKind = '24h' | '7d' | '30d' | 'all';
+/**
+ * How far back the detail view looks: a length in milliseconds, or everything.
+ *
+ * WHY THIS IS A NUMBER AND NOT FOUR NAMES
+ *   This used to be `'24h' | '7d' | '30d' | 'all'` — a property of the UI, not of
+ *   the readings. A series spanning eight years got the same four buttons as one
+ *   spanning eight hours, so five of its seven years were reachable only through
+ *   "All"; and "24h" was measured back from NOW, so on a series whose last
+ *   reading is from 2018 every preset except "All" was empty. A filter is a lens
+ *   on the readings that exist, so the lens is now derived FROM them —
+ *   `windowChoices` — and measured back from the last reading.
+ */
+export type WindowKind = 'all' | number;
 
-export const WINDOW_KINDS: WindowKind[] = ['24h', '7d', '30d', 'all'];
+export interface WindowChoice {
+  value: WindowKind;
+  label: string;
+}
 
-export const WINDOW_LABELS: Record<WindowKind, string> = {
-  '24h': '24h',
-  '7d': '7 days',
-  '30d': '30 days',
-  all: 'All',
-};
+/**
+ * The rungs a look-back can land on. Each one is a duration a person would say
+ * out loud; the list stops at ten years because a span longer than that is a
+ * history, and "All" is the honest name for it.
+ */
+const STEP_MS: Array<{ ms: number; label: string }> = [
+  { ms: 5 * 60e3, label: '5 min' },
+  { ms: 15 * 60e3, label: '15 min' },
+  { ms: 3600e3, label: '1 hour' },
+  { ms: 6 * 3600e3, label: '6 hours' },
+  { ms: 24 * 3600e3, label: '1 day' },
+  { ms: 3 * 24 * 3600e3, label: '3 days' },
+  { ms: 7 * 24 * 3600e3, label: '7 days' },
+  { ms: 30 * 24 * 3600e3, label: '30 days' },
+  { ms: 90 * 24 * 3600e3, label: '3 months' },
+  { ms: 365 * 24 * 3600e3, label: '1 year' },
+  { ms: 3 * 365 * 24 * 3600e3, label: '3 years' },
+  { ms: 10 * 365 * 24 * 3600e3, label: '10 years' },
+];
 
-const WINDOW_MS: Record<Exclude<WindowKind, 'all'>, number> = {
-  '24h': 24 * 3600e3,
-  '7d': 7 * 24 * 3600e3,
-  '30d': 30 * 24 * 3600e3,
-};
+/** The longest rung that is still no longer than `ms`. */
+function snapDown(ms: number): { ms: number; label: string } {
+  let best = STEP_MS[0];
+  for (const step of STEP_MS) if (step.ms <= ms) best = step;
+  return best;
+}
+
+/**
+ * The look-backs THIS series can be read at, derived from its own span.
+ *
+ * Three depths of the same data — half of it, an eighth, a thirty-second — then
+ * "All". Half/a-third-style fractions are how you actually scrub a series: the
+ * question is never "what happened in the last 24 hours" but "what happened in
+ * the last bit of this", and what "the last bit" means depends on the series. An
+ * eight-year series gets 3 months / 1 year / 3 years; an eight-hour one gets
+ * 15 min / 1 hour. Same code, no configuration, and every option contains
+ * readings.
+ */
+export function windowChoices(points: MetricPoint[]): WindowChoice[] {
+  const all: WindowChoice = { value: 'all', label: 'All' };
+  if (points.length < 3) return [all];
+  const first = points[0].ts;
+  const last = points[points.length - 1].ts;
+  const span = Math.max(first, last) - Math.min(first, last);
+  if (!(span > 0)) return [all];
+  const choices: WindowChoice[] = [];
+  for (const depth of [span / 2, span / 8, span / 32]) {
+    const step = snapDown(depth);
+    // A rung at or past the full span is "All" wearing another label.
+    if (step.ms >= span) continue;
+    if (choices.some((c) => c.value === step.ms)) continue;
+    choices.push({ value: step.ms, label: step.label });
+  }
+  choices.sort((a, b) => Number(a.value) - Number(b.value));
+  return [...choices, all];
+}
+
+/**
+ * A stored window choice, from this version or from the four-preset one.
+ *
+ * The view spec is remembered per device in localStorage, so an old `'30d'` is
+ * still on people's phones. It is translated rather than discarded: the number
+ * it stood for is exactly what the new shape stores.
+ */
+export function normaliseWindow(raw: unknown): WindowKind {
+  const legacy: Record<string, number> = {
+    '24h': 24 * 3600e3,
+    '7d': 7 * 24 * 3600e3,
+    '30d': 30 * 24 * 3600e3,
+  };
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+  return legacy[String(raw)] ?? 'all';
+}
 
 /**
  * The readings a window actually contains.
  *
+ * **Measured back from the LAST READING, not from `now`.** That is the whole
+ * difference between a lens and a trap: a backfilled series whose newest reading
+ * is from 2018 asked for "the last 7 days" and got nothing, because the question
+ * had been silently changed to "the last 7 days of today". The readings are the
+ * subject; the clock is not.
+ *
  * A window keeps the LAST point before it opens, when there is one, so a line
- * does not start at the left edge with no history: "7 days" of a once-a-day
+ * does not start at the left edge with no history: seven days of a once-a-day
  * series is otherwise six intervals and an empty seventh.
  */
-export function pointsInWindow(points: MetricPoint[], window: WindowKind, now = Date.now()): MetricPoint[] {
+export function pointsInWindow(points: MetricPoint[], window: WindowKind): MetricPoint[] {
   if (window === 'all') return points;
-  const from = now - WINDOW_MS[window];
+  const span = Number(window);
+  if (!Number.isFinite(span) || span <= 0 || points.length === 0) return points;
+  const last = points.reduce((a, b) => (b.ts > a.ts ? b : a), points[0]);
+  const from = last.ts - span;
   const inside = points.filter((p) => p.ts >= from);
   if (inside.length === points.length) return points;
   const before = [...points].reverse().find((p) => p.ts < from);
