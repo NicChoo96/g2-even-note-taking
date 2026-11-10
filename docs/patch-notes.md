@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.77
+
+v0.3.77 - Ask a bar what it is
+
+- Tap or hover a chart point to see the exact reading and any dimensions kept
+beside it, such as the project a launch went by.
+- Those come from the text series under the same name, so a number can gain
+them later; a chip row picks which ones show.
+- Chart type, window and those picks are remembered per series on this device,
+and the first guess at the type follows the readings: one price per quarter
+draws as bars, not a line through a slope.
+
 ## 0.3.76
 
 v0.3.76 - A note beside a number
