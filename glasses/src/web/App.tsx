@@ -76,6 +76,13 @@ const TAB_ORDER: Tab[] = [
   'export',
 ];
 
+/**
+ * The tabs that get the wide shell, because each is a two-pane surface: a list
+ * on the left and the thing you picked on the right. The 780px reading column
+ * that suits Notes squeezes every one of them.
+ */
+const WIDE_TABS: Tab[] = ['agents', 'jarvis', 'files', 'docs', 'data'];
+
 function tabLabel(id: Tab): string {
   if (id === 'settings') return 'Settings';
   if (id === 'jarvis') return 'Jarvis';
@@ -347,13 +354,16 @@ export default function App() {
   return (
     // `app-wide` widens the shell for the two-pane tabs: Agents (master list +
     // editor), Jarvis (live timeline + action catalog), Files (document list +
-    // sandboxed preview) and now Docs (library + editor). The 760px reading
-    // width that suits notes would squeeze all four.
+    // sandboxed preview), Docs (library + editor) and Data (a list of numbers
+    // beside the chart of one of them). The 780px reading column that suits
+    // notes squeezes all five.
+    //
+    // `app-data` is that class PLUS height: Data is the one tab whose two panes
+    // scroll on their own, so on a desktop the split fills the window instead of
+    // stopping at a 460px list and leaving the bottom half of the screen empty.
     <div
-      className={`app${
-        activeTab === 'agents' || activeTab === 'jarvis' || activeTab === 'files' || activeTab === 'docs'
-          ? ' app-wide'
-          : ''
+      className={`app${WIDE_TABS.includes(activeTab) ? ' app-wide' : ''}${
+        activeTab === 'data' ? ' app-data' : ''
       }`}
     >
       <header className="app-header">

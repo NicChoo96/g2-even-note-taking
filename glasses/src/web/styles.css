@@ -2968,8 +2968,21 @@ p.empty {
 
 /* …and at a real width it becomes the column the detail pane sits beside. */
 @media (min-width: 721px) {
-  .data-split { grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); }
-  .metric-master { flex-direction: column; overflow-x: visible; max-height: 460px; overflow-y: auto; }
+  .data-split {
+    grid-template-columns: minmax(240px, 340px) minmax(0, 1fr);
+    /* One row, stretched: the height is decided by the window (see `.app-data`),
+       never by the content, so the two panes END together. */
+    grid-template-rows: minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .metric-master {
+    flex-direction: column;
+    overflow-x: visible;
+    /* No 460px cap: the list and the pane are two views of one screen. */
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
+  }
   .mm-group { flex-direction: column; gap: 2px; width: 100%; }
   .mm-group-head {
     display: block;
@@ -2984,6 +2997,84 @@ p.empty {
   .metric-master-row { min-width: 0; width: 100%; border-color: transparent; background: transparent; }
   .metric-master-row:hover { background: var(--panel-2); }
   .metric-master-row.active { background: var(--panel-2); }
+}
+
+/* ── Data on a desktop: use the window ─────────────────────────────────────
+   The tab is a master·detail surface — a column of numbers beside the chart of
+   the one you picked — and both panes scroll independently, so the split should
+   take whatever height is LEFT rather than stopping at its content. Without
+   this the page ended at a 460px list with half a desktop window of empty space
+   under it, which reads as "unfinished" rather than "nothing more to show".
+
+   The chain is `.app` (100dvh flex column) → `main.content` → `.data-panel` →
+   `.data-split`, and every link has to pass the height down (`flex: 1` +
+   `min-height: 0`, so a tall readings table scrolls its own pane instead of
+   pushing the footer off the screen). */
+@media (min-width: 721px) {
+  /* Wider than the other two-pane tabs, because this one draws a chart in half
+     of it and a 1080px shell leaves the plot narrower than the phone's. */
+  .app-data { max-width: 1240px; }
+
+  /* A DEFINITE height, not `min-height`. `flex: 1` only distributes space that
+     exists: a container sized by its content has none to give, so the split
+     grew with the readings table and pushed the footer off the screen. Pinning
+     the shell to the viewport is what turns "as tall as the content" into "as
+     tall as the window", and `overflow: hidden` is what stops the page from
+     scrolling twice — the panes scroll, not the page. */
+  .app-data {
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  .app-data main.content {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    /* The PANEL scrolls when the window is short, never the document: the
+       header, the tabs and the footer must not slide away from a dashboard. */
+    overflow-y: auto;
+  }
+
+  .app-data .data-panel {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .app-data .data-split {
+    flex: 1 1 auto;
+    min-height: 0;
+    /* "Whatever is left" is not a size. Above this split sit a title row, the
+       three-step help and the add-bar — on a 800px window that leaves 271px,
+       which is smaller than the 460px list it replaced. So the split claims a
+       real share of the window (55dvh) and the panel scrolls for the rest. */
+    min-height: min(560px, 55dvh);
+  }
+
+  /* The search bar keeps its height; the list under it takes the rest and is
+     the thing that scrolls. */
+  .app-data .metric-master-wrap {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .app-data .metric-master { flex: 1 1 auto; }
+
+  .app-data .metric-detail-wrap {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  /* ONE scrollbar, not two. The readings used to scroll inside a 220px box
+     nested in a pane that scrolls as well; with the pane taller there is room
+     to let the rows extend and scroll the pane itself. */
+  .app-data .metric-readings {
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 .mm-top { display: flex; align-items: baseline; gap: 6px; }
