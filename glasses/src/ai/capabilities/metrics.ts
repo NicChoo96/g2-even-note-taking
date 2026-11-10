@@ -276,4 +276,71 @@ export const metricsCapabilities: Capability[] = [
       };
     },
   },
+  {
+    /**
+     * Remove ONE reading — the missing half of "record a number".
+     *
+     * WHY IT NEEDS ITS OWN CAPABILITY. `metrics.act write` can correct a value,
+     * because the same slot replaces. It cannot remove a reading that should not
+     * exist at all, and until this existed a single mistyped launch sat in the
+     * middle of a history with no verb that could reach it: the only deletes
+     * were "every reading" and "every reading older than X", and neither can
+     * take out one row from 2023.
+     *
+     * WHY `confirm`. Destructive and irreversible: a deleted reading is gone,
+     * and nothing else in this app can bring it back. Tap-to-accept costs the
+     * wearer one gesture on a rare operation and is the difference between a
+     * correction and a lost number.
+     */
+    name: 'metrics.forget',
+    page: GLOBAL_PAGE,
+    effect: 'write',
+    confirm: true,
+    title: 'Remove a reading',
+    description:
+      'Delete ONE reading from a dashboard series, named by its slot (the date or label it was ' +
+      'recorded under). Use it when the wearer says a reading is wrong and should not be there, or ' +
+      'to clean up a test row — not to correct a value, which is a `metrics act` write to the same ' +
+      'slot. `read` first: every row it returns shows its slot when the slot is not simply the ' +
+      'date, and that string is what this takes. It cannot empty a series, and nothing here can ' +
+      'recover a reading once removed.',
+    params: [
+      {
+        name: 'series',
+        type: 'string',
+        required: true,
+        description: 'The series key, e.g. "tengah.bto.4room".',
+      },
+      {
+        name: 'slot',
+        type: 'string',
+        required: true,
+        description: 'Which reading: its slot exactly as `read` printed it, e.g. "2023-10-15".',
+      },
+    ],
+    run: async (args) => {
+      const send: Record<string, unknown> = {
+        action: 'delete',
+        series: args.series ?? '',
+        slot: args.slot ?? '',
+      };
+      const reply = await runTool({ kind: 'metrics', toolId: METRICS_TOOL_ID, args: send });
+      const text = String(reply.result ?? '');
+      if (!reply.ok) {
+        const reason = String(reply.error || text || 'the relay refused the call').trim();
+        return {
+          ok: false,
+          summary: reason.length > 96 ? `${reason.slice(0, 93)}...` : reason,
+          data: { error: reason, text },
+          hint: `${reason}. Do not retry with a different slot — read the series and name a row it printed.`,
+        };
+      }
+      const firstLine = text.split('\n')[0].trim();
+      return {
+        ok: true,
+        summary: firstLine.length > 96 ? `${firstLine.slice(0, 93)}...` : firstLine || 'removed',
+        data: { text },
+      };
+    },
+  },
 ];

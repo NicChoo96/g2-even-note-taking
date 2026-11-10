@@ -843,11 +843,15 @@ assert('the jev capability offers an optional rank switch to Jarvis', /name: 'ra
 // the store IS (a unit, once set, is permanent) rather than what it holds. That
 // difference is carried by the capability's `confirm`, so it can be a
 // tap-to-accept instead of an effect gate the model learns to click through.
+//
+// metrics.forget is the thirteenth, and gated for the opposite reason: it is the
+// only capability that DESTROYS a reading. Rewriting a slot corrects a value;
+// deleting one removes it, and nothing can put it back.
 assert('the capability derives a ranking from the decision', /rankAnswers\(parsed\.value, reply\.answers\)/.test(capSrc));
 check(
-  'the app-wide catalog is jev.decide, location.get, web.search, metrics.act, metrics.declare and the seven nav/app actions',
+  'the app-wide catalog is jev.decide, location.get, web.search, metrics.act, metrics.declare, metrics.forget and the seven nav/app actions',
   ui.allCapabilities().filter((c) => c.page === ui.GLOBAL_PAGE).length,
-  12,
+  13,
 );
 
 // The invariant behind the 0.3.28 bug, stated as a test rather than a comment:

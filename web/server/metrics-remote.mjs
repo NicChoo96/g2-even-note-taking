@@ -166,9 +166,14 @@ export function createMetricsRemote({ baseUrl, token, fetchImpl = fetch, timeout
    * destructures the client, and that is exactly the kind of bug that only shows
    * up in the one code path nobody exercises.
    */
-  async function removeSamples(series, before) {
+  async function removeSamples(series, before, slot) {
     const qs = new URLSearchParams({ series: String(series) });
-    if (Number.isFinite(Number(before)) && Number(before) > 0) {
+    // `slot` names ONE reading; `before` cuts the history at a moment. They are
+    // mutually exclusive on the hub, because a caller that sent both meant one
+    // of them and guessing would make an accidental wipe look like an edit.
+    if (typeof slot === 'string' && slot.trim() !== '') {
+      qs.set('slot', slot.trim());
+    } else if (Number.isFinite(Number(before)) && Number(before) > 0) {
       qs.set('before', String(Math.floor(Number(before))));
     }
     const res = await call('DELETE', `/samples?${qs.toString()}`);

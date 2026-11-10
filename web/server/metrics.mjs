@@ -116,6 +116,36 @@ function normalisePrecision(raw, type) {
 }
 
 /**
+ * The millisecond instant a date-shaped slot names, or `null`.
+ *
+ * `2023-10-15`, `2023-10-15 13:00`, `2023-10-15T13:00` and `2026-11` are the
+ * shapes a launch, a day or a month take. A slot that is not a date (`close-1`,
+ * `london`) is not one, and keeps meaning "no time here".
+ *
+ * Mirrors the hub's `_slot_instant` on purpose — see `normaliseSample` for why the
+ * rule has to exist on both sides.
+ *
+ * The bounds are checked rather than trusted: `Date.UTC(2026, 12, 1)` does not
+ * return `NaN`, it rolls into January 2027, so an unchecked month would invent a
+ * date instead of declining to read one.
+ */
+export function slotInstant(slot) {
+  const match = /^(\d{4})-(\d{2})(?:-(\d{2}))?(?:[T ](\d{2}):(\d{2}))?$/.exec(String(slot ?? '').trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3] ?? 1);
+  const hour = Number(match[4] ?? 0);
+  const minute = Number(match[5] ?? 0);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return null;
+  const ms = Date.UTC(year, month - 1, day, hour, minute);
+  const check = new Date(ms);
+  // A day that month does not have (31 February) rolls over, so it is not a date.
+  if (check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
+  return ms;
+}
+
+/**
  * Validate one sample against its DECLARED series.
  *
  * The failure this exists to prevent: a prompt asks for a price, the endpoint
@@ -146,11 +176,19 @@ export function normaliseSample(input, series, now = Date.now()) {
   } else {
     value = String(raw ?? '').slice(0, 500);
   }
+  const slot = String(input.slot ?? '').trim().slice(0, 40);
   const tsRaw = Number(input.ts);
-  const ts = Number.isFinite(tsRaw) && tsRaw > 0 ? Math.floor(tsRaw) : now;
+  // A DATE-SHAPED SLOT IS WHEN IT HAPPENED.
+  //
+  // Mirrors the hub's `_slot_instant`, on purpose: without it the relay stamped
+  // `now` before the hub ever saw the write, so `slot: 2023-10-15` with no time
+  // landed at today 04:00 and its sibling label sat at a different place on the
+  // time axis than the price it describes. The rule lives in both places because
+  // both can be the store — a relay with no hub keeps its own readings.
+  const fromSlot = slotInstant(slot);
+  const ts = Number.isFinite(tsRaw) && tsRaw > 0 ? Math.floor(tsRaw) : (fromSlot ?? now);
   // The slot is what makes a double fire harmless. Absent, the sample is a point
   // in time, not a slot — both are allowed, but only one can deduplicate.
-  const slot = String(input.slot ?? '').trim().slice(0, 40);
   return {
     ok: true,
     sample: {

@@ -46,10 +46,12 @@ export function metricsToolSchema() {
       description:
         'Read, create and record the dashboard series the wearer keeps. `list` shows ' +
         'what exists and its latest value, `read` returns one series\u2019 history, `declare` creates a ' +
-        'series so something new can be tracked, and `write` records a value. Declare ONE well-named ' +
+        'series so something new can be tracked, `write` records a value, and `delete` removes a ' +
+        'reading. Declare ONE well-named ' +
         'series per measure (not one per day), because the unit and type are fixed once created and a ' +
         'total cap applies. Values are stored with the scheduled slot, so writing twice for the same ' +
-        'slot replaces rather than duplicates.\n\n' +
+        'slot replaces rather than duplicates \u2014 which is what makes an EDIT possible: rewrite the ' +
+        'slot to correct a wrong value, delete the slot to remove a wrong reading.\n\n' +
         'A SERIES HOLDS ONE VALUE PER SLOT. A number series takes numbers; a series declared with ' +
         'valueType "string" takes text (up to 500 characters) and is shown as a table. An ATTRIBUTE ' +
         'that belongs beside a number \u2014 an estate name, a project, a location \u2014 is its own ' +
@@ -62,9 +64,10 @@ export function metricsToolSchema() {
         properties: {
           action: {
             type: 'string',
-            enum: ['list', 'read', 'declare', 'write'],
+            enum: ['list', 'read', 'declare', 'write', 'delete'],
             description:
-              'list = what exists; read = one series\u2019 history; declare = create a series; write = store a value.',
+              'list = what exists; read = one series\u2019 history; declare = create a series; write = store a value; ' +
+              'delete = remove one reading (by slot) or those before a cutoff.',
           },
           series: {
             type: 'string',
@@ -111,8 +114,14 @@ export function metricsToolSchema() {
             type: 'string',
             description:
               'For write: WHEN the reading was taken, as an ISO date/time (2026-10-08T13:00+08:00) or ' +
-              'epoch milliseconds. Omit for \u201cnow\u201d. Send it when backfilling history, or every ' +
-              'backfilled point lands at the moment of the run.',
+              'epoch milliseconds. Omit for \u201cnow\u201d \u2014 unless the slot is itself a date, in which case ' +
+              'the slot IS the time. Send it when backfilling history.',
+          },
+          before: {
+            type: 'string',
+            description:
+              'For delete: remove readings older than this (ISO date/time or epoch milliseconds). ' +
+              'Use it only when clearing a range; the whole series is not deletable from here.',
           },
         },
         required: ['action'],
@@ -189,6 +198,7 @@ export async function runMetricsTool(tool, args, deps) {
   const read = typeof deps?.readSeries === 'function' ? deps.readSeries : null;
   const declare = typeof deps?.declareSeries === 'function' ? deps.declareSeries : null;
   const write = typeof deps?.writeSample === 'function' ? deps.writeSample : null;
+  const remove = typeof deps?.deleteSamples === 'function' ? deps.deleteSamples : null;
 
   if (action === 'list') {
     if (!list) return { ok: false, text: 'metrics are not available on this relay' };
@@ -232,9 +242,16 @@ export async function runMetricsTool(tool, args, deps) {
     // the join happens here, keyed on the slot, and each row comes back whole.
     const attrs = await siblingAttributes(key, list, read, limit);
     const rows = points.map((p) => {
-      const when = `${new Date(p.ts).toISOString().slice(0, 16).replace('T', ' ')}  ${formatNumber(p.value, res.precision)}${unit}`;
+      const iso = new Date(p.ts).toISOString();
+      const when = `${iso.slice(0, 16).replace('T', ' ')}`;
+      // THE SLOT IS HOW A ROW IS ADDRESSED. `delete` takes one, so a row that
+      // does not print its slot cannot be surgically removed from what the model
+      // was shown: it would have to guess an identity it never saw. Printed only
+      // when the slot says something the date does not.
+      const badge = p.slot && !iso.startsWith(String(p.slot)) ? ` \u00b7 slot ${p.slot}` : '';
+      const value = `${formatNumber(p.value, res.precision)}${unit}`;
       const extra = attributesAt(attrs, p);
-      return extra ? `${when} · ${extra}` : when;
+      return `${when}  ${value}${badge}${extra ? ` \u00b7 ${extra}` : ''}`;
     });
     const attrNote = attrs.length
       ? `\n(attributes joined from ${attrs.map((a) => a.key).join(', ')} by slot)`
@@ -246,6 +263,39 @@ export async function runMetricsTool(tool, args, deps) {
         `${res.truncated ? ' (newest only; ask for a smaller range if you need older ones)' : ''}:\n` +
         rows.join('\n') +
         attrNote,
+    };
+  }
+
+  if (action === 'delete') {
+    const key = String(args?.series ?? '').trim().toLowerCase();
+    if (!key) return { ok: false, text: 'delete needs a series key, e.g. "sgx.dbs.price"' };
+    const slot = String(args?.slot ?? '').trim();
+    const beforeRaw = args?.before === undefined || args?.before === null ? '' : String(args.before).trim();
+    const before = beforeRaw ? Date.parse(beforeRaw) || Number(beforeRaw) : NaN;
+    // ONE SCOPE, AND NEVER THE WHOLE SERIES. A reading is named by its slot, so
+    // that is what an edit removes; a range delete needs a cutoff. Reaching for
+    // "everything" is how a model that mis-read a question destroys a history,
+    // and the Data page already has that verb behind an explicit confirmation.
+    if (!slot && !Number.isFinite(before)) {
+      return {
+        ok: false,
+        text:
+          'delete needs a slot (one reading, e.g. "2023-10-15") or a before date (a cutoff). ' +
+          'It will not clear a whole series — read it first and name what should go.',
+      };
+    }
+    if (slot && Number.isFinite(before)) {
+      return { ok: false, text: 'send either a slot (one reading) or a before date (a cutoff), not both' };
+    }
+    if (!remove) return { ok: false, text: 'deleting readings is not available on this relay' };
+    const res = await remove(key, { slot, before: Number.isFinite(before) ? Math.floor(before) : null });
+    if (!res?.ok) return { ok: false, text: res?.error ?? `could not delete from "${key}"` };
+    const what = slot ? `reading "${slot}"` : `readings before ${new Date(before).toISOString().slice(0, 10)}`;
+    return {
+      ok: true,
+      text: res.deleted
+        ? `Deleted ${what} from "${key}"; ${res.deleted} reading(s) removed.`
+        : `Nothing to delete: "${key}" has no ${what}.`,
     };
   }
 
@@ -325,7 +375,7 @@ export async function runMetricsTool(tool, args, deps) {
     };
   }
 
-  return { ok: false, text: `unknown metrics action "${action}" — use list, read, declare or write` };
+  return { ok: false, text: `unknown metrics action "${action}" — use list, read, declare, write or delete` };
 }
 
 /** Group thousands, keep the series' precision. Never a bare float in front of a model. */

@@ -36,6 +36,7 @@ const {
   normaliseSample,
   normaliseSeries,
   seriesDefinition,
+  slotInstant,
   trimSamples,
   viewKindFor,
 } = await import(`${pathToFileURL(metricsPath).href}?v=${Date.now()}`);
@@ -604,6 +605,25 @@ check(
   chart.numericPoints([{ ts: 1, value: 'Plantation Dew', slot: '2026-11' }]).length,
   0,
 );
+
+// A DATE-SHAPED SLOT IS WHEN IT HAPPENED. The relay stamped `now` before the hub
+// ever saw the write, so a sibling label written at `slot: 2023-10-15` landed at
+// today 04:00 while its price sat at the launch: two readings describing one
+// moment, on two different days on the axis.
+const DAY0 = Date.UTC(2023, 9, 15);
+check('a date slot reads as a date', slotInstant('2023-10-15'), DAY0);
+check('a month slot is the first of that month', slotInstant('2026-11'), Date.UTC(2026, 10, 1));
+check('a slot with a time keeps it', slotInstant('2026-11-10T13:30'), Date.UTC(2026, 10, 10, 13, 30));
+check('a word is not a date', slotInstant('close-1'), null);
+check('nor is a 13th month', slotInstant('2026-13'), null);
+check('nor is 31 February', slotInstant('2026-02-31'), null);
+
+const datedSample = normaliseSample({ value: 7, slot: '2023-10-15' }, price, Date.now());
+check('a dated slot sets the reading time', datedSample.sample.ts, DAY0);
+const timedSample = normaliseSample({ value: 7, slot: 'close-1' }, price, 1_700_000_000_000);
+check('an ordinary slot still means now', timedSample.sample.ts, 1_700_000_000_000);
+const explicitTs = normaliseSample({ value: 7, slot: '2023-10-15', ts: 1_700_000_000_000 }, price, Date.now());
+check('an explicit time beats the slot', explicitTs.sample.ts, 1_700_000_000_000);
 
 const chartSrc = readFileSync(chartPath, 'utf8');
 check('the chart has a hit area per reading', /className="chart-hit"/.test(chartSrc), true);

@@ -48,7 +48,7 @@ const schema = metricsToolSchema({});
 is('the schema is a function call', schema.type, 'function');
 is('with the agreed name', schema.function.name, METRICS_TOOL_NAME);
 const fn = schema.function.parameters;
-is('four actions, and declare is one of them', fn.properties.action.enum, ['list', 'read', 'declare', 'write']);
+is('five actions, and declare is one of them', fn.properties.action.enum, ['list', 'read', 'declare', 'write', 'delete']);
 is(
   'declare takes the schema fields, not just a key',
   ['label', 'unit', 'valueType', 'cadence'].filter((k) => k in fn.properties),
@@ -370,10 +370,60 @@ check(
 // NOT 'declare' any more — that is a real action now, and using it here made the
 // test pass for the wrong reason (it refused only because no declare dependency
 // was supplied). A test whose "unknown" input became known is a test that stopped
-// covering anything.
-const unknown = await runMetricsTool({ kind: 'metrics' }, { action: 'delete', series: 'x.y' }, {});
+// covering anything. It happened AGAIN with 'delete': the assertion went on
+// passing because a delete with no slot is refused, which is a different rule.
+const unknown = await runMetricsTool({ kind: 'metrics' }, { action: 'append', series: 'x.y' }, {});
 check('an unknown action is refused', unknown.ok === false, 'an unknown action was accepted');
-check('and lists the valid ones', /list, read, declare or write/.test(text(unknown)), true);
+check('and lists the valid ones', /list, read, declare, write or delete/.test(text(unknown)), true);
+
+// ── 4b. delete: ONE reading, named by its slot ─────────────────────────────
+// A reading is named by its slot, so that is what an edit removes. Before this
+// the only deletes were "everything" and "everything older", which cannot take
+// one mistyped launch out of the middle of a history.
+let deleted = null;
+const deletedOne = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'delete', series: 'tengah.bto.4room', slot: '2023-10-15' },
+  {
+    deleteSamples: async (key, scope) => {
+      deleted = { key, ...scope };
+      return { ok: true, deleted: 1 };
+    },
+  },
+);
+check('delete reaches the store with the slot', deleted, { key: 'tengah.bto.4room', slot: '2023-10-15', before: null });
+check('and reports what went', /Deleted reading "2023-10-15"/.test(text(deletedOne)), text(deletedOne));
+
+const nothing = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'delete', series: 'tengah.bto.4room', slot: '2023-10-15' },
+  { deleteSamples: async () => ({ ok: true, deleted: 0 }) },
+);
+check('nothing matched is a receipt, not a failure', nothing.ok, true);
+check('…and says nothing was there', /Nothing to delete/.test(text(nothing)), text(nothing));
+
+const noScope = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'delete', series: 'tengah.bto.4room' },
+  { deleteSamples: async () => ({ ok: true, deleted: 99 }) },
+);
+check('a delete with no scope is refused', !noScope.ok, text(noScope));
+check('…so a series cannot be emptied by accident', /will not clear a whole series/.test(text(noScope)), text(noScope));
+
+const bothScopes = await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'delete', series: 'tengah.bto.4room', slot: '2023-10-15', before: '2024-01-01' },
+  { deleteSamples: async () => ({ ok: true, deleted: 1 }) },
+);
+check('slot and before together are refused', !bothScopes.ok, text(bothScopes));
+
+let cutoff = null;
+await runMetricsTool(
+  { kind: 'metrics' },
+  { action: 'delete', series: 'tengah.bto.4room', before: '2024-01-01' },
+  { deleteSamples: async (_key, scope) => ((cutoff = scope.before), { ok: true, deleted: 3 }) },
+);
+check('a cutoff delete sends a timestamp', Number.isFinite(cutoff), true);
 
 // ── 5b. A WEEK OF NEWS, one write per day ─────────────────────────────────
 // The ask this exists for: "search the news for rate-cut mentions each day this

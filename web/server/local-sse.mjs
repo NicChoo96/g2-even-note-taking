@@ -3791,6 +3791,55 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Delete readings: all of them, those before a cutoff, or exactly ONE.
+  //
+  // `slot` is what makes an edit possible on a store whose readings are NAMED by
+  // slot. Fix a wrong value by rewriting that slot; remove a stray reading by
+  // deleting it. Before this the only verbs were "everything" and "everything
+  // older than X", so a single bad reading in the middle of a history — a
+  // typo'd launch, a test row — could not be reached at all, and the only fix
+  // was to delete the whole series and re-write it.
+  if (url.pathname === '/api/metrics/samples' && req.method === 'DELETE') {
+    const owner = requireOwner(req, url);
+    if (!owner) {
+      json(res, 401, { ok: false, error: 'owner sign-in required' });
+      return;
+    }
+    const key = String(url.searchParams.get('series') ?? '').trim().toLowerCase();
+    const slot = String(url.searchParams.get('slot') ?? '').trim();
+    const beforeRaw = Number(url.searchParams.get('before'));
+    const before = Number.isFinite(beforeRaw) && beforeRaw > 0 ? Math.floor(beforeRaw) : null;
+    if (!key) {
+      json(res, 400, { ok: false, error: 'a delete needs a series key' });
+      return;
+    }
+    // One scope only. A caller that sent both meant one of them, and guessing
+    // would turn an accidental wipe into something that looked like an edit.
+    if (slot && before !== null) {
+      json(res, 400, { ok: false, error: 'send either slot (one reading) or before (a cutoff), not both' });
+      return;
+    }
+    if (metricsRemote) {
+      const removed = await metricsRemote.removeSamples(key, before, slot);
+      if (!removed.ok) {
+        json(res, removed.status === 404 ? 404 : 502, { ok: false, error: removed.error || 'the hub refused the delete' });
+        return;
+      }
+      json(res, 200, { ...(await metricsPayload()), series: key, slot: slot || null, before, deleted: removed.deleted });
+      return;
+    }
+    const all = metricStore.samples[key] ?? [];
+    const keep = slot
+      ? all.filter((s) => String(s.slot ?? '') !== slot)
+      : before !== null
+        ? all.filter((s) => Number(s.ts) >= before)
+        : [];
+    metricStore.samples[key] = keep;
+    saveMetrics();
+    json(res, 200, { ...(await metricsPayload()), series: key, slot: slot || null, before, deleted: all.length - keep.length });
+    return;
+  }
+
   // Append samples directly — the door an agent or a script uses when the number
   // was already fetched by something else. Idempotent by `slot`.
   if (url.pathname === '/api/metrics/samples' && req.method === 'POST') {
@@ -5848,8 +5897,7 @@ function metricToolDeps() {
     },
 
     async writeSample(input) {
-      // THE HUB IS THE TRUTH IN HUB MODE. A series created straight on the hub
-      // (which is what `declare` does) is not in `cronConfig.series` — that only
+      // THE HUB IS THE TRUTH IN HUB MODE. A series created straight on the hub      // (which is what `declare` does) is not in `cronConfig.series` — that only
       // holds what the SCHEDULE document declared — and `metricStore` is empty.
       // Looking only at those two is why `list` showed six psi.* series and
       // every write to them answered "unknown series".
@@ -5895,6 +5943,30 @@ function metricToolDeps() {
      */
     async declareSeries(input) {
       return declareMetricSeries(input);
+    },
+
+    /**
+     * Delete readings: one by its slot, or everything before a cutoff.
+     *
+     * A reading is NAMED by its slot, which is what makes an edit addressable:
+     * correct one by rewriting that slot, remove a stray one by deleting it.
+     * The whole-history case is deliberately NOT reachable from here — the Data
+     * page asks for that with an explicit flag, and a model that can wipe a
+     * series' history in one call will eventually do it by accident.
+     */
+    async deleteSamples(key, { slot = '', before = null } = {}) {
+      if (metricsRemote) {
+        const res = await metricsRemote.removeSamples(key, before, slot);
+        if (!res.ok) return { ok: false, error: res.error || 'the hub refused the delete' };
+        return { ok: true, deleted: res.deleted };
+      }
+      const all = metricStore.samples[key] ?? [];
+      const keep = slot
+        ? all.filter((s) => String(s.slot ?? '') !== slot)
+        : all.filter((s) => Number(s.ts) >= Number(before ?? 0));
+      metricStore.samples[key] = keep;
+      saveMetrics();
+      return { ok: true, deleted: all.length - keep.length };
     },
   };
 }

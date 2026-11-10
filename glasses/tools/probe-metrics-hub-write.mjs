@@ -231,6 +231,33 @@ try {
   const extraReason = String(extraField.json?.details?.rejected?.[0]?.error ?? '');
   check('an extra field on a reading is refused', extraField.status === 400, `status ${extraField.status}`);
   check('…and the refusal teaches the sibling shape', /own series written at the same slot/.test(extraReason), extraReason.slice(0, 200));
+
+  // 9. A DATE-SHAPED SLOT IS WHEN IT HAPPENED, and one reading can be removed.
+  //    Both were broken: a sibling written with `slot: 2023-10-15` and no `ts`
+  //    was stamped NOW (so the label sat at today 04:00, off its price), and a
+  //    stray reading in the middle of a history had no delete that could reach
+  //    it — the only scopes were "everything" and "everything older".
+  const dated = await tool({ action: 'write', series: PROBE, value: 7, slot: '2023-10-15' });
+  check('a dated slot writes', dated.json.ok === true, JSON.stringify(dated.json).slice(0, 140));
+  const withDate = await tool({ action: 'read', series: PROBE, limit: 20 });
+  const datedRow = String(withDate.json.result ?? '')
+    .split('\n')
+    .find((line) => /2023-10-15/.test(line)) ?? '';
+  check('…stamped with that date, not with now', /2023-10-15 00:00/.test(datedRow), datedRow || '(no 2023 row)');
+
+  const removedOne = await tool({ action: 'delete', series: PROBE, slot: '2023-10-15' });
+  check('one reading can be deleted by its slot', removedOne.json.ok === true, JSON.stringify(removedOne.json).slice(0, 160));
+  check('…and the receipt says how many', /1 reading\(s\) removed/.test(String(removedOne.json.result)), String(removedOne.json.result ?? '').slice(0, 160));
+  const afterDelete = await tool({ action: 'read', series: PROBE, limit: 20 });
+  const survivors = String(afterDelete.json.result ?? '');
+  check('…and only that one went', /2023-10-15/.test(survivors) === false && /2018-11-04/.test(survivors), survivors.slice(0, 240));
+
+  const againDelete = await tool({ action: 'delete', series: PROBE, slot: '2023-10-15' });
+  check('deleting it twice is a receipt, not a failure', againDelete.json.ok === true && /Nothing to delete/.test(String(againDelete.json.result)), String(againDelete.json.result ?? '').slice(0, 140));
+
+  const noScope = await tool({ action: 'delete', series: PROBE });
+  check('a delete with no scope is refused', noScope.json.ok === false);
+  check('…so a series cannot be emptied by a model mistake', /will not clear a whole series/.test(String(noScope.json.result)), String(noScope.json.result ?? '').slice(0, 160));
 } catch (err) {
   failures.push('the probe could not run');
   console.log(`FAIL  the probe could not run — ${err instanceof Error ? err.message : String(err)}`);

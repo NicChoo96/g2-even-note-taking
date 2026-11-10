@@ -78,11 +78,12 @@ export { __calls, __setReply } from './web/agents-client.ts';
 });
 const { metricsCapabilities, METRICS_TEXT_CHARS, __calls, __setReply } = await import(pathToFileURL(outfile).href);
 
-// ── 1. two capabilities: act freely, declare behind a tap ──────────────
+// ── 1. three capabilities: act freely, declare and forget behind a tap ──
 // They are deliberately separate: the confirmation gate is per-capability, so
 // folding `declare` into `act` would either strip the tap from creating a series
-// or add one to every read.
-check('two capabilities', metricsCapabilities.length, 2);
+// or add one to every read. `forget` is gated for the opposite reason — it is the
+// only one that DESTROYS a reading, and nothing can bring one back.
+check('three capabilities', metricsCapabilities.length, 3);
 const cap = metricsCapabilities.find((c) => c.name === 'metrics.act');
 const declareCap = metricsCapabilities.find((c) => c.name === 'metrics.declare');
 checkTrue('act exists', Boolean(cap));
@@ -99,6 +100,28 @@ check('and not gated behind a tap', cap.confirm, undefined);
 check('declare is app-wide too', declareCap.page, 'global');
 check('declare is a write', declareCap.effect, 'write');
 check('and it IS gated behind a tap', declareCap.confirm, true);
+
+// ── 1b. forget: the one capability that destroys a reading ─────────────────
+// A deleted reading cannot be recovered, so it takes a slot the wearer has to
+// confirm — and it deliberately cannot reach the whole series.
+const forgetCap = metricsCapabilities.find((c) => c.name === 'metrics.forget');
+checkTrue('forget exists', Boolean(forgetCap));
+check('forget is app-wide', forgetCap.page, 'global');
+check('forget is gated behind a tap', forgetCap.confirm, true);
+check('forget takes the series and the slot', forgetCap.params.filter((p) => p.required).map((p) => p.name), ['series', 'slot']);
+check('and says nothing can bring a reading back', /recover/i.test(forgetCap.description), true);
+
+__setReply({ ok: true, result: 'Deleted reading "2023-10-15" from "tengah.bto.4room"; 1 reading(s) removed.' });
+await forgetCap.run({ series: 'tengah.bto.4room', slot: '2023-10-15' });
+const forgetCall = __calls[__calls.length - 1];
+check('forget asks the relay to delete', forgetCall.args.action, 'delete');
+check('…naming one reading', forgetCall.args.slot, '2023-10-15');
+check('…and never a cutoff', 'before' in forgetCall.args, false);
+
+__setReply({ ok: false, error: 'a delete needs a slot', result: '' });
+const forgetFailed = await forgetCap.run({ series: 'tengah.bto.4room', slot: '' });
+check('a refused forget is not a success', forgetFailed.ok, false);
+check('…and repeats the relay sentence', /needs a slot/.test(String(forgetFailed.summary)), true);
 check(
   'declare asks for the schema, not just a key',
   declareCap.params.map((p) => p.name),
