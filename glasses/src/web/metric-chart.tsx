@@ -12,8 +12,8 @@
 //   type) and the wearer chooses how to look at it. So the chart type is a LOCAL
 //   view choice — it changes nothing on the hub, which is also why it is safe to
 //   remember per device.
+import { useState } from 'react';
 import type { MetricPoint } from './metrics-client';
-
 /** What the wearer can switch between. `table` is not drawn — the caller renders rows. */
 export type ChartKind = 'line' | 'area' | 'bar' | 'step';
 
@@ -145,13 +145,58 @@ export function pointsInWindow(points: MetricPoint[], window: WindowKind): Metri
 }
 
 /** Only the readings a chart can draw. A string series is a table, full stop. */
-export function numericPoints(points: MetricPoint[]): Array<{ ts: number; value: number }> {
-  const out: Array<{ ts: number; value: number }> = [];
+export interface ChartPoint {
+  ts: number;
+  value: number;
+  /** What an attribute series is joined on. See `AttributeSeries`. */
+  slot?: string;
+}
+
+/**
+ * One dimension that sits BESIDE the value: a project name, an estate, a
+ * location. It is its own text series at the same slot — the store holds one
+ * value per reading — and it reaches the chart already keyed by slot.
+ *
+ * Nothing here knows what the dimensions MEAN. `tengah.bto.4room.project` is not
+ * a special case; whatever sibling text series a series has get offered, so the
+ * same chart shows a BTO project today and anything else tomorrow.
+ */
+export interface AttributeSeries {
+  key: string;
+  label: string;
+  bySlot: Map<string, string>;
+}
+
+export function numericPoints(points: MetricPoint[]): ChartPoint[] {
+  const out: ChartPoint[] = [];
   for (const p of points) {
     const n = typeof p.value === 'number' ? p.value : Number(String(p.value).replace(/,/g, '').trim());
-    if (Number.isFinite(n)) out.push({ ts: p.ts, value: n });
+    if (Number.isFinite(n)) out.push({ ts: p.ts, value: n, ...(p.slot ? { slot: p.slot } : {}) });
   }
   return out;
+}
+
+/**
+ * The chart a series ASKS for, before anyone has chosen.
+ *
+ * A line says "this moved continuously"; a bar says "this happened, once per
+ * period". Which one is honest is a property of the READINGS, not of taste: a
+ * price quoted every minute is a trace, while a BTO launch priced once a quarter
+ * is a set of events, and drawing it as a line invents a slope between two
+ * launches that never existed.
+ *
+ * So the default follows the gap between readings: months apart reads as bars,
+ * days apart reads as a line. Anyone can override it — this is only the first
+ * guess, and it is stored once they do.
+ */
+export function defaultKind(points: MetricPoint[]): ChartKind {
+  const ts = points.map((p) => p.ts).sort((a, b) => a - b);
+  if (ts.length < 3) return 'line';
+  const gaps: number[] = [];
+  for (let i = 1; i < ts.length; i += 1) gaps.push(ts[i] - ts[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const median = gaps[Math.floor(gaps.length / 2)];
+  return median >= 20 * 24 * 3600e3 ? 'bar' : 'line';
 }
 
 function tick(n: number, precision: number): string {
@@ -160,6 +205,19 @@ function tick(n: number, precision: number): string {
   const [whole, frac] = fixed.split('.');
   const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   return frac ? `${grouped}.${frac}` : grouped;
+}
+
+/**
+ * The full timestamp, for a tooltip.
+ *
+ * The axis label says `11/1` because that is all the space there is; a tooltip
+ * exists to answer the question the axis could not, so it says the year, the day
+ * and the minute.
+ */
+function fullStamp(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function stamp(ts: number, span: number): string {
@@ -177,12 +235,27 @@ export function MetricChart({
   kind,
   unit,
   precision,
+  attributes,
 }: {
-  points: Array<{ ts: number; value: number }>;
+  points: ChartPoint[];
   kind: ChartKind;
   unit: string;
   precision: number;
+  /**
+   * The dimensions that sit beside the value, already keyed by slot. Empty for a
+   * series with no siblings — the chart is then exactly what it was before.
+   */
+  attributes?: AttributeSeries[];
 }) {
+  /**
+   * Which reading is being examined, if any.
+   *
+   * A tap (or a hover) is the only way to ask "which launch is that bar?" — the
+   * axis can say the month and nothing else, and the project name lives in a
+   * different series. Held here rather than in the parent because it is a
+   * property of looking at the chart, not of the series.
+   */
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
   if (!points.length) {
     return <p className="hint-line chart-empty">No readings in this window.</p>;
   }
@@ -214,7 +287,19 @@ export function MetricChart({
   const max = rawMax === min ? min + 1 : rawMax;
   const span = max - min;
 
-  const xAt = (i: number) => padL + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  /**
+   * Where reading `i` sits.
+   *
+   * A LINE runs edge to edge — the first point is the left axis, the last is the
+   * right one. A BAR cannot: centred on the axis it hangs half outside the plot
+   * and collides with its own value label, which is exactly what the first BTO
+   * launch did. A bar therefore owns a BAND, and sits in the middle of it.
+   */
+  const band = plotW / Math.max(1, points.length);
+  const xAt = (i: number) =>
+    kind === 'bar'
+      ? padL + band * (i + 0.5)
+      : padL + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
   const yAt = (v: number) => padT + plotH - ((v - min) / span) * plotH;
 
   const line = points.map((p, i) => `${xAt(i).toFixed(2)},${yAt(p.value).toFixed(2)}`);
@@ -229,7 +314,36 @@ export function MetricChart({
     return { v, y: yAt(v) };
   });
 
-  const barW = Math.max(1.5, (plotW / points.length) * 0.68);
+  const barW = Math.max(1.5, band * 0.68);
+
+  /**
+   * The tooltip, when one is showing.
+   *
+   * Built here rather than inline so the box is sized to its WIDEST line before
+   * it is drawn — a box that grows after the text is how a tooltip ends up with
+   * a line hanging out of the side of it.
+   */
+  const active =
+    activeIndex !== null && points[activeIndex]
+      ? (() => {
+          const p = points[activeIndex];
+          // The dimensions, joined on the slot. Nothing here knows what they
+          // mean; whatever text series sit beside this one are shown.
+          const attrs = (attributes ?? []).flatMap((a) => {
+            const value = p.slot ? a.bySlot.get(p.slot) : undefined;
+            return value ? [`${a.label}: ${value}`] : [];
+          });
+          const lines = [fullStamp(p.ts), `${tick(p.value, precision)}${unit ? ` ${unit}` : ''}`, ...attrs];
+          const boxW = Math.min(W - 8, Math.max(120, Math.ceil(Math.max(...lines.map((l) => l.length)) * 6.4 + 16)));
+          const boxH = 12 + lines.length * 14;
+          const x = xAt(activeIndex);
+          const y = yAt(p.value);
+          const boxX = Math.min(Math.max(x - boxW / 2, 4), W - boxW - 4);
+          // Above the point when there is room, below it when there is not.
+          const boxY = y - boxH - 12 >= padT ? y - boxH - 12 : Math.min(y + 12, padT + plotH - boxH);
+          return { index: activeIndex, lines, boxW, boxH, boxX, boxY };
+        })()
+      : null;
 
   return (
     <svg className="metric-chart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`${kind} chart of ${points.length} readings`}>
@@ -283,9 +397,7 @@ export function MetricChart({
       )}
 
       {points.map((p, i) => (
-        <circle key={`d-${p.ts}-${i}`} className="chart-dot" cx={xAt(i)} cy={yAt(p.value)} r={points.length > 60 ? 0 : 2}>
-          <title>{`${stamp(p.ts, timeSpan)} · ${tick(p.value, precision)}${unit ? ` ${unit}` : ''}`}</title>
-        </circle>
+        <circle key={`d-${p.ts}-${i}`} className="chart-dot" cx={xAt(i)} cy={yAt(p.value)} r={points.length > 60 ? 0 : 2} />
       ))}
 
       <text className="chart-tick" x={padL} y={H - 6} textAnchor="start">
@@ -294,6 +406,52 @@ export function MetricChart({
       <text className="chart-tick" x={W - padR} y={H - 6} textAnchor="end">
         {stamp(t1, timeSpan)}
       </text>
+
+      {/* A strip per reading, not a hit test on a 2px dot: a thumb on a phone
+          cannot aim at the dot, and a bar chart's target is the bar's column. */}
+      {points.map((p, i) => {
+        const hitW = kind === 'bar' ? band : plotW / Math.max(1, points.length - 1);
+        return (
+          <rect
+            key={`hit-${p.ts}-${i}`}
+            className="chart-hit"
+            x={xAt(i) - hitW / 2}
+            y={padT}
+            width={Math.max(4, hitW)}
+            height={plotH}
+            onPointerDown={() => setActiveIndex(i)}
+            onPointerEnter={(e) => {
+              // Mouse hovers; a finger does not, and treating its touch-enter as
+              // a hover would show a tooltip the user cannot then dismiss.
+              if (e.pointerType === 'mouse') setActiveIndex(i);
+            }}
+          />
+        );
+      })}
+
+      {active && (
+        <g className="chart-tip" pointerEvents="none">
+          <line className="chart-guide" x1={xAt(active.index)} x2={xAt(active.index)} y1={padT} y2={padT + plotH} />
+          <rect
+            className="chart-tip-box"
+            x={active.boxX}
+            y={active.boxY}
+            width={active.boxW}
+            height={active.boxH}
+            rx={6}
+          />
+          {active.lines.map((text, i) => (
+            <text
+              key={`${text}-${i}`}
+              className={i === 0 ? 'chart-tip-when' : 'chart-tip-line'}
+              x={active.boxX + 8}
+              y={active.boxY + 16 + i * 14}
+            >
+              {text}
+            </text>
+          ))}
+        </g>
+      )}
     </svg>
   );
 }

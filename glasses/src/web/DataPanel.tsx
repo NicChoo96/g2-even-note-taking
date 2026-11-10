@@ -29,10 +29,12 @@ import {
   CHART_KINDS,
   CHART_LABELS,
   MetricChart,
+  defaultKind,
   normaliseWindow,
   numericPoints,
   pointsInWindow,
   windowChoices,
+  type AttributeSeries,
   type ChartKind,
   type WindowKind,
 } from './metric-chart';
@@ -52,6 +54,15 @@ type ViewKind = ChartKind | 'table';
 interface ViewSpec {
   kind: ViewKind;
   window: WindowKind;
+  /**
+   * WHICH dimensions sit beside the value in the chart, by attribute series key.
+   *
+   * Absent means "whatever this series has" — so a series that gains an
+   * attribute later shows it without anyone re-configuring anything, and a
+   * choice made once is remembered. Stored with the rest of the view, per series,
+   * in localStorage; nothing about it is a property of the store.
+   */
+  fields?: string[];
 }
 
 function daysLabel(days: number[] | null): string {
@@ -139,6 +150,7 @@ function SeriesDetail({
   view,
   onView,
   onDelete,
+  attributes,
 }: {
   series: MetricSeries;
   collector?: Collector;
@@ -147,6 +159,8 @@ function SeriesDetail({
   view: ViewSpec;
   onView: (next: ViewSpec) => void;
   onDelete: () => void;
+  /** Text series that sit beside this one, keyed by slot. See `AttributeSeries`. */
+  attributes: AttributeSeries[];
 }) {
   /**
    * The look-backs this series offers, computed from the readings themselves.
@@ -161,6 +175,16 @@ function SeriesDetail({
   const windowed = pointsInWindow(series.points, active);
   const plotted = numericPoints(windowed);
   const rows = [...windowed].reverse().slice(0, 60);
+  // Which dimensions are shown: the ones chosen, or all of them when nobody has
+  // chosen yet — a series that gains an attribute should reveal it rather than
+  // stay silent until someone finds a toggle.
+  const chosen = view.fields ?? attributes.map((a) => a.key);
+  const shown = attributes.filter((a) => chosen.includes(a.key));
+  const alsoAt = (slot?: string) =>
+    shown.flatMap((a) => {
+      const value = slot ? a.bySlot.get(slot) : undefined;
+      return value ? [`${a.label}: ${value}`] : [];
+    });
 
   return (
     <section className="metric-detail">
@@ -224,8 +248,43 @@ function SeriesDetail({
         </div>
       </div>
 
+      {/* Which dimensions ride along. This is the "how the view looks" switch for
+          multi-dimensional data: the labels come from whatever text series sit
+          beside this one, so nothing here is BTO-specific, and the choice is
+          remembered with the rest of the view. */}
+      {attributes.length > 0 && (
+        <div className="md-attrs" role="group" aria-label="Show beside the value">
+          <span className="md-attrs-label">Also show</span>
+          {attributes.map((a) => {
+            const on = chosen.includes(a.key);
+            return (
+              <button
+                key={a.key}
+                className={on ? 'md-attr-chip active' : 'md-attr-chip'}
+                aria-pressed={on}
+                onClick={() =>
+                  onView({
+                    ...view,
+                    fields: on ? chosen.filter((k) => k !== a.key) : [...chosen, a.key],
+                  })
+                }
+                title={on ? `Hide ${a.label} in the chart` : `Show ${a.label} in the chart`}
+              >
+                {a.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {series.type === 'number' && view.kind !== 'table' && plotted.length > 0 ? (
-        <MetricChart points={plotted} kind={view.kind} unit={series.unit} precision={series.precision} />
+        <MetricChart
+          points={plotted}
+          kind={view.kind}
+          unit={series.unit}
+          precision={series.precision}
+          attributes={shown}
+        />
       ) : null}
 
       {rows.length === 0 ? (
@@ -239,6 +298,7 @@ function SeriesDetail({
               <tr>
                 <th>When</th>
                 <th className="num">Value</th>
+                {shown.length > 0 && <th>Also</th>}
               </tr>
             </thead>
             <tbody>
@@ -246,6 +306,7 @@ function SeriesDetail({
                 <tr key={`${p.ts}-${i}`}>
                   <td>{new Date(p.ts).toLocaleString()}</td>
                   <td className="num">{formatValue(series, p.value)}</td>
+                  {shown.length > 0 && <td className="metric-also">{alsoAt(p.slot).join(' · ')}</td>}
                 </tr>
               ))}
             </tbody>
@@ -696,9 +757,37 @@ export function DataPanel() {
     const stored = views[s.key];
     // `window` may be a number, `'all'`, or one of the four old preset names —
     // `normaliseWindow` is the one place that translation happens.
-    return stored
-      ? { kind: stored.kind, window: normaliseWindow(stored.window) }
-      : { kind: s.type === 'string' ? 'table' : 'line', window: 'all' };
+    if (stored) {
+      return {
+        kind: stored.kind,
+        window: normaliseWindow(stored.window),
+        ...(Array.isArray(stored.fields) ? { fields: stored.fields } : {}),
+      };
+    }
+    // Nothing chosen yet: pick the kind the READINGS ask for. A launch priced
+    // once a quarter is a bar, not a line through a slope nobody measured.
+    return { kind: s.type === 'string' ? 'table' : defaultKind(s.points), window: 'all' };
+  };
+
+  /**
+   * The text series that sit BESIDE this one: `tengah.bto.4room` + its
+   * `…​.project` / `.estate`. Discovered by prefix rather than configured, so the
+   * chart works for whatever a series has now — and for whatever it gains later
+   * — instead of knowing about BTO launches specifically.
+   */
+  const attributesFor = (target: MetricSeries): AttributeSeries[] => {
+    const prefix = `${target.key}.`;
+    return series
+      .filter((s) => s.type === 'string' && s.key.startsWith(prefix))
+      .map((s) => {
+        const bySlot = new Map<string, string>();
+        for (const p of s.points) {
+          const text = p.value === null || p.value === undefined ? '' : String(p.value).trim();
+          if (p.slot && text) bySlot.set(p.slot, text);
+        }
+        return { key: s.key, label: s.label || s.key.slice(prefix.length), bySlot };
+      })
+      .filter((a) => a.bySlot.size > 0);
   };
 
   return (
@@ -833,6 +922,7 @@ export function DataPanel() {
               view={viewOf(selected)}
               onView={(next) => setViews((v) => ({ ...v, [selected.key]: next }))}
               onDelete={() => void removeSeries(selected.key)}
+              attributes={attributesFor(selected)}
             />
           ) : (
             <p className="hint-line">Nothing to show yet.</p>

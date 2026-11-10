@@ -6002,7 +6002,12 @@ async function metricsPayload() {
     delta: deltaOf(samples),
     view: viewKindFor(def, Math.min(samples.length, 200)),
     provenance: describeSample(latestOf(samples)),
-    points: samples.slice(-240).map((s) => ({ ts: s.ts, value: s.value })),
+    // `slot` travels with each point because it is the reading's IDENTITY: it is
+    // what a chart needs to join an attribute (a project, an estate) that lives
+    // in its own text series at the same slot. Without it the tooltip can only
+    // guess, and timestamps do not line up: a launch's price and its project
+    // name are minutes apart even when they describe the same moment.
+    points: samples.slice(-240).map((s) => ({ ts: s.ts, value: s.value, ...(s.slot ? { slot: s.slot } : {}) })),
   });
 
   if (metricsRemote) {

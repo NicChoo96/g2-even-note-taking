@@ -3174,6 +3174,80 @@ p.empty {
 .chart-dot { fill: var(--accent); }
 .chart-empty { margin: 14px 0; }
 
+/* ── the tooltip ───────────────────────────────────────────────────────────
+   A tap on a phone, a hover with a mouse. The strip that receives it is
+   invisible and one reading wide, because a thumb cannot aim at a 2px dot. */
+.chart-hit {
+  fill: transparent;
+  pointer-events: all;
+  cursor: crosshair;
+  touch-action: manipulation;
+}
+
+.chart-guide {
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+}
+
+.chart-tip-box {
+  fill: var(--panel);
+  stroke: var(--accent);
+  stroke-width: 1;
+  opacity: 0.98;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.45));
+}
+
+.chart-tip-when {
+  fill: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+
+.chart-tip-line {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ── dimensions beside the value ───────────────────────────────────────────── */
+.md-attrs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.md-attrs-label {
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.md-attr-chip {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  font-size: 11px;
+  padding: 4px 10px;
+  min-height: 28px;
+  cursor: pointer;
+}
+
+.md-attr-chip.active {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.metric-also {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 /* ── the readings themselves ──────────────────────────────────────────────── */
 .metric-readings {
   width: 100%;

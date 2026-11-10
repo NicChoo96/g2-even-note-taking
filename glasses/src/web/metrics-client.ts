@@ -9,6 +9,15 @@ import { API_BASE } from '../stream';
 export interface MetricPoint {
   ts: number;
   value: number | string;
+  /**
+   * The reading's identity, when it has one.
+   *
+   * Two series only line up on the slot — a launch's price and the project name
+   * recorded for it were written seconds apart, so nothing about their
+   * timestamps says they belong to the same row. Absent for a plain point in
+   * time, which is why an attribute cannot be attached to those.
+   */
+  slot?: string;
 }
 
 export interface MetricSeries {

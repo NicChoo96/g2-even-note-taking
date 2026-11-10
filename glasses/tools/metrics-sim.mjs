@@ -568,5 +568,58 @@ check('and so does nonsense', chart.normaliseWindow('yesterday'), 'all');
 check('zero is not a window', chart.normaliseWindow(0), 'all');
 check('nor is a negative one', chart.normaliseWindow(-5), 'all');
 
+// ── 12. the view says what it is showing, and the caveat it needs ─────────
+// A line claims "this moved continuously"; a bar claims "this happened, once
+// per period". Which is TRUE is a property of the readings: a BTO launch priced
+// once a quarter drawn as a line invents a slope between two launches that never
+// existed. So the default kind follows the gap between readings.
+const DAY = 86_400_000;
+check(
+  'readings a quarter apart default to bars',
+  chart.defaultKind([pt(Date.UTC(2026, 0, 1)), pt(Date.UTC(2026, 3, 1)), pt(Date.UTC(2026, 6, 1))]),
+  'bar',
+);
+check(
+  'readings a day apart default to a line',
+  chart.defaultKind([pt(0), pt(DAY), pt(2 * DAY), pt(3 * DAY), pt(4 * DAY)]),
+  'line',
+);
+check('two readings are a line, not two bars', chart.defaultKind([pt(0), pt(30 * DAY)]), 'line');
+check('one reading is a line', chart.defaultKind([pt(0)]), 'line');
+
+// The slot is the join key, so numericPoints must not drop it on the floor —
+// that is the mistake readSeries made, and it made every attribute invisible.
+check(
+  'a chart point keeps its slot',
+  chart.numericPoints([{ ts: 1, value: 339000, slot: '2026-11' }]),
+  [{ ts: 1, value: 339000, slot: '2026-11' }],
+);
+check(
+  'a point without a slot has none added',
+  chart.numericPoints([{ ts: 1, value: 5 }]),
+  [{ ts: 1, value: 5 }],
+);
+check(
+  'a text reading is not a chart point',
+  chart.numericPoints([{ ts: 1, value: 'Plantation Dew', slot: '2026-11' }]).length,
+  0,
+);
+
+const chartSrc = readFileSync(chartPath, 'utf8');
+check('the chart has a hit area per reading', /className="chart-hit"/.test(chartSrc), true);
+check('a tap opens the tooltip', /onPointerDown=\{\(\) => setActiveIndex\(i\)\}/.test(chartSrc), true);
+check('a mouse hover opens it too', /pointerType === 'mouse'/.test(chartSrc), true);
+check('the tooltip draws the attributes', /attributes \?\? \[\]\)\.flatMap/.test(chartSrc), true);
+
+// The dimensions are DISCOVERED from sibling text series, never configured for
+// a particular dataset — "tengah.bto.4room.project" is not a special case.
+check('attributes are found by prefix', /const prefix = `\$\{target\.key\}\.`/.test(panelSrc), true);
+check('only text siblings count', /s\.type === 'string' && s\.key\.startsWith\(prefix\)/.test(panelSrc), true);
+check('the wearer can choose which ones show', /'md-attr-chip active' : 'md-attr-chip'/.test(panelSrc), true);
+check('the choice is part of the stored view', /fields: on \? chosen\.filter/.test(panelSrc), true);
+check('the chart is handed the chosen dimensions', /attributes=\{shown\}/.test(panelSrc), true);
+check('the readings table shows them too', /metric-also/.test(panelSrc), true);
+check('an unchosen view keeps showing everything', /view\.fields \?\? attributes\.map/.test(panelSrc), true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
