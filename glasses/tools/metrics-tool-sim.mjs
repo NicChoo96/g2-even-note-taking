@@ -408,6 +408,16 @@ check('an unknown action is refused', unknown.ok === false, 'an unknown action w
 check('and names both vocabularies', /list, read, declare, write, delete/.test(text(unknown)), true);
 check('…including the table actions', /objects, object, objectDeclare, recordWrite, recordDelete/.test(text(unknown)), true);
 
+// THE DESCRIPTION IS PART OF THE CONTRACT. 0.3.80 shipped seriesDelete and
+// tableDelete while the prose still ended "Nothing here can empty a whole series
+// or table" — and a model that reads its own tool description reported exactly
+// that, so the verbs existed and were unreachable from where it was looking.
+const desc = schema.function.description;
+check('the description names the destroy verbs', /seriesDelete/.test(desc) && /tableDelete/.test(desc), desc.slice(-160));
+check('…and never claims a series cannot be emptied', !/Nothing here can empty/.test(desc), 'the pre-0.3.80 sentence is back');
+check('…nor that a whole series is undeletable from here', !/not deletable from here/.test(JSON.stringify(fn)), true);
+check('and the row key points at tableDelete', /tableDelete/.test(fn.properties.key.description), fn.properties.key.description);
+
 // ── 4b. delete: ONE reading, named by its slot ─────────────────────────────
 // A reading is named by its slot, so that is what an edit removes. Before this
 // the only deletes were "everything" and "everything older", which cannot take

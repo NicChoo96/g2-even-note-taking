@@ -42,6 +42,10 @@ qr-prototype.png
 .g2-agent-cron.json
 # A paired-device credential minted by scripts/repair-agents.mjs. Never commit it.
 .tmp-e2e-repair-device.txt
+# The local dashboard store, written when METRICS_API is unset. The wearer's real
+# readings live on the hub; this file is whatever a local relay happened to see,
+# so committing it would fork the store into git as well as onto the disk.
+.g2-metrics.json
 
 # Watchdog-sim test artifacts (generated/downloaded wav)
 glasses/tools/*.wav

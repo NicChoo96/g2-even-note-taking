@@ -104,8 +104,11 @@ export function metricsToolSchema() {
         'belongs in an object, and a single charted number stays a series.\n\n' +
         'Writing the same series slot twice REPLACES the earlier reading, and writing the same record key ' +
         'twice MERGES into that row \u2014 so a partial write corrects one field, and a re-run is safe. ' +
-        'A record\u2019s values are merged unless you send `replace`. Deleting is always addressed: one ' +
-        'reading by slot, one row by its key. Nothing here can empty a whole series or table.',
+        'A record\u2019s values are merged unless you send `replace`. Deleting is addressed: one reading by ' +
+        '`slot`, one row by its `key`, and a WHOLE series or table with `seriesDelete` / `tableDelete`. ' +
+        'Those last two refuse while anything is still inside and answer with the COUNT until you send ' +
+        '`purge: true` \u2014 tell the wearer that number and get their agreement before you do. A series ' +
+        'that has been merged into a table is removed that way, so a merge need not leave it behind.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -175,7 +178,7 @@ export function metricsToolSchema() {
             type: 'string',
             description:
               'For delete: remove readings older than this (ISO date/time or epoch milliseconds). ' +
-              'Use it only when clearing a range; the whole series is not deletable from here.',
+              'Use it only when clearing a range; to remove the series itself call `seriesDelete`.',
           },
           fields: {
             type: 'array',
@@ -228,8 +231,8 @@ export function metricsToolSchema() {
           key: {
             type: 'string',
             description:
-              'For recordDelete: the row to remove \u2014 exactly the key `object` printed. There is no ' +
-              '"clear the table" here; name one row, or use the Data page.',
+              'For recordDelete: the row to remove \u2014 exactly the key `object` printed. To remove every ' +
+              'row at once send `tableDelete` with `purge: true`, which asks the wearer first.',
           },
           purge: {
             type: 'boolean',

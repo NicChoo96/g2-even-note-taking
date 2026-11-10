@@ -151,6 +151,11 @@ check('the actions are exactly the relay’s two vocabularies', byName.get('acti
   'recordWrite',
 ]);
 checkTrue('action is required', byName.get('action').required);
+// The six actions are 'add and correct' only, so the description has to send a
+// model that wants to REMOVE somewhere — otherwise it reads its own tool list,
+// finds no delete, and reports to the wearer that the app cannot delete at all.
+checkTrue('metrics.act sends removal to metrics__forget', /metrics__forget/.test(cap.description));
+checkTrue('…and says plainly that it removes nothing itself', /NOTHING HERE REMOVES/i.test(cap.description));
 check('series, limit, value, slot, at and rows exist', [...byName.keys()], ['action', 'series', 'limit', 'value', 'slot', 'at', 'rows']);
 // `at` is what makes a backfill possible: without it a month of readings would
 // all be stamped with the moment the run happened.

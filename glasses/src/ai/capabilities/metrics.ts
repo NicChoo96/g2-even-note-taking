@@ -276,6 +276,11 @@ export const metricsCapabilities: Capability[] = [
       'goes in an object. A single charted measurement is a SERIES. Do not keep the same row both ways \u2014 ' +
       'four sibling series joined by slot is the old shape objects replace. If the rows are not a time ' +
       'series at all (contacts, an inventory), that is still an object; a record with no date is legal.\n' +
+      'NOTHING HERE REMOVES A SERIES OR A TABLE. Those six actions only add and correct. Removing is ' +
+      '`metrics__forget`, which is always callable and is the verb for a cleanup: a series that has been ' +
+      'merged into a table is deleted with what=series (it reports how many readings go first, then takes ' +
+      'purge:true), and a table with what=table. Never describe this tool as unable to delete \u2014 the ' +
+      'deleting lives one capability over, behind the wearer\u2019s tap.\n' +
       'Use it whenever a question is about tracked data ("how is DBS", "what did I record yesterday", ' +
       '"which launches are still unsold") or when the wearer tells you some to keep.',
     params: [
@@ -286,7 +291,8 @@ export const metricsCapabilities: Capability[] = [
         required: true,
         description:
           'Series: list = what exists; read = one series history; write = record a value. ' +
-          'Tables: objects = which tables exist; object = one table\u2019s rows; recordWrite = upsert rows.',
+          'Tables: objects = which tables exist; object = one table\u2019s rows; recordWrite = upsert rows. ' +
+          'None of these remove a series or a table \u2014 that is metrics__forget.',
       },
       {
         name: 'series',
