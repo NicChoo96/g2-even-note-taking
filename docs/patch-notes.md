@@ -2,6 +2,15 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.82
+
+v0.3.82 - The Data tab works on the glasses
+
+- The dashboard and the tables could only be read by a signed-in owner, and the
+packaged app signs in as a paired device - so the Data tab came up empty in the
+Even app while the browser showed everything. A paired device can now read.
+- A refused read now says why, instead of looking like an empty dashboard.
+
 ## 0.3.81
 
 v0.3.81 - Jarvis can find the delete
