@@ -3168,15 +3168,79 @@ p.empty {
 .md-seg button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ── the chart ────────────────────────────────────────────────────────────── */
+.chart-wrap { margin: 6px 0 2px; }
 .metric-chart { width: 100%; height: auto; display: block; }
+
+/*
+  ONE COLOUR PER PLOTTED SERIES.
+
+  Six hues and then it repeats: a seventh line on a phone is a legend nobody can
+  read, and `MAX_COMPARE` already stops the series picker at six. The variable is
+  set by `.chart-series-N` so a single class on an SVG element picks the colour
+  for its stroke, fill and swatch without three rules per series.
+*/
+.chart-series-0 { --chart-c: var(--accent); }
+.chart-series-1 { --chart-c: #e0913c; }
+.chart-series-2 { --chart-c: #4fa3d1; }
+.chart-series-3 { --chart-c: #74b96b; }
+.chart-series-4 { --chart-c: #b784d6; }
+.chart-series-5 { --chart-c: #d3717c; }
 
 .chart-grid { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; }
 .chart-tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-.chart-line { stroke: var(--accent); stroke-width: 1.8; vector-effect: non-scaling-stroke; }
-.chart-area { fill: var(--accent); opacity: 0.16; }
-.chart-bar { fill: var(--accent); opacity: 0.75; }
-.chart-dot { fill: var(--accent); }
+.chart-line { stroke: var(--chart-c, var(--accent)); stroke-width: 1.8; vector-effect: non-scaling-stroke; }
+.chart-area { fill: var(--chart-c, var(--accent)); opacity: 0.16; }
+.chart-bar { fill: var(--chart-c, var(--accent)); opacity: 0.75; }
+.chart-dot { fill: var(--chart-c, var(--accent)); }
 .chart-empty { margin: 14px 0; }
+
+/* The shared legend. One entry per plotted series, named with the colour it is
+   drawn in — without it, two tickers on one axis are guesswork. */
+.chart-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 4px 0 0;
+  padding: 0;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.chart-legend li { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+
+.chart-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--chart-c, var(--accent));
+  flex: none;
+}
+
+.chart-legend-unit { color: var(--muted); }
+.chart-x-title { margin: 2px 0 0; font-size: 10px; color: var(--muted); letter-spacing: 0.03em; }
+
+/* The x-axis column picker. A native select is the right control here: forty
+   columns scroll in place on a phone, and it is keyboard-reachable for free. */
+.md-xaxis {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 0;
+}
+
+.md-xaxis select {
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  min-width: 0;
+  max-width: 46vw;
+}
 
 /* ── the tooltip ───────────────────────────────────────────────────────────
    A tap on a phone, a hover with a mouse. The strip that receives it is

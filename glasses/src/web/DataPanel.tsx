@@ -50,16 +50,23 @@ import {
 import {
   CHART_KINDS,
   CHART_LABELS,
-  MetricChart,
+  PlotChart,
   defaultKind,
   normaliseWindow,
-  numericPoints,
   pointsInWindow,
   windowChoices,
   type AttributeSeries,
   type ChartKind,
   type WindowKind,
 } from './metric-chart';
+import {
+  alignSeries,
+  pickXField,
+  plotFields,
+  sliceWindow,
+  slotCount,
+  tableView,
+} from './chart-data';
 
 const DAY_INITIALS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -91,9 +98,36 @@ interface ViewSpec {
    * A row has several numbers and only one can be the y axis, so the choice is
    * the wearer's and is remembered per table with the rest of the view. Absent
    * means "the first numeric column", which is a default rather than a claim
-   * about which number matters.
+   * about which number matters. Kept beside `yFields` so a view stored before
+   * multi-column plotting still opens exactly as it was left.
    */
   field?: string;
+  /**
+   * For a TABLE: WHICH COLUMNS ARE PLOTTED, in order.
+   *
+   * The columns are data — a later write can infer a new one — so nothing here
+   * names a column: the wearer picks, and every numeric column is offered. Absent
+   * means "`field`, or the first numeric column".
+   */
+  yFields?: string[];
+  /**
+   * For a TABLE: which column runs along the x axis.
+   *
+   * Not necessarily time. A table may plot price against flat type, or a count
+   * against an estate; a date column only decides that the axis is FORMATTED as
+   * time and sorted oldest-first. Absent means "the first date column, else the
+   * first column".
+   */
+  xField?: string;
+  /**
+   * For a SERIES: other series plotted with it, by key.
+   *
+   * Two tickers cannot be compared as one line, so the chart takes a set: every
+   * series here shares this one's axis, its own colour and its own legend entry.
+   * Remembered with the rest of the view — comparing the same three is a habit,
+   * not a one-off.
+   */
+  compare?: string[];
   /**
    * For a TABLE: which COLUMN VALUES the view is restricted to.
    *
@@ -244,6 +278,7 @@ function SeriesDetail({
   onView,
   onDelete,
   attributes,
+  others,
 }: {
   series: MetricSeries;
   collector?: Collector;
@@ -254,6 +289,8 @@ function SeriesDetail({
   onDelete: () => void;
   /** Text series that sit beside this one, keyed by slot. See `AttributeSeries`. */
   attributes: AttributeSeries[];
+  /** Other numeric series, offered for a shared chart. */
+  others: MetricSeries[];
 }) {
   /**
    * The look-backs this series offers, computed from the readings themselves.
@@ -266,8 +303,22 @@ function SeriesDetail({
   const choices = windowChoices(series.points);
   const active = choices.some((c) => c.value === view.window) ? view.window : 'all';
   const windowed = pointsInWindow(series.points, active);
-  const plotted = numericPoints(windowed);
   const rows = [...windowed].reverse().slice(0, 60);
+  /**
+   * THE CHART IS A SET OF SERIES. Its own line plus whatever the wearer asked to
+   * compare it with — two tickers cannot be read as one line, and three charts
+   * read by eye is not a comparison. A stored key that no longer exists is
+   * dropped silently: a series can be deleted, and a chart must not break over a
+   * stale preference.
+   */
+  const compared = (view.compare ?? []).filter((k) => others.some((s) => s.key === k));
+  const sources = [series, ...compared.map((k) => others.find((s) => s.key === k) as MetricSeries)];
+  const plot = alignSeries(
+    sources.map((s) => ({ key: s.key, label: s.label || s.key, unit: s.unit, precision: s.precision, points: s.points })),
+  );
+  const shownPlot = sliceWindow(plot.slots, plot.series, active);
+  /** Six lines is already a lot on a phone; the seventh colour would repeat. */
+  const MAX_COMPARE = 5;
   // Which dimensions are shown: the ones chosen, or all of them when nobody has
   // chosen yet — a series that gains an attribute should reveal it rather than
   // stay silent until someone finds a toggle.
@@ -370,14 +421,44 @@ function SeriesDetail({
         </div>
       )}
 
-      {series.type === 'number' && view.kind !== 'table' && plotted.length > 0 ? (
-        <MetricChart
-          points={plotted}
-          kind={view.kind}
-          unit={series.unit}
-          precision={series.precision}
-          attributes={shown}
-        />
+      {/* COMPARE. Two or more series on ONE axis, which is the only way to read
+          them against each other — separate charts are compared by eye, and the
+          eye is bad at it. The choice is remembered with the rest of the view. */}
+      {series.type === 'number' && others.length > 0 && (
+        <div className="md-attrs" role="group" aria-label="Plot beside this one">
+          <span className="md-attrs-label">Compare</span>
+          {others.map((o) => {
+            const on = compared.includes(o.key);
+            const full = !on && compared.length >= MAX_COMPARE;
+            return (
+              <button
+                key={o.key}
+                className={on ? 'md-attr-chip active' : 'md-attr-chip'}
+                aria-pressed={on}
+                disabled={full}
+                onClick={() =>
+                  onView({
+                    ...view,
+                    compare: on ? compared.filter((k) => k !== o.key) : [...compared, o.key],
+                  })
+                }
+                title={
+                  full
+                    ? `Six lines is the limit — untick one first`
+                    : on
+                      ? `Stop plotting ${o.label || o.key}`
+                      : `Plot ${o.label || o.key} on the same axis`
+                }
+              >
+                {o.label || o.key}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {series.type === 'number' && view.kind !== 'table' && slotCount(shownPlot.slots) > 0 ? (
+        <PlotChart slots={shownPlot.slots} series={shownPlot.series} kind={view.kind} attributes={shown} />
       ) : null}
 
       {rows.length === 0 ? (
@@ -562,10 +643,22 @@ function TableDetail({
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
-  const numeric = table.fields.filter((f) => f.type === 'number');
-  const chartField =
-    view.field && numeric.some((f) => f.key === view.field) ? view.field : (numeric[0]?.key ?? '');
-  const field = table.fields.find((f) => f.key === chartField);
+  /** Every numeric column may be plotted; which ones EXIST is the store's business. */
+  const numeric = plotFields(table.fields);
+  /**
+   * THE AXIS IS A CHOICE, NOT A PROPERTY. The columns are data, so nothing here
+   * may name one: a date column makes the axis TIME (formatted, oldest first),
+   * and any other column makes it a category of whatever that cell holds. A
+   * stored key that no longer exists falls back rather than breaking the view — a
+   * column can be renamed by the next schema change.
+   */
+  const xField =
+    view.xField && table.fields.some((f) => f.key === view.xField) ? view.xField : pickXField(table.fields);
+  const xInfo = table.fields.find((f) => f.key === xField);
+  const chosenY = (view.yFields ?? (view.field ? [view.field] : [])).filter((k) =>
+    numeric.some((f) => f.key === k),
+  );
+  const yFields = chosenY.length ? chosenY : numeric[0] ? [numeric[0].key] : [];
   const filters = view.filters ?? {};
   const range = view.range;
   /**
@@ -574,25 +667,42 @@ function TableDetail({
    */
   const matching = applyRange(applyFilters(table.records, filters), range);
   /**
-   * Only rows with a place in time can be plotted, and `slot` carries the ROW KEY
-   * so the chart's tooltip can find that row's other cells. A row with no date is
-   * legal in this store; it simply has no x position, and the table still shows it.
+   * THE ROWS → SLOTS. `tableView` sorts a time axis OLDEST FIRST, which is the
+   * fix for a chart that drew 2026 on the left: the store hands rows back
+   * newest-first, and a trend read right to left is a trend that is not there.
+   * Rows with nothing in the x column are left out and COUNTED, so the chart can
+   * say how many it could not place instead of quietly dropping them.
    */
-  const points = matching
-    .filter((r) => typeof r.ts === 'number')
-    .map((r) => ({ ts: r.ts as number, value: r.values[chartField] as number | string, slot: r.key }));
-  const plotted = numericPoints(points);
-  const choices = windowChoices(plotted);
+  const points = tableView(matching, table.fields, xField, yFields);
+  const choices = windowChoices(
+    points.slots.kind === 'time' ? points.slots.ts.map((ts) => ({ ts, value: 0 })) : [],
+  );
   // An explicit range IS the window, so the presets step aside rather than
   // multiplying into "the last 3 months of 2018-2021", which nobody asked for.
   const activeWindow = range ? 'all' : choices.some((c) => c.value === view.window) ? view.window : 'all';
-  // The window is measured on the rows' own instants, then narrowed to the ones
-  // that hold a number — a row whose cell is text has no y position, and the
-  // chart says so by leaving it out rather than by plotting a zero.
-  const windowed = numericPoints(pointsInWindow(points, activeWindow));
+  const shownPlot = sliceWindow(points.slots, points.series, activeWindow);
+  /**
+   * Two columns on one axis share one scale, so if their magnitudes are far
+   * apart the smaller one is a flat line along the bottom and looks like missing
+   * data. Nothing here rescales them (a second y axis invents a comparison that
+   * was never measured); it says so and lets the wearer plot them one at a time.
+   */
+  const scales = shownPlot.series
+    .map((s) => ({
+      label: s.label,
+      max: Math.max(0, ...s.values.filter((v): v is number => v !== null).map((v) => Math.abs(v))),
+    }))
+    .filter((s) => s.max > 0);
+  const biggest = scales.reduce((a, b) => (b.max > a.max ? b : a), { label: '', max: 0 });
+  const smallest = scales.reduce((a, b) => (b.max < a.max ? b : a), { label: '', max: Infinity });
+  const spread = scales.length > 1 && smallest.max > 0 ? biggest.max / smallest.max : 1;
+  const scaleGap =
+    spread >= 20
+      ? `${biggest.label} and ${smallest.label} are about ${Math.round(spread)}x apart, so ${smallest.label} will read as a flat line. Untick one to read it on its own.`
+      : '';
   /** The other columns, keyed by ROW KEY — every cell of the row, in the tooltip. */
   const attributes: AttributeSeries[] = table.fields
-    .filter((f) => f.key !== chartField)
+    .filter((f) => f.type !== 'number' && f.key !== xField)
     .map((f) => {
       const bySlot = new Map<string, string>();
       for (const r of matching) {
@@ -673,19 +783,48 @@ function TableDetail({
       </header>
 
       <div className="md-controls">
+        {/* THE AXIS PICKER. Every column is offered, because the columns are data:
+            a date makes the axis time, anything else makes it a category. */}
+        {table.fields.length > 0 && (
+          <label className="md-xaxis">
+            <span>X</span>
+            <select
+              value={xField}
+              onChange={(e) => onView({ ...view, xField: e.target.value })}
+              title="Which column runs along the x axis"
+            >
+              {table.fields.map((f) => (
+                <option key={f.key} value={f.key}>
+                  {fieldTitle(f)}
+                  {f.type === 'date' ? ' (date)' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {/* WHICH COLUMNS ARE PLOTTED. Multi-select, because two numbers per row is
+            exactly what a table of rows is for; the last one cannot be turned off,
+            or there would be a chart type and nothing to draw. */}
         {numeric.length > 0 && (
-          <div className="md-seg" role="group" aria-label="Which column to chart">
-            {numeric.map((f) => (
-              <button
-                key={f.key}
-                className={chartField === f.key ? 'active' : ''}
-                onClick={() => onView({ ...view, field: f.key })}
-                aria-pressed={chartField === f.key}
-                title={`Plot ${fieldTitle(f)}`}
-              >
-                {fieldTitle(f)}
-              </button>
-            ))}
+          <div className="md-seg" role="group" aria-label="Which columns to plot">
+            {numeric.map((f) => {
+              const on = yFields.includes(f.key);
+              return (
+                <button
+                  key={f.key}
+                  className={on ? 'active' : ''}
+                  onClick={() => {
+                    const next = on ? yFields.filter((k) => k !== f.key) : [...yFields, f.key];
+                    const keep = next.length ? next : [f.key];
+                    onView({ ...view, yFields: keep, field: keep[0] });
+                  }}
+                  aria-pressed={on}
+                  title={on ? `Stop plotting ${fieldTitle(f)}` : `Plot ${fieldTitle(f)} too`}
+                >
+                  {f.label || f.key}
+                </button>
+              );
+            })}
           </div>
         )}
         {numeric.length > 0 && (
@@ -781,23 +920,38 @@ function TableDetail({
           No numeric column yet, so there is nothing to chart. The rows are below.
         </p>
       )}
-      {numeric.length > 0 && view.kind !== 'table' && plotted.length > 1 && field ? (
-        <MetricChart
-          points={windowed}
-          kind={view.kind as ChartKind}
-          unit={field.unit}
-          precision={field.precision}
+      {numeric.length > 0 && view.kind !== 'table' && slotCount(shownPlot.slots) > 0 ? (
+        <PlotChart
+          slots={shownPlot.slots}
+          series={shownPlot.series}
+          kind={view.kind}
+          xTitle={xInfo ? fieldTitle(xInfo) : xField}
+          rowKeys={points.rowKeys.slice(shownPlot.start)}
           attributes={attributes}
         />
       ) : null}
-      {numeric.length > 0 && view.kind !== 'table' && plotted.length === 1 ? (
+      {/* ONE AXIS, SO ONE SCALE. Two columns whose magnitudes are orders apart
+          cannot both be read — the smaller one flattens onto the axis — and a
+          chart that silently does that looks like a bug in the data. */}
+      {scaleGap ? <p className="hint-line">{scaleGap}</p> : null}
+      {/* WHAT THE CHART COULD NOT PLACE, said out loud. A row with nothing in the x
+          column has no position on any axis, and a chart that silently ignores it
+          contradicts the table underneath. */}
+      {numeric.length > 0 && view.kind !== 'table' && points.droppedX > 0 ? (
         <p className="hint-line">
-          One dated row — {cellText(field as RecordField, plotted[0].value)}. A chart needs two.
+          {points.droppedX} row{points.droppedX === 1 ? '' : 's'} left out — nothing in{' '}
+          {xInfo ? fieldTitle(xInfo) : 'the x column'} to place {points.droppedX === 1 ? 'it' : 'them'} on.
         </p>
       ) : null}
-      {numeric.length > 0 && view.kind !== 'table' && plotted.length === 0 ? (
+      {points.collapsed > 0 ? (
         <p className="hint-line">
-          No row has a date, so this column has no place on a time axis. It reads as a table below.
+          {points.collapsed} more row{points.collapsed === 1 ? '' : 's'} share a value already on the axis —
+          showing the newest of each. Filter or pick another x column to see them apart.
+        </p>
+      ) : null}
+      {numeric.length > 0 && view.kind !== 'table' && slotCount(shownPlot.slots) === 0 ? (
+        <p className="hint-line">
+          Nothing to plot against {xInfo ? fieldTitle(xInfo) : 'that column'}. The rows are below.
         </p>
       ) : null}
 
@@ -1449,6 +1603,9 @@ export function DataPanel() {
         kind: stored.kind,
         window: normaliseWindow(stored.window),
         ...(Array.isArray(stored.fields) ? { fields: stored.fields } : {}),
+        // Comparing three tickers is a habit, not a one-off, so the set survives a
+        // reload with the rest of the view.
+        ...(Array.isArray(stored.compare) && stored.compare.length ? { compare: stored.compare } : {}),
       };
     }
     // Nothing chosen yet: pick the kind the READINGS ask for. A launch priced
@@ -1472,6 +1629,10 @@ export function DataPanel() {
         kind: stored.kind,
         window: normaliseWindow(stored.window),
         ...(stored.field ? { field: stored.field } : {}),
+        // The axis and the plotted columns are part of how this table is being
+        // looked at: a schema change must not silently re-pick them.
+        ...(stored.xField ? { xField: stored.xField } : {}),
+        ...(Array.isArray(stored.yFields) && stored.yFields.length ? { yFields: stored.yFields } : {}),
         // The lenses are part of "how this table is being looked at", so a reload
         // must not silently drop them back to every row.
         ...(stored.filters && Object.keys(stored.filters).length ? { filters: stored.filters } : {}),
@@ -1681,6 +1842,7 @@ export function DataPanel() {
               onView={(next) => setViews((v) => ({ ...v, [openSeries.key]: next }))}
               onDelete={() => void removeSeries(openSeries.key)}
               attributes={attributesFor(openSeries)}
+              others={series.filter((s) => s.key !== openSeries.key && s.type === 'number' && s.points.length > 0)}
             />
           ) : (
             <p className="hint-line">Nothing to show yet.</p>

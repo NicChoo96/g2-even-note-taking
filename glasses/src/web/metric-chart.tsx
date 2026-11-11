@@ -14,6 +14,7 @@
 //   remember per device.
 import { useState } from 'react';
 import type { MetricPoint } from './metrics-client';
+import { slotCount, type PlotSeries, type PlotSlots } from './chart-data';
 /** What the wearer can switch between. `table` is not drawn — the caller renders rows. */
 export type ChartKind = 'line' | 'area' | 'bar' | 'step';
 
@@ -230,41 +231,63 @@ function stamp(ts: number, span: number): string {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-export function MetricChart({
-  points,
+/**
+ * The chart: one or more series over a shared x axis.
+ *
+ * WHY IT TAKES A LIST OF SERIES
+ *   One series at a time was the previous shape, and it made "compare NVDA, AMD and
+ *   TSMC" impossible by construction — three charts, read by eye. Everything here
+ *   is aligned by `chart-data.ts` before it arrives, so the component's job is
+ *   only geometry: min/max across ALL series, one polyline per series, a shared
+ *   legend, and a tooltip that names every series at the touched slot.
+ *
+ * WHY A NULL IS A GAP
+ *   A series with no reading at a slot must not be joined to its neighbour: that
+ *   draws a line through a value nobody recorded. `segments()` breaks the polyline
+ *   instead, and a bar is simply absent.
+ *
+ * THE X AXIS IS SLOTS, NOT ALWAYS TIME
+ *   `slots.kind` is `time` (formatted from the stamps) or `category` (the cell text
+ *   itself) — a table may plot price against flat type and never have a date at
+ *   all. The component does not care which; it only decides how to label.
+ */
+export function PlotChart({
+  slots,
+  series,
   kind,
-  unit,
-  precision,
+  xTitle,
+  rowKeys,
   attributes,
 }: {
-  points: ChartPoint[];
+  slots: PlotSlots;
+  series: PlotSeries[];
   kind: ChartKind;
-  unit: string;
-  precision: number;
-  /**
-   * The dimensions that sit beside the value, already keyed by slot. Empty for a
-   * series with no siblings — the chart is then exactly what it was before.
-   */
+  /** The column or series the x axis came from — for the caption below. */
+  xTitle?: string;
+  /** The ROW behind each slot, so a tooltip can read that row's other cells. */
+  rowKeys?: Array<string | undefined>;
+  /** Text dimensions keyed by row, shown in the tooltip. */
   attributes?: AttributeSeries[];
 }) {
   /**
-   * Which reading is being examined, if any.
-   *
-   * A tap (or a hover) is the only way to ask "which launch is that bar?" — the
-   * axis can say the month and nothing else, and the project name lives in a
-   * different series. Held here rather than in the parent because it is a
-   * property of looking at the chart, not of the series.
+   * Which slot is being examined, if any. A tap (or a mouse hover) is the only way
+   * to ask "which launch is that bar?", so the hit strips below cover a whole
+   * column — a thumb cannot aim at a 2px dot.
    */
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  if (!points.length) {
-    return <p className="hint-line chart-empty">No readings in this window.</p>;
+
+  const n = slotCount(slots);
+  const drawable = series.filter((s) => s.values.some((v) => v !== null));
+  if (!n || drawable.length === 0) {
+    return <p className="hint-line chart-empty">No readings to plot for this choice.</p>;
   }
-  if (points.length === 1) {
+  if (n === 1) {
+    const solo = drawable
+      .map((s) => `${tick(s.values[0] as number, s.precision)}${s.unit ? ` ${s.unit}` : ''}`)
+      .join(', ');
     return (
       <p className="hint-line chart-empty">
-        One reading — {tick(points[0].value, precision)}
-        {unit ? ` ${unit}` : ''}. A chart needs two; this becomes a line as soon as a collector, an agent or Jarvis
-        records another.
+        One point — {solo}. A chart needs two; this becomes a line as soon as another row or reading arrives.
       </p>
     );
   }
@@ -278,7 +301,7 @@ export function MetricChart({
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
 
-  const values = points.map((p) => p.value);
+  const values = drawable.flatMap((s) => s.values.filter((v): v is number => v !== null));
   const rawMin = Math.min(...values);
   const rawMax = Math.max(...values);
   // Bars grow from zero, so the baseline has to include it. A line does not:
@@ -288,170 +311,269 @@ export function MetricChart({
   const span = max - min;
 
   /**
-   * Where reading `i` sits.
-   *
-   * A LINE runs edge to edge — the first point is the left axis, the last is the
-   * right one. A BAR cannot: centred on the axis it hangs half outside the plot
-   * and collides with its own value label, which is exactly what the first BTO
-   * launch did. A bar therefore owns a BAND, and sits in the middle of it.
+   * Where slot `i` sits. A LINE runs edge to edge; a BAR owns a band and sits in
+   * the middle of it, or it hangs half outside the plot and collides with its own
+   * label.
    */
-  const band = plotW / Math.max(1, points.length);
-  const xAt = (i: number) =>
-    kind === 'bar'
-      ? padL + band * (i + 0.5)
-      : padL + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  const band = plotW / n;
+  const xAt = (i: number) => (kind === 'bar' ? padL + band * (i + 0.5) : padL + (i / (n - 1)) * plotW);
   const yAt = (v: number) => padT + plotH - ((v - min) / span) * plotH;
 
-  const line = points.map((p, i) => `${xAt(i).toFixed(2)},${yAt(p.value).toFixed(2)}`);
-  const t0 = points[0].ts;
-  const t1 = points[points.length - 1].ts;
-  const timeSpan = Math.max(0, t1 - t0);
+  const timeSpan =
+    slots.kind === 'time' ? Math.max(0, slots.ts[slots.ts.length - 1] - slots.ts[0]) : 0;
+  const labelAt = (i: number) =>
+    slots.kind === 'time' ? stamp(slots.ts[i], timeSpan) : clipLabel(slots.labels[i]);
 
-  // Three gridlines: top, middle, bottom. Enough to read a value off, few enough
-  // that a 10-line-tall card is not a wall of text.
+  // Three gridlines: enough to read a value off, few enough that a phone is not
+  // a wall of text.
   const grid = [0, 0.5, 1].map((f) => {
     const v = max - span * f;
     return { v, y: yAt(v) };
   });
 
-  const barW = Math.max(1.5, band * 0.68);
+  /** Bars are grouped inside a slot's band when several series share the chart. */
+  const groupW = band * 0.8;
+  const barW = Math.max(1.5, groupW / drawable.length);
 
   /**
-   * The tooltip, when one is showing.
+   * One series as polyline runs, broken at every null.
    *
-   * Built here rather than inline so the box is sized to its WIDEST line before
-   * it is drawn — a box that grows after the text is how a tooltip ends up with
-   * a line hanging out of the side of it.
+   * A step chart inserts the elbow between two readings — the value holds until
+   * the next one, which is what "step" means.
+   */
+  const segments = (s: PlotSeries): Array<Array<[number, number]>> => {
+    const out: Array<Array<[number, number]>> = [];
+    let run: Array<[number, number]> = [];
+    s.values.forEach((v, i) => {
+      if (v === null) {
+        if (run.length > 1) out.push(run);
+        run = [];
+        return;
+      }
+      const x = xAt(i);
+      const y = yAt(v);
+      if (kind === 'step' && run.length) {
+        const prev = run[run.length - 1];
+        if (prev[0] !== x) run.push([x, prev[1]]);
+      }
+      run.push([x, y]);
+    });
+    if (run.length > 1) out.push(run);
+    return out;
+  };
+
+  /**
+   * The tooltip, sized to its widest line BEFORE it is drawn — a box that grows
+   * after the text is how a tooltip ends up with a line hanging out of the side.
    */
   const active =
-    activeIndex !== null && points[activeIndex]
+    activeIndex !== null && activeIndex < n
       ? (() => {
-          const p = points[activeIndex];
-          // The dimensions, joined on the slot. Nothing here knows what they
-          // mean; whatever text series sit beside this one are shown.
+          const when =
+            slots.kind === 'time' ? fullStamp(slots.ts[activeIndex]) : slots.labels[activeIndex];
+          const rowKey = rowKeys?.[activeIndex];
           const attrs = (attributes ?? []).flatMap((a) => {
-            const value = p.slot ? a.bySlot.get(p.slot) : undefined;
+            const value = rowKey ? a.bySlot.get(rowKey) : undefined;
             return value ? [`${a.label}: ${value}`] : [];
           });
-          const lines = [fullStamp(p.ts), `${tick(p.value, precision)}${unit ? ` ${unit}` : ''}`, ...attrs];
+          const lines = [
+            when,
+            ...drawable.map((s) => {
+              const v = s.values[activeIndex];
+              return `${s.label}: ${v === null ? 'no reading' : `${tick(v, s.precision)}${s.unit ? ` ${s.unit}` : ''}`}`;
+            }),
+            ...attrs,
+          ];
           const boxW = Math.min(W - 8, Math.max(120, Math.ceil(Math.max(...lines.map((l) => l.length)) * 6.4 + 16)));
           const boxH = 12 + lines.length * 14;
           const x = xAt(activeIndex);
-          const y = yAt(p.value);
+          const top = drawable.reduce<number | null>((acc, s) => {
+            const v = s.values[activeIndex];
+            return v === null ? acc : Math.min(acc ?? Infinity, yAt(v));
+          }, null);
+          const y = top ?? padT + plotH / 2;
           const boxX = Math.min(Math.max(x - boxW / 2, 4), W - boxW - 4);
-          // Above the point when there is room, below it when there is not.
           const boxY = y - boxH - 12 >= padT ? y - boxH - 12 : Math.min(y + 12, padT + plotH - boxH);
           return { index: activeIndex, lines, boxW, boxH, boxX, boxY };
         })()
       : null;
 
+  /** The row key behind a slot, for a table's attributes. */
+
   return (
-    <svg className="metric-chart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`${kind} chart of ${points.length} readings`}>
-      {grid.map((g) => (
-        <g key={g.y}>
-          <line className="chart-grid" x1={padL} x2={W - padR} y1={g.y} y2={g.y} />
-          <text className="chart-tick" x={padL - 6} y={g.y + 3} textAnchor="end">
-            {tick(g.v, precision)}
-          </text>
-        </g>
-      ))}
-
-      {kind === 'bar' &&
-        points.map((p, i) => {
-          const y = yAt(p.value);
-          const zero = yAt(Math.max(min, 0));
-          return (
-            <rect
-              key={`${p.ts}-${i}`}
-              className="chart-bar"
-              x={xAt(i) - barW / 2}
-              y={Math.min(y, zero)}
-              width={barW}
-              height={Math.max(1, Math.abs(zero - y))}
-            />
-          );
-        })}
-
-      {kind === 'area' && (
-        <polygon
-          className="chart-area"
-          points={`${xAt(0).toFixed(2)},${(padT + plotH).toFixed(2)} ${line.join(' ')} ${xAt(points.length - 1).toFixed(2)},${(padT + plotH).toFixed(2)}`}
-        />
-      )}
-
-      {kind === 'step' ? (
-        <polyline
-          className="chart-line"
-          fill="none"
-          points={points
-            .map((p, i) => {
-              const x = xAt(i).toFixed(2);
-              const y = yAt(p.value).toFixed(2);
-              const prevX = i === 0 ? x : xAt(i - 1).toFixed(2);
-              return `${prevX},${y} ${x},${y}`;
-            })
-            .join(' ')}
-        />
-      ) : (
-        kind !== 'bar' && <polyline className="chart-line" fill="none" points={line.join(' ')} />
-      )}
-
-      {points.map((p, i) => (
-        <circle key={`d-${p.ts}-${i}`} className="chart-dot" cx={xAt(i)} cy={yAt(p.value)} r={points.length > 60 ? 0 : 2} />
-      ))}
-
-      <text className="chart-tick" x={padL} y={H - 6} textAnchor="start">
-        {stamp(t0, timeSpan)}
-      </text>
-      <text className="chart-tick" x={W - padR} y={H - 6} textAnchor="end">
-        {stamp(t1, timeSpan)}
-      </text>
-
-      {/* A strip per reading, not a hit test on a 2px dot: a thumb on a phone
-          cannot aim at the dot, and a bar chart's target is the bar's column. */}
-      {points.map((p, i) => {
-        const hitW = kind === 'bar' ? band : plotW / Math.max(1, points.length - 1);
-        return (
-          <rect
-            key={`hit-${p.ts}-${i}`}
-            className="chart-hit"
-            x={xAt(i) - hitW / 2}
-            y={padT}
-            width={Math.max(4, hitW)}
-            height={plotH}
-            onPointerDown={() => setActiveIndex(i)}
-            onPointerEnter={(e) => {
-              // Mouse hovers; a finger does not, and treating its touch-enter as
-              // a hover would show a tooltip the user cannot then dismiss.
-              if (e.pointerType === 'mouse') setActiveIndex(i);
-            }}
-          />
-        );
-      })}
-
-      {active && (
-        <g className="chart-tip" pointerEvents="none">
-          <line className="chart-guide" x1={xAt(active.index)} x2={xAt(active.index)} y1={padT} y2={padT + plotH} />
-          <rect
-            className="chart-tip-box"
-            x={active.boxX}
-            y={active.boxY}
-            width={active.boxW}
-            height={active.boxH}
-            rx={6}
-          />
-          {active.lines.map((text, i) => (
-            <text
-              key={`${text}-${i}`}
-              className={i === 0 ? 'chart-tip-when' : 'chart-tip-line'}
-              x={active.boxX + 8}
-              y={active.boxY + 16 + i * 14}
-            >
-              {text}
+    <div className="chart-wrap">
+      <svg
+        className="metric-chart"
+        viewBox={`0 0 ${W} ${H}`}
+        role="img"
+        aria-label={`${kind} chart of ${drawable.map((s) => s.label).join(', ')} over ${n} points`}
+      >
+        {grid.map((g) => (
+          <g key={g.y}>
+            <line className="chart-grid" x1={padL} x2={W - padR} y1={g.y} y2={g.y} />
+            <text className="chart-tick" x={padL - 6} y={g.y + 3} textAnchor="end">
+              {tick(g.v, 0)}
             </text>
+          </g>
+        ))}
+
+        {kind === 'bar' &&
+          drawable.map((s, si) =>
+            s.values.map((v, i) => {
+              if (v === null) return null;
+              const y = yAt(v);
+              const zero = yAt(Math.max(min, 0));
+              const x = xAt(i) - groupW / 2 + si * barW;
+              return (
+                <rect
+                  key={`${s.key}-${i}`}
+                  className={`chart-bar chart-series-${si % 6}`}
+                  x={x}
+                  y={Math.min(y, zero)}
+                  width={barW}
+                  height={Math.max(1, Math.abs(zero - y))}
+                />
+              );
+            }),
+          )}
+
+        {kind === 'area' &&
+          drawable.length === 1 &&
+          segments(drawable[0]).map((seg, si) => (
+            <polygon
+              key={`area-${si}`}
+              className="chart-area chart-series-0"
+              points={[[seg[0][0], padT + plotH], ...seg, [seg[seg.length - 1][0], padT + plotH]]
+                .map((p) => `${p[0].toFixed(2)},${p[1].toFixed(2)}`)
+                .join(' ')}
+            />
           ))}
-        </g>
-      )}
-    </svg>
+
+        {kind !== 'bar' &&
+          kind !== 'area' &&
+          drawable.map((s, si) =>
+            segments(s).map((seg, gi) => (
+              <polyline
+                key={`${s.key}-${gi}`}
+                className={`chart-line chart-series-${si % 6}`}
+                fill="none"
+                points={seg.map((p) => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(' ')}
+              />
+            )),
+          )}
+
+        {kind === 'area' &&
+          drawable.length === 1 &&
+          segments(drawable[0]).map((seg, gi) => (
+            <polyline
+              key={`edge-${gi}`}
+              className="chart-line chart-series-0"
+              fill="none"
+              points={seg.map((p) => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(' ')}
+            />
+          ))}
+
+        {/* Dots only while the chart is sparse: at 60 points a dot per reading is
+            a solid smear, and the line already says where the readings are. */}
+        {n <= 40 &&
+          kind !== 'bar' &&
+          drawable.map((s, si) =>
+            s.values.map((v, i) =>
+              v === null ? null : (
+                <circle
+                  key={`d-${s.key}-${i}`}
+                  className={`chart-dot chart-series-${si % 6}`}
+                  cx={xAt(i)}
+                  cy={yAt(v)}
+                  r={2}
+                />
+              ),
+            ),
+          )}
+
+        <text className="chart-tick" x={padL} y={H - 6} textAnchor="start">
+          {labelAt(0)}
+        </text>
+        <text className="chart-tick" x={W - padR} y={H - 6} textAnchor="end">
+          {labelAt(n - 1)}
+        </text>
+
+        {/* A strip per slot, not a hit test on a 2px dot. */}
+        {drawable.length >= 1 &&
+          Array.from({ length: n }, (_, i) => {
+            const hitW = kind === 'bar' ? band : plotW / Math.max(1, n - 1);
+            return (
+              <rect
+                key={`hit-${i}`}
+                className="chart-hit"
+                x={xAt(i) - hitW / 2}
+                y={padT}
+                width={Math.max(4, hitW)}
+                height={plotH}
+                onPointerDown={() => setActiveIndex(i)}
+                onPointerEnter={(e) => {
+                  // Mouse hovers; a finger does not, and treating its touch-enter
+                  // as a hover shows a tooltip the user cannot dismiss.
+                  if (e.pointerType === 'mouse') setActiveIndex(i);
+                }}
+              />
+            );
+          })}
+
+        {active && (
+          <g className="chart-tip" pointerEvents="none">
+            <line
+              className="chart-guide"
+              x1={xAt(active.index)}
+              x2={xAt(active.index)}
+              y1={padT}
+              y2={padT + plotH}
+            />
+            <rect
+              className="chart-tip-box"
+              x={active.boxX}
+              y={active.boxY}
+              width={active.boxW}
+              height={active.boxH}
+              rx={6}
+            />
+            {active.lines.map((text, i) => (
+              <text
+                key={`${text}-${i}`}
+                className={i === 0 ? 'chart-tip-when' : 'chart-tip-line'}
+                x={active.boxX + 8}
+                y={active.boxY + 16 + i * 14}
+              >
+                {text}
+              </text>
+            ))}
+          </g>
+        )}
+      </svg>
+
+      {/* THE SHARED LEGEND. One entry per plotted series, named with the colour it
+          is drawn in, so two tickers on one chart stay tellable apart. */}
+      <ul className="chart-legend">
+        {drawable.map((s, i) => (
+          <li key={s.key}>
+            <i className={`chart-swatch chart-series-${i % 6}`} aria-hidden="true" />
+            {s.label}
+            {s.unit ? <span className="chart-legend-unit">{s.unit}</span> : null}
+          </li>
+        ))}
+      </ul>
+      {xTitle ? <p className="chart-x-title">x: {xTitle}</p> : null}
+    </div>
   );
+}
+
+/**
+ * A category label short enough to sit under an axis.
+ *
+ * The full value is still in the tooltip and in the table, so nothing is lost —
+ * the axis only has room for one word.
+ */
+function clipLabel(text: string): string {
+  const s = String(text ?? '');
+  return s.length > 12 ? `${s.slice(0, 11)}…` : s;
 }

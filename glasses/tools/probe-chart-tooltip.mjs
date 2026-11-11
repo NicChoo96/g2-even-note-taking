@@ -51,11 +51,16 @@ await build({
     contents: `
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { MetricChart } from './web/metric-chart.tsx';
+import { PlotChart } from './web/metric-chart.tsx';
 
 const day = 86_400_000;
-const launch = (month, price) => ({ ts: Date.UTC(2026, month, 1), value: price, slot: '2026-' + String(month + 1).padStart(2, '0') });
-const points = [launch(0, 290000), launch(5, 310000), launch(10, 339000)];
+const slots = { kind: 'time', ts: [Date.UTC(2026, 0, 1), Date.UTC(2026, 5, 1), Date.UTC(2026, 10, 1)] };
+// The row identities the tooltip reads its dimensions from. A table passes its
+// own row keys here; this probe passes the same month labels it always used.
+const rowKeys = ['2026-01', '2026-06', '2026-11'];
+const series = [
+  { key: 'price', label: 'Price', unit: 'SGD', precision: 2, values: [290000, 310000, 339000] },
+];
 
 const projects = new Map([
   ['2026-01', 'Garden Vale'],
@@ -65,11 +70,11 @@ const projects = new Map([
 const estates = new Map([['2026-11', 'Tengah']]);
 
 createRoot(document.getElementById('root')).render(
-  React.createElement(MetricChart, {
-    points,
+  React.createElement(PlotChart, {
+    slots,
+    series,
+    rowKeys,
     kind: 'bar',
-    unit: 'SGD',
-    precision: 2,
     attributes: [
       { key: 'tengah.bto.4room.project', label: 'project', bySlot: projects },
       { key: 'tengah.bto.4room.estate', label: 'estate', bySlot: estates },

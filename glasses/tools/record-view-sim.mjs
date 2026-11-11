@@ -186,7 +186,7 @@ const panel = readFileSync(resolve(here, '../src/web/DataPanel.tsx'), 'utf8');
 checkTrue(
   'the chart, the tooltip and the table all read ONE filtered row set',
   /const matching = applyRange\(applyFilters\(table\.records, filters\), range\)/.test(panel) &&
-    /const points = matching/.test(panel) &&
+    /const points = tableView\(matching, table\.fields, xField, yFields\)/.test(panel) &&
     /for \(const r of matching\)/.test(panel) &&
     /\{matching\.map\(\(row\) =>/.test(panel),
 );
