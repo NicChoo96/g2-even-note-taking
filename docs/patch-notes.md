@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.83
+
+v0.3.83 - Any column on the chart
+
+- A table's chart is now yours to configure: pick any column for the x axis - a
+date reads oldest to newest, anything else reads as categories - and tick as
+many numeric columns as you want plotted together.
+- Two or more series share one chart with a legend naming each line, and any
+series can be compared with another from the same view.
+- A date axis sorts oldest first. It used to draw newest on the left, so a trend
+read backwards.
+
 ## 0.3.82
 
 v0.3.82 - The Data tab works on the glasses
