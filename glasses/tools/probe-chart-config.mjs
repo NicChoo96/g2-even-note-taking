@@ -1,23 +1,30 @@
 #!/usr/bin/env node
-// PROBE — can a chart be CONFIGURED, on a phone and on a desktop, against the
-// real component and the real stylesheet?
+// PROBE — is the Data tab's chart area actually usable, on a phone and on a
+// desktop, against the real component and the real stylesheet?
 //
 // WHY THIS EXISTS
-//   The store's columns are data, so the chart is not coded: the wearer picks the
-//   x column and which columns to plot, and may compare several series on one
-//   axis. Every one of those is a geometry question as much as a logic question —
-//   a select that pushes a 390px page sideways, a legend that never appears, an
-//   axis that reads newest-to-oldest are all invisible to a unit test on the pure
-//   helpers, which is why `chart-plot-sim.mjs` covers the rules and this covers
-//   the pixels.
+//   The store's columns are data, so the chart is configured rather than coded —
+//   an x column, a set of y columns, an optional set of compared series, a zoom and
+//   a filter row. Every one of those is a geometry question as much as a logic
+//   question: a 640x200 viewBox squeezed into a phone is a 110px chart with 5px
+//   text, a dropdown that cannot be dismissed traps the page, a chip row that never
+//   wraps scrolls the layout sideways, and a category axis that prints two of four
+//   labels hides its own subject. None of that is visible to a unit test on the
+//   pure helpers, which is why `chart-plot-sim.mjs` covers the rules and this
+//   covers the pixels and the taps.
 //
 // WHAT IT MEASURES
 //   1. the chart opens with the numeric columns plotted, and a legend names them;
-//   2. ticking a second column ADDS a legend entry (multi-series, one axis);
-//   3. changing the x select to a text column turns the axis into categories;
-//   4. a date axis is ASCENDING — the leftmost label is the oldest row;
-//   5. the compare chips put a second SERIES on the same axis;
-//   6. at 390px nothing overflows sideways, and at 1440px it still reads.
+//   2. COMPARE is a dropdown: it opens, it selects, and it closes on an outside tap;
+//   3. ticking a second column adds a legend entry, and a mixed-scale pair is called
+//      out rather than silently flattened;
+//   4. changing the x select to a text column turns the axis into categories — and
+//      EVERY category is labelled when there are few;
+//   5. a date axis is ASCENDING (the first slot's tooltip is the oldest row);
+//   6. the FILTER dropdowns close on an outside tap too;
+//   7. zoom steps the drawing in, reports its window, and resets;
+//   8. at 390px the page does not overflow sideways and the plot is TALL (a scaled
+//      down desktop chart was the "small chart" complaint), and at 1440px it reads.
 //
 // WHAT IT IS NOT
 //   The real DataPanel with a stubbed fetch, not a signed-in app. The data is a
@@ -83,17 +90,16 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { DataPanel } from './web/DataPanel.tsx';
 
-const day = 86_400_000;
 const ts = (iso) => Date.parse(iso + 'T00:00:00Z');
 
-// THE FIXTURE: a series store with two tickers (so compare has something to
-// compare), and a table whose columns are data — a date, two labels and TWO
-// numbers, which is the shape that needs a column picker.
+// THE FIXTURE: two tickers (so compare has something to compare) and a table whose
+// columns are data — a date, a label, TWO numbers, and FOUR distinct flat types
+// with two repeats, which is what the category axis has to label honestly.
 const metrics = {
   ok: true,
   series: [
     { key: 'nvda.price', label: 'NVDA price', type: 'number', unit: 'USD', precision: 2, cadence: 'daily',
-      source: 'agent', retention: 2000, count: 2, latest: { ts: ts('2026-11-03'), value: 126 }, delta: 6,
+      source: 'agent', retention: 2000, count: 3, latest: { ts: ts('2026-11-03'), value: 126 }, delta: 6,
       view: 'series', provenance: 'fixture',
       points: [{ ts: ts('2026-11-01'), value: 120 }, { ts: ts('2026-11-02'), value: 123 }, { ts: ts('2026-11-03'), value: 126 }] },
     { key: 'amd.price', label: 'AMD price', type: 'number', unit: 'USD', precision: 2, cadence: 'daily',
@@ -117,7 +123,7 @@ const row = (key, iso, flat, price, psf) => ({
 const records = {
   ok: true,
   objects: [{
-    key: 'tengah.bto.4room',
+    key: 'tengah.bto',
     label: 'Tengah BTO',
     strict: false,
     fields: [
@@ -126,15 +132,17 @@ const records = {
       { key: 'price', label: 'Price', type: 'number', unit: 'SGD', precision: 0 },
       { key: 'psf', label: 'PSF', type: 'number', unit: 'SGD', precision: 2 },
     ],
-    count: 4,
+    count: 6,
     latestTs: ts('2026-11-09'),
     records: [
       row('r-2026', '2026-11-09', '4-room', 339000, 1120.5),
-      row('r-2023', '2023-10-15', '5-room', 460000, 1080),
-      row('r-2022', '2022-02-15', '4-room', 291000, 940),
+      row('r-2025', '2025-06-01', '5-room', 460000, 1080),
+      row('r-2023', '2023-10-15', '5-room', 440000, 1050),
+      row('r-2022', '2022-02-15', '3-room', 228000, 940),
+      row('r-2019', '2019-05-10', '2-room', 130000, 700),
       row('r-2018', '2018-11-01', '4-room', 290000, 880),
     ],
-    total: 4,
+    total: 6,
   }],
   now: Date.now(),
   store: { mode: 'hub', durable: true },
@@ -163,7 +171,6 @@ createRoot(document.getElementById('root')).render(
   platform: 'browser',
   jsx: 'automatic',
   define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env': '{}' },
-  loader: { '.ts': 'ts', '.tsx': 'tsx' },
   outfile: bundlePath,
   logLevel: 'silent',
 });
@@ -181,12 +188,10 @@ try {
   await page.setContent(html, { waitUntil: 'load' });
   await page.waitForSelector('.metric-chart');
 
-  // The legend's text is the series name and its unit, which the component puts in
-  // two elements — compare the NAMES, not the concatenation.
+  // The legend's text is the series name followed by its unit in a <span>; compare
+  // the NAMES, not the concatenation.
   const legend = async () =>
     page.evaluate(() =>
-      // The label is the li's own TEXT NODE; its first child is the colour swatch
-      // and its unit is a <span>, and neither is the series' name.
       [...document.querySelectorAll('.chart-legend li')].map((li) =>
         [...li.childNodes]
           .filter((n) => n.nodeType === 3)
@@ -196,21 +201,29 @@ try {
       ),
     );
   // SVG nodes have no innerText; `textContent` is what a chart label has.
-  const axis = async () =>
-    (
-      await page.evaluate(() =>
-        [...document.querySelectorAll('svg.metric-chart text.chart-tick')].map((t) => t.textContent ?? ''),
-      )
-    ).slice(-2);
+  const xTicks = async () =>
+    page.evaluate(() => [...document.querySelectorAll('.chart-x-tick')].map((t) => (t.textContent ?? '').trim()));
+  const tooltip = () => page.evaluate(() => document.querySelector('.chart-tip')?.textContent ?? '');
+  const panels = () => page.locator('.dp-menu-panel').count();
+  /** A tap in the page margin — outside every panel. */
+  const tapOutside = async () => {
+    await page.mouse.click(4, 4);
+    await page.waitForTimeout(80);
+  };
 
-  // ── 1. the series view: one line, and the compare chips exist ────────────
-  check('a series opens as one plotted line', (await legend()).length, 1);
-  checkTrue('the compare control lists the other series', (await page.locator('button:has-text("AMD price")').count()) > 0);
+  // ── 1. the series view: one line ─────────────────────────────────────────
+  check('a series opens as one plotted line', await legend(), ['NVDA price']);
 
-  // ── 5. compare: a second SERIES on the same axis ─────────────────────────
-  await page.locator('button:has-text("AMD price")').first().click();
-  await page.waitForFunction(() => document.querySelectorAll('.chart-legend li').length === 2);
-  check('comparing adds a second line', await legend(), ['NVDA price', 'AMD price']);
+  // ── 2. COMPARE is a dropdown, and it dismisses ───────────────────────────
+  await page.locator('.md-compare .dp-menu-btn').click();
+  checkTrue('the compare control opens a dropdown', (await panels()) === 1);
+  await tapOutside();
+  check('…and a tap outside closes it', await panels(), 0);
+
+  await page.locator('.md-compare .dp-menu-btn').click();
+  await page.locator('.dp-menu-opt:has-text("AMD price") input').check();
+  check('comparing adds a second line to the same axis', await legend(), ['NVDA price', 'AMD price']);
+  await tapOutside();
   checkTrue(
     'each line has its own colour class',
     (await page.evaluate(
@@ -220,34 +233,28 @@ try {
         ).size,
     )) === 2,
   );
-  await page.screenshot({ path: join(shot, 'desktop-compare.png'), fullPage: false });
+  await page.screenshot({ path: join(shot, 'desktop-compare.png') });
 
-  // ── 2/3/4. the table: pick columns, pick the axis ─────────────────────────
+  // ── 3/4. the table: columns, axis, categories ───────────────────────────
   await page.locator('.metric-master-row:has-text("Tengah BTO")').first().click();
   await page.waitForFunction(() => /Price/.test(document.querySelector('.chart-legend')?.textContent ?? ''));
   check('the table plots its first numeric column', await legend(), ['Price']);
 
-  // The X picker is a select over EVERY column, dates included.
   const options = await page.locator('.md-xaxis select option').allInnerTexts();
   checkTrue('the x picker offers every column', options.length === 4 && options.some((o) => /Launch date/.test(o)));
 
-  // A DATE axis, ascending: the FIRST slot must be the OLDEST row. Checking the
-  // axis text cannot prove that (an axis label is `11/1` in any year), so the
-  // tooltip — which prints the full stamp — is what answers it.
-  const dateAxis = await axis();
-  console.log(`        date axis: ${dateAxis.join('  ...  ')}`);
+  // A DATE axis, ascending: the FIRST slot must be the OLDEST row. The axis text
+  // cannot prove that (`11/1` is any year), so the tooltip answers it.
   await page.locator('.chart-hit').first().click();
-  const firstTip = await page.evaluate(() => document.querySelector('.chart-tip')?.textContent ?? '');
+  const firstTip = await tooltip();
   console.log(`        first slot: ${firstTip}`);
   checkTrue('a date axis is ASCENDING — the first slot is the OLDEST row', /2018-11-01/.test(firstTip));
-  checkTrue('…and the first slot holds that row\u2019s value', /290,000/.test(firstTip));
+  checkTrue('…and the first slot holds that row’s value', /290,000/.test(firstTip));
 
   // Tick the second numeric column: two series, one shared legend.
   await page.locator('.md-seg[aria-label="Which columns to plot"] button:has-text("PSF")').first().click();
   await page.waitForFunction(() => document.querySelectorAll('.chart-legend li').length === 2);
   check('ticking a column adds it to the same chart', await legend(), ['Price', 'PSF']);
-  // Price is ~460,000 and PSF ~1,120: one axis cannot show both, and a chart that
-  // silently flattens one looks like missing data.
   checkTrue(
     'a mixed-scale pair is called out rather than silently flattened',
     /apart, so PSF will read as a flat line/.test(await page.locator('.data-panel').innerText()),
@@ -256,21 +263,62 @@ try {
 
   // The x axis becomes CATEGORIES when the chosen column is text.
   await page.locator('.md-xaxis select').selectOption('flat_type');
-  await page.waitForFunction(() => /4-room/.test(document.querySelector('.chart-x-title')?.textContent ?? 'x') || /4-room/.test(document.querySelector('svg.metric-chart')?.textContent ?? ''));
-  const catAxis = await axis();
-  console.log(`        category axis: ${catAxis.join('  ...  ') || '(labels are the first and last only)'}`);
-  checkTrue('a text x column labels the axis with its values', catAxis.some((t) => /room/.test(t)));
+  await page.waitForFunction(() => document.querySelectorAll('.chart-x-tick').length > 2);
+  const catTicks = await xTicks();
+  console.log(`        category axis: ${catTicks.join('  ') || '(none)'}`);
+  check('every category is labelled when there are few', [...catTicks].sort(), ['2-room', '3-room', '4-room', '5-room']);
   checkTrue('…and says which column it is', /Flat type/.test(await page.locator('.chart-x-title').innerText()));
   await page.screenshot({ path: join(shot, 'desktop-categories.png') });
 
-  // ── 6. the same view on a phone ──────────────────────────────────────────
+  // ── 5. the FILTER dropdowns dismiss too ─────────────────────────────────
+  const filterBtn = page.locator('.rec-filters .dp-menu-btn').first();
+  if ((await filterBtn.count()) > 0) {
+    await filterBtn.click();
+    checkTrue('a filter opens a dropdown', (await panels()) === 1);
+    await tapOutside();
+    check('…and a tap outside closes it', await panels(), 0);
+  }
+
+  // ── 6. zoom ─────────────────────────────────────────────────────────────
+  const zoomIn = page.locator('.chart-zoom button[aria-label="Zoom in"]');
+  const countText = () => page.locator('.chart-toolbar-count').innerText();
+  const before = await countText();
+  // The total is whatever this axis holds — four categories here, not six rows.
+  const total = Number(/(\d+)/.exec(before)?.[1] ?? 0);
+  await zoomIn.click();
+  await page.waitForTimeout(100);
+  const zoomed = await countText();
+  console.log(`        zoom: ${before} -> ${zoomed}`);
+  checkTrue(`zooming in reports a window of the ${total} readings`, new RegExp(`of ${total}$`).test(zoomed) && zoomed !== before);
+  checkTrue('…and the axis label count shrinks with it', (await xTicks()).length <= catTicks.length);
+  await page.screenshot({ path: join(shot, 'desktop-zoom.png') });
+  await page.locator('.chart-zoom-reset').click();
+  await page.waitForTimeout(100);
+  check('Reset returns to the whole chart', await countText(), `${total} points`);
+
+  // ── 7. the phone ────────────────────────────────────────────────────────
   await page.setViewportSize({ width: 390, height: 900 });
-  await page.waitForTimeout(120);
+  await page.waitForTimeout(200);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   check('nothing overflows sideways at 390px', overflow <= 0, true);
+  const svgBox = await page.locator('svg.metric-chart').boundingBox();
+  const widths = await page.evaluate(() => {
+    const w = (sel) => Math.round(document.querySelector(sel)?.getBoundingClientRect().width ?? 0);
+    return { viewport: window.innerWidth, pane: w('.metric-detail'), wrap: w('.chart-wrap'), svg: w('svg.metric-chart') };
+  });
+  console.log(`        phone widths: ${JSON.stringify(widths)}`);
+  console.log(`        phone plot: ${Math.round(svgBox.width)}x${Math.round(svgBox.height)}`);
+  checkTrue('the plot is TALL on a phone, not a scaled-down desktop chart', svgBox.height >= 200);
   const selectBox = await page.locator('.md-xaxis select').boundingBox();
   check('the x picker is on screen and usable at 390px', Boolean(selectBox && selectBox.width > 40), true);
   check('the legend still names both series at 390px', (await legend()).length, 2);
+  const yTicks = await page.evaluate(() =>
+    [...document.querySelectorAll('svg.metric-chart text.chart-tick')]
+      .map((t) => (t.textContent ?? '').trim())
+      .filter((t) => /^[-\d.,]+[km]?$/.test(t)),
+  );
+  console.log(`        phone y labels: ${yTicks.join(' / ')}`);
+  checkTrue('the y axis is compacted on a phone, not 460,000.00', yTicks.some((t) => /k$|m$/.test(t)));
   await page.screenshot({ path: join(shot, 'phone-categories.png'), fullPage: true });
 } finally {
   await browser.close();

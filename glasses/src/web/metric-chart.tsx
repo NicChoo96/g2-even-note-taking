@@ -12,7 +12,7 @@
 //   type) and the wearer chooses how to look at it. So the chart type is a LOCAL
 //   view choice — it changes nothing on the hub, which is also why it is safe to
 //   remember per device.
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { MetricPoint } from './metrics-client';
 import { slotCount, type PlotSeries, type PlotSlots } from './chart-data';
 /** What the wearer can switch between. `table` is not drawn — the caller renders rows. */
@@ -251,6 +251,40 @@ function stamp(ts: number, span: number): string {
  *   itself) — a table may plot price against flat type and never have a date at
  *   all. The component does not care which; it only decides how to label.
  */
+/**
+ * The chart: one or more series over a shared x axis, sized for the surface it
+ * lands on.
+ *
+ * WHY IT TAKES A LIST OF SERIES
+ *   One series at a time made "compare NVDA, AMD and TSMC" impossible by
+ *   construction. Everything here is aligned by `chart-data.ts` before it arrives,
+ *   so the component's job is geometry: min/max across ALL series, one polyline per
+ *   series, a shared legend, and a tooltip that names every series at the touched
+ *   slot.
+ *
+ * WHY A NULL IS A GAP
+ *   A series with no reading at a slot must not be joined to its neighbour: that
+ *   draws a line through a value nobody recorded. `segments()` breaks the polyline
+ *   instead, and a bar is simply absent.
+ *
+ * WHY THE AXIS LABELS ARE NOT JUST FIRST AND LAST (0.3.84)
+ *   A category axis with four values used to print two of them, so "4-room ...
+ *   5-room" left the reader guessing what the middle bars were. When there are few
+ *   slots, EVERY label is drawn; only a crowded axis thins out, and it thins to
+ *   evenly-spaced ticks rather than to its endpoints.
+ *
+ * WHY IT MEASURES ITSELF
+ *   A 640x200 viewBox scaled to a 350px phone is a 110px-tall chart with 5px text —
+ *   technically a chart, practically a sparkline. The box is measured and a narrow
+ *   one gets a TALLER plot, so the same component is a card on a phone and a panel
+ *   on a desktop.
+ *
+ * ZOOM
+ *   The store holds hundreds of readings, and the honest question is often "what
+ *   happened in this stretch" — so the chart can zoom (2x, 4x, 8x) and step along
+ *   the readings. It zooms the DRAWING, not the data: the window chips still filter
+ *   what the chart is given, and nothing about the store changes.
+ */
 export function PlotChart({
   slots,
   series,
@@ -269,39 +303,73 @@ export function PlotChart({
   /** Text dimensions keyed by row, shown in the tooltip. */
   attributes?: AttributeSeries[];
 }) {
+  const { ref: boxRef, w: W, h: H } = useChartBox();
   /**
    * Which slot is being examined, if any. A tap (or a mouse hover) is the only way
    * to ask "which launch is that bar?", so the hit strips below cover a whole
    * column — a thumb cannot aim at a 2px dot.
    */
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState(0);
 
-  const n = slotCount(slots);
-  const drawable = series.filter((s) => s.values.some((v) => v !== null));
-  if (!n || drawable.length === 0) {
-    return <p className="hint-line chart-empty">No readings to plot for this choice.</p>;
+  const total = slotCount(slots);
+  // A new row set (a filter, a new x column, a different window) starts at 1x:
+  // carrying a 4x zoom into a chart that now holds four points shows nothing.
+  useEffect(() => {
+    setZoom(1);
+    setOffset(0);
+    setActiveIndex(null);
+  }, [total, slots.kind]);
+
+  const drawableAll = series.filter((s) => s.values.some((v) => v !== null));
+  const visibleCount = Math.max(2, Math.ceil(total / zoom));
+  const maxStart = Math.max(0, total - visibleCount);
+  const start = Math.min(Math.max(0, offset), maxStart);
+  const end = start + visibleCount;
+  const zoomed = zoom > 1 && total > 2;
+
+  if (total === 0 || drawableAll.length === 0) {
+    return (
+      <div className="chart-wrap" ref={boxRef}>
+        <p className="hint-line chart-empty">No readings to plot for this choice.</p>
+      </div>
+    );
   }
-  if (n === 1) {
-    const solo = drawable
+  if (total === 1) {
+    const solo = drawableAll
       .map((s) => `${tick(s.values[0] as number, s.precision)}${s.unit ? ` ${s.unit}` : ''}`)
       .join(', ');
     return (
-      <p className="hint-line chart-empty">
-        One point — {solo}. A chart needs two; this becomes a line as soon as another row or reading arrives.
-      </p>
+      <div className="chart-wrap" ref={boxRef}>
+        <p className="hint-line chart-empty">
+          One point — {solo}. A chart needs two; this becomes a line as soon as another row or reading arrives.
+        </p>
+      </div>
     );
   }
 
-  const W = 640;
-  const H = 200;
-  const padL = 52;
+  /** The slice this drawing shows. Nothing is filtered — only the view moves. */
+  const viewSlots: PlotSlots =
+    slots.kind === 'time'
+      ? { kind: 'time', ts: slots.ts.slice(start, end) }
+      : { kind: 'category', labels: slots.labels.slice(start, end) };
+  const viewSeries = drawableAll.map((s) => ({ ...s, values: s.values.slice(start, end) }));
+  const viewRowKeys = rowKeys ? rowKeys.slice(start, end) : undefined;
+  const n = slotCount(viewSlots);
+
+  const isNarrow = W < 520;
+  const padL = isNarrow ? 34 : 52;
   const padR = 10;
   const padT = 10;
-  const padB = 24;
+  // Room under the axis for the labels: one line when they sit flat, more when
+  // they have to lean over to fit.
+  const manyLabels = viewSlots.kind === 'category' && n > (isNarrow ? 5 : 9);
+  const padB = manyLabels ? 44 : 26;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
 
-  const values = drawable.flatMap((s) => s.values.filter((v): v is number => v !== null));
+  const values = viewSeries.flatMap((s) => s.values.filter((v): v is number => v !== null));
   const rawMin = Math.min(...values);
   const rawMax = Math.max(...values);
   // Bars grow from zero, so the baseline has to include it. A line does not:
@@ -309,6 +377,7 @@ export function PlotChart({
   const min = kind === 'bar' ? Math.min(0, rawMin) : rawMin;
   const max = rawMax === min ? min + 1 : rawMax;
   const span = max - min;
+  const precision = Math.max(...viewSeries.map((s) => s.precision), 0);
 
   /**
    * Where slot `i` sits. A LINE runs edge to edge; a BAR owns a band and sits in
@@ -320,9 +389,27 @@ export function PlotChart({
   const yAt = (v: number) => padT + plotH - ((v - min) / span) * plotH;
 
   const timeSpan =
-    slots.kind === 'time' ? Math.max(0, slots.ts[slots.ts.length - 1] - slots.ts[0]) : 0;
+    viewSlots.kind === 'time' ? Math.max(0, viewSlots.ts[viewSlots.ts.length - 1] - viewSlots.ts[0]) : 0;
   const labelAt = (i: number) =>
-    slots.kind === 'time' ? stamp(slots.ts[i], timeSpan) : clipLabel(slots.labels[i]);
+    viewSlots.kind === 'time' ? stamp(viewSlots.ts[i], timeSpan) : clipLabel(viewSlots.labels[i]);
+
+  /**
+   * WHICH LABELS TO DRAW.
+   *
+   * A category axis holds names, not a continuum: four flat types are four
+   * readable labels, and printing two of them is the chart hiding its own subject.
+   * So a small category axis labels every slot; only when the labels genuinely
+   * cannot fit does it thin — evenly, so the axis still spans its whole range.
+   */
+  const labelIndices = (() => {
+    if (viewSlots.kind === 'category') {
+      if (n <= 14) return Array.from({ length: n }, (_, i) => i);
+      const want = isNarrow ? 5 : 9;
+      return evenlySpaced(n, want);
+    }
+    if (n === 2) return [0, 1];
+    return evenlySpaced(n, isNarrow ? 3 : 5);
+  })();
 
   // Three gridlines: enough to read a value off, few enough that a phone is not
   // a wall of text.
@@ -333,7 +420,7 @@ export function PlotChart({
 
   /** Bars are grouped inside a slot's band when several series share the chart. */
   const groupW = band * 0.8;
-  const barW = Math.max(1.5, groupW / drawable.length);
+  const barW = Math.max(1.5, groupW / viewSeries.length);
 
   /**
    * One series as polyline runs, broken at every null.
@@ -370,24 +457,27 @@ export function PlotChart({
     activeIndex !== null && activeIndex < n
       ? (() => {
           const when =
-            slots.kind === 'time' ? fullStamp(slots.ts[activeIndex]) : slots.labels[activeIndex];
-          const rowKey = rowKeys?.[activeIndex];
+            viewSlots.kind === 'time' ? fullStamp(viewSlots.ts[activeIndex]) : viewSlots.labels[activeIndex];
+          const rowKey = viewRowKeys?.[activeIndex];
           const attrs = (attributes ?? []).flatMap((a) => {
             const value = rowKey ? a.bySlot.get(rowKey) : undefined;
             return value ? [`${a.label}: ${value}`] : [];
           });
           const lines = [
             when,
-            ...drawable.map((s) => {
+            ...viewSeries.map((s) => {
               const v = s.values[activeIndex];
               return `${s.label}: ${v === null ? 'no reading' : `${tick(v, s.precision)}${s.unit ? ` ${s.unit}` : ''}`}`;
             }),
             ...attrs,
           ];
-          const boxW = Math.min(W - 8, Math.max(120, Math.ceil(Math.max(...lines.map((l) => l.length)) * 6.4 + 16)));
+          const boxW = Math.min(
+            W - 8,
+            Math.max(120, Math.ceil(Math.max(...lines.map((l) => l.length)) * (isNarrow ? 5.8 : 6.4) + 16)),
+          );
           const boxH = 12 + lines.length * 14;
           const x = xAt(activeIndex);
-          const top = drawable.reduce<number | null>((acc, s) => {
+          const top = viewSeries.reduce<number | null>((acc, s) => {
             const v = s.values[activeIndex];
             return v === null ? acc : Math.min(acc ?? Infinity, yAt(v));
           }, null);
@@ -398,27 +488,86 @@ export function PlotChart({
         })()
       : null;
 
-  /** The row key behind a slot, for a table's attributes. */
-
   return (
-    <div className="chart-wrap">
+    <div className="chart-wrap" ref={boxRef}>
+      {/* ZOOM. The drawing moves; the data does not. `‹ ›` step along the
+          readings when the whole of a long series cannot be seen at once. */}
+      <div className="chart-toolbar">
+        <span className="chart-toolbar-count">
+          {zoomed ? `${start + 1}–${end} of ${total}` : `${total} point${total === 1 ? '' : 's'}`}
+        </span>
+        <div className="chart-zoom" role="group" aria-label="Zoom the chart">
+          <button
+            type="button"
+            onClick={() => setZoom((z) => Math.max(1, Math.round(z / 2)))}
+            disabled={!zoomed}
+            aria-label="Zoom out"
+            title="Zoom out"
+          >
+            −
+          </button>
+          <span className="chart-zoom-level">{zoomed ? `${zoom}×` : '1×'}</span>
+          <button
+            type="button"
+            onClick={() => setZoom((z) => Math.min(8, z * 2))}
+            disabled={visibleCount <= 2 || zoom >= 8}
+            aria-label="Zoom in"
+            title="Zoom in"
+          >
+            +
+          </button>
+          {zoomed && (
+            <>
+              <button
+                type="button"
+                onClick={() => setOffset(Math.max(0, start - visibleCount))}
+                disabled={start === 0}
+                aria-label="Earlier points"
+                title="Earlier"
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                onClick={() => setOffset(Math.min(maxStart, start + visibleCount))}
+                disabled={start >= maxStart}
+                aria-label="Later points"
+                title="Later"
+              >
+                ›
+              </button>
+              <button
+                type="button"
+                className="chart-zoom-reset"
+                onClick={() => {
+                  setZoom(1);
+                  setOffset(0);
+                }}
+              >
+                Reset
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
       <svg
         className="metric-chart"
         viewBox={`0 0 ${W} ${H}`}
         role="img"
-        aria-label={`${kind} chart of ${drawable.map((s) => s.label).join(', ')} over ${n} points`}
+        aria-label={`${kind} chart of ${viewSeries.map((s) => s.label).join(', ')} over ${n} points`}
       >
         {grid.map((g) => (
           <g key={g.y}>
             <line className="chart-grid" x1={padL} x2={W - padR} y1={g.y} y2={g.y} />
             <text className="chart-tick" x={padL - 6} y={g.y + 3} textAnchor="end">
-              {tick(g.v, 0)}
+              {isNarrow ? compactTick(g.v) : tick(g.v, precision)}
             </text>
           </g>
         ))}
 
         {kind === 'bar' &&
-          drawable.map((s, si) =>
+          viewSeries.map((s, si) =>
             s.values.map((v, i) => {
               if (v === null) return null;
               const y = yAt(v);
@@ -438,8 +587,8 @@ export function PlotChart({
           )}
 
         {kind === 'area' &&
-          drawable.length === 1 &&
-          segments(drawable[0]).map((seg, si) => (
+          viewSeries.length === 1 &&
+          segments(viewSeries[0]).map((seg, si) => (
             <polygon
               key={`area-${si}`}
               className="chart-area chart-series-0"
@@ -451,7 +600,7 @@ export function PlotChart({
 
         {kind !== 'bar' &&
           kind !== 'area' &&
-          drawable.map((s, si) =>
+          viewSeries.map((s, si) =>
             segments(s).map((seg, gi) => (
               <polyline
                 key={`${s.key}-${gi}`}
@@ -463,8 +612,8 @@ export function PlotChart({
           )}
 
         {kind === 'area' &&
-          drawable.length === 1 &&
-          segments(drawable[0]).map((seg, gi) => (
+          viewSeries.length === 1 &&
+          segments(viewSeries[0]).map((seg, gi) => (
             <polyline
               key={`edge-${gi}`}
               className="chart-line chart-series-0"
@@ -477,7 +626,7 @@ export function PlotChart({
             a solid smear, and the line already says where the readings are. */}
         {n <= 40 &&
           kind !== 'bar' &&
-          drawable.map((s, si) =>
+          viewSeries.map((s, si) =>
             s.values.map((v, i) =>
               v === null ? null : (
                 <circle
@@ -491,34 +640,43 @@ export function PlotChart({
             ),
           )}
 
-        <text className="chart-tick" x={padL} y={H - 6} textAnchor="start">
-          {labelAt(0)}
-        </text>
-        <text className="chart-tick" x={W - padR} y={H - 6} textAnchor="end">
-          {labelAt(n - 1)}
-        </text>
+        {labelIndices.map((i) => {
+          const text = labelAt(i);
+          const x = kind === 'bar' ? xAt(i) : xAt(i);
+          return (
+            <text
+              key={`xl-${i}`}
+              className="chart-tick chart-x-tick"
+              x={x}
+              y={H - (manyLabels ? 10 : 8)}
+              textAnchor={manyLabels ? 'end' : i === 0 && !isNarrow ? 'start' : i === n - 1 && !isNarrow ? 'end' : 'middle'}
+              {...(manyLabels ? { transform: `rotate(-40 ${x} ${H - 10})` } : {})}
+            >
+              {text}
+            </text>
+          );
+        })}
 
         {/* A strip per slot, not a hit test on a 2px dot. */}
-        {drawable.length >= 1 &&
-          Array.from({ length: n }, (_, i) => {
-            const hitW = kind === 'bar' ? band : plotW / Math.max(1, n - 1);
-            return (
-              <rect
-                key={`hit-${i}`}
-                className="chart-hit"
-                x={xAt(i) - hitW / 2}
-                y={padT}
-                width={Math.max(4, hitW)}
-                height={plotH}
-                onPointerDown={() => setActiveIndex(i)}
-                onPointerEnter={(e) => {
-                  // Mouse hovers; a finger does not, and treating its touch-enter
-                  // as a hover shows a tooltip the user cannot dismiss.
-                  if (e.pointerType === 'mouse') setActiveIndex(i);
-                }}
-              />
-            );
-          })}
+        {Array.from({ length: n }, (_, i) => {
+          const hitW = kind === 'bar' ? band : plotW / Math.max(1, n - 1);
+          return (
+            <rect
+              key={`hit-${i}`}
+              className="chart-hit"
+              x={xAt(i) - hitW / 2}
+              y={padT}
+              width={Math.max(4, hitW)}
+              height={plotH}
+              onPointerDown={() => setActiveIndex(i)}
+              onPointerEnter={(e) => {
+                // Mouse hovers; a finger does not, and treating its touch-enter
+                // as a hover shows a tooltip the user cannot dismiss.
+                if (e.pointerType === 'mouse') setActiveIndex(i);
+              }}
+            />
+          );
+        })}
 
         {active && (
           <g className="chart-tip" pointerEvents="none">
@@ -554,7 +712,7 @@ export function PlotChart({
       {/* THE SHARED LEGEND. One entry per plotted series, named with the colour it
           is drawn in, so two tickers on one chart stay tellable apart. */}
       <ul className="chart-legend">
-        {drawable.map((s, i) => (
+        {viewSeries.map((s, i) => (
           <li key={s.key}>
             <i className={`chart-swatch chart-series-${i % 6}`} aria-hidden="true" />
             {s.label}
@@ -565,6 +723,64 @@ export function PlotChart({
       {xTitle ? <p className="chart-x-title">x: {xTitle}</p> : null}
     </div>
   );
+}
+
+/**
+ * How big this chart actually is, in CSS pixels.
+ *
+ * Starts at the desktop size so the first paint is a sensible box, then measures
+ * — a narrow box gets a TALLER plot, because a 640x200 viewBox squeezed into
+ * 350px is a 110px chart with 5px text.
+ */
+function useChartBox() {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [box, setBox] = useState({ w: 640, h: 200 });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => {
+      // The box IS the viewBox: measuring at the real width keeps the scale at 1,
+      // so 10px text is 10px on a phone. A floor of 280 used to force a narrow
+      // pane to draw at 0.83 scale, which is the same shrinking it was meant to fix.
+      const w = Math.max(200, Math.round(el.clientWidth || 640));
+      setBox((prev) => {
+        const h = w < 520 ? 260 : 200;
+        return prev.w === w && prev.h === h ? prev : { w, h };
+      });
+    };
+    measure();
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, []);
+  return { ref, w: box.w, h: box.h };
+}
+
+/**
+ * A y-axis label that fits a phone.
+ *
+ * `460,000.00` on a 232px plot is a 34px label column and a plot with 150px of
+ * drawing room; `460k` says the same thing at a glance and gives the drawing back.
+ * The tooltip keeps the full precision, so nothing is lost.
+ */
+function compactTick(v: number): string {
+  const abs = Math.abs(v);
+  if (abs >= 1e6) return `${(v / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}m`;
+  if (abs >= 1e3) return `${(v / 1e3).toFixed(abs >= 1e4 ? 0 : 1)}k`;
+  if (abs >= 10) return String(Math.round(v * 10) / 10);
+  return String(Math.round(v * 100) / 100);
+}
+
+/** `k` indices spread evenly across `n` slots, always including both ends. */function evenlySpaced(n: number, k: number): number[] {
+  if (n <= k) return Array.from({ length: n }, (_, i) => i);
+  const out = new Set<number>([0, n - 1]);
+  const step = (n - 1) / (k - 1);
+  for (let i = 0; i < k; i += 1) out.add(Math.round(i * step));
+  return [...out].sort((a, b) => a - b);
 }
 
 /**

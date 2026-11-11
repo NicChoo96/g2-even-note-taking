@@ -173,7 +173,22 @@ checkTrue('the x axis is a control, over every column', /title="Which column run
 checkTrue('the plotted columns are multi-select', /aria-label="Which columns to plot"/.test(panel));
 checkTrue('the chart is handed slots + series, not one column', /<PlotChart[\s\S]{0,200}slots=\{shownPlot\.slots\}[\s\S]{0,80}series=\{shownPlot\.series\}/.test(panel));
 checkTrue('…and the x column is named under it', /xTitle=\{xInfo \? fieldTitle\(xInfo\) : xField\}/.test(panel));
-checkTrue('two series can share the axis', /aria-label="Plot beside this one"/.test(panel) && /view\.compare/.test(panel));
+checkTrue('two series can share the axis', /label="Compare"/.test(panel) && /view\.compare/.test(panel));
+checkTrue(
+  '…chosen from a dropdown, not a row of chips that grows with the store',
+  /className="md-compare"/.test(panel) && /aria-label="Series to compare"/.test(panel),
+);
+checkTrue(
+  'every dropdown closes on an outside tap and on Escape',
+  /document\.addEventListener\('pointerdown', onDown, true\)/.test(panel) &&
+    /e\.key === 'Escape'/.test(panel) &&
+    /!el\.contains\(e\.target\)/.test(panel),
+);
+checkTrue(
+  'a chip wraps, then truncates, instead of scrolling the row sideways',
+  /md-chip-text/.test(panel) && /max-width: 150px/.test(readFileSync(resolve(here, '../src/web/styles.css'), 'utf8')),
+);
+checkTrue('the control groups are labelled', /md-controls-label/.test(panel) && />Plot</.test(panel) && />Window</.test(panel));
 checkTrue('the picked columns and axis are remembered', /stored\.xField/.test(panel) && /stored\.yFields/.test(panel) && /stored\.compare/.test(panel));
 checkTrue('what could not be placed is reported', /left out — nothing in/.test(panel) && /share a value already on the axis/.test(panel));
 checkTrue(
@@ -185,9 +200,19 @@ const chart = readFileSync(resolve(here, '../src/web/metric-chart.tsx'), 'utf8')
 checkTrue('the legend names every plotted series', /className="chart-legend"/.test(chart) && /s\.label/.test(chart));
 checkTrue('each series gets its own colour class', /chart-series-\$\{si % 6\}/.test(chart));
 checkTrue('a null BREAKS the line rather than joining it', /if \(v === null\) \{[\s\S]{0,80}run = \[\];[\s\S]{0,40}return;/.test(chart));
-checkTrue('bars are grouped when several series share a slot', /groupW \/ drawable\.length/.test(chart));
-checkTrue('the tooltip names every series at the touched slot', /drawable\.map\(\(s\) => \{[\s\S]{0,160}no reading/.test(chart));
-checkTrue('a category axis labels itself from the cell text', /slots\.kind === 'time' \? stamp\(slots\.ts\[i\], timeSpan\) : clipLabel/.test(chart));
+checkTrue('bars are grouped when several series share a slot', /band \* 0\.8[\s\S]{0,60}\/ viewSeries\.length/.test(chart));
+checkTrue('the tooltip names every series at the touched slot', /viewSeries\.map\(\(s\) => \{[\s\S]{0,160}no reading/.test(chart));
+checkTrue('a category axis labels itself from the cell text', /viewSlots\.kind === 'time' \? stamp\(viewSlots\.ts\[i\], timeSpan\) : clipLabel/.test(chart));
+checkTrue(
+  'a small category axis labels EVERY slot, not just its ends',
+  /if \(viewSlots\.kind === 'category'\) \{[\s\S]{0,120}n <= 14\) return Array\.from/.test(chart),
+);
+checkTrue('a crowded axis thins to evenly-spaced ticks', /return evenlySpaced\(n, want\)/.test(chart));
+checkTrue(
+  'the chart measures its own box and is TALLER when narrow',
+  /useChartBox\(\)/.test(chart) && /w < 520 \? 260 : 200/.test(chart),
+);
+checkTrue('the drawing can zoom and step without touching the data', /chart-zoom/.test(chart) && /setZoom/.test(chart) && /setOffset/.test(chart));
 
 console.log(fail ? `\n${fail} FAILURE(S) of ${pass + fail}` : `\nALL PASS (${pass} assertions)`);
 process.exit(fail ? 1 : 0);

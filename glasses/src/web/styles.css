@@ -3142,16 +3142,35 @@ p.empty {
 .md-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  justify-content: space-between;
+  gap: 8px 10px;
+  align-items: flex-start;
+  justify-content: flex-start;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   padding: 6px 0;
 }
 
+/* One question per group, with its own small heading — "Chart / Line Area Bar"
+   reads as a choice, while nine unlabelled pills read as a toolbar of mystery. */
+.md-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.md-controls-label {
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex: none;
+}
+
 /* A segmented control, so "which view" reads as a choice among five, not five
    independent buttons that all look pressed. */
-.md-seg { display: flex; gap: 3px; flex-wrap: wrap; }
+.md-seg { display: flex; gap: 3px; flex-wrap: wrap; min-width: 0; max-width: 100%; }
 
 .md-seg button {
   font-size: 11px;
@@ -3161,6 +3180,18 @@ p.empty {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
+  /* WRAP, THEN TRUNCATE. A column called "Price per square foot" used to make the
+     row wider than a phone and the row scrolled sideways instead. */
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-chip-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 719px) {
+  .md-seg button { max-width: 42vw; }
 }
 
 .md-seg button:hover:not(:disabled) { color: inherit; border-color: var(--accent); }
@@ -3168,8 +3199,51 @@ p.empty {
 .md-seg button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ── the chart ────────────────────────────────────────────────────────────── */
-.chart-wrap { margin: 6px 0 2px; }
+.chart-wrap { margin: 6px 0 2px; min-width: 0; }
 .metric-chart { width: 100%; height: auto; display: block; }
+
+/* The zoom strip. Small, right-aligned, and only as wide as it needs to be — it
+   is a lens on the drawing, not a second toolbar. */
+.chart-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.chart-toolbar-count {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chart-zoom { display: inline-flex; align-items: center; gap: 2px; }
+
+.chart-zoom button {
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chart-zoom button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.chart-zoom button:disabled { opacity: 0.35; cursor: default; }
+.chart-zoom-level {
+  font-size: 10px;
+  color: var(--muted);
+  min-width: 22px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.chart-zoom-reset { font-size: 10px !important; }
 
 /*
   ONE COLOUR PER PLOTTED SERIES.
@@ -3479,9 +3553,7 @@ p.empty {
 }
 
 /* ── table filters (Excel's filter row, in the store's vocabulary) ──────────
-   A row of disclosures: the summary is the chip, the panel is the value list.
-   `<details>` is used so keyboard and Escape work for free; the only thing
-   needed here is the look and the list's own scrolling. */
+   A row of dropdowns: the button is the chip, the panel is the value list. */
 .rec-filters {
   display: flex;
   flex-wrap: wrap;
@@ -3490,25 +3562,32 @@ p.empty {
   margin: 0 0 8px;
 }
 
-.rec-filter { position: relative; }
+/* ── a dismissable dropdown ───────────────────────────────────────────────────
+   Used by the filters and by the compare picker. The panel closes on a tap
+   ANYWHERE outside it (a document pointerdown listener) and on Escape, because a
+   `<details>` panel pinned to the bottom of a phone screen could only be closed
+   by reloading the page. */
+.dp-menu { position: relative; display: inline-flex; min-width: 0; }
 
-.rec-filter > summary {
-  list-style: none;
-  cursor: pointer;
+.dp-menu-btn {
   display: inline-flex;
   align-items: baseline;
   gap: 5px;
   padding: 3px 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
+  background: transparent;
   font-size: 11px;
   color: var(--text-soft, inherit);
+  cursor: pointer;
   max-width: 220px;
+  min-width: 0;
 }
-.rec-filter > summary::-webkit-details-marker { display: none; }
-.rec-filter > summary:hover { border-color: var(--border-strong, var(--border)); }
-/* A summary cannot hold a block child, so the caret is drawn, not typed. */
-.rec-filter > summary::after {
+
+.dp-menu-btn:hover { border-color: var(--border-strong, var(--border)); }
+
+/* A caret, drawn rather than typed: the button holds two spans. */
+.dp-menu-btn::after {
   content: "";
   width: 0;
   height: 0;
@@ -3518,19 +3597,28 @@ p.empty {
   opacity: 0.55;
   position: relative;
   top: -1px;
+  flex: none;
 }
 
-.rec-filter.active > summary {
+.dp-menu.active > .dp-menu-btn {
   border-color: var(--accent, #8a98fb);
   color: var(--accent-strong, var(--accent, #8a98fb));
 }
 
-.rec-filter-name { color: var(--muted); }
-.rec-filter-value { font-weight: 600; }
+.dp-menu.open > .dp-menu-btn { border-color: var(--accent, #8a98fb); }
 
-.rec-filter-panel {
+.dp-menu-label {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.dp-menu-value { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+.dp-menu-panel {
   position: absolute;
-  z-index: 20;
+  z-index: 30;
   top: calc(100% + 4px);
   left: 0;
   min-width: 200px;
@@ -3542,36 +3630,51 @@ p.empty {
   box-shadow: var(--shadow, 0 12px 30px rgba(0, 0, 0, 0.45));
 }
 
-.rec-filter-panel input[type='search'] {
+.dp-menu-search {
   width: 100%;
   margin-bottom: 6px;
   font-size: 12px;
   padding: 5px 8px;
 }
 
-.rec-filter-list { max-height: 220px; overflow: auto; }
+.dp-menu-list { max-height: 220px; overflow: auto; }
 
-.rec-filter-opt {
+.dp-menu-opt {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 2px;
+  padding: 6px 2px;
   font-size: 12px;
   cursor: pointer;
 }
-.rec-filter-opt > span {
+.dp-menu-opt.disabled { opacity: 0.45; cursor: default; }
+.dp-menu-opt > span {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
-.rec-filter-opt > em {
+.dp-menu-opt > em {
   font-style: normal;
   font-size: 10px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.rec-filter-opt input[type='checkbox'] { width: 15px; height: 15px; }
+.dp-menu-opt input[type='checkbox'] { width: 15px; height: 15px; flex: none; }
+
+.dp-menu-clear {
+  margin-top: 6px;
+  width: 100%;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.dp-menu-clear:hover { border-color: var(--accent); color: var(--accent); }
 
 /* WRAPS, because two date inputs are ~360px together and a 390px phone has
    ~330px of pane: on one line they push the page sideways instead of the
@@ -3598,9 +3701,10 @@ p.empty {
 
 /* A panel anchored with `left: 0` to a chip near the right edge runs off a
    phone. Under 720px it becomes a bottom-ish sheet pinned to the viewport, which
-   also puts every value within thumb reach. */
+   also puts every value within thumb reach — and because the panel now closes on
+   an outside tap, that sheet is dismissable. */
 @media (max-width: 719px) {
-  .rec-filter-panel {
+  .dp-menu-panel {
     position: fixed;
     top: auto;
     bottom: 12px;
@@ -3609,6 +3713,7 @@ p.empty {
     max-width: none;
     max-height: 60vh;
   }
-  .rec-filter-list { max-height: 40vh; }
+  .dp-menu-list { max-height: 40vh; }
+  .dp-menu-btn { max-width: 46vw; }
   .rec-filters { gap: 5px; }
 }

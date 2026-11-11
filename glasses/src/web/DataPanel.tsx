@@ -10,7 +10,7 @@
 // `kind: 'fetch'`, so it is saved through the same PUT the Schedule tab uses and
 // lands in the same durable document. Nothing here invents a second source of
 // truth.
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchSchedule, saveSchedule } from './agents-client';
 import {
   collectNow,
@@ -357,38 +357,44 @@ function SeriesDetail({
       </div>
 
       <div className="md-controls">
-        <div className="md-seg" role="group" aria-label="Chart type">
-          {CHART_KINDS.map((kind) => (
+        <div className="md-group">
+          <span className="md-controls-label">Chart</span>
+          <div className="md-seg" role="group" aria-label="Chart type">
+            {CHART_KINDS.map((kind) => (
+              <button
+                key={kind}
+                className={view.kind === kind ? 'active' : ''}
+                onClick={() => onView({ ...view, kind })}
+                disabled={series.type !== 'number'}
+                aria-pressed={view.kind === kind}
+              >
+                {CHART_LABELS[kind]}
+              </button>
+            ))}
             <button
-              key={kind}
-              className={view.kind === kind ? 'active' : ''}
-              onClick={() => onView({ ...view, kind })}
-              disabled={series.type !== 'number'}
-              aria-pressed={view.kind === kind}
+              className={view.kind === 'table' ? 'active' : ''}
+              onClick={() => onView({ ...view, kind: 'table' })}
+              aria-pressed={view.kind === 'table'}
+              title="Read the readings as rows"
             >
-              {CHART_LABELS[kind]}
+              Table
             </button>
-          ))}
-          <button
-            className={view.kind === 'table' ? 'active' : ''}
-            onClick={() => onView({ ...view, kind: 'table' })}
-            aria-pressed={view.kind === 'table'}
-            title="Read the readings as rows"
-          >
-            Table
-          </button>
+          </div>
         </div>
-        <div className="md-seg" role="group" aria-label="Time window">
-          {choices.map((c) => (
-            <button
-              key={String(c.value)}
-              className={active === c.value ? 'active' : ''}
-              onClick={() => onView({ ...view, window: c.value })}
-              aria-pressed={active === c.value}
-            >
-              {c.label}
-            </button>
-          ))}
+        <div className="md-group">
+          <span className="md-controls-label">Window</span>
+          <div className="md-seg" role="group" aria-label="Time window">
+            {choices.map((c) => (
+              <button
+                key={String(c.value)}
+                className={active === c.value ? 'active' : ''}
+                onClick={() => onView({ ...view, window: c.value })}
+                aria-pressed={active === c.value}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -422,38 +428,58 @@ function SeriesDetail({
       )}
 
       {/* COMPARE. Two or more series on ONE axis, which is the only way to read
-          them against each other — separate charts are compared by eye, and the
-          eye is bad at it. The choice is remembered with the rest of the view. */}
+          them against each other. It was a row of chips, which grew with the
+          store — a dozen tickers turned the control into a wall of buttons, and
+          most of them are unrelated to what you are looking at. A dropdown costs
+          one line however many series exist, and it names what is selected. */}
       {series.type === 'number' && others.length > 0 && (
-        <div className="md-attrs" role="group" aria-label="Plot beside this one">
-          <span className="md-attrs-label">Compare</span>
-          {others.map((o) => {
-            const on = compared.includes(o.key);
-            const full = !on && compared.length >= MAX_COMPARE;
-            return (
-              <button
-                key={o.key}
-                className={on ? 'md-attr-chip active' : 'md-attr-chip'}
-                aria-pressed={on}
-                disabled={full}
-                onClick={() =>
-                  onView({
-                    ...view,
-                    compare: on ? compared.filter((k) => k !== o.key) : [...compared, o.key],
-                  })
-                }
-                title={
-                  full
-                    ? `Six lines is the limit — untick one first`
-                    : on
-                      ? `Stop plotting ${o.label || o.key}`
-                      : `Plot ${o.label || o.key} on the same axis`
-                }
-              >
-                {o.label || o.key}
+        <div className="md-attrs">
+          <span className="md-attrs-label">Series</span>
+          <Menu
+            className="md-compare"
+            label="Compare"
+            value={
+              compared.length === 0
+                ? 'just this one'
+                : compared.length === 1
+                  ? others.find((s) => s.key === compared[0])?.label || compared[0]
+                  : `${compared.length} series`
+            }
+            active={compared.length > 0}
+            title="Plot other series on the same axis"
+          >
+            <div className="dp-menu-list" role="group" aria-label="Series to compare">
+              {others.map((o) => {
+                const on = compared.includes(o.key);
+                const full = !on && compared.length >= MAX_COMPARE;
+                return (
+                  <label key={o.key} className={full ? 'dp-menu-opt disabled' : 'dp-menu-opt'} title={o.key}>
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      disabled={full}
+                      onChange={() =>
+                        onView({
+                          ...view,
+                          compare: on ? compared.filter((k) => k !== o.key) : [...compared, o.key],
+                        })
+                      }
+                    />
+                    <span>{o.label || o.key}</span>
+                    {o.unit ? <em>{o.unit}</em> : null}
+                  </label>
+                );
+              })}
+            </div>
+            {compared.length >= MAX_COMPARE && (
+              <p className="hint-line">Six lines is the limit — untick one first.</p>
+            )}
+            {compared.length > 0 && (
+              <button type="button" className="dp-menu-clear" onClick={() => onView({ ...view, compare: [] })}>
+                Clear
               </button>
-            );
-          })}
+            )}
+          </Menu>
         </div>
       )}
 
@@ -538,12 +564,74 @@ function rowWhen(row: RecordRow): string {
 }
 
 /**
- * One column's filter, as a dropdown with a search box and checkboxes.
+ * A dropdown that closes when you tap ANYWHERE else.
  *
- * WHY `<details>` AND NOT A POPOVER. A disclosure is keyboard-reachable, closes
- * on Escape, and needs no outside-click listener or focus trap — three things a
- * hand-rolled popover gets wrong, invisibly, on a phone. The search box is what
- * the wearer asked for: with forty projects, typing two letters beats scrolling.
+ * WHY NOT `<details>`: a disclosure closes only on its own summary. On a phone the
+ * panel is pinned to the bottom of the viewport and covers the chip that opened
+ * it, so there was no way out except reloading the page — the wearer said exactly
+ * that. This is a button plus a panel, with a document-level pointerdown listener
+ * that closes it when the tap lands outside, plus Escape for a keyboard.
+ *
+ * It stays a disclosure in every way that matters: one button, one panel, no focus
+ * trap, and the panel is a normal child of the page.
+ */
+function Menu({
+  label,
+  value,
+  active,
+  className,
+  title,
+  children,
+}: {
+  label: string;
+  value: string;
+  /** Highlighted when this menu is doing something (a filter is on, a compare is set). */
+  active?: boolean;
+  className?: string;
+  title?: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: Event) => {
+      const el = ref.current;
+      if (el && e.target instanceof Node && !el.contains(e.target)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    // Capture phase: a panel that stops propagation must not trap the tap.
+    document.addEventListener('pointerdown', onDown, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className={`dp-menu${open ? ' open' : ''}${active ? ' active' : ''}${className ? ` ${className}` : ''}`} ref={ref}>
+      <button
+        type="button"
+        className="dp-menu-btn"
+        aria-expanded={open}
+        aria-haspopup="true"
+        title={title ?? label}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="dp-menu-label">{label}</span>
+        <span className="dp-menu-value">{value}</span>
+      </button>
+      {open && <div className="dp-menu-panel">{children}</div>}
+    </div>
+  );
+}
+
+/**
+ * One column's filter, as a dropdown with a search box and checkboxes.
  *
  * WHY MULTI-SELECT. "4-room and 5-room" is one question about flat types, not two
  * separate views; single-select would force a detour through "All" between them.
@@ -568,41 +656,42 @@ function RecordFilterMenu({
     onChange(selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value]);
 
   return (
-    <details className={selected.length ? 'rec-filter active' : 'rec-filter'}>
-      <summary title={`Filter by ${field.key}`}>
-        <span className="rec-filter-name">{fieldTitle(field)}</span>
-        <span className="rec-filter-value">{filterLabel({ [field.key]: selected }, field)}</span>
-      </summary>
-      <div className="rec-filter-panel">
-        {options.length > 6 && (
-          <input
-            type="search"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder={`Search ${fieldTitle(field).toLowerCase()}`}
-            aria-label={`Search ${fieldTitle(field)} values`}
-            autoComplete="off"
-            spellCheck={false}
-          />
-        )}
-        <div className="rec-filter-list" role="group" aria-label={`${fieldTitle(field)} values`}>
-          <label className="rec-filter-opt">
-            <input type="checkbox" checked={selected.length === 0} onChange={() => onChange([])} />
-            <span>All</span>
-            <em>{rows.length}</em>
+    <Menu
+      className="rec-filter"
+      label={fieldTitle(field)}
+      value={filterLabel({ [field.key]: selected }, field)}
+      active={selected.length > 0}
+      title={`Filter by ${field.key}`}
+    >
+      {options.length > 6 && (
+        <input
+          type="search"
+          className="dp-menu-search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={`Search ${fieldTitle(field).toLowerCase()}`}
+          aria-label={`Search ${fieldTitle(field)} values`}
+          autoComplete="off"
+          spellCheck={false}
+        />
+      )}
+      <div className="dp-menu-list" role="group" aria-label={`${fieldTitle(field)} values`}>
+        <label className="dp-menu-opt">
+          <input type="checkbox" checked={selected.length === 0} onChange={() => onChange([])} />
+          <span>All</span>
+          <em>{rows.length}</em>
+        </label>
+        {shown.slice(0, 40).map((o) => (
+          <label key={o.value} className="dp-menu-opt">
+            <input type="checkbox" checked={selected.includes(o.value)} onChange={() => toggle(o.value)} />
+            <span title={o.value}>{o.value}</span>
+            <em>{o.count}</em>
           </label>
-          {shown.slice(0, 40).map((o) => (
-            <label key={o.value} className="rec-filter-opt">
-              <input type="checkbox" checked={selected.includes(o.value)} onChange={() => toggle(o.value)} />
-              <span title={o.value}>{o.value}</span>
-              <em>{o.count}</em>
-            </label>
-          ))}
-          {shown.length > 40 && <p className="hint-line">+{shown.length - 40} more — type to narrow</p>}
-          {shown.length === 0 && <p className="hint-line">No value matches “{q}”.</p>}
-        </div>
+        ))}
+        {shown.length > 40 && <p className="hint-line">+{shown.length - 40} more — type to narrow</p>}
+        {shown.length === 0 && <p className="hint-line">No value matches “{q}”.</p>}
       </div>
-    </details>
+    </Menu>
   );
 }
 
@@ -806,61 +895,70 @@ function TableDetail({
             exactly what a table of rows is for; the last one cannot be turned off,
             or there would be a chart type and nothing to draw. */}
         {numeric.length > 0 && (
-          <div className="md-seg" role="group" aria-label="Which columns to plot">
-            {numeric.map((f) => {
-              const on = yFields.includes(f.key);
-              return (
-                <button
-                  key={f.key}
-                  className={on ? 'active' : ''}
-                  onClick={() => {
-                    const next = on ? yFields.filter((k) => k !== f.key) : [...yFields, f.key];
-                    const keep = next.length ? next : [f.key];
-                    onView({ ...view, yFields: keep, field: keep[0] });
-                  }}
-                  aria-pressed={on}
-                  title={on ? `Stop plotting ${fieldTitle(f)}` : `Plot ${fieldTitle(f)} too`}
-                >
-                  {f.label || f.key}
-                </button>
-              );
-            })}
+          <div className="md-group">
+            <span className="md-controls-label">Plot</span>
+            <div className="md-seg" role="group" aria-label="Which columns to plot">
+              {numeric.map((f) => {
+                const on = yFields.includes(f.key);
+                return (
+                  <button
+                    key={f.key}
+                    className={on ? 'active' : ''}
+                    onClick={() => {
+                      const next = on ? yFields.filter((k) => k !== f.key) : [...yFields, f.key];
+                      const keep = next.length ? next : [f.key];
+                      onView({ ...view, yFields: keep, field: keep[0] });
+                    }}
+                    aria-pressed={on}
+                    title={`${on ? 'Stop plotting' : 'Plot'} ${fieldTitle(f)}`}
+                  >
+                    <span className="md-chip-text">{f.label || f.key}</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
         )}
         {numeric.length > 0 && (
-          <div className="md-seg" role="group" aria-label="Chart type">
-            {CHART_KINDS.map((kind) => (
+          <div className="md-group">
+            <span className="md-controls-label">Chart</span>
+            <div className="md-seg" role="group" aria-label="Chart type">
+              {CHART_KINDS.map((kind) => (
+                <button
+                  key={kind}
+                  className={view.kind === kind ? 'active' : ''}
+                  onClick={() => onView({ ...view, kind })}
+                  aria-pressed={view.kind === kind}
+                >
+                  {CHART_LABELS[kind]}
+                </button>
+              ))}
               <button
-                key={kind}
-                className={view.kind === kind ? 'active' : ''}
-                onClick={() => onView({ ...view, kind })}
-                aria-pressed={view.kind === kind}
+                className={view.kind === 'table' ? 'active' : ''}
+                onClick={() => onView({ ...view, kind: 'table' })}
+                aria-pressed={view.kind === 'table'}
+                title="Just the rows"
               >
-                {CHART_LABELS[kind]}
+                Table
               </button>
-            ))}
-            <button
-              className={view.kind === 'table' ? 'active' : ''}
-              onClick={() => onView({ ...view, kind: 'table' })}
-              aria-pressed={view.kind === 'table'}
-              title="Just the rows"
-            >
-              Table
-            </button>
+            </div>
           </div>
         )}
         {numeric.length > 0 && view.kind !== 'table' && choices.length > 1 && (
-          <div className="md-seg" role="group" aria-label="Time window">
-            {choices.map((c) => (
-              <button
-                key={String(c.value)}
-                className={activeWindow === c.value ? 'active' : ''}
-                onClick={() => onView({ ...view, window: c.value })}
-                aria-pressed={activeWindow === c.value}
-              >
-                {c.label}
-              </button>
-            ))}
+          <div className="md-group">
+            <span className="md-controls-label">Window</span>
+            <div className="md-seg" role="group" aria-label="Time window">
+              {choices.map((c) => (
+                <button
+                  key={String(c.value)}
+                  className={activeWindow === c.value ? 'active' : ''}
+                  onClick={() => onView({ ...view, window: c.value })}
+                  aria-pressed={activeWindow === c.value}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </div>
@@ -1166,8 +1264,13 @@ export function DataPanel() {
    * The three steps stay OPEN until dismissed, and on a dashboard with no
    * readings they are the whole page — that is the case where someone needs to
    * be told what a series is.
+   *
+   * ONCE THERE IS DATA THEY ARE IN THE WAY, and they were: three paragraphs
+   * between the wearer and the chart on every visit, on a phone. The dismissal is
+   * remembered, so "How this works" is a thing you can ask for rather than a thing
+   * you scroll past.
    */
-  const [helpDismissed, setHelpDismissed] = useState(false);
+  const [helpDismissed, setHelpDismissed] = useState(() => readStored('hub:data:helpSeen', false));
   const [draft, setDraft] = useState<Draft>(BLANK);
   /** The standalone "add a series" form: four fields, no collector. */
   const [seriesDraft, setSeriesDraft] = useState<{ key: string; label: string; unit: string; type: 'number' | 'string' }>({
@@ -1221,6 +1324,23 @@ export function DataPanel() {
       /* private mode */
     }
   }, [views]);
+
+  /**
+   * The first visit that has data is the last time the steps are in the way. They
+   * are still one tap away in the header, and a dashboard with nothing in it keeps
+   * them open because that is exactly the case they exist for.
+   */
+  useEffect(() => {
+    if (helpDismissed || loading) return;
+    const hasData = (metrics?.series.length ?? 0) > 0 || (records?.objects.length ?? 0) > 0;
+    if (!hasData) return;
+    setHelpDismissed(true);
+    try {
+      localStorage.setItem('hub:data:helpSeen', 'true');
+    } catch {
+      /* private mode — it comes back next launch, which is harmless */
+    }
+  }, [helpDismissed, loading, metrics, records]);
 
   const reload = useCallback(async () => {
     // BOTH stores, in one round of round trips: the master list shows numbers and
