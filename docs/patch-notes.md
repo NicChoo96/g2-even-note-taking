@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.84
+
+v0.3.84 - A chart you can work with
+
+- Taller on a phone, with abbreviated axis numbers (460k, not 460,000.00).
+- A category axis labels every value when there are few.
+- Every dropdown closes on an outside tap, and on Escape.
+- Long column names truncate instead of scrolling the row.
+- Zoom in, out and step along the readings.
+- Comparing series is a dropdown, not a chip row that grows.
+- The help steps aside once you have data.
+
 ## 0.3.83
 
 v0.3.83 - Any column on the chart
