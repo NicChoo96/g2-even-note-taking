@@ -2,6 +2,18 @@
 
 Store-submission notes. Each entry must stay under 500 characters.
 
+## 0.3.85
+
+v0.3.85 - Sort, readable menus, tidy cards
+
+- A Sort control: pick any column and either direction, and the rows below the
+chart follow the same order.
+- A date axis that spans years now prints the year, so oldest-to-newest cannot
+read as jumbled.
+- Dropdowns sit on a lifted surface with hover, checked and focus states, so
+they read as a layer instead of stray text.
+- Every card in the phone strip is one width, and a long column list truncates.
+
 ## 0.3.84
 
 v0.3.84 - A chart you can work with
