@@ -65,7 +65,9 @@ import {
   plotFields,
   sliceWindow,
   slotCount,
+  sortRows,
   tableView,
+  type SortSpec,
 } from './chart-data';
 
 const DAY_INITIALS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
@@ -119,6 +121,16 @@ interface ViewSpec {
    * first column".
    */
   xField?: string;
+  /**
+   * For a TABLE: which column the rows are ORDERED by, and which way.
+   *
+   * Absent means automatic — a time axis ascending, a category axis alphabetically,
+   * which is the order that needs no explanation. Choosing a field ranks the rows
+   * by it, and the chart follows that order (as categories, because a time axis
+   * out of order draws a line that jumps backwards and looks like bad data).
+   */
+  sortBy?: string;
+  sortDir?: 'asc' | 'desc';
   /**
    * For a SERIES: other series plotted with it, by key.
    *
@@ -756,13 +768,24 @@ function TableDetail({
    */
   const matching = applyRange(applyFilters(table.records, filters), range);
   /**
+   * ONE ORDER, shared by the chart and the table.
+   *
+   * A wearer who sorts by price expects the rows underneath to be in that order
+   * too — a ranked chart above an unsorted list is two answers to one question.
+   */
+  const sortSpec: SortSpec | undefined =
+    view.sortBy && table.fields.some((f) => f.key === view.sortBy)
+      ? { by: view.sortBy, dir: view.sortDir ?? 'asc' }
+      : undefined;
+  const ordered = sortRows(matching, table.fields, sortSpec);
+  /**
    * THE ROWS → SLOTS. `tableView` sorts a time axis OLDEST FIRST, which is the
    * fix for a chart that drew 2026 on the left: the store hands rows back
    * newest-first, and a trend read right to left is a trend that is not there.
    * Rows with nothing in the x column are left out and COUNTED, so the chart can
    * say how many it could not place instead of quietly dropping them.
    */
-  const points = tableView(matching, table.fields, xField, yFields);
+  const points = tableView(ordered, table.fields, xField, yFields, sortSpec);
   const choices = windowChoices(
     points.slots.kind === 'time' ? points.slots.ts.map((ts) => ({ ts, value: 0 })) : [],
   );
@@ -890,6 +913,66 @@ function TableDetail({
               ))}
             </select>
           </label>
+        )}
+        {/* SORT. The order used to be implicit — oldest first, or alphabetical —
+            with no way to say "by price". This picks the field, and the rows
+            below the chart follow the same order. */}
+        {table.fields.length > 1 && (
+          <Menu
+            className="md-sort"
+            label="Sort"
+            value={
+              sortSpec
+                ? `${fieldTitle(table.fields.find((f) => f.key === sortSpec.by) as RecordField)} ${sortSpec.dir === 'desc' ? '↓' : '↑'}`
+                : xInfo?.type === 'date'
+                  ? 'oldest first'
+                  : 'A-Z'
+            }
+            active={Boolean(sortSpec)}
+            title="Which column orders the rows"
+          >
+            <div className="dp-menu-list" role="group" aria-label="Sort by">
+              <label className="dp-menu-opt">
+                <input
+                  type="radio"
+                  name="dp-sort"
+                  checked={!sortSpec}
+                  onChange={() => onView({ ...view, sortBy: undefined, sortDir: undefined })}
+                />
+                <span>Automatic</span>
+                <em>{xInfo?.type === 'date' ? 'oldest first' : 'A-Z'}</em>
+              </label>
+              {table.fields.map((f) => (
+                <label key={f.key} className="dp-menu-opt">
+                  <input
+                    type="radio"
+                    name="dp-sort"
+                    checked={view.sortBy === f.key}
+                    onChange={() => onView({ ...view, sortBy: f.key, sortDir: view.sortDir ?? 'asc' })}
+                  />
+                  <span>{fieldTitle(f)}</span>
+                </label>
+              ))}
+            </div>
+            <div className="dp-sort-dir" role="group" aria-label="Sort direction">
+              <button
+                type="button"
+                className={sortSpec?.dir === 'asc' ? 'on' : ''}
+                disabled={!sortSpec}
+                onClick={() => onView({ ...view, sortDir: 'asc' })}
+              >
+                ↑ Ascending
+              </button>
+              <button
+                type="button"
+                className={sortSpec?.dir === 'desc' ? 'on' : ''}
+                disabled={!sortSpec}
+                onClick={() => onView({ ...view, sortDir: 'desc' })}
+              >
+                ↓ Descending
+              </button>
+            </div>
+          </Menu>
         )}
         {/* WHICH COLUMNS ARE PLOTTED. Multi-select, because two numbers per row is
             exactly what a table of rows is for; the last one cannot be turned off,
@@ -1079,7 +1162,7 @@ function TableDetail({
               </tr>
             </thead>
             <tbody>
-              {matching.map((row) => (
+              {ordered.map((row) => (
                 <tr key={row.key} className={editing === row.key ? 'editing' : ''}>
                   <td className="rec-key">
                     <span title={row.key}>{row.key}</span>
@@ -1753,6 +1836,10 @@ export function DataPanel() {
         // looked at: a schema change must not silently re-pick them.
         ...(stored.xField ? { xField: stored.xField } : {}),
         ...(Array.isArray(stored.yFields) && stored.yFields.length ? { yFields: stored.yFields } : {}),
+        // The order is a lens too: "by price, highest first" is a way of reading the
+        // rows, not a property of them.
+        ...(stored.sortBy ? { sortBy: stored.sortBy } : {}),
+        ...(stored.sortDir ? { sortDir: stored.sortDir } : {}),
         // The lenses are part of "how this table is being looked at", so a reload
         // must not silently drop them back to every row.
         ...(stored.filters && Object.keys(stored.filters).length ? { filters: stored.filters } : {}),

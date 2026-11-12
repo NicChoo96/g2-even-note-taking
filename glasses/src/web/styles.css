@@ -26,6 +26,11 @@
   --panel: #151922;
   --panel-2: #1b202b;
   --panel-3: #222836;
+  /* One step ABOVE panel-3: a dropdown is a layer, and a layer that is the same
+     colour as the card it opens over has no edge at all in dark mode. */
+  --panel-lift: #2a3142;
+  --row-hover: rgba(255, 255, 255, 0.07);
+  --row-on: rgba(138, 152, 251, 0.18);
   --border: #262c3a;
   --border-strong: #333b4d;
 
@@ -71,6 +76,9 @@
   --panel: #ffffff;
   --panel-2: #f7f8fc;
   --panel-3: #eef1f8;
+  --panel-lift: #ffffff;
+  --row-hover: rgba(24, 32, 55, 0.06);
+  --row-on: rgba(91, 99, 211, 0.12);
   --border: #e4e7f0;
   --border-strong: #d2d7e6;
 
@@ -2951,11 +2959,19 @@ p.empty {
 /* The prefix heading is redundant in a horizontal strip on a phone. */
 .mm-group-head { display: none; }
 
+/* One width for every card in the phone strip.
+
+   A card used to size itself to its WIDEST child — a table listing nine column
+   names — so `coe.exercise` stretched three cards wide and the strip turned into a
+   sideways scroll. Equal width, and the column list truncates. */
 .metric-master-row {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 118px;
+  flex: 0 0 168px;
+  width: 168px;
+  max-width: 168px;
+  min-width: 0;
   scroll-snap-align: start;
   text-align: left;
   border: 1px solid var(--border);
@@ -2998,7 +3014,7 @@ p.empty {
     border-bottom: 1px solid var(--border);
     margin-bottom: 4px;
   }
-  .metric-master-row { min-width: 0; width: 100%; border-color: transparent; background: transparent; }
+  .metric-master-row { min-width: 0; width: 100%; max-width: none; flex: 1 1 auto; border-color: transparent; background: transparent; }
   .metric-master-row:hover { background: var(--panel-2); }
   .metric-master-row.active { background: var(--panel-2); }
 }
@@ -3515,6 +3531,10 @@ p.empty {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* It is a flex child: without this it reports its CONTENT width as the card's
+     minimum and the ellipsis never gets a chance to happen. */
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* Wider than the readings table: a row has as many columns as the wearer's data
@@ -3576,7 +3596,7 @@ p.empty {
   padding: 3px 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: transparent;
+  background: var(--panel-2, rgba(255, 255, 255, 0.04));
   font-size: 11px;
   color: var(--text-soft, inherit);
   cursor: pointer;
@@ -3584,7 +3604,13 @@ p.empty {
   min-width: 0;
 }
 
-.dp-menu-btn:hover { border-color: var(--border-strong, var(--border)); }
+.dp-menu-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--panel-3, rgba(255, 255, 255, 0.08));
+}
+
+.dp-menu-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* A caret, drawn rather than typed: the button holds two spans. */
 .dp-menu-btn::after {
@@ -3624,11 +3650,24 @@ p.empty {
   min-width: 200px;
   max-width: 280px;
   padding: 8px;
+  /* A LIFTED SURFACE, not the page colour. The panel used `--panel`, which is the
+     same tone as the card it opens over — in dark mode the list had no edge at
+     all and the options read as stray text. One step lighter, a real border and a
+     deeper shadow make it obviously a layer above. */
   border: 1px solid var(--border-strong, var(--border));
   border-radius: 10px;
-  background: var(--panel, #14161d);
-  box-shadow: var(--shadow, 0 12px 30px rgba(0, 0, 0, 0.45));
+  background: var(--panel-lift, var(--panel-3, #23262f));
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 16px 40px rgba(0, 0, 0, 0.65);
 }
+
+/* Every option is a target: it shows a row highlight on hover, and a checked one
+   stays highlighted so a multi-select list can be read at a glance. */
+.dp-menu-opt:hover { background: var(--row-hover, rgba(255, 255, 255, 0.07)); border-radius: 6px; }
+.dp-menu-opt:has(input:checked) { background: var(--row-on, rgba(138, 152, 251, 0.14)); border-radius: 6px; }
+.dp-menu-opt:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+
+.dp-menu-opt input[type='checkbox'],
+.dp-menu-opt input[type='radio'] { accent-color: var(--accent); }
 
 .dp-menu-search {
   width: 100%;
@@ -3675,6 +3714,25 @@ p.empty {
   cursor: pointer;
 }
 .dp-menu-clear:hover { border-color: var(--accent); color: var(--accent); }
+
+/* The sort direction pair. Two buttons, because "ascending" is a word a wearer
+   reads faster than an arrow alone. */
+.dp-sort-dir { display: flex; gap: 4px; margin-top: 6px; }
+
+.dp-sort-dir button {
+  flex: 1;
+  font-size: 11px;
+  padding: 5px 6px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.dp-sort-dir button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.dp-sort-dir button.on { border-color: var(--accent); background: var(--accent); color: #fff; }
+.dp-sort-dir button:disabled { opacity: 0.4; cursor: default; }
 
 /* WRAPS, because two date inputs are ~360px together and a 390px phone has
    ~330px of pane: on one line they push the page sideways instead of the

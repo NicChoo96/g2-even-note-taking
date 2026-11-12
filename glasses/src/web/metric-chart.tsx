@@ -228,6 +228,14 @@ function stamp(ts: number, span: number): string {
   if (span <= 36 * 3600e3) {
     return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   }
+  /**
+   * ACROSS YEARS, THE DAY ALONE IS A LIE. An ascending axis of `11/15, 8/15,
+   * 2/15, 5/15, 11/9` is perfectly sorted — in different years — and reads as
+   * broken because the only thing that changed is the part that is not printed.
+   * Past a year of span, the year goes in.
+   */
+  const year = String(d.getFullYear()).slice(2);
+  if (span >= 300 * 24 * 3600e3) return `${d.getMonth() + 1}/${d.getDate()}/${year}`;
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 

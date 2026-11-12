@@ -155,7 +155,40 @@ check('…so the line has a start, not a bare edge', cut.series[0].values, [2, 3
 check('…and says where it started', cut.start, 1);
 check('All is untouched', P.sliceWindow(wide.slots, wide.series, 'all').slots.ts.length, 5);
 
-// ── G. the small rules ─────────────────────────────────────────────────────
+// ── G. sorting: one field, one order, shared by chart and table ─────────────
+const byPriceDesc = P.sortRows(ROWS, FIELDS, { by: 'price', dir: 'desc' });
+check('a numeric sort ranks the rows', byPriceDesc.map((r) => r.values.price), [460000, 353000, 339000, 290000, 0]);
+const byPriceAsc = P.sortRows(ROWS, FIELDS, { by: 'price', dir: 'asc' });
+check('…and reverses', byPriceAsc.map((r) => r.values.price), [0, 290000, 339000, 353000, 460000]);
+const byDateDesc = P.sortRows(ROWS, FIELDS, { by: 'launch_date', dir: 'desc' });
+check('a date sort uses the instant', byDateDesc[0].key, 'r-2026');
+check('no sort leaves the rows exactly as they came', P.sortRows(ROWS, FIELDS, undefined), ROWS);
+check(
+  'a text sort is natural, not byte order',
+  P.sortRows(
+    [{ key: 'b', values: { flat_type: '10-room' } }, { key: 'a', values: { flat_type: '9-room' } }],
+    FIELDS,
+    { by: 'flat_type', dir: 'asc' },
+  ).map((r) => r.key),
+  ['a', 'b'],
+);
+const blank = P.sortRows(
+  [{ key: 'blank', values: { price: null } }, { key: 'low', values: { price: 1 } }, { key: 'high', values: { price: 9 } }],
+  FIELDS,
+  { by: 'price', dir: 'desc' },
+);
+check('a blank sorts LAST, in either direction', blank.map((r) => r.key), ['high', 'low', 'blank']);
+
+// Sorted by something other than x: the axis becomes categories in that order.
+const ranked = P.tableView(byPriceDesc, FIELDS, 'flat_type', ['price'], { by: 'price', dir: 'desc' });
+check('sorting by another field makes a CATEGORY axis (a time axis would zigzag)', ranked.slots.kind, 'category');
+check('…and the labels are in the sorted order', ranked.slots.labels, ['5-room', '4-room']);
+check('…carrying the top-ranked row of each', ranked.series[0].values, [460000, 353000]);
+const timeDesc = P.tableView(P.sortRows(ROWS, FIELDS, { by: 'launch_date', dir: 'desc' }), FIELDS, 'launch_date', ['price'], { by: 'launch_date', dir: 'desc' });
+check('sorting BY the x column keeps it a time axis', timeDesc.slots.kind, 'time');
+check('…newest first when asked', timeDesc.series[0].values[0], 339000);
+
+// ── H. the small rules ─────────────────────────────────────────────────────
 check('the x column defaults to the first DATE column', P.pickXField(FIELDS), 'launch_date');
 check('…or the first column when nothing is a date', P.pickXField(FIELDS.slice(1)), 'estate');
 check('only numeric columns are offered to plot', P.plotFields(FIELDS).map((f) => f.key), ['price', 'psf']);
@@ -167,7 +200,12 @@ check('a bare date is an instant', P.instantOf('2026-11-09'), day('2026-11-09'))
 const panel = readFileSync(resolve(here, '../src/web/DataPanel.tsx'), 'utf8');
 checkTrue(
   'the table plot is built from the ONE filtered row set',
-  /const points = tableView\(matching, table\.fields, xField, yFields\)/.test(panel),
+  /const points = tableView\(ordered, table\.fields, xField, yFields, sortSpec\)/.test(panel) &&
+    /const ordered = sortRows\(matching, table\.fields, sortSpec\)/.test(panel),
+);
+checkTrue(
+  'the SORT is one field, chosen from a dropdown, and the table follows it',
+  /className="md-sort"/.test(panel) && /aria-label="Sort by"/.test(panel) && /↓ Descending/.test(panel),
 );
 checkTrue('the x axis is a control, over every column', /title="Which column runs along the x axis"/.test(panel) && /table\.fields\.map\(\(f\) => \(\s*<option/.test(panel));
 checkTrue('the plotted columns are multi-select', /aria-label="Which columns to plot"/.test(panel));
@@ -208,6 +246,10 @@ checkTrue(
   /if \(viewSlots\.kind === 'category'\) \{[\s\S]{0,120}n <= 14\) return Array\.from/.test(chart),
 );
 checkTrue('a crowded axis thins to evenly-spaced ticks', /return evenlySpaced\(n, want\)/.test(chart));
+checkTrue(
+  'an axis spanning years prints the YEAR, so an ascending axis cannot look reversed',
+  /span >= 300 \* 24 \* 3600e3\) return `\$\{d\.getMonth\(\) \+ 1\}\/\$\{d\.getDate\(\)\}\/\$\{year\}`/.test(chart),
+);
 checkTrue(
   'the chart measures its own box and is TALLER when narrow',
   /useChartBox\(\)/.test(chart) && /w < 520 \? 260 : 200/.test(chart),

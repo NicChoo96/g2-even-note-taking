@@ -143,6 +143,33 @@ const records = {
       row('r-2018', '2018-11-01', '4-room', 290000, 880),
     ],
     total: 6,
+  }, {
+    // THE REPORTED CARD: nine columns with long names, which used to set the card's
+    // width and stretch the strip into a sideways scroll.
+    key: 'coe.exercise',
+    label: 'coe.exercise',
+    strict: false,
+    fields: [
+      { key: 'exercise_date', label: 'exercise_date', type: 'date', unit: '', precision: 0 },
+      { key: 'exercise_category', label: 'exercise_category', type: 'text', unit: '', precision: 0 },
+      { key: 'quota_premium_sgd', label: 'quota_premium_sgd', type: 'number', unit: 'SGD', precision: 0 },
+      { key: 'previous_premium_sgd', label: 'previous_premium_sgd', type: 'number', unit: 'SGD', precision: 0 },
+      { key: 'change_sgd', label: 'change_sgd', type: 'number', unit: 'SGD', precision: 0 },
+      { key: 'quota_bids_required', label: 'quota_bids_required', type: 'number', unit: '', precision: 0 },
+      { key: 'bids_received', label: 'bids_received', type: 'number', unit: '', precision: 0 },
+      { key: 'quota_available', label: 'quota_available', type: 'number', unit: '', precision: 0 },
+      { key: 'source_note', label: 'source_note', type: 'text', unit: '', precision: 0 },
+    ],
+    count: 5,
+    latestTs: ts('2026-11-09'),
+    records: [{
+      key: 'coe-1',
+      ts: ts('2026-11-09'),
+      values: { exercise_date: '2026-11-09', exercise_category: 'Cat A', quota_premium_sgd: 98000 },
+      createdAt: 0,
+      updatedAt: 0,
+    }],
+    total: 5,
   }],
   now: Date.now(),
   store: { mode: 'hub', durable: true },
@@ -270,6 +297,57 @@ try {
   checkTrue('…and says which column it is', /Flat type/.test(await page.locator('.chart-x-title').innerText()));
   await page.screenshot({ path: join(shot, 'desktop-categories.png') });
 
+  // ── 4b. SORT: a field, a direction, and the rows follow ──────────────────
+  await page.locator('.md-sort .dp-menu-btn').click();
+  const panelBg = await page.evaluate(() => {
+    const bg = (sel) => getComputedStyle(document.querySelector(sel)).backgroundColor;
+    return { panel: bg('.dp-menu-panel'), card: bg('.metric-detail') };
+  });
+  console.log(`        dropdown surface: ${panelBg.panel} over card ${panelBg.card}`);
+  checkTrue('the dropdown surface is a LAYER, not the card colour', panelBg.panel !== panelBg.card);
+
+  // The option under the pointer must react, or a list of values has no affordance.
+  // Measured on an UNSELECTED row: a checked one is already highlighted, so a
+  // hover on it proves nothing.
+  const plainOpt = page.locator('.md-sort .dp-menu-opt:has-text("PSF")');
+  const beforeHover = await plainOpt.evaluate((el) => getComputedStyle(el).backgroundColor);
+  await plainOpt.hover();
+  await page.waitForTimeout(80);
+  const afterHover = await plainOpt.evaluate((el) => getComputedStyle(el).backgroundColor);
+  checkTrue('an option highlights on hover', beforeHover !== afterHover);
+  await page.screenshot({ path: join(shot, 'desktop-dropdown.png') });
+
+  await page.locator('.md-sort .dp-menu-opt:has-text("Price") input').check();
+  await page.locator('.dp-sort-dir button:has-text("Descending")').click();
+  await tapOutside();
+  checkTrue(
+    'the sort control names the field and the direction',
+    /Price/.test(await page.locator('.md-sort .dp-menu-value').innerText()) &&
+      /↓/.test(await page.locator('.md-sort .dp-menu-value').innerText()),
+  );
+  await page.waitForTimeout(120);
+  const sortedTicks = await xTicks();
+  console.log(`        sorted axis: ${sortedTicks.join('  ')}`);
+  check('sorting by price DESC reorders the axis (5-room first)', sortedTicks.slice(0, 2), ['5-room', '4-room']);
+  checkTrue(
+    '…and the table follows the same order',
+    /460,000/.test((await page.locator('.record-table tbody tr').first().innerText()) ?? ''),
+  );
+  await page.screenshot({ path: join(shot, 'desktop-sorted.png') });
+
+  // Back to automatic, and to a date axis: the labels must carry the YEAR, or an
+  // ascending axis of 11/15, 8/15, 2/15 reads as broken.
+  await page.locator('.md-sort .dp-menu-btn').click();
+  await page.locator('.md-sort .dp-menu-opt:has-text("Automatic") input').check();
+  await tapOutside();
+  await page.locator('.md-xaxis select').selectOption('launch_date');
+  await page.waitForTimeout(120);
+  const yearTicks = await xTicks();
+  console.log(`        date axis: ${yearTicks.join('  ')}`);
+  checkTrue('a multi-year date axis prints the year', yearTicks.some((t) => /\/\d{2}$/.test(t)));
+  const yearOrder = yearTicks.map((t) => Number(/(\d{2})$/.exec(t)?.[1] ?? 0));
+  checkTrue('…so the axis reads oldest to newest', yearOrder.every((y, i) => i === 0 || y >= yearOrder[i - 1]));
+
   // ── 5. the FILTER dropdowns dismiss too ─────────────────────────────────
   const filterBtn = page.locator('.rec-filters .dp-menu-btn').first();
   if ((await filterBtn.count()) > 0) {
@@ -319,6 +397,20 @@ try {
   );
   console.log(`        phone y labels: ${yTicks.join(' / ')}`);
   checkTrue('the y axis is compacted on a phone, not 460,000.00', yTicks.some((t) => /k$|m$/.test(t)));
+
+  // ── 8. the master strip: ONE width per card, truncated detail ────────────
+  const cards = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('.metric-master-row')];
+    const coe = rows.find((r) => /coe\.exercise/.test(r.textContent ?? ''));
+    const cols = coe?.querySelector('.mm-table-cols');
+    return {
+      widths: [...new Set(rows.map((r) => Math.round(r.getBoundingClientRect().width)))],
+      colsTruncated: cols ? cols.scrollWidth > cols.clientWidth + 1 : false,
+    };
+  });
+  console.log(`        card widths: ${JSON.stringify(cards)}`);
+  check('every card in the strip is the same width', cards.widths.length, 1);
+  checkTrue('a nine-column table truncates its column list instead of widening its card', cards.colsTruncated);
   await page.screenshot({ path: join(shot, 'phone-categories.png'), fullPage: true });
 } finally {
   await browser.close();

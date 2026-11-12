@@ -97,13 +97,21 @@ export function pickXField(fields: RecordField[]): string {
  * Reduce a row set to slots and plot columns.
  *
  * `rows` arrive newest-first from the store; nothing downstream may depend on
- * that, so the sort happens here (rule 1 above).
+ * that, so the sort happens here (rule 1 above) — unless the caller has already
+ * chosen an order with `sort`, in which case that order is kept and the axis
+ * follows it.
+ *
+ * WHEN A SORT FIELD IS NOT THE X COLUMN, the axis becomes CATEGORIES of the x
+ * value in that order. Plotting unsorted timestamps on a time axis would draw a
+ * line that jumps backwards, which reads as a data error rather than as "sorted
+ * by price".
  */
 export function tableView(
   rows: RecordRow[],
   fields: RecordField[],
   xField: string,
   yFields: string[],
+  sort?: SortSpec,
 ): TablePlot {
   const x = fields.find((f) => f.key === xField);
   const ys = fields.filter((f) => f.type === 'number' && yFields.includes(f.key));
@@ -117,7 +125,10 @@ export function tableView(
   const empty = { slots: { kind: 'category' as const, labels: [] }, series, rowKeys: [], droppedX: 0, collapsed: 0 };
   if (!x) return empty;
 
-  if (x.type === 'date') {
+  // Sorted by something else: the x values are labels, in the caller's order.
+  const byOther = Boolean(sort && sort.by !== xField);
+
+  if (x.type === 'date' && !byOther) {
     const dated: Array<{ ts: number; row: RecordRow }> = [];
     let droppedX = 0;
     for (const row of rows) {
@@ -125,8 +136,9 @@ export function tableView(
       if (ts === null) droppedX += 1;
       else dated.push({ ts, row });
     }
-    // ASCENDING, oldest first. A stable sort keeps same-day rows in store order.
-    dated.sort((a, b) => a.ts - b.ts);
+    // ASCENDING, oldest first — unless the wearer asked for the other way round.
+    // A stable sort keeps same-day rows in the order they arrived.
+    if (!sort || sort.dir !== 'desc') dated.sort((a, b) => a.ts - b.ts);
     return {
       slots: { kind: 'time', ts: dated.map((d) => d.ts) },
       series: series.map((s, i) => ({
@@ -163,7 +175,11 @@ export function tableView(
       collapsed += 1;
     }
   }
-  order.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  // Sorted by another field, the labels are in THAT order — a ranked list, not an
+  // alphabetical one. Otherwise they are ordered so the axis is stable between
+  // renders. Either way the FIRST row for a label wins, which — given the store's
+  // newest-first order — is the most recent row for that label.
+  if (!byOther) order.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const picked = order.map((label) => rowsByLabel.get(label) as RecordRow);
   return {
     slots: { kind: 'category', labels: order },
@@ -177,6 +193,44 @@ export function tableView(
 function buildValues(rows: RecordRow[], field: RecordField | undefined): Array<number | null> {
   if (!field) return rows.map(() => null);
   return rows.map((r) => numberOrNull(r.values?.[field.key]));
+}
+
+/** Which field, and which way, the wearer chose to order the rows. */
+export interface SortSpec {
+  by: string;
+  dir: 'asc' | 'desc';
+}
+
+/** A row's value in one field, as something sortable. */
+function sortValue(row: RecordRow, field: RecordField): number | string | null {
+  const raw = row.values?.[field.key];
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (field.type === 'number') return numberOrNull(raw);
+  if (field.type === 'bool') return raw ? 1 : 0;
+  return String(cellValue(row, field));
+}
+
+/**
+ * Order the rows by one field — the ONE order the chart and the table share.
+ *
+ * A blank cell sorts LAST in either direction: it is not "the smallest value",
+ * it is the absence of one, and a ranked list that puts blanks first reads as if
+ * those rows scored nothing.
+ */
+export function sortRows(rows: RecordRow[], fields: RecordField[], sort?: SortSpec): RecordRow[] {
+  if (!sort) return rows;
+  const field = fields.find((f) => f.key === sort.by);
+  if (!field) return rows;
+  const dir = sort.dir === 'desc' ? -1 : 1;
+  return [...rows].sort((a, b) => {
+    const av = sortValue(a, field);
+    const bv = sortValue(b, field);
+    if (av === null && bv === null) return 0;
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+    return String(av).localeCompare(String(bv), undefined, { numeric: true }) * dir;
+  });
 }
 
 /** A series as the plot needs it, before alignment. */
